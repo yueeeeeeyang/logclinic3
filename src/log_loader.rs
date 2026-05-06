@@ -31,7 +31,7 @@ use zip::ZipArchive;
 /// - `summary` 用于标题右侧展示加载结果摘要，避免 UI 层重复计算节点和错误数量。
 ///
 /// 边界条件：
-/// - 当前结构不保存真实文件句柄，也不缓存压缩包解码器；后续点击节点读取正文时必须重新按来源规则打开。
+/// - 当前结构不保存真实文件句柄，也不缓存压缩包解码器；点击节点读取正文时会按 `LogFileSource` 重新打开。
 /// - 展开状态属于 UI 会话状态，不写入该加载结果，避免业务数据和交互状态耦合。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoadedLogTree {
@@ -45,8 +45,8 @@ pub struct LoadedLogTree {
     /// 按展示顺序扁平化后的目录树行。
     ///
     /// 边界条件：
-    /// - 行内只包含展示所需的名称、层级、类型和元信息，不包含完整正文。
-    /// - 后续如需点击读取，应新增稳定来源 ID，而不是让 UI 反向解析展示文本。
+    /// - 行内只包含展示所需的名称、层级、类型、元信息和可打开来源，不包含完整正文。
+    /// - 可打开来源只出现在普通文件节点上，目录、压缩包根和错误节点不会伪装成可读取文件。
     pub rows: Vec<LogTreeRow>,
 
     /// 加载过程中收集到的非致命错误数量。
@@ -66,7 +66,7 @@ pub struct LoadedLogTree {
 ///
 /// 边界条件：
 /// - `id` 只在一次加载结果内部稳定，不跨加载、不跨进程持久化，后续不能把它当作文件来源 ID 使用。
-/// - 当前节点不可选、不保存持久来源定位；后续点击读取正文需要先定义来源定位规则。
+/// - `source` 只存在于可打开的普通文件节点，目录或错误节点没有来源定位。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogTreeRow {
     /// 当前加载结果内部的稳定节点 ID。
@@ -106,10 +106,10 @@ pub struct LogTreeRow {
     /// - 使用加载层计算结果比 UI 根据后续行深度推断更可靠，也减少虚拟列表滚动时的重复计算。
     pub has_children: bool,
 
-    /// 节点右侧补充信息。
+    /// 节点补充信息。
     ///
     /// 边界条件：
-    /// - 文件节点通常展示大小；目录节点可以为空；错误节点展示简短错误类别。
+    /// - 文件节点通常展示大小；目录节点展示递归包含的文件数量；错误节点展示简短错误类别。
     /// - 这里不展示绝对路径，避免窄面板被长路径挤压。
     pub meta: Option<String>,
 
@@ -119,6 +119,17 @@ pub struct LogTreeRow {
     /// - 当前 UI 只展示简短元信息，后续可以把该字段接入悬浮提示或状态面板。
     /// - 非错误节点通常为 `None`。
     pub error_message: Option<String>,
+
+    /// 当前节点对应的日志正文来源。
+    ///
+    /// 业务意图：
+    /// - 文件节点点击后必须能准确知道该读取本地文件，还是压缩包内部成员。
+    /// - 来源模型由加载层生成，UI 层不能从展示名称、缩进或父节点文本反推真实路径。
+    ///
+    /// 边界条件：
+    /// - 只有 `LogTreeEntryKind::File` 节点可以携带来源；其它节点保持 `None`。
+    /// - 来源只表示“如何重新读取原始字节”，不缓存文件句柄、解码结果或压缩包 reader。
+    pub source: Option<LogFileSource>,
 }
 
 /// 目录树节点的业务类型。
@@ -148,7 +159,7 @@ pub enum LogTreeEntryKind {
 ///
 /// 边界条件：
 /// - 这里只基于文件名扩展名判断格式，不读取魔数；后续如需更强识别能力需要补充验收标准。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ArchiveFormat {
     /// ZIP 压缩包。
     Zip,
@@ -158,6 +169,82 @@ pub enum ArchiveFormat {
     TarGz,
     /// 7-Zip 压缩包。
     SevenZ,
+}
+
+/// 左侧目录树中文件节点的可打开来源。
+///
+/// 业务意图：
+/// - 日志查看必须支持普通文件和压缩包内部文件，因此需要把两种读取入口统一成一个可复制的数据模型。
+/// - 该结构只保存定位信息，不保存原始字节和解码文本，避免目录树扫描阶段提前读取大文件。
+///
+/// 边界条件：
+/// - 本地文件来源不跟随符号链接；目录扫描阶段已经把符号链接作为不可打开节点展示。
+/// - 压缩包成员路径使用安全归一化后的 `/` 分隔路径，不直接信任压缩包原始路径文本。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LogFileSource {
+    /// 普通文件系统中的日志文件。
+    LocalFile {
+        /// 文件系统真实路径。
+        ///
+        /// 业务意图：
+        /// - 后续打开文件时必须直接使用该路径读取原始字节。
+        /// - 路径可能包含非 UTF-8 字节，因此模型保存 `PathBuf`，展示时才做有损转换。
+        path: PathBuf,
+    },
+
+    /// 压缩包内部的日志文件条目。
+    ArchiveMember {
+        /// 压缩包文件本身的路径。
+        archive_path: PathBuf,
+        /// 压缩包格式，用于分发到对应的流式读取实现。
+        archive_format: ArchiveFormat,
+        /// 压缩包内部安全归一化后的成员路径。
+        member_path: String,
+    },
+}
+
+impl LogFileSource {
+    /// 返回当前来源用于 tab 去重的稳定键。
+    ///
+    /// 业务意图：
+    /// - 用户重复点击同一个文件时应切换到已有 tab，而不是打开多个重复 tab。
+    /// - 本地文件按规范化路径去重，压缩包成员按“压缩包路径 + 格式 + 成员路径”去重。
+    ///
+    /// 边界条件：
+    /// - `canonicalize` 可能因为权限或文件瞬间被删除而失败，此时回退到原始路径展示文本，保证 UI 仍可继续工作。
+    /// - 该键只服务当前进程内去重，不写入磁盘，也不作为跨平台持久 ID。
+    pub fn stable_key(&self) -> String {
+        match self {
+            Self::LocalFile { path } => format!("local:{}", normalized_path_for_key(path)),
+            Self::ArchiveMember {
+                archive_path,
+                archive_format,
+                member_path,
+            } => format!(
+                "archive:{}:{}:{}",
+                archive_format.label(),
+                normalized_path_for_key(archive_path),
+                member_path
+            ),
+        }
+    }
+
+    /// 返回适合 tab 标题和错误文案使用的短名称。
+    ///
+    /// 业务意图：
+    /// - tab 空间有限，普通文件展示文件名，压缩包成员展示成员文件名。
+    /// - 当路径没有普通文件名时回退到完整路径，避免出现空标题。
+    pub fn display_name(&self) -> String {
+        match self {
+            Self::LocalFile { path } => display_name_for_path(path),
+            Self::ArchiveMember { member_path, .. } => member_path
+                .rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .unwrap_or(member_path)
+                .to_string(),
+        }
+    }
 }
 
 impl ArchiveFormat {
@@ -324,6 +411,7 @@ fn load_single_source(path: &Path, error_count: &mut usize) -> TreeNode {
             kind: LogTreeEntryKind::Symlink,
             meta: Some("符号链接".to_string()),
             error_message: None,
+            source: None,
             children: Vec::new(),
         };
     }
@@ -341,6 +429,7 @@ fn load_single_source(path: &Path, error_count: &mut usize) -> TreeNode {
                 kind: LogTreeEntryKind::Archive,
                 meta: Some(format.label().to_string()),
                 error_message: None,
+                source: None,
                 children: Vec::new(),
             };
 
@@ -361,6 +450,9 @@ fn load_single_source(path: &Path, error_count: &mut usize) -> TreeNode {
             kind: LogTreeEntryKind::File,
             meta: Some(format_byte_size(metadata.len())),
             error_message: None,
+            source: Some(LogFileSource::LocalFile {
+                path: path.to_path_buf(),
+            }),
             children: Vec::new(),
         };
     }
@@ -409,13 +501,16 @@ fn scan_directory(root_path: &Path, root: &mut TreeNode, error_count: &mut usize
 
                 let file_type = entry.file_type();
                 if file_type.is_dir() {
-                    root.add_leaf_path(&segments, LogTreeEntryKind::Directory, None, None);
+                    root.add_leaf_path(&segments, LogTreeEntryKind::Directory, None, None, None);
                 } else if file_type.is_file() {
                     let size = entry.metadata().ok().map(|metadata| metadata.len());
                     root.add_leaf_path(
                         &segments,
                         LogTreeEntryKind::File,
                         size.map(format_byte_size),
+                        Some(LogFileSource::LocalFile {
+                            path: entry.path().to_path_buf(),
+                        }),
                         None,
                     );
                 } else if file_type.is_symlink() {
@@ -424,6 +519,7 @@ fn scan_directory(root_path: &Path, root: &mut TreeNode, error_count: &mut usize
                         LogTreeEntryKind::Symlink,
                         Some("符号链接".to_string()),
                         None,
+                        None,
                     );
                 } else {
                     *error_count += 1;
@@ -431,6 +527,7 @@ fn scan_directory(root_path: &Path, root: &mut TreeNode, error_count: &mut usize
                         &segments,
                         LogTreeEntryKind::Error,
                         Some("不支持".to_string()),
+                        None,
                         Some("当前目录项不是普通文件、目录或符号链接".to_string()),
                     );
                 }
@@ -492,6 +589,8 @@ fn scan_zip_archive(
         })?;
         add_archive_entry(
             root,
+            path,
+            ArchiveFormat::Zip,
             entry.name(),
             entry.is_dir(),
             Some(entry.size()),
@@ -539,6 +638,8 @@ fn scan_rar_archive(
 
         add_archive_entry(
             root,
+            path,
+            ArchiveFormat::Rar,
             &raw_name,
             entry.is_directory(),
             Some(entry.unpacked_size),
@@ -585,7 +686,7 @@ fn scan_tar_gz_archive(
             }
         };
 
-        let path = match entry.path() {
+        let entry_path = match entry.path() {
             Ok(path) => path,
             Err(error) => {
                 *error_count += 1;
@@ -593,11 +694,19 @@ fn scan_tar_gz_archive(
                 continue;
             }
         };
-        let raw_name = path.to_string_lossy();
+        let raw_name = entry_path.to_string_lossy();
         let is_directory = entry.header().entry_type().is_dir();
         let size = entry.size();
 
-        add_archive_entry(root, &raw_name, is_directory, Some(size), error_count);
+        add_archive_entry(
+            root,
+            path,
+            ArchiveFormat::TarGz,
+            &raw_name,
+            is_directory,
+            Some(size),
+            error_count,
+        );
     }
 
     Ok(())
@@ -622,9 +731,11 @@ fn scan_7z_archive(
     for entry in archive.files {
         add_archive_entry(
             root,
+            path,
+            ArchiveFormat::SevenZ,
             &entry.name,
             entry.is_directory(),
-            Some(entry.size()),
+            Some(entry.size),
             error_count,
         );
     }
@@ -643,6 +754,8 @@ fn scan_7z_archive(
 /// - 目录条目不展示大小；文件条目展示未压缩大小。
 fn add_archive_entry(
     root: &mut TreeNode,
+    archive_path: &Path,
+    archive_format: ArchiveFormat,
     raw_name: &str,
     is_directory: bool,
     size: Option<u64>,
@@ -668,7 +781,17 @@ fn add_archive_entry(
         size.map(format_byte_size)
     };
 
-    root.add_leaf_path(&segments, kind, meta, None);
+    let source = if is_directory {
+        None
+    } else {
+        Some(LogFileSource::ArchiveMember {
+            archive_path: archive_path.to_path_buf(),
+            archive_format,
+            member_path: join_archive_segments(&segments),
+        })
+    };
+
+    root.add_leaf_path(&segments, kind, meta, source, None);
 }
 
 /// 将普通文件系统相对路径拆成目录树片段。
@@ -739,6 +862,27 @@ fn split_archive_entry_path(raw_name: &str) -> Result<Vec<String>, String> {
     Ok(segments)
 }
 
+/// 将压缩包内部路径归一化为安全、稳定、跨平台的成员路径。
+///
+/// 业务意图：
+/// - 日志目录树和日志内容读取必须使用同一套路径安全规则，否则树中可见的条目可能无法被点击打开。
+/// - 归一化结果统一使用 `/` 分隔，便于作为 `LogFileSource::ArchiveMember::member_path` 的稳定定位。
+///
+/// 边界条件：
+/// - 该函数只接受安全相对路径；绝对路径、盘符路径、上级目录和 NUL 字符都会返回错误。
+/// - 返回值用于匹配压缩包条目，不会直接拼接到本地文件系统路径，因此不会触发实际解压写入。
+pub fn normalize_archive_member_path(raw_name: &str) -> Result<String, String> {
+    split_archive_entry_path(raw_name).map(|segments| join_archive_segments(&segments))
+}
+
+/// 将已经安全拆分的压缩包路径片段重新连接成成员路径。
+///
+/// 业务意图：
+/// - 集中使用 `/` 作为压缩包内部路径分隔符，避免 ZIP、RAR、TAR 和 7Z 各自保留不同原始分隔符。
+fn join_archive_segments(segments: &[String]) -> String {
+    segments.join("/")
+}
+
 /// 为本地路径生成目录树根节点显示名。
 ///
 /// 业务意图：
@@ -749,6 +893,22 @@ fn display_name_for_path(path: &Path) -> String {
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| path.display().to_string())
+}
+
+/// 将文件系统路径转成用于当前进程内去重的稳定文本。
+///
+/// 业务意图：
+/// - tab 去重需要把同一个文件的不同相对写法归并到同一个键。
+/// - `canonicalize` 可以消除 `.`、`..` 和符号链接后的差异；如果失败，仍要回退到原始路径，避免路径瞬时不可用导致 UI 崩溃。
+///
+/// 边界条件：
+/// - 该函数只用于当前进程内的比较和展示，不作为安全边界，也不写入持久配置。
+/// - 路径可能不是合法 UTF-8，因此这里使用有损转换；真实读取仍使用 `PathBuf`。
+fn normalized_path_for_key(path: &Path) -> String {
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// 将字节数格式化成适合目录树元信息展示的短文本。
@@ -794,6 +954,12 @@ struct TreeNode {
     meta: Option<String>,
     /// 错误详细信息。
     error_message: Option<String>,
+    /// 文件节点的可打开来源。
+    ///
+    /// 业务意图：
+    /// - 构建树时就保存来源，扁平化后 UI 才能直接打开对应日志正文。
+    /// - 中间目录和错误节点没有正文来源，保持为 `None`。
+    source: Option<LogFileSource>,
     /// 子节点列表。
     children: Vec<TreeNode>,
 }
@@ -809,6 +975,7 @@ impl TreeNode {
             kind,
             meta: None,
             error_message: None,
+            source: None,
             children: Vec::new(),
         }
     }
@@ -827,6 +994,7 @@ impl TreeNode {
             kind: LogTreeEntryKind::Error,
             meta: Some(meta.into()),
             error_message: Some(error_message.into()),
+            source: None,
             children: Vec::new(),
         }
     }
@@ -878,6 +1046,7 @@ impl TreeNode {
         segments: &[String],
         kind: LogTreeEntryKind,
         meta: Option<String>,
+        source: Option<LogFileSource>,
         error_message: Option<String>,
     ) {
         if segments.is_empty() {
@@ -892,6 +1061,7 @@ impl TreeNode {
         let leaf_label = &segments[segments.len() - 1];
         let leaf = current.get_or_insert_child(leaf_label, kind);
         leaf.meta = meta;
+        leaf.source = source;
         leaf.error_message = error_message;
     }
 
@@ -946,12 +1116,50 @@ impl TreeNode {
             label: self.label.clone(),
             kind: self.kind,
             has_children: !self.children.is_empty(),
-            meta: self.meta.clone(),
+            meta: self.display_meta(),
             error_message: self.error_message.clone(),
+            source: self.source.clone(),
         });
 
         for child in &self.children {
             child.flatten_into(depth + 1, next_row_id, rows);
+        }
+    }
+
+    /// 返回当前节点适合目录树展示的补充信息。
+    ///
+    /// 业务意图：
+    /// - 用户要求文件夹名称后展示文件夹中的文件数量，因此目录节点需要在扁平化时补齐该派生信息。
+    /// - 文件数量使用递归统计，能表达该目录下所有可打开日志文件的规模，避免父目录只含子目录时显示为 0。
+    ///
+    /// 边界条件：
+    /// - 压缩包根节点继续显示格式信息，避免 “ZIP/RAR/7Z” 格式提示被文件数覆盖。
+    /// - 错误、符号链接和普通文件沿用构建阶段写入的元信息，不额外派生数量。
+    fn display_meta(&self) -> Option<String> {
+        match self.kind {
+            LogTreeEntryKind::Directory => Some(format!("{} 个文件", self.descendant_file_count())),
+            LogTreeEntryKind::Archive
+            | LogTreeEntryKind::File
+            | LogTreeEntryKind::Symlink
+            | LogTreeEntryKind::Error => self.meta.clone(),
+        }
+    }
+
+    /// 递归统计当前节点下可打开文件节点数量。
+    ///
+    /// 业务意图：
+    /// - 目录树中的文件数量用于帮助用户快速判断目录规模，而不是统计目录项总数。
+    /// - 只把 `LogTreeEntryKind::File` 计入数量，避免错误节点、符号链接或纯目录影响日志文件规模判断。
+    ///
+    /// 边界条件：
+    /// - 当前目录本身不可能是文件节点时才调用；即使未来复用到其它节点，普通文件也会按 1 个文件处理。
+    fn descendant_file_count(&self) -> usize {
+        match self.kind {
+            LogTreeEntryKind::File => 1,
+            LogTreeEntryKind::Directory | LogTreeEntryKind::Archive => {
+                self.children.iter().map(Self::descendant_file_count).sum()
+            }
+            LogTreeEntryKind::Symlink | LogTreeEntryKind::Error => 0,
         }
     }
 }
@@ -1037,12 +1245,18 @@ mod tests {
             &["b.log".to_string()],
             LogTreeEntryKind::File,
             Some("1 KB".to_string()),
+            Some(LogFileSource::LocalFile {
+                path: PathBuf::from("b.log"),
+            }),
             None,
         );
         root.add_leaf_path(
             &["api".to_string(), "access.log".to_string()],
             LogTreeEntryKind::File,
             Some("2 KB".to_string()),
+            Some(LogFileSource::LocalFile {
+                path: PathBuf::from("api/access.log"),
+            }),
             None,
         );
         root.sort_recursively();
@@ -1051,10 +1265,12 @@ mod tests {
         let mut next_row_id = 0usize;
         root.flatten_into(0, &mut next_row_id, &mut rows);
 
+        assert_eq!(rows[0].meta.as_deref(), Some("2 个文件"));
         assert_eq!(rows[1].label, "api");
         assert_eq!(rows[1].kind, LogTreeEntryKind::Directory);
         assert!(rows[1].has_children);
         assert_eq!(rows[1].id, 1);
+        assert_eq!(rows[1].meta.as_deref(), Some("1 个文件"));
         assert_eq!(rows[2].label, "access.log");
         assert!(!rows[2].has_children);
         assert_eq!(rows[3].label, "b.log");

@@ -7,6 +7,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# chardetng 用于日志正文的编码自动检测；检测失败时 UI 允许用户手动切换编码重新解码。
+chardetng = "1.0.0"
+# encoding_rs 显式提供 UTF-8、GBK、GB18030 和 Big5 解码能力，避免只依赖 GPUI 的传递依赖。
+encoding_rs = "0.8.35"
 # flate2 用于流式解码 tar.gz/tgz 的 gzip 层，不负责把压缩包内容解压到磁盘。
 flate2 = "1.1.9"
 # GPUI 是当前桌面窗口和交互渲染框架，版本固定到 crates.io 已确认的 0.2.2。
