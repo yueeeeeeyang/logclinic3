@@ -21,6 +21,12 @@ lucide-icons = "1.14.0"
 sevenz-rust = { version = "0.6.1", default-features = false, features = ["bzip2", "zstd"] }
 # tar 用于遍历 tar.gz/tgz 内部条目头部，配合 flate2 实现流式目录树构建。
 tar = "0.4.45"
+# tree-sitter 提供增量解析和查询能力；本项目只在小型 XML/properties 文件上启用整文件语法高亮。
+tree-sitter = "0.26.8"
+# tree-sitter-properties 提供 Java properties 文件语法和官方高亮查询，避免手写完整 properties 解析器。
+tree-sitter-properties = "0.3.0"
+# tree-sitter-xml 提供 XML 语法和官方高亮查询，供右侧只读查看器生成标签、属性和值的高亮范围。
+tree-sitter-xml = "0.7.0"
 # unrar 用于读取 RAR 文件列表；当前只使用 listing 模式，不执行解压写入。
 unrar = "0.5.8"
 # walkdir 用于递归扫描用户选择的目录，并显式关闭符号链接跟随。

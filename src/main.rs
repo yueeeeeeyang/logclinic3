@@ -13,17 +13,19 @@ use std::{borrow::Cow, collections::HashSet, path::PathBuf, sync::Arc};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AppContext, Application, ClickEvent, Context, FontWeight, HighlightStyle, InteractiveElement,
-    IntoElement, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Render, ScrollHandle, SharedString,
+    AppContext, Application, ClickEvent, Context, FontWeight, InteractiveElement, IntoElement,
+    ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, PathPromptOptions, Pixels, Render, ScrollHandle, SharedString,
     StatefulInteractiveElement, Styled as _, StyledText, TitlebarOptions, UniformListScrollHandle,
     Window, WindowBounds, WindowOptions, div, point, px, rgb, size, uniform_list,
 };
 use lucide_icons::{Icon, LUCIDE_FONT_BYTES};
 
+mod highlighting;
 mod log_content;
 mod log_loader;
 
+use highlighting::highlight_line;
 use log_content::{
     DecodedLogDocument, EncodingChoice, LogContentError, LogTextEncoding, decode_log_bytes,
     read_log_source_bytes,
@@ -43,9 +45,9 @@ const MAIN_WINDOW_TITLE: &str = "LogClinic";
 /// 主窗口的默认宽度。
 ///
 /// 业务约束：
-/// - 用户明确要求默认窗口宽度保持为 1200px。
+/// - 用户明确要求默认窗口宽度调整为 1400px，以便日志 tab 和正文区域在首次打开时有更多横向空间。
 /// - 这里使用浮点字面量是为了匹配 GPUI `px` 的尺寸 API，避免在调用处反复转换。
-const MAIN_WINDOW_WIDTH: f32 = 1200.0;
+const MAIN_WINDOW_WIDTH: f32 = 1400.0;
 
 /// 主窗口的默认高度。
 ///
@@ -518,6 +520,43 @@ impl LoadedLogTreeState {
     /// - 渲染可见行时需要根据该状态选择向右或向下的展开箭头。
     fn is_expanded(&self, node_id: usize) -> bool {
         self.expanded_node_ids.contains(&node_id)
+    }
+
+    /// 如果指定压缩包节点内部只有一个可打开文件，则返回该文件来源。
+    ///
+    /// 业务意图：
+    /// - 用户从左侧树点击压缩包文件时，如果压缩包内部只有一个日志文件，直接打开正文比先展开再点文件更符合预期。
+    /// - 该规则只在 UI 交互层生效，不改变加载层的目录树结构，后续仍可以展示完整压缩包内容。
+    ///
+    /// 边界条件：
+    /// - 只有 `Archive` 节点会触发该规则；普通目录即使只有一个文件也保持展开/收起行为。
+    /// - “只有一个文件”按可打开的文件节点统计，目录节点不计数；如果发现两个及以上文件则返回 `None`。
+    /// - 错误节点和符号链接不作为可打开日志来源，避免把不可读条目误当作候选文件。
+    fn single_file_source_for_archive(&self, node_id: usize) -> Option<LogFileSource> {
+        let archive_index = self
+            .tree
+            .rows
+            .iter()
+            .position(|row| row.id == node_id && row.kind == LogTreeEntryKind::Archive)?;
+        let archive_depth = self.tree.rows[archive_index].depth;
+        let mut single_source: Option<LogFileSource> = None;
+
+        for row in self.tree.rows.iter().skip(archive_index + 1) {
+            if row.depth <= archive_depth {
+                break;
+            }
+
+            if row.kind != LogTreeEntryKind::File {
+                continue;
+            }
+
+            let source = row.source.clone()?;
+            if single_source.replace(source).is_some() {
+                return None;
+            }
+        }
+
+        single_source
     }
 
     /// 切换某个可展开节点的展开状态。
@@ -1489,8 +1528,17 @@ impl MainView {
         row: &LoadedLogTreeRow,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        // 性能约束：虚拟列表渲染会频繁调用本函数，只有压缩包根节点才需要扫描子树判断是否可直接打开。
+        // 普通文件、目录和错误节点不能进入该线性扫描路径，否则大目录滚动时会把每行渲染放大为 O(整棵树)。
+        let direct_archive_source = if row.kind == LogTreeEntryKind::Archive {
+            self.single_file_archive_source(row.id)
+        } else {
+            None
+        };
+        let row_source = row.source.clone().or(direct_archive_source);
+        let can_toggle = row.has_children && row_source.is_none();
         let is_expanded = self.is_log_tree_node_expanded(row.id);
-        let expand_icon = if row.has_children {
+        let expand_icon = if can_toggle {
             Some(if is_expanded {
                 Icon::ChevronDown
             } else {
@@ -1508,8 +1556,8 @@ impl MainView {
                 expand_icon,
                 item_icon,
                 icon_color,
-                can_toggle: row.has_children,
-                source: row.source.clone(),
+                can_toggle,
+                source: row_source,
                 label: row.label.clone(),
                 meta: row.meta.clone(),
             },
@@ -1609,6 +1657,22 @@ impl MainView {
             LogTreeLoadState::Empty
             | LogTreeLoadState::Loading { .. }
             | LogTreeLoadState::Failed { .. } => false,
+        }
+    }
+
+    /// 返回单文件压缩包根节点可以直接打开的内部文件来源。
+    ///
+    /// 业务意图：
+    /// - 该方法把“压缩包只有一个文件时直接打开”的交互规则收口在主视图，避免渲染函数理解完整树扫描细节。
+    /// - 非加载状态和非压缩包节点统一返回 `None`，调用方可以继续走普通展开/收起逻辑。
+    fn single_file_archive_source(&self, node_id: usize) -> Option<LogFileSource> {
+        match &self.load_state {
+            LogTreeLoadState::Loaded(tree_state) => {
+                tree_state.single_file_source_for_archive(node_id)
+            }
+            LogTreeLoadState::Empty
+            | LogTreeLoadState::Loading { .. }
+            | LogTreeLoadState::Failed { .. } => None,
         }
     }
 
@@ -1712,6 +1776,7 @@ impl MainView {
         source: LogFileSource,
         context: &mut Context<Self>,
     ) {
+        let source_name = source.display_name();
         context
             .spawn(async move |view, app| {
                 let result = app
@@ -1719,7 +1784,11 @@ impl MainView {
                     .spawn(async move {
                         match read_log_source_bytes(&source) {
                             Ok(raw_bytes) => {
-                                match decode_log_bytes(&raw_bytes, EncodingChoice::Auto) {
+                                match decode_log_bytes(
+                                    &raw_bytes,
+                                    EncodingChoice::Auto,
+                                    &source_name,
+                                ) {
                                     Ok(document) => LogTabLoadResult::Ready {
                                         raw_bytes,
                                         document,
@@ -1812,6 +1881,7 @@ impl MainView {
         };
         self.tab_context_menu = None;
         self.encoding_dropdown_menu = None;
+        let source_name = tab.title.clone();
         if self
             .log_scrollbar_drag
             .is_some_and(|drag| drag.tab_id == tab_id)
@@ -1819,7 +1889,7 @@ impl MainView {
             self.log_scrollbar_drag = None;
         }
         context.notify();
-        self.spawn_log_tab_decode(tab_id, raw_bytes, encoding_choice, context);
+        self.spawn_log_tab_decode(tab_id, raw_bytes, encoding_choice, source_name, context);
     }
 
     /// 启动日志 tab 的后台重新解码任务。
@@ -1831,6 +1901,7 @@ impl MainView {
         tab_id: usize,
         raw_bytes: Arc<Vec<u8>>,
         encoding_choice: EncodingChoice,
+        source_name: String,
         context: &mut Context<Self>,
     ) {
         context
@@ -1838,7 +1909,7 @@ impl MainView {
                 let result = app
                     .background_executor()
                     .spawn(async move {
-                        decode_log_bytes(&raw_bytes, encoding_choice)
+                        decode_log_bytes(&raw_bytes, encoding_choice, &source_name)
                             .map(|document| LogTabDecodeResult::Ready {
                                 encoding_choice,
                                 document,
@@ -2992,10 +3063,20 @@ impl MainView {
                                     .map(|document| {
                                         range
                                             .filter_map(|index| {
-                                                document
-                                                    .lines
-                                                    .get(index)
-                                                    .map(|line| (index, line.clone()))
+                                                document.lines.get(index).map(|line| {
+                                                    let precomputed = document
+                                                        .precomputed_highlights
+                                                        .as_ref()
+                                                        .and_then(|highlights| {
+                                                            highlights.lines.get(index)
+                                                        });
+                                                    let line_highlights = highlight_line(
+                                                        document.highlight_mode,
+                                                        line,
+                                                        precomputed,
+                                                    );
+                                                    (index, line.clone(), line_highlights)
+                                                })
                                             })
                                             .collect::<Vec<_>>()
                                     })
@@ -3003,12 +3084,13 @@ impl MainView {
 
                                 lines
                                     .into_iter()
-                                    .map(|(index, line)| {
+                                    .map(|(index, line, highlights)| {
                                         let horizontal_line_number_offset =
                                             -row_scroll_handle.0.borrow().base_handle.offset().x;
                                         Self::render_log_line(
                                             index,
                                             line,
+                                            highlights,
                                             line_number_width,
                                             horizontal_line_number_offset,
                                         )
@@ -3395,11 +3477,10 @@ impl MainView {
     fn render_log_line(
         line_index: usize,
         line: String,
+        highlights: Vec<(std::ops::Range<usize>, gpui::HighlightStyle)>,
         line_number_width: f32,
         horizontal_line_number_offset: Pixels,
     ) -> gpui::Div {
-        let highlights = Self::log_line_highlights(&line);
-
         div()
             .relative()
             .h(px(LOG_VIEWER_ROW_HEIGHT))
@@ -3437,38 +3518,6 @@ impl MainView {
                     .border_color(rgb(0xe5e7eb))
                     .child((line_index + 1).to_string()),
             )
-    }
-
-    /// 计算日志行中的级别关键字高亮范围。
-    ///
-    /// 业务意图：
-    /// - 第一版只做日志级别高亮，覆盖 FATAL、ERROR、WARN、INFO、DEBUG 和 TRACE。
-    /// - 关键字都是 ASCII，大写匹配可以保证字节范围就是合法 UTF-8 边界，适合 `StyledText` 高亮。
-    fn log_line_highlights(line: &str) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
-        const LEVELS: &[(&str, u32, u32)] = &[
-            ("FATAL", 0xa40e26, 0xffebe9),
-            ("ERROR", 0xcf222e, 0xffebe9),
-            ("WARN", 0x9a6700, 0xfff8c5),
-            ("INFO", 0x0969da, 0xddf4ff),
-            ("DEBUG", 0x57606a, 0xf6f8fa),
-            ("TRACE", 0x8250df, 0xfbefff),
-        ];
-
-        for (keyword, color, background) in LEVELS {
-            if let Some(start) = line.find(keyword) {
-                return vec![(
-                    start..start + keyword.len(),
-                    HighlightStyle {
-                        color: Some(rgb(*color).into()),
-                        background_color: Some(rgb(*background).into()),
-                        font_weight: Some(FontWeight::BOLD),
-                        ..Default::default()
-                    },
-                )];
-            }
-        }
-
-        Vec::new()
     }
 
     /// 打开 tab 右键菜单。
@@ -3813,4 +3862,96 @@ fn main() {
         })
         .expect("创建 LogClinic 主窗口失败，应用无法继续启动");
     });
+}
+
+#[cfg(test)]
+mod tests {
+    //! 主界面纯状态逻辑测试。
+    //!
+    //! 业务意图：
+    //! - GPUI 渲染交互主要依赖手动验收，但目录树状态这类纯数据规则可以通过单元测试锁定。
+    //! - 本模块只验证不需要窗口系统的行为，避免测试环境依赖 macOS 或 Windows 图形能力。
+
+    use super::*;
+
+    /// 构造测试用目录树行。
+    ///
+    /// 业务意图：
+    /// - 测试只关心节点层级、类型和来源，统一构造函数可以避免每个用例重复填充无关展示字段。
+    fn test_tree_row(
+        id: usize,
+        depth: usize,
+        kind: LogTreeEntryKind,
+        has_children: bool,
+        source: Option<LogFileSource>,
+    ) -> LoadedLogTreeRow {
+        LoadedLogTreeRow {
+            id,
+            depth,
+            label: format!("node-{}", id),
+            kind,
+            has_children,
+            meta: None,
+            error_message: None,
+            source,
+        }
+    }
+
+    /// 构造测试用压缩包成员来源。
+    ///
+    /// 边界条件：
+    /// - 路径只用于来源相等性判断，不会在测试中访问真实文件系统。
+    fn test_archive_member(member_path: &str) -> LogFileSource {
+        LogFileSource::ArchiveMember {
+            archive_path: PathBuf::from("logs.zip"),
+            archive_format: log_loader::ArchiveFormat::Zip,
+            member_path: member_path.to_string(),
+        }
+    }
+
+    /// 验证单文件压缩包会返回内部成员来源，供 UI 点击压缩包根节点时直接打开。
+    #[test]
+    fn 单文件压缩包返回唯一成员来源() {
+        let source = test_archive_member("access.log");
+        let tree = LoadedLogTree {
+            summary: "2 个节点".to_string(),
+            rows: vec![
+                test_tree_row(0, 0, LogTreeEntryKind::Archive, true, None),
+                test_tree_row(1, 1, LogTreeEntryKind::File, false, Some(source.clone())),
+            ],
+            error_count: 0,
+        };
+        let state = LoadedLogTreeState::new(tree);
+
+        assert_eq!(state.single_file_source_for_archive(0), Some(source));
+    }
+
+    /// 验证多文件压缩包不会被绑定到单个成员，仍应保留展开/收起目录树的行为。
+    #[test]
+    fn 多文件压缩包不返回直接打开来源() {
+        let tree = LoadedLogTree {
+            summary: "3 个节点".to_string(),
+            rows: vec![
+                test_tree_row(0, 0, LogTreeEntryKind::Archive, true, None),
+                test_tree_row(
+                    1,
+                    1,
+                    LogTreeEntryKind::File,
+                    false,
+                    Some(test_archive_member("access.log")),
+                ),
+                test_tree_row(
+                    2,
+                    1,
+                    LogTreeEntryKind::File,
+                    false,
+                    Some(test_archive_member("error.log")),
+                ),
+            ],
+            error_count: 0,
+        };
+        let state = LoadedLogTreeState::new(tree);
+
+        assert_eq!(state.single_file_source_for_archive(0), None);
+    }
 }

@@ -14,7 +14,7 @@ use std::{
     error::Error,
     fmt::{self, Display},
     fs::{self, File},
-    io::{BufReader, Read},
+    io::{BufReader, Cursor, Read},
     path::Path,
     sync::Arc,
 };
@@ -25,6 +25,7 @@ use flate2::read::GzDecoder;
 use tar::Archive as TarArchive;
 use zip::ZipArchive;
 
+use crate::highlighting::{HighlightMode, PrecomputedHighlights, prepare_highlighting};
 use crate::log_loader::{ArchiveFormat, LogFileSource, normalize_archive_member_path};
 
 /// 单个日志 tab 允许缓存的最大原始字节数。
@@ -148,6 +149,18 @@ pub struct DecodedLogDocument {
     /// - 空内容会被 `split_decoded_lines` 规范成一行空字符串，因此这里始终可以安全返回 0。
     /// - 字符数量不是精确像素宽度，但日志正文使用等宽字体时足以作为横向测量样本。
     pub longest_line_index: usize,
+    /// 当前文档使用的高亮模式。
+    ///
+    /// 业务意图：
+    /// - 高亮模式在解码阶段根据文件名和内容一次性识别，虚拟列表渲染当前行时不再重复推断。
+    /// - 编码切换后会重新生成该字段，避免错误编码下的内容继续使用旧高亮结果。
+    pub highlight_mode: HighlightMode,
+    /// XML/properties 小文件的预计算高亮。
+    ///
+    /// 业务意图：
+    /// - Tree-sitter 需要整文件语法树才能准确高亮标签、属性和 properties key/value。
+    /// - 大文件会保持 `None` 并降级为轻量规则，避免打开和滚动性能受影响。
+    pub precomputed_highlights: Option<PrecomputedHighlights>,
     /// 解码过程中是否出现替换字符。
     ///
     /// 业务意图：
@@ -209,6 +222,28 @@ impl Error for LogContentError {}
 /// - 超过 200MB 的来源不会继续读取。
 /// - 压缩包成员按安全归一化路径匹配，避免原始分隔符差异导致树上能看到但打开失败。
 pub fn read_log_source_bytes(source: &LogFileSource) -> Result<Arc<Vec<u8>>, LogContentError> {
+    if let Some(format) = archive_format_for_source(source) {
+        let bytes = match source {
+            LogFileSource::LocalFile { path } => read_single_file_archive_from_path(path, format)?,
+            LogFileSource::ArchiveMember {
+                archive_path,
+                archive_format,
+                member_path,
+            } => {
+                let archive_bytes =
+                    read_archive_member(archive_path, *archive_format, member_path)?;
+                read_single_file_archive_from_bytes(
+                    &archive_bytes,
+                    format,
+                    member_path,
+                    "压缩包内嵌套压缩包",
+                )?
+            }
+        };
+
+        return Ok(Arc::new(bytes));
+    }
+
     let bytes = match source {
         LogFileSource::LocalFile { path } => read_local_file(path)?,
         LogFileSource::ArchiveMember {
@@ -221,6 +256,23 @@ pub fn read_log_source_bytes(source: &LogFileSource) -> Result<Arc<Vec<u8>>, Log
     Ok(Arc::new(bytes))
 }
 
+/// 判断被点击的日志来源本身是否也是一个受支持压缩包。
+///
+/// 业务意图：
+/// - 左侧树可能来自目录或外层压缩包，里面的 `thread_xxx.zip` 这类条目会被加载层当作普通文件节点展示。
+/// - 点击这种文件时不能把 ZIP/RAR/7Z 二进制直接交给编码检测，而应该先按压缩包规则读取其内部唯一文件。
+///
+/// 边界条件：
+/// - 这里只根据文件名扩展名判断格式，和加载层 `ArchiveFormat::from_path` 保持一致。
+fn archive_format_for_source(source: &LogFileSource) -> Option<ArchiveFormat> {
+    match source {
+        LogFileSource::LocalFile { path } => ArchiveFormat::from_path(path),
+        LogFileSource::ArchiveMember { member_path, .. } => {
+            ArchiveFormat::from_path(Path::new(member_path))
+        }
+    }
+}
+
 /// 将原始字节按指定策略解码成日志文档。
 ///
 /// 业务意图：
@@ -229,13 +281,16 @@ pub fn read_log_source_bytes(source: &LogFileSource) -> Result<Arc<Vec<u8>>, Log
 pub fn decode_log_bytes(
     raw_bytes: &[u8],
     choice: EncodingChoice,
+    source_name: &str,
 ) -> Result<DecodedLogDocument, LogContentError> {
     match choice {
         EncodingChoice::Auto => {
             let encoding = detect_log_encoding(raw_bytes)?;
-            decode_with_encoding(raw_bytes, encoding, true)
+            decode_with_encoding(raw_bytes, encoding, true, source_name)
         }
-        EncodingChoice::Manual(encoding) => decode_with_encoding(raw_bytes, encoding, false),
+        EncodingChoice::Manual(encoding) => {
+            decode_with_encoding(raw_bytes, encoding, false, source_name)
+        }
     }
 }
 
@@ -271,6 +326,380 @@ fn read_archive_member(
         ArchiveFormat::Rar => read_rar_member(archive_path, member_path),
         ArchiveFormat::TarGz => read_tar_gz_member(archive_path, member_path),
         ArchiveFormat::SevenZ => read_7z_member(archive_path, member_path),
+    }
+}
+
+/// 从本地压缩包文件中读取唯一的普通文件成员。
+///
+/// 业务意图：
+/// - 用户可能在已加载目录树中直接点击 `.zip`、`.rar`、`.tar.gz` 或 `.7z` 文件。
+/// - 如果该压缩包内部只有一个文件，直接打开这个文件可以减少一次展开和选择操作。
+///
+/// 边界条件：
+/// - 压缩包为空或包含多个文件时返回明确错误，不把压缩包二进制伪装成日志文本。
+/// - 读取仍通过各格式 reader 完成，不把成员写入临时目录。
+fn read_single_file_archive_from_path(
+    archive_path: &Path,
+    archive_format: ArchiveFormat,
+) -> Result<Vec<u8>, LogContentError> {
+    let label = archive_path.display().to_string();
+    let member_path =
+        single_file_archive_member_path_from_path(archive_path, archive_format, label.as_str())?;
+    read_archive_member(archive_path, archive_format, &member_path)
+}
+
+/// 从内存中的压缩包字节读取唯一普通文件成员。
+///
+/// 业务意图：
+/// - 外层压缩包里的 `thread_xxx.zip` 这类嵌套压缩包不能落盘解压，也不能写临时文件。
+/// - 这里直接基于外层成员的原始字节构造 reader，若内层只有一个文件，就继续读取该文件字节交给编码检测。
+///
+/// 边界条件：
+/// - ZIP、TAR.GZ 和 7Z 支持从内存 reader 读取；RAR 当前 `unrar` API 需要路径，嵌套 RAR 暂时返回清晰错误。
+fn read_single_file_archive_from_bytes(
+    archive_bytes: &[u8],
+    archive_format: ArchiveFormat,
+    label: &str,
+    context_label: &str,
+) -> Result<Vec<u8>, LogContentError> {
+    match archive_format {
+        ArchiveFormat::Zip => read_single_file_zip_from_bytes(archive_bytes, label),
+        ArchiveFormat::TarGz => read_single_file_tar_gz_from_bytes(archive_bytes, label),
+        ArchiveFormat::SevenZ => read_single_file_7z_from_bytes(archive_bytes, label),
+        ArchiveFormat::Rar => Err(LogContentError::new(format!(
+            "{} {} 暂不支持直接从内存读取 RAR，请先选择外层解包后的 RAR 文件",
+            context_label, label
+        ))),
+    }
+}
+
+/// 获取本地压缩包中唯一普通文件成员的安全路径。
+///
+/// 业务意图：
+/// - 本地压缩包可以先扫描目录项确认只有一个文件，再复用现有按成员读取的流式实现。
+fn single_file_archive_member_path_from_path(
+    archive_path: &Path,
+    archive_format: ArchiveFormat,
+    label: &str,
+) -> Result<String, LogContentError> {
+    match archive_format {
+        ArchiveFormat::Zip => single_file_zip_member_path(archive_path, label),
+        ArchiveFormat::Rar => single_file_rar_member_path(archive_path, label),
+        ArchiveFormat::TarGz => single_file_tar_gz_member_path(archive_path, label),
+        ArchiveFormat::SevenZ => single_file_7z_member_path(archive_path, label),
+    }
+}
+
+/// 从 ZIP 文件目录中找出唯一普通文件成员路径。
+fn single_file_zip_member_path(
+    archive_path: &Path,
+    label: &str,
+) -> Result<String, LogContentError> {
+    let file = File::open(archive_path).map_err(|error| {
+        LogContentError::new(format!(
+            "无法打开 ZIP 压缩包 {}：{}",
+            archive_path.display(),
+            error
+        ))
+    })?;
+    let mut archive = ZipArchive::new(BufReader::new(file))
+        .map_err(|error| LogContentError::new(format!("无法读取 ZIP 目录：{}", error)))?;
+    let mut single_member = None;
+
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).map_err(|error| {
+            LogContentError::new(format!("无法读取 ZIP 条目 {}：{}", index, error))
+        })?;
+        if entry.is_dir() {
+            continue;
+        }
+
+        let normalized = normalize_archive_member_path(entry.name()).map_err(|reason| {
+            LogContentError::new(format!("{} 内包含非法 ZIP 条目：{}", label, reason))
+        })?;
+        remember_single_archive_member(&mut single_member, normalized, label)?;
+    }
+
+    require_single_archive_member(single_member, label)
+}
+
+/// 从 RAR 文件目录中找出唯一普通文件成员路径。
+fn single_file_rar_member_path(
+    archive_path: &Path,
+    label: &str,
+) -> Result<String, LogContentError> {
+    let archive = unrar::Archive::new(archive_path)
+        .open_for_listing()
+        .map_err(|error| LogContentError::new(format!("无法打开 RAR 目录：{}", error)))?;
+    let mut single_member = None;
+
+    for entry in archive {
+        let entry =
+            entry.map_err(|error| LogContentError::new(format!("无法读取 RAR 条目：{}", error)))?;
+        if entry.is_directory() {
+            continue;
+        }
+        if entry.is_encrypted() {
+            return Err(LogContentError::new(format!(
+                "{} 内唯一文件是加密 RAR 条目，暂不支持读取",
+                label
+            )));
+        }
+
+        let raw_name = entry.filename.to_string_lossy();
+        let normalized = normalize_archive_member_path(&raw_name).map_err(|reason| {
+            LogContentError::new(format!("{} 内包含非法 RAR 条目：{}", label, reason))
+        })?;
+        remember_single_archive_member(&mut single_member, normalized, label)?;
+    }
+
+    require_single_archive_member(single_member, label)
+}
+
+/// 从 TAR.GZ 文件目录中找出唯一普通文件成员路径。
+fn single_file_tar_gz_member_path(
+    archive_path: &Path,
+    label: &str,
+) -> Result<String, LogContentError> {
+    let file = File::open(archive_path).map_err(|error| {
+        LogContentError::new(format!(
+            "无法打开 TAR.GZ 压缩包 {}：{}",
+            archive_path.display(),
+            error
+        ))
+    })?;
+    let decoder = GzDecoder::new(BufReader::new(file));
+    let mut archive = TarArchive::new(decoder);
+    let entries = archive
+        .entries()
+        .map_err(|error| LogContentError::new(format!("无法读取 TAR.GZ 目录：{}", error)))?;
+    let mut single_member = None;
+
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| LogContentError::new(format!("无法读取 TAR.GZ 条目：{}", error)))?;
+        if entry.header().entry_type().is_dir() {
+            continue;
+        }
+
+        let entry_path = entry.path().map_err(|error| {
+            LogContentError::new(format!("无法读取 TAR.GZ 条目路径：{}", error))
+        })?;
+        let raw_name = entry_path.to_string_lossy();
+        let normalized = normalize_archive_member_path(&raw_name).map_err(|reason| {
+            LogContentError::new(format!("{} 内包含非法 TAR.GZ 条目：{}", label, reason))
+        })?;
+        remember_single_archive_member(&mut single_member, normalized, label)?;
+    }
+
+    require_single_archive_member(single_member, label)
+}
+
+/// 从 7Z 文件目录中找出唯一普通文件成员路径。
+fn single_file_7z_member_path(archive_path: &Path, label: &str) -> Result<String, LogContentError> {
+    let archive = sevenz_rust::Archive::open(archive_path)
+        .map_err(|error| LogContentError::new(format!("无法读取 7Z 目录：{}", error)))?;
+    let mut single_member = None;
+
+    for entry in archive.files {
+        if entry.is_directory() {
+            continue;
+        }
+
+        let normalized = normalize_archive_member_path(&entry.name).map_err(|reason| {
+            LogContentError::new(format!("{} 内包含非法 7Z 条目：{}", label, reason))
+        })?;
+        remember_single_archive_member(&mut single_member, normalized, label)?;
+    }
+
+    require_single_archive_member(single_member, label)
+}
+
+/// 记录候选唯一成员；出现第二个文件时立即返回多文件错误。
+///
+/// 业务意图：
+/// - 单文件压缩包直接打开只在“恰好一个普通文件”时成立，两个及以上文件必须让用户选择具体文件。
+fn remember_single_archive_member(
+    single_member: &mut Option<String>,
+    candidate: String,
+    label: &str,
+) -> Result<(), LogContentError> {
+    if single_member.replace(candidate).is_some() {
+        return Err(LogContentError::new(format!(
+            "{} 内包含多个文件，请展开后选择具体日志文件",
+            label
+        )));
+    }
+    Ok(())
+}
+
+/// 校验扫描结果是否恰好包含一个文件成员。
+fn require_single_archive_member(
+    single_member: Option<String>,
+    label: &str,
+) -> Result<String, LogContentError> {
+    single_member.ok_or_else(|| {
+        LogContentError::new(format!(
+            "{} 内没有可打开的普通文件，无法直接显示日志内容",
+            label
+        ))
+    })
+}
+
+/// 从内存 ZIP 字节中读取唯一普通文件。
+///
+/// 业务意图：
+/// - 外层压缩包中的 ZIP 成员已经以字节流形式读入内存；这里继续用 `ZipArchive` 解析，不写临时文件。
+fn read_single_file_zip_from_bytes(
+    archive_bytes: &[u8],
+    label: &str,
+) -> Result<Vec<u8>, LogContentError> {
+    let cursor = Cursor::new(archive_bytes);
+    let mut archive = ZipArchive::new(cursor)
+        .map_err(|error| LogContentError::new(format!("无法读取嵌套 ZIP 目录：{}", error)))?;
+    let mut single_index = None;
+    let mut single_member = None;
+
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).map_err(|error| {
+            LogContentError::new(format!("无法读取嵌套 ZIP 条目 {}：{}", index, error))
+        })?;
+        if entry.is_dir() {
+            continue;
+        }
+
+        let normalized = normalize_archive_member_path(entry.name()).map_err(|reason| {
+            LogContentError::new(format!("{} 内包含非法 ZIP 条目：{}", label, reason))
+        })?;
+        remember_single_archive_member(&mut single_member, normalized, label)?;
+        single_index = Some(index);
+    }
+
+    let member_label = require_single_archive_member(single_member, label)?;
+    let Some(index) = single_index else {
+        return Err(LogContentError::new(format!(
+            "{} 内没有可打开的普通文件，无法直接显示日志内容",
+            label
+        )));
+    };
+    let mut entry = archive
+        .by_index(index)
+        .map_err(|error| LogContentError::new(format!("无法读取嵌套 ZIP 唯一文件：{}", error)))?;
+    let size = entry.size();
+    ensure_size_within_limit(size, &member_label)?;
+    read_reader_to_vec_with_limit(&mut entry, Some(size), &member_label)
+}
+
+/// 从内存 TAR.GZ 字节中读取唯一普通文件。
+///
+/// 业务意图：
+/// - TAR.GZ 是顺序格式，读取第一个普通文件后仍需继续遍历条目，确认不存在第二个文件。
+fn read_single_file_tar_gz_from_bytes(
+    archive_bytes: &[u8],
+    label: &str,
+) -> Result<Vec<u8>, LogContentError> {
+    let decoder = GzDecoder::new(Cursor::new(archive_bytes));
+    let mut archive = TarArchive::new(decoder);
+    let entries = archive
+        .entries()
+        .map_err(|error| LogContentError::new(format!("无法读取嵌套 TAR.GZ 目录：{}", error)))?;
+    let mut single_member = None;
+    let mut single_bytes = None;
+
+    for entry in entries {
+        let mut entry = entry.map_err(|error| {
+            LogContentError::new(format!("无法读取嵌套 TAR.GZ 条目：{}", error))
+        })?;
+        if entry.header().entry_type().is_dir() {
+            continue;
+        }
+
+        let entry_path = entry.path().map_err(|error| {
+            LogContentError::new(format!("无法读取嵌套 TAR.GZ 条目路径：{}", error))
+        })?;
+        let raw_name = entry_path.to_string_lossy();
+        let normalized = normalize_archive_member_path(&raw_name).map_err(|reason| {
+            LogContentError::new(format!("{} 内包含非法 TAR.GZ 条目：{}", label, reason))
+        })?;
+        remember_single_archive_member(&mut single_member, normalized.clone(), label)?;
+        let size = entry.size();
+        ensure_size_within_limit(size, &normalized)?;
+        single_bytes = Some(read_reader_to_vec_with_limit(
+            &mut entry,
+            Some(size),
+            &normalized,
+        )?);
+    }
+
+    require_single_archive_member(single_member, label)?;
+    single_bytes.ok_or_else(|| {
+        LogContentError::new(format!(
+            "{} 内没有可打开的普通文件，无法直接显示日志内容",
+            label
+        ))
+    })
+}
+
+/// 从内存 7Z 字节中读取唯一普通文件。
+///
+/// 业务意图：
+/// - `sevenz-rust` 支持 `Read + Seek` reader，因此可以用内存 cursor 处理外层压缩包中的 7Z 成员。
+fn read_single_file_7z_from_bytes(
+    archive_bytes: &[u8],
+    label: &str,
+) -> Result<Vec<u8>, LogContentError> {
+    let cursor = Cursor::new(archive_bytes);
+    let mut reader = sevenz_rust::SevenZReader::new(
+        cursor,
+        archive_bytes.len() as u64,
+        sevenz_rust::Password::empty(),
+    )
+    .map_err(|error| LogContentError::new(format!("无法读取嵌套 7Z 目录：{}", error)))?;
+    let mut single_member = None;
+    let mut result: Option<Result<Vec<u8>, LogContentError>> = None;
+
+    reader
+        .for_each_entries(|entry, entry_reader| {
+            if entry.is_directory() {
+                return Ok(true);
+            }
+
+            let normalized = match normalize_archive_member_path(entry.name()) {
+                Ok(path) => path,
+                Err(reason) => {
+                    result = Some(Err(LogContentError::new(format!(
+                        "{} 内包含非法 7Z 条目：{}",
+                        label, reason
+                    ))));
+                    return Ok(false);
+                }
+            };
+            if let Err(error) =
+                remember_single_archive_member(&mut single_member, normalized.clone(), label)
+            {
+                result = Some(Err(error));
+                return Ok(false);
+            }
+
+            result = Some(
+                ensure_size_within_limit(entry.size, &normalized).and_then(|_| {
+                    read_reader_to_vec_with_limit(entry_reader, Some(entry.size), &normalized)
+                }),
+            );
+            Ok(true)
+        })
+        .map_err(|error| LogContentError::new(format!("读取嵌套 7Z 日志文件失败：{}", error)))?;
+
+    match result {
+        Some(Ok(bytes)) => {
+            require_single_archive_member(single_member, label)?;
+            Ok(bytes)
+        }
+        Some(Err(error)) => Err(error),
+        None => Err(LogContentError::new(format!(
+            "{} 内没有可打开的普通文件，无法直接显示日志内容",
+            label
+        ))),
     }
 }
 
@@ -576,6 +1005,7 @@ fn decode_with_encoding(
     raw_bytes: &[u8],
     encoding: LogTextEncoding,
     detected_automatically: bool,
+    source_name: &str,
 ) -> Result<DecodedLogDocument, LogContentError> {
     let decoded = decode_lossy(raw_bytes, encoding)?;
     if detected_automatically && decoded.had_errors {
@@ -593,12 +1023,15 @@ fn decode_with_encoding(
 
     let lines = split_decoded_lines(&decoded.text);
     let longest_line_index = longest_log_line_index(&lines);
+    let highlight_plan = prepare_highlighting(source_name, &decoded.text, &lines, raw_bytes.len());
 
     Ok(DecodedLogDocument {
         encoding,
         detected_automatically,
         lines,
         longest_line_index,
+        highlight_mode: highlight_plan.mode,
+        precomputed_highlights: highlight_plan.precomputed,
         had_replacements: decoded.had_errors,
         warning,
     })
@@ -678,14 +1111,14 @@ mod tests {
     //! - UI tab 行为由主界面逻辑和手动验收覆盖，本模块只验证读字节和解码数据的正确性。
 
     use super::*;
-    use std::io::{self, Write};
+    use std::io::{self, Cursor, Write};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     /// 验证 UTF-8 BOM 会被自动识别并在解码时移除。
     #[test]
     fn 自动识别_utf8_bom() {
         let bytes = b"\xEF\xBB\xBFINFO \xE6\x97\xA5\xE5\xBF\x97".to_vec();
-        let document = decode_log_bytes(&bytes, EncodingChoice::Auto).unwrap();
+        let document = decode_log_bytes(&bytes, EncodingChoice::Auto, "access.log").unwrap();
 
         assert_eq!(document.encoding, LogTextEncoding::Utf8Bom);
         assert_eq!(document.lines[0], "INFO 日志");
@@ -695,7 +1128,7 @@ mod tests {
     #[test]
     fn 自动识别_utf8() {
         let bytes = "INFO 普通 UTF-8 日志".as_bytes().to_vec();
-        let document = decode_log_bytes(&bytes, EncodingChoice::Auto).unwrap();
+        let document = decode_log_bytes(&bytes, EncodingChoice::Auto, "access.log").unwrap();
 
         assert_eq!(document.encoding, LogTextEncoding::Utf8);
         assert_eq!(document.lines[0], "INFO 普通 UTF-8 日志");
@@ -707,7 +1140,7 @@ mod tests {
         let bytes = "短行\nINFO 这是当前最长的一行\n中等长度"
             .as_bytes()
             .to_vec();
-        let document = decode_log_bytes(&bytes, EncodingChoice::Auto).unwrap();
+        let document = decode_log_bytes(&bytes, EncodingChoice::Auto, "access.log").unwrap();
 
         assert_eq!(document.longest_line_index, 1);
     }
@@ -716,8 +1149,12 @@ mod tests {
     #[test]
     fn 手动_gbk_解码() {
         let (bytes, _, _) = GBK.encode("ERROR 中文日志");
-        let document =
-            decode_log_bytes(&bytes, EncodingChoice::Manual(LogTextEncoding::Gbk)).unwrap();
+        let document = decode_log_bytes(
+            &bytes,
+            EncodingChoice::Manual(LogTextEncoding::Gbk),
+            "access.log",
+        )
+        .unwrap();
 
         assert_eq!(document.lines[0], "ERROR 中文日志");
         assert!(!document.had_replacements);
@@ -727,7 +1164,7 @@ mod tests {
     #[test]
     fn 自动识别_gb18030_扩展字符() {
         let (bytes, _, _) = GB18030.encode("INFO 𠀀");
-        let document = decode_log_bytes(&bytes, EncodingChoice::Auto).unwrap();
+        let document = decode_log_bytes(&bytes, EncodingChoice::Auto, "access.log").unwrap();
 
         assert_eq!(document.encoding, LogTextEncoding::Gb18030);
         assert_eq!(document.lines[0], "INFO 𠀀");
@@ -737,8 +1174,12 @@ mod tests {
     #[test]
     fn 手动_big5_解码() {
         let (bytes, _, _) = BIG5.encode("WARN 繁體日誌");
-        let document =
-            decode_log_bytes(&bytes, EncodingChoice::Manual(LogTextEncoding::Big5)).unwrap();
+        let document = decode_log_bytes(
+            &bytes,
+            EncodingChoice::Manual(LogTextEncoding::Big5),
+            "access.log",
+        )
+        .unwrap();
 
         assert_eq!(document.lines[0], "WARN 繁體日誌");
     }
@@ -747,10 +1188,18 @@ mod tests {
     #[test]
     fn 手动编码切换复用原始字节重新解码() {
         let (bytes, _, _) = GBK.encode("ERROR 中文日志");
-        let gbk_document =
-            decode_log_bytes(&bytes, EncodingChoice::Manual(LogTextEncoding::Gbk)).unwrap();
-        let utf8_document =
-            decode_log_bytes(&bytes, EncodingChoice::Manual(LogTextEncoding::Utf8)).unwrap();
+        let gbk_document = decode_log_bytes(
+            &bytes,
+            EncodingChoice::Manual(LogTextEncoding::Gbk),
+            "access.log",
+        )
+        .unwrap();
+        let utf8_document = decode_log_bytes(
+            &bytes,
+            EncodingChoice::Manual(LogTextEncoding::Utf8),
+            "access.log",
+        )
+        .unwrap();
 
         assert_eq!(gbk_document.lines[0], "ERROR 中文日志");
         assert!(utf8_document.had_replacements);
@@ -790,6 +1239,70 @@ mod tests {
         })?;
 
         assert_eq!(&bytes[..], b"INFO zip");
+        fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    /// 验证外层压缩包里的单文件 ZIP 成员会继续读取内部唯一文件，而不是把 ZIP 二进制当作日志文本。
+    #[test]
+    fn 读取外层_zip_中的单文件_zip_成员原始字节() -> Result<(), Box<dyn Error>> {
+        let temp_dir = unique_temp_dir("logclinic3-nested-zip-content-test")?;
+        let archive_path = temp_dir.join("outer.zip");
+        let inner_cursor = Cursor::new(Vec::new());
+        let mut inner_writer = zip::ZipWriter::new(inner_cursor);
+
+        inner_writer.start_file("thread.log", zip::write::SimpleFileOptions::default())?;
+        inner_writer.write_all(b"INFO nested zip")?;
+        let inner_zip_bytes = inner_writer.finish()?.into_inner();
+
+        let archive_file = File::create(&archive_path)?;
+        let mut zip_writer = zip::ZipWriter::new(archive_file);
+        zip_writer.start_file(
+            "thread_000209.zip",
+            zip::write::SimpleFileOptions::default(),
+        )?;
+        zip_writer.write_all(&inner_zip_bytes)?;
+        zip_writer.finish()?;
+
+        let bytes = read_log_source_bytes(&LogFileSource::ArchiveMember {
+            archive_path: archive_path.clone(),
+            archive_format: ArchiveFormat::Zip,
+            member_path: "thread_000209.zip".to_string(),
+        })?;
+
+        assert_eq!(&bytes[..], b"INFO nested zip");
+        fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    /// 验证外层压缩包里的多文件 ZIP 成员不会随意打开第一个文件，避免用户看到错误日志。
+    #[test]
+    fn 多文件嵌套_zip_要求选择具体文件() -> Result<(), Box<dyn Error>> {
+        let temp_dir = unique_temp_dir("logclinic3-multi-nested-zip-content-test")?;
+        let archive_path = temp_dir.join("outer.zip");
+        let inner_cursor = Cursor::new(Vec::new());
+        let mut inner_writer = zip::ZipWriter::new(inner_cursor);
+
+        inner_writer.start_file("first.log", zip::write::SimpleFileOptions::default())?;
+        inner_writer.write_all(b"INFO first")?;
+        inner_writer.start_file("second.log", zip::write::SimpleFileOptions::default())?;
+        inner_writer.write_all(b"INFO second")?;
+        let inner_zip_bytes = inner_writer.finish()?.into_inner();
+
+        let archive_file = File::create(&archive_path)?;
+        let mut zip_writer = zip::ZipWriter::new(archive_file);
+        zip_writer.start_file("thread_multi.zip", zip::write::SimpleFileOptions::default())?;
+        zip_writer.write_all(&inner_zip_bytes)?;
+        zip_writer.finish()?;
+
+        let error = read_log_source_bytes(&LogFileSource::ArchiveMember {
+            archive_path: archive_path.clone(),
+            archive_format: ArchiveFormat::Zip,
+            member_path: "thread_multi.zip".to_string(),
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("多个文件"));
         fs::remove_dir_all(temp_dir)?;
         Ok(())
     }
