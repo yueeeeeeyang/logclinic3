@@ -28,6 +28,75 @@ pub const TREE_SITTER_HIGHLIGHT_MAX_BYTES: usize = 10 * 1024 * 1024;
 /// - 行数很多但文件字节数不大时，预计算每行高亮 Vec 也会产生额外内存和初始化成本，因此需要单独限制。
 pub const TREE_SITTER_HIGHLIGHT_MAX_LINES: usize = 100_000;
 
+/// 语法高亮实际使用的主题。
+///
+/// 业务意图：
+/// - 应用主题支持明亮和暗色背景，语法高亮颜色必须跟随实际背景，否则暗色优化会反过来破坏明亮主题可读性。
+/// - 类型放在高亮模块内，避免 UI 调色板细节泄漏到日志解码和搜索模块。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyntaxTheme {
+    /// 适用于白色或浅色日志正文背景。
+    Light,
+    /// 适用于深色日志正文背景。
+    Dark,
+}
+
+/// 单套语法高亮调色板。
+///
+/// 业务意图：
+/// - 高亮规则负责“哪些片段需要强调”，调色板负责“在当前背景上如何显示”，两者分开后可避免主题切换时复制规则。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SyntaxPalette {
+    /// 普通语法文本颜色，例如 XML 文本节点。
+    text: u32,
+    /// 弱化但仍可读的文本颜色，例如 Java 包名前缀、括号和分隔符。
+    muted: u32,
+    /// 注释颜色。
+    comment: u32,
+    /// 蓝色强调，用于属性名、方法名和线程名等可定位标识。
+    blue: u32,
+    /// 绿色强调，用于字符串、配置值和源码文件名。
+    green: u32,
+    /// 紫色强调，用于 XML 标签、类型名和类名。
+    purple: u32,
+    /// 橙色强调，用于时间戳、行号和数字。
+    orange: u32,
+    /// 黄色强调，用于等待状态和警告类信号。
+    yellow: u32,
+    /// 红色强调，用于错误、异常和阻塞状态。
+    red: u32,
+}
+
+impl SyntaxPalette {
+    /// 返回指定主题的语法高亮调色板。
+    fn for_theme(theme: SyntaxTheme) -> Self {
+        match theme {
+            SyntaxTheme::Light => Self {
+                text: 0x24292f,
+                muted: 0x57606a,
+                comment: 0x6a737d,
+                blue: 0x0969da,
+                green: 0x116329,
+                purple: 0x8250df,
+                orange: 0x953800,
+                yellow: 0x9a6700,
+                red: 0xcf222e,
+            },
+            SyntaxTheme::Dark => Self {
+                text: 0xc9d1d9,
+                muted: 0xb8c2cc,
+                comment: 0x8b949e,
+                blue: 0x58a6ff,
+                green: 0x56d364,
+                purple: 0xd2a8ff,
+                orange: 0xffab70,
+                yellow: 0xe3b341,
+                red: 0xff7b72,
+            },
+        }
+    }
+}
+
 /// 当前右侧查看器支持的高亮模式。
 ///
 /// 业务意图：
@@ -92,6 +161,7 @@ pub fn prepare_highlighting(
     text: &str,
     lines: &[String],
     raw_size: usize,
+    theme: SyntaxTheme,
 ) -> HighlightPlan {
     let detected_mode = detect_highlight_mode(source_name, lines);
 
@@ -99,7 +169,9 @@ pub fn prepare_highlighting(
         HighlightMode::Xml | HighlightMode::Properties
             if should_precompute_tree_sitter_highlights(raw_size, lines.len()) =>
         {
-            if let Some(precomputed) = build_precomputed_highlights(detected_mode, text, lines) {
+            if let Some(precomputed) =
+                build_precomputed_highlights(detected_mode, text, lines, theme)
+            {
                 return HighlightPlan {
                     mode: detected_mode,
                     precomputed: Some(precomputed),
@@ -165,16 +237,17 @@ pub fn highlight_line(
     mode: HighlightMode,
     line: &str,
     precomputed: Option<&LineHighlights>,
+    theme: SyntaxTheme,
 ) -> LineHighlights {
     if let Some(highlights) = precomputed {
         return highlights.clone();
     }
 
     let mut highlights = match mode {
-        HighlightMode::Log => log_line_highlights(line),
-        HighlightMode::JavaThread => java_thread_line_highlights(line),
-        HighlightMode::Properties => properties_line_fallback_highlights(line),
-        HighlightMode::Xml => xml_line_fallback_highlights(line),
+        HighlightMode::Log => log_line_highlights(line, theme),
+        HighlightMode::JavaThread => java_thread_line_highlights(line, theme),
+        HighlightMode::Properties => properties_line_fallback_highlights(line, theme),
+        HighlightMode::Xml => xml_line_fallback_highlights(line, theme),
         HighlightMode::Plain => Vec::new(),
     };
     normalize_line_highlights(&mut highlights);
@@ -195,6 +268,7 @@ pub fn build_precomputed_highlights(
     mode: HighlightMode,
     text: &str,
     lines: &[String],
+    theme: SyntaxTheme,
 ) -> Option<PrecomputedHighlights> {
     let (language, query_source) = match mode {
         HighlightMode::Properties => (
@@ -208,7 +282,7 @@ pub fn build_precomputed_highlights(
         HighlightMode::Log | HighlightMode::JavaThread | HighlightMode::Plain => return None,
     };
 
-    tree_sitter_highlights_for_text(language, query_source, text, lines)
+    tree_sitter_highlights_for_text(language, query_source, text, lines, theme)
 }
 
 /// 使用指定 Tree-sitter 语言和查询生成每行高亮。
@@ -217,6 +291,7 @@ fn tree_sitter_highlights_for_text(
     query_source: &str,
     text: &str,
     lines: &[String],
+    theme: SyntaxTheme,
 ) -> Option<PrecomputedHighlights> {
     let mut parser = Parser::new();
     parser.set_language(&language).ok()?;
@@ -240,7 +315,7 @@ fn tree_sitter_highlights_for_text(
             .get(capture.index as usize)
             .copied()
             .unwrap_or_default();
-        let Some(style) = style_for_tree_sitter_capture(capture_name) else {
+        let Some(style) = style_for_tree_sitter_capture(capture_name, theme) else {
             continue;
         };
         push_global_highlight(
@@ -332,29 +407,30 @@ fn first_line_overlapping(line_ranges: &[Range<usize>], start: usize) -> usize {
     low
 }
 
-/// 将 Tree-sitter capture 名称映射到当前浅色主题样式。
-fn style_for_tree_sitter_capture(capture_name: &str) -> Option<HighlightStyle> {
+/// 将 Tree-sitter capture 名称映射到暗色主题也可读的通用样式。
+fn style_for_tree_sitter_capture(capture_name: &str, theme: SyntaxTheme) -> Option<HighlightStyle> {
+    let palette = SyntaxPalette::for_theme(theme);
     let style = if capture_name.starts_with("comment") {
-        syntax_style(0x6a737d, None, None)
+        syntax_style(palette.comment, None, None)
     } else if capture_name.starts_with("tag") || capture_name.starts_with("type") {
-        syntax_style(0x8250df, None, Some(FontWeight::BOLD))
+        syntax_style(palette.purple, None, Some(FontWeight::BOLD))
     } else if capture_name.starts_with("property") || capture_name.starts_with("attribute") {
-        syntax_style(0x0969da, None, None)
+        syntax_style(palette.blue, None, None)
     } else if capture_name.starts_with("string") {
-        syntax_style(0x116329, None, None)
+        syntax_style(palette.green, None, None)
     } else if capture_name.starts_with("number") || capture_name.starts_with("boolean") {
-        syntax_style(0x953800, None, None)
+        syntax_style(palette.orange, None, None)
     } else if capture_name.starts_with("keyword") {
-        syntax_style(0x8250df, None, Some(FontWeight::BOLD))
+        syntax_style(palette.purple, None, Some(FontWeight::BOLD))
     } else if capture_name.starts_with("operator")
         || capture_name.starts_with("punctuation")
         || capture_name.starts_with("constant")
     {
-        syntax_style(0x57606a, None, None)
+        syntax_style(palette.muted, None, None)
     } else if capture_name.starts_with("markup") {
-        syntax_style(0x24292f, None, None)
+        syntax_style(palette.text, None, None)
     } else if capture_name.starts_with("error") {
-        syntax_style(0xcf222e, Some(0xffebe9), Some(FontWeight::BOLD))
+        syntax_style(palette.red, None, Some(FontWeight::BOLD))
     } else {
         return None;
     };
@@ -445,40 +521,41 @@ fn first_non_empty_line(lines: &[String]) -> Option<&str> {
 }
 
 /// 生成普通日志单行高亮。
-fn log_line_highlights(line: &str) -> LineHighlights {
-    let mut highlights = java_thread_line_highlights(line);
+fn log_line_highlights(line: &str, theme: SyntaxTheme) -> LineHighlights {
+    let mut highlights = java_thread_line_highlights(line, theme);
 
-    push_timestamp_highlight(line, &mut highlights);
-    push_log_level_highlight(line, &mut highlights);
-    push_bracket_thread_highlight(line, &mut highlights);
-    push_logger_like_highlight(line, &mut highlights);
+    push_timestamp_highlight(line, &mut highlights, theme);
+    push_log_level_highlight(line, &mut highlights, theme);
+    push_bracket_thread_highlight(line, &mut highlights, theme);
+    push_logger_like_highlight(line, &mut highlights, theme);
 
     highlights
 }
 
 /// 生成 Java 线程 dump 或异常堆栈单行高亮。
-fn java_thread_line_highlights(line: &str) -> LineHighlights {
+fn java_thread_line_highlights(line: &str, theme: SyntaxTheme) -> LineHighlights {
     let mut highlights = Vec::new();
 
-    push_java_thread_header_highlight(line, &mut highlights);
-    push_java_state_highlight(line, &mut highlights);
-    push_java_stack_frame_highlight(line, &mut highlights);
-    push_java_exception_highlight(line, &mut highlights);
-    push_java_lock_highlight(line, &mut highlights);
+    push_java_thread_header_highlight(line, &mut highlights, theme);
+    push_java_state_highlight(line, &mut highlights, theme);
+    push_java_stack_frame_highlight(line, &mut highlights, theme);
+    push_java_exception_highlight(line, &mut highlights, theme);
+    push_java_lock_highlight(line, &mut highlights, theme);
 
     highlights
 }
 
 /// properties 的轻量降级高亮。
-fn properties_line_fallback_highlights(line: &str) -> LineHighlights {
+fn properties_line_fallback_highlights(line: &str, theme: SyntaxTheme) -> LineHighlights {
     let mut highlights = Vec::new();
+    let palette = SyntaxPalette::for_theme(theme);
     let trimmed_start = line.len() - line.trim_start().len();
     let trimmed = &line[trimmed_start..];
 
     if trimmed.starts_with('#') || trimmed.starts_with('!') {
         highlights.push((
             trimmed_start..line.len(),
-            syntax_style(0x6a737d, None, None),
+            syntax_style(palette.comment, None, None),
         ));
         return highlights;
     }
@@ -486,31 +563,35 @@ fn properties_line_fallback_highlights(line: &str) -> LineHighlights {
     if let Some(separator) = find_unescaped_property_separator(line) {
         highlights.push((
             0..separator,
-            syntax_style(0x0969da, None, Some(FontWeight::BOLD)),
+            syntax_style(palette.blue, None, Some(FontWeight::BOLD)),
         ));
-        highlights.push((separator..separator + 1, syntax_style(0x57606a, None, None)));
+        highlights.push((
+            separator..separator + 1,
+            syntax_style(palette.muted, None, None),
+        ));
         if separator + 1 < line.len() {
             highlights.push((
                 separator + 1..line.len(),
-                syntax_style(0x116329, None, None),
+                syntax_style(palette.green, None, None),
             ));
         }
     }
 
-    push_escape_highlights(line, &mut highlights);
+    push_escape_highlights(line, &mut highlights, theme);
     highlights
 }
 
 /// XML 的轻量降级高亮。
-fn xml_line_fallback_highlights(line: &str) -> LineHighlights {
+fn xml_line_fallback_highlights(line: &str, theme: SyntaxTheme) -> LineHighlights {
     let mut highlights = Vec::new();
+    let palette = SyntaxPalette::for_theme(theme);
     let trimmed_start = line.len() - line.trim_start().len();
     let trimmed = &line[trimmed_start..];
 
     if trimmed.starts_with("<!--") {
         highlights.push((
             trimmed_start..line.len(),
-            syntax_style(0x6a737d, None, None),
+            syntax_style(palette.comment, None, None),
         ));
         return highlights;
     }
@@ -522,16 +603,22 @@ fn xml_line_fallback_highlights(line: &str) -> LineHighlights {
             break;
         };
         let tag_end = tag_start + relative_end + 1;
-        highlights.push((tag_start..tag_start + 1, syntax_style(0x57606a, None, None)));
-        highlights.push((tag_end - 1..tag_end, syntax_style(0x57606a, None, None)));
+        highlights.push((
+            tag_start..tag_start + 1,
+            syntax_style(palette.muted, None, None),
+        ));
+        highlights.push((
+            tag_end - 1..tag_end,
+            syntax_style(palette.muted, None, None),
+        ));
 
         if let Some(name_range) = xml_tag_name_range(line, tag_start, tag_end) {
             highlights.push((
                 name_range,
-                syntax_style(0x8250df, None, Some(FontWeight::BOLD)),
+                syntax_style(palette.purple, None, Some(FontWeight::BOLD)),
             ));
         }
-        push_xml_attribute_highlights(&line[tag_start..tag_end], tag_start, &mut highlights);
+        push_xml_attribute_highlights(&line[tag_start..tag_end], tag_start, &mut highlights, theme);
         offset = tag_end;
     }
 
@@ -539,11 +626,11 @@ fn xml_line_fallback_highlights(line: &str) -> LineHighlights {
 }
 
 /// 高亮日志时间戳。
-fn push_timestamp_highlight(line: &str, highlights: &mut LineHighlights) {
+fn push_timestamp_highlight(line: &str, highlights: &mut LineHighlights, theme: SyntaxTheme) {
     let timestamp_ranges = log_timestamp_ranges(line);
     if !timestamp_ranges.is_empty() {
         for range in timestamp_ranges {
-            highlights.push((range, timestamp_style()));
+            highlights.push((range, timestamp_style(theme)));
         }
         return;
     }
@@ -564,7 +651,7 @@ fn push_timestamp_highlight(line: &str, highlights: &mut LineHighlights) {
     {
         highlights.push((
             trimmed_start..trimmed_start + timestamp_end,
-            timestamp_style(),
+            timestamp_style(theme),
         ));
     }
 }
@@ -981,26 +1068,28 @@ fn is_timestamp_adjacent_byte(byte: u8) -> bool {
 /// 业务意图：
 /// - 时间是日志排障的第一定位维度，使用较深的橙色和粗体，让它在等宽正文中明显区别于普通数字。
 /// - 按用户要求不使用背景色，避免大面积时间列出现色块干扰阅读。
-fn timestamp_style() -> HighlightStyle {
-    syntax_style(0x953800, None, Some(FontWeight::BOLD))
+fn timestamp_style(theme: SyntaxTheme) -> HighlightStyle {
+    let palette = SyntaxPalette::for_theme(theme);
+    syntax_style(palette.orange, None, Some(FontWeight::BOLD))
 }
 
 /// 高亮日志等级关键字。
-fn push_log_level_highlight(line: &str, highlights: &mut LineHighlights) {
-    const LEVELS: &[(&str, u32, u32)] = &[
-        ("FATAL", 0xa40e26, 0xffebe9),
-        ("ERROR", 0xcf222e, 0xffebe9),
-        ("WARN", 0x9a6700, 0xfff8c5),
-        ("INFO", 0x0969da, 0xddf4ff),
-        ("DEBUG", 0x57606a, 0xf6f8fa),
-        ("TRACE", 0x8250df, 0xfbefff),
+fn push_log_level_highlight(line: &str, highlights: &mut LineHighlights, theme: SyntaxTheme) {
+    let palette = SyntaxPalette::for_theme(theme);
+    let levels = [
+        ("FATAL", palette.red, 0xffebe9),
+        ("ERROR", palette.red, 0xffebe9),
+        ("WARN", palette.yellow, 0xfff8c5),
+        ("INFO", palette.blue, 0xddf4ff),
+        ("DEBUG", palette.muted, 0xf6f8fa),
+        ("TRACE", palette.purple, 0xfbefff),
     ];
 
-    for (keyword, color, background) in LEVELS {
+    for (keyword, color, background) in levels {
         if let Some(start) = line.find(keyword) {
             highlights.push((
                 start..start + keyword.len(),
-                syntax_style(*color, Some(*background), Some(FontWeight::BOLD)),
+                syntax_style(color, Some(background), Some(FontWeight::BOLD)),
             ));
             return;
         }
@@ -1008,7 +1097,8 @@ fn push_log_level_highlight(line: &str, highlights: &mut LineHighlights) {
 }
 
 /// 高亮常见方括号或花括号线程名。
-fn push_bracket_thread_highlight(line: &str, highlights: &mut LineHighlights) {
+fn push_bracket_thread_highlight(line: &str, highlights: &mut LineHighlights, theme: SyntaxTheme) {
+    let palette = SyntaxPalette::for_theme(theme);
     for (open, close) in [('[', ']'), ('{', '}')] {
         let Some(start) = line.find(open) else {
             continue;
@@ -1019,14 +1109,18 @@ fn push_bracket_thread_highlight(line: &str, highlights: &mut LineHighlights) {
         let end = start + 1 + relative_end + close.len_utf8();
         let content = &line[start + 1..end - close.len_utf8()];
         if !content.trim().is_empty() && content.len() <= 80 && !is_log_level_text(content.trim()) {
-            highlights.push((start..end, syntax_style(0x57606a, Some(0xf6f8fa), None)));
+            highlights.push((
+                start..end,
+                syntax_style(palette.muted, Some(0xf6f8fa), None),
+            ));
             return;
         }
     }
 }
 
 /// 高亮常见 logger 或 Java class token。
-fn push_logger_like_highlight(line: &str, highlights: &mut LineHighlights) {
+fn push_logger_like_highlight(line: &str, highlights: &mut LineHighlights, theme: SyntaxTheme) {
+    let palette = SyntaxPalette::for_theme(theme);
     // Java 栈帧会被专用规则拆成包名、类名、方法名和源码位置；如果这里再把整段
     // `java.util.concurrent.Foo.bar` 当作 logger 覆盖，会把细分样式重新压成一整块。
     if line.trim_start().starts_with("at ") {
@@ -1038,7 +1132,7 @@ fn push_logger_like_highlight(line: &str, highlights: &mut LineHighlights) {
         {
             highlights.push((
                 start..start + token.len(),
-                syntax_style(0x8250df, None, None),
+                syntax_style(palette.purple, None, None),
             ));
             return;
         }
@@ -1046,7 +1140,12 @@ fn push_logger_like_highlight(line: &str, highlights: &mut LineHighlights) {
 }
 
 /// 高亮 Java 线程头部中的线程名和常见属性。
-fn push_java_thread_header_highlight(line: &str, highlights: &mut LineHighlights) {
+fn push_java_thread_header_highlight(
+    line: &str,
+    highlights: &mut LineHighlights,
+    theme: SyntaxTheme,
+) {
+    let palette = SyntaxPalette::for_theme(theme);
     let trimmed_start = line.len() - line.trim_start().len();
     let trimmed = &line[trimmed_start..];
     if !looks_like_java_thread_header(trimmed) {
@@ -1059,20 +1158,21 @@ fn push_java_thread_header_highlight(line: &str, highlights: &mut LineHighlights
         let end = trimmed_start + 1 + end_quote + 1;
         highlights.push((
             trimmed_start..end,
-            syntax_style(0x0969da, Some(0xddf4ff), Some(FontWeight::BOLD)),
+            syntax_style(palette.blue, Some(0xddf4ff), Some(FontWeight::BOLD)),
         ));
     }
 
-    push_java_thread_header_attribute_highlights(line, highlights);
+    push_java_thread_header_attribute_highlights(line, highlights, theme);
 }
 
 /// 高亮 Java 线程状态。
-fn push_java_state_highlight(line: &str, highlights: &mut LineHighlights) {
+fn push_java_state_highlight(line: &str, highlights: &mut LineHighlights, theme: SyntaxTheme) {
+    let palette = SyntaxPalette::for_theme(theme);
     if let Some(start) = line.find("java.lang.Thread.State:") {
         let label_end = start + "java.lang.Thread.State:".len();
         highlights.push((
             start..label_end,
-            syntax_style(0x57606a, None, Some(FontWeight::BOLD)),
+            syntax_style(palette.muted, None, Some(FontWeight::BOLD)),
         ));
     }
 
@@ -1085,14 +1185,22 @@ fn push_java_state_highlight(line: &str, highlights: &mut LineHighlights) {
         "TERMINATED",
     ] {
         if let Some(start) = line.find(state) {
-            highlights.push((start..start + state.len(), java_thread_state_style(state)));
+            highlights.push((
+                start..start + state.len(),
+                java_thread_state_style(state, theme),
+            ));
             return;
         }
     }
 }
 
 /// 高亮 Java 栈帧。
-fn push_java_stack_frame_highlight(line: &str, highlights: &mut LineHighlights) {
+fn push_java_stack_frame_highlight(
+    line: &str,
+    highlights: &mut LineHighlights,
+    theme: SyntaxTheme,
+) {
+    let palette = SyntaxPalette::for_theme(theme);
     let trimmed_start = line.len() - line.trim_start().len();
     let trimmed = &line[trimmed_start..];
     if !trimmed.starts_with("at ") {
@@ -1101,25 +1209,33 @@ fn push_java_stack_frame_highlight(line: &str, highlights: &mut LineHighlights) 
 
     highlights.push((
         trimmed_start..trimmed_start + 2,
-        syntax_style(0x57606a, None, Some(FontWeight::BOLD)),
+        syntax_style(palette.muted, None, Some(FontWeight::BOLD)),
     ));
     if let Some(paren_start) = trimmed.find('(') {
         let frame_start = trimmed_start + 3;
         let frame_end = trimmed_start + paren_start;
         if frame_start < frame_end {
-            push_java_call_target_highlights(line, frame_start..frame_end, highlights);
+            push_java_call_target_highlights(line, frame_start..frame_end, highlights, theme);
         }
-        push_java_frame_source_highlights(line, trimmed_start, trimmed, paren_start, highlights);
+        push_java_frame_source_highlights(
+            line,
+            trimmed_start,
+            trimmed,
+            paren_start,
+            highlights,
+            theme,
+        );
     }
 }
 
 /// 高亮 Java 异常类和异常链标记。
-fn push_java_exception_highlight(line: &str, highlights: &mut LineHighlights) {
+fn push_java_exception_highlight(line: &str, highlights: &mut LineHighlights, theme: SyntaxTheme) {
+    let palette = SyntaxPalette::for_theme(theme);
     for marker in ["Caused by:", "Suppressed:"] {
         if let Some(start) = line.find(marker) {
             highlights.push((
                 start..start + marker.len(),
-                syntax_style(0xcf222e, Some(0xffebe9), Some(FontWeight::BOLD)),
+                syntax_style(palette.red, Some(0xffebe9), Some(FontWeight::BOLD)),
             ));
         }
     }
@@ -1131,7 +1247,8 @@ fn push_java_exception_highlight(line: &str, highlights: &mut LineHighlights) {
                 start,
                 token,
                 highlights,
-                syntax_style(0xcf222e, Some(0xffebe9), Some(FontWeight::BOLD)),
+                syntax_style(palette.red, Some(0xffebe9), Some(FontWeight::BOLD)),
+                theme,
             );
             return;
         }
@@ -1139,21 +1256,23 @@ fn push_java_exception_highlight(line: &str, highlights: &mut LineHighlights) {
 }
 
 /// 高亮 Java 锁等待和持有信息。
-fn push_java_lock_highlight(line: &str, highlights: &mut LineHighlights) {
-    for (marker, color, background) in [
-        ("deadlock", 0xcf222e, 0xffebe9),
-        ("waiting to lock", 0xcf222e, 0xffebe9),
-        ("- waiting on", 0x9a6700, 0xfff8c5),
-        ("- parking to wait for", 0x9a6700, 0xfff8c5),
-        ("- locked", 0x1a7f37, 0xdfffe0),
-        ("locked", 0x1a7f37, 0xdfffe0),
-    ] {
+fn push_java_lock_highlight(line: &str, highlights: &mut LineHighlights, theme: SyntaxTheme) {
+    let palette = SyntaxPalette::for_theme(theme);
+    let markers = [
+        ("deadlock", palette.red, 0xffebe9),
+        ("waiting to lock", palette.red, 0xffebe9),
+        ("- waiting on", palette.yellow, 0xfff8c5),
+        ("- parking to wait for", palette.yellow, 0xfff8c5),
+        ("- locked", palette.green, 0xdfffe0),
+        ("locked", palette.green, 0xdfffe0),
+    ];
+    for (marker, color, background) in markers {
         if let Some(start) = line.find(marker) {
             highlights.push((
                 start..start + marker.len(),
                 syntax_style(color, Some(background), Some(FontWeight::BOLD)),
             ));
-            push_java_monitor_object_highlight(line, start + marker.len(), highlights);
+            push_java_monitor_object_highlight(line, start + marker.len(), highlights, theme);
             return;
         }
     }
@@ -1165,7 +1284,12 @@ fn push_java_lock_highlight(line: &str, highlights: &mut LineHighlights) {
 /// - 线程 dump 头部通常包含线程名、`id`、`tid`、`nid`、优先级和 CPU 时间；这些字段对定位
 ///   线程身份和资源占用很关键，不能只把线程名染色后让其它信息淹没在普通文本里。
 /// - 这里按 ASCII 标记扫描，不解析整行语法，保证在大型线程 dump 的虚拟列表滚动中保持 O(行长)。
-fn push_java_thread_header_attribute_highlights(line: &str, highlights: &mut LineHighlights) {
+fn push_java_thread_header_attribute_highlights(
+    line: &str,
+    highlights: &mut LineHighlights,
+    theme: SyntaxTheme,
+) {
+    let palette = SyntaxPalette::for_theme(theme);
     for marker in [
         "id=",
         "tid=",
@@ -1176,7 +1300,7 @@ fn push_java_thread_header_attribute_highlights(line: &str, highlights: &mut Lin
         "elapsed=",
         "CPU Time=",
     ] {
-        push_java_header_key_value_highlights(line, marker, highlights);
+        push_java_header_key_value_highlights(line, marker, highlights, theme);
     }
 
     // HotSpot 线程头常见 `#12` 序号；它不是键值对，但对人工对照线程也有价值。
@@ -1189,7 +1313,10 @@ fn push_java_thread_header_attribute_highlights(line: &str, highlights: &mut Lin
             end += 1;
         }
         if end > start + 1 {
-            highlights.push((start..end, syntax_style(0x953800, Some(0xfff8c5), None)));
+            highlights.push((
+                start..end,
+                syntax_style(palette.orange, Some(0xfff8c5), None),
+            ));
             break;
         }
         cursor = start + 1;
@@ -1205,7 +1332,9 @@ fn push_java_header_key_value_highlights(
     line: &str,
     marker: &str,
     highlights: &mut LineHighlights,
+    theme: SyntaxTheme,
 ) {
+    let palette = SyntaxPalette::for_theme(theme);
     let Some(relative_equal) = marker.rfind('=') else {
         return;
     };
@@ -1225,14 +1354,14 @@ fn push_java_header_key_value_highlights(
         if key_start < equal {
             highlights.push((
                 key_start..equal,
-                syntax_style(0x57606a, None, Some(FontWeight::BOLD)),
+                syntax_style(palette.muted, None, Some(FontWeight::BOLD)),
             ));
         }
-        highlights.push((equal..equal + 1, syntax_style(0x57606a, None, None)));
+        highlights.push((equal..equal + 1, syntax_style(palette.muted, None, None)));
         if value_start < value_end {
             highlights.push((
                 value_start..value_end,
-                syntax_style(0x116329, None, Some(FontWeight::BOLD)),
+                syntax_style(palette.green, None, Some(FontWeight::BOLD)),
             ));
         }
 
@@ -1263,16 +1392,17 @@ fn is_java_header_key_byte(byte: u8) -> bool {
 /// 业务意图：
 /// - `RUNNABLE`、`BLOCKED`、`WAITING` 等状态本身就是诊断信号，使用状态色可以让问题线程
 ///   在大量重复栈帧中更快被扫到。
-fn java_thread_state_style(state: &str) -> HighlightStyle {
+fn java_thread_state_style(state: &str, theme: SyntaxTheme) -> HighlightStyle {
+    let palette = SyntaxPalette::for_theme(theme);
     match state {
-        "RUNNABLE" => syntax_style(0x1a7f37, Some(0xdfffe0), Some(FontWeight::BOLD)),
-        "BLOCKED" => syntax_style(0xcf222e, Some(0xffebe9), Some(FontWeight::BOLD)),
+        "RUNNABLE" => syntax_style(palette.green, Some(0xdfffe0), Some(FontWeight::BOLD)),
+        "BLOCKED" => syntax_style(palette.red, Some(0xffebe9), Some(FontWeight::BOLD)),
         "WAITING" | "TIMED_WAITING" => {
-            syntax_style(0x9a6700, Some(0xfff8c5), Some(FontWeight::BOLD))
+            syntax_style(palette.yellow, Some(0xfff8c5), Some(FontWeight::BOLD))
         }
-        "NEW" => syntax_style(0x0969da, Some(0xddf4ff), Some(FontWeight::BOLD)),
-        "TERMINATED" => syntax_style(0x57606a, Some(0xf6f8fa), Some(FontWeight::BOLD)),
-        _ => syntax_style(0x57606a, Some(0xf6f8fa), Some(FontWeight::BOLD)),
+        "NEW" => syntax_style(palette.blue, Some(0xddf4ff), Some(FontWeight::BOLD)),
+        "TERMINATED" => syntax_style(palette.muted, Some(0xf6f8fa), Some(FontWeight::BOLD)),
+        _ => syntax_style(palette.muted, Some(0xf6f8fa), Some(FontWeight::BOLD)),
     }
 }
 
@@ -1287,12 +1417,14 @@ fn push_java_call_target_highlights(
     line: &str,
     frame_range: Range<usize>,
     highlights: &mut LineHighlights,
+    theme: SyntaxTheme,
 ) {
+    let palette = SyntaxPalette::for_theme(theme);
     let frame = &line[frame_range.clone()];
     let Some(method_dot_relative) = frame.rfind('.') else {
         highlights.push((
             frame_range,
-            syntax_style(0x8250df, None, Some(FontWeight::BOLD)),
+            syntax_style(palette.purple, None, Some(FontWeight::BOLD)),
         ));
         return;
     };
@@ -1308,19 +1440,19 @@ fn push_java_call_target_highlights(
     if frame_range.start < class_start.saturating_sub(1) {
         highlights.push((
             frame_range.start..class_start - 1,
-            syntax_style(0x57606a, None, None),
+            syntax_style(palette.muted, None, None),
         ));
     }
     if class_start < method_dot {
         highlights.push((
             class_start..method_dot,
-            syntax_style(0x8250df, None, Some(FontWeight::BOLD)),
+            syntax_style(palette.purple, None, Some(FontWeight::BOLD)),
         ));
     }
     if method_start < frame_range.end {
         highlights.push((
             method_start..frame_range.end,
-            syntax_style(0x0969da, None, Some(FontWeight::BOLD)),
+            syntax_style(palette.blue, None, Some(FontWeight::BOLD)),
         ));
     }
 }
@@ -1336,14 +1468,16 @@ fn push_java_frame_source_highlights(
     trimmed: &str,
     paren_start: usize,
     highlights: &mut LineHighlights,
+    theme: SyntaxTheme,
 ) {
+    let palette = SyntaxPalette::for_theme(theme);
     let open = trimmed_start + paren_start;
     let close = trimmed[paren_start..]
         .find(')')
         .map(|relative| open + relative)
         .unwrap_or(trimmed_start + trimmed.len());
 
-    highlights.push((open..open + 1, syntax_style(0x57606a, None, None)));
+    highlights.push((open..open + 1, syntax_style(palette.muted, None, None)));
     if close > open + 1 {
         let inner_start = open + 1;
         let inner_end = close;
@@ -1351,26 +1485,29 @@ fn push_java_frame_source_highlights(
         if matches!(inner, "Native Method" | "Unknown Source") {
             highlights.push((
                 inner_start..inner_end,
-                syntax_style(0x57606a, Some(0xf6f8fa), None),
+                syntax_style(palette.muted, Some(0xf6f8fa), None),
             ));
         } else if let Some(relative_colon) = inner.rfind(':') {
             let colon = inner_start + relative_colon;
             if inner_start < colon {
-                highlights.push((inner_start..colon, syntax_style(0x116329, None, None)));
+                highlights.push((inner_start..colon, syntax_style(palette.green, None, None)));
             }
-            highlights.push((colon..colon + 1, syntax_style(0x57606a, None, None)));
+            highlights.push((colon..colon + 1, syntax_style(palette.muted, None, None)));
             if colon + 1 < inner_end {
                 highlights.push((
                     colon + 1..inner_end,
-                    syntax_style(0x953800, None, Some(FontWeight::BOLD)),
+                    syntax_style(palette.orange, None, Some(FontWeight::BOLD)),
                 ));
             }
         } else {
-            highlights.push((inner_start..inner_end, syntax_style(0x116329, None, None)));
+            highlights.push((
+                inner_start..inner_end,
+                syntax_style(palette.green, None, None),
+            ));
         }
     }
     if close < trimmed_start + trimmed.len() {
-        highlights.push((close..close + 1, syntax_style(0x57606a, None, None)));
+        highlights.push((close..close + 1, syntax_style(palette.muted, None, None)));
     }
 }
 
@@ -1384,11 +1521,16 @@ fn push_java_type_token_highlight(
     token: &str,
     highlights: &mut LineHighlights,
     class_style: HighlightStyle,
+    theme: SyntaxTheme,
 ) {
+    let palette = SyntaxPalette::for_theme(theme);
     if let Some(relative_dot) = token.rfind('.') {
         let class_start = start + relative_dot + 1;
         if start < class_start - 1 {
-            highlights.push((start..class_start - 1, syntax_style(0x57606a, None, None)));
+            highlights.push((
+                start..class_start - 1,
+                syntax_style(palette.muted, None, None),
+            ));
         }
         highlights.push((class_start..start + token.len(), class_style));
     } else {
@@ -1405,7 +1547,9 @@ fn push_java_monitor_object_highlight(
     line: &str,
     search_start: usize,
     highlights: &mut LineHighlights,
+    theme: SyntaxTheme,
 ) {
+    let palette = SyntaxPalette::for_theme(theme);
     let Some(relative_start) = line[search_start..].find('<') else {
         return;
     };
@@ -1414,7 +1558,10 @@ fn push_java_monitor_object_highlight(
         return;
     };
     let end = start + relative_end + 1;
-    highlights.push((start..end, syntax_style(0x8250df, Some(0xfbefff), None)));
+    highlights.push((
+        start..end,
+        syntax_style(palette.purple, Some(0xfbefff), None),
+    ));
 }
 
 /// 判断单行是否像 Java 线程 dump 的线程头。
@@ -1455,7 +1602,8 @@ fn find_unescaped_property_separator(line: &str) -> Option<usize> {
 }
 
 /// 高亮字符串中的 properties 转义序列。
-fn push_escape_highlights(line: &str, highlights: &mut LineHighlights) {
+fn push_escape_highlights(line: &str, highlights: &mut LineHighlights, theme: SyntaxTheme) {
+    let palette = SyntaxPalette::for_theme(theme);
     let bytes = line.as_bytes();
     let mut index = 0usize;
     while index < bytes.len() {
@@ -1471,7 +1619,7 @@ fn push_escape_highlights(line: &str, highlights: &mut LineHighlights) {
             if index < end {
                 highlights.push((
                     index..end,
-                    syntax_style(0x953800, None, Some(FontWeight::BOLD)),
+                    syntax_style(palette.orange, None, Some(FontWeight::BOLD)),
                 ));
             }
             index = end;
@@ -1532,7 +1680,9 @@ fn push_xml_attribute_highlights(
     tag_text: &str,
     tag_offset: usize,
     highlights: &mut LineHighlights,
+    theme: SyntaxTheme,
 ) {
+    let palette = SyntaxPalette::for_theme(theme);
     let bytes = tag_text.as_bytes();
     let mut index = 0usize;
 
@@ -1554,11 +1704,11 @@ fn push_xml_attribute_highlights(
             if cursor < bytes.len() && bytes[cursor] == b'=' {
                 highlights.push((
                     tag_offset + name_start..tag_offset + name_end,
-                    syntax_style(0x0969da, None, None),
+                    syntax_style(palette.blue, None, None),
                 ));
                 highlights.push((
                     tag_offset + cursor..tag_offset + cursor + 1,
-                    syntax_style(0x57606a, None, None),
+                    syntax_style(palette.muted, None, None),
                 ));
                 if cursor + 1 < bytes.len() {
                     push_xml_attribute_value_highlight(
@@ -1566,6 +1716,7 @@ fn push_xml_attribute_highlights(
                         tag_offset,
                         cursor + 1,
                         highlights,
+                        theme,
                     );
                 }
             }
@@ -1581,7 +1732,9 @@ fn push_xml_attribute_value_highlight(
     tag_offset: usize,
     value_start: usize,
     highlights: &mut LineHighlights,
+    theme: SyntaxTheme,
 ) {
+    let palette = SyntaxPalette::for_theme(theme);
     let bytes = tag_text.as_bytes();
     let mut cursor = value_start;
     while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
@@ -1601,7 +1754,7 @@ fn push_xml_attribute_value_highlight(
     }
     highlights.push((
         tag_offset + start..tag_offset + cursor,
-        syntax_style(0x116329, None, None),
+        syntax_style(palette.green, None, None),
     ));
 }
 
@@ -1701,10 +1854,31 @@ mod tests {
     /// - 高亮样式属于 GPUI 类型，单元测试只关心“关键 token 是否被拆分出来”。
     /// - 通过片段断言可以避免测试和具体颜色强绑定，后续微调主题色不会导致无关失败。
     fn highlighted_fragments(mode: HighlightMode, line: &str) -> Vec<&str> {
-        highlight_line(mode, line, None)
+        highlight_line(mode, line, None, SyntaxTheme::Light)
             .iter()
             .map(|(range, _style)| &line[range.clone()])
             .collect()
+    }
+
+    /// 返回指定片段对应的高亮样式。
+    ///
+    /// 业务意图：
+    /// - 暗色主题可读性依赖具体颜色，部分测试需要锁定关键 token 不再回退到浅色主题的深灰或深绿。
+    fn style_for_fragment(
+        mode: HighlightMode,
+        line: &str,
+        fragment: &str,
+        theme: SyntaxTheme,
+    ) -> Option<HighlightStyle> {
+        highlight_line(mode, line, None, theme)
+            .into_iter()
+            .find(|(range, _style)| &line[range.clone()] == fragment)
+            .map(|(_range, style)| style)
+    }
+
+    /// 断言高亮样式使用指定文字颜色。
+    fn assert_style_color(style: HighlightStyle, color: u32) {
+        assert_eq!(style.color, Some(rgb(color).into()));
     }
 
     /// 验证 `.log` 文件按普通日志模式处理，并能高亮日志等级。
@@ -1714,7 +1888,7 @@ mod tests {
 
         assert_eq!(detect_highlight_mode("app.log", &lines), HighlightMode::Log);
         assert!(
-            highlight_line(HighlightMode::Log, &lines[0], None)
+            highlight_line(HighlightMode::Log, &lines[0], None, SyntaxTheme::Light)
                 .iter()
                 .any(|(range, _style)| &lines[0][range.clone()] == "ERROR")
         );
@@ -1772,7 +1946,7 @@ mod tests {
     #[test]
     fn common_log_非_ascii_月份不会截断_utf8() {
         let line = "06/féé/2026:12:00:00 +0800 GET /index.html";
-        let highlights = highlight_line(HighlightMode::Log, line, None);
+        let highlights = highlight_line(HighlightMode::Log, line, None, SyntaxTheme::Light);
 
         for (range, _style) in highlights {
             assert!(line.is_char_boundary(range.start));
@@ -1789,17 +1963,59 @@ mod tests {
             "   java.lang.Thread.State: BLOCKED",
             "server.port=8080",
         ] {
-            for (_range, style) in highlight_line(HighlightMode::Log, line, None) {
+            for (_range, style) in
+                highlight_line(HighlightMode::Log, line, None, SyntaxTheme::Light)
+            {
                 assert!(style.background_color.is_none());
             }
         }
+    }
+
+    /// 验证语法高亮基础色在暗色主题下保持可读。
+    ///
+    /// 业务意图：
+    /// - XML/properties 的 Tree-sitter 高亮曾复用浅色主题深灰、深绿和近黑色，暗色背景下几乎不可见。
+    /// - 这里直接锁定 capture 到颜色的映射，避免后续调色时重新引入低对比颜色。
+    #[test]
+    fn tree_sitter_高亮基础色适配暗色背景() {
+        assert_style_color(
+            style_for_tree_sitter_capture("markup.raw", SyntaxTheme::Dark)
+                .expect("markup 应有样式"),
+            SyntaxPalette::for_theme(SyntaxTheme::Dark).text,
+        );
+        assert_style_color(
+            style_for_tree_sitter_capture("string", SyntaxTheme::Dark).expect("string 应有样式"),
+            SyntaxPalette::for_theme(SyntaxTheme::Dark).green,
+        );
+        assert_style_color(
+            style_for_tree_sitter_capture("punctuation.delimiter", SyntaxTheme::Dark)
+                .expect("标点应有样式"),
+            SyntaxPalette::for_theme(SyntaxTheme::Dark).muted,
+        );
+    }
+
+    /// 验证明亮主题保留原有深色语法颜色。
+    ///
+    /// 业务意图：
+    /// - 暗色主题需要亮色高亮，但明亮主题必须继续使用深色高亮，避免浅灰文字落在白色背景上不可读。
+    #[test]
+    fn tree_sitter_高亮基础色保留明亮主题对比度() {
+        assert_style_color(
+            style_for_tree_sitter_capture("punctuation.delimiter", SyntaxTheme::Light)
+                .expect("标点应有样式"),
+            SyntaxPalette::for_theme(SyntaxTheme::Light).muted,
+        );
+        assert_style_color(
+            style_for_tree_sitter_capture("string", SyntaxTheme::Light).expect("string 应有样式"),
+            SyntaxPalette::for_theme(SyntaxTheme::Light).green,
+        );
     }
 
     /// 验证时间戳候选前缀包含中文时，高亮范围仍保持合法 UTF-8 边界。
     #[test]
     fn 中文时间戳候选截断保持_utf8_边界() {
         let line = "2026-05-06中文中文中文中文中文中文中文中文 ERROR failed";
-        let highlights = highlight_line(HighlightMode::Log, line, None);
+        let highlights = highlight_line(HighlightMode::Log, line, None, SyntaxTheme::Light);
 
         for (range, _style) in highlights {
             assert!(line.is_char_boundary(range.start));
@@ -1811,7 +2027,7 @@ mod tests {
     #[test]
     fn properties_中文转义范围保持_utf8_边界() {
         let line = "path=\\中文";
-        let highlights = highlight_line(HighlightMode::Properties, line, None);
+        let highlights = highlight_line(HighlightMode::Properties, line, None, SyntaxTheme::Light);
 
         for (range, _style) in highlights {
             assert!(line.is_char_boundary(range.start));
@@ -1823,7 +2039,7 @@ mod tests {
     #[test]
     fn 方括号日志等级优先按等级高亮() {
         let line = "[ERROR] failed";
-        let highlights = highlight_line(HighlightMode::Log, line, None);
+        let highlights = highlight_line(HighlightMode::Log, line, None, SyntaxTheme::Light);
 
         assert!(
             highlights
@@ -1851,14 +2067,24 @@ mod tests {
             HighlightMode::JavaThread
         );
         assert!(
-            highlight_line(HighlightMode::JavaThread, &lines[1], None)
-                .iter()
-                .any(|(range, _style)| &lines[1][range.clone()] == "RUNNABLE")
+            highlight_line(
+                HighlightMode::JavaThread,
+                &lines[1],
+                None,
+                SyntaxTheme::Light
+            )
+            .iter()
+            .any(|(range, _style)| &lines[1][range.clone()] == "RUNNABLE")
         );
         assert!(
-            highlight_line(HighlightMode::JavaThread, &lines[2], None)
-                .iter()
-                .any(|(range, _style)| &lines[2][range.clone()] == "Caused by:")
+            highlight_line(
+                HighlightMode::JavaThread,
+                &lines[2],
+                None,
+                SyntaxTheme::Light
+            )
+            .iter()
+            .any(|(range, _style)| &lines[2][range.clone()] == "Caused by:")
         );
     }
 
@@ -1874,6 +2100,38 @@ mod tests {
         assert!(fragments.contains(&"take"));
         assert!(fragments.contains(&"LinkedBlockingQueue.java"));
         assert!(fragments.contains(&"442"));
+    }
+
+    /// 验证线程日志中大量重复的包名前缀不再使用暗色下过低对比的灰色。
+    #[test]
+    fn java线程栈帧弱化文本在暗色主题下仍可读() {
+        let line =
+            "    at java.util.concurrent.LinkedBlockingQueue.take(LinkedBlockingQueue.java:442)";
+        let style = style_for_fragment(
+            HighlightMode::JavaThread,
+            line,
+            "java.util.concurrent",
+            SyntaxTheme::Dark,
+        )
+        .expect("包名前缀应被高亮");
+
+        assert_style_color(style, SyntaxPalette::for_theme(SyntaxTheme::Dark).muted);
+    }
+
+    /// 验证线程日志弱化文本在明亮主题下不会使用暗色主题浅灰。
+    #[test]
+    fn java线程栈帧弱化文本保留明亮主题对比度() {
+        let line =
+            "    at java.util.concurrent.LinkedBlockingQueue.take(LinkedBlockingQueue.java:442)";
+        let style = style_for_fragment(
+            HighlightMode::JavaThread,
+            line,
+            "java.util.concurrent",
+            SyntaxTheme::Light,
+        )
+        .expect("包名前缀应被高亮");
+
+        assert_style_color(style, SyntaxPalette::for_theme(SyntaxTheme::Light).muted);
     }
 
     /// 验证截图中的轻量线程头格式也能高亮线程名、线程 id 和 CPU 时间。
@@ -1904,7 +2162,13 @@ mod tests {
     fn properties_文件识别并生成预计算高亮() {
         let text = "# 注释\nserver.port=8080\napp.name=LogClinic";
         let lines = text.lines().map(ToString::to_string).collect::<Vec<_>>();
-        let plan = prepare_highlighting("app.properties", text, &lines, text.len());
+        let plan = prepare_highlighting(
+            "app.properties",
+            text,
+            &lines,
+            text.len(),
+            SyntaxTheme::Light,
+        );
 
         assert_eq!(plan.mode, HighlightMode::Properties);
         assert!(plan.precomputed.is_some());
@@ -1916,7 +2180,7 @@ mod tests {
     fn xml_文件识别并生成预计算高亮() {
         let text = r#"<configuration><property name="log.level">INFO</property></configuration>"#;
         let lines = vec![text.to_string()];
-        let plan = prepare_highlighting("log.xml", text, &lines, text.len());
+        let plan = prepare_highlighting("log.xml", text, &lines, text.len(), SyntaxTheme::Light);
 
         assert_eq!(plan.mode, HighlightMode::Xml);
         assert!(plan.precomputed.is_some());
@@ -1955,6 +2219,7 @@ mod tests {
             "<root/>",
             &lines,
             TREE_SITTER_HIGHLIGHT_MAX_BYTES + 1,
+            SyntaxTheme::Light,
         );
 
         assert_eq!(plan.mode, HighlightMode::Log);
@@ -1965,7 +2230,7 @@ mod tests {
     #[test]
     fn 中文内容中的高亮范围保持_utf8_边界() {
         let line = "INFO 中文日志";
-        let highlights = highlight_line(HighlightMode::Log, line, None);
+        let highlights = highlight_line(HighlightMode::Log, line, None, SyntaxTheme::Light);
 
         for (range, _style) in highlights {
             assert!(line.is_char_boundary(range.start));

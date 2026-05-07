@@ -2,13 +2,13 @@
 //!
 //! 当前阶段负责创建 GPUI 主窗口、顶部工具栏、可拖动左右分栏、左侧日志目录树和右侧日志 tab 工作区。
 //! “加载日志”已经接入真实路径选择和来源扫描，日志文件点击后可以读取正文、自动识别编码并只读展示；
-//! 搜索、日志正文只读选择复制、语法高亮和编码切换已接入；实时追踪和设置持久化等尚未定义的业务功能
-//! 仍需在明确业务规则和验收标准后再接入。
+//! 搜索、日志正文只读选择复制、语法高亮、编码切换、设置窗口和主题持久化已接入；实时追踪等尚未定义的
+//! 业务功能仍需在明确业务规则和验收标准后再接入。
 //!
 //! 跨平台约束：
 //! - macOS 和 Windows 都需要从同一个入口启动主窗口，因此这里不写平台专属逻辑。
 //! - 窗口尺寸使用 GPUI 的逻辑像素表达，由 GPUI 负责映射到具体平台窗口系统。
-//! - 当前不持久化窗口位置或尺寸，避免在尚未定义配置目录和权限规则前写入用户文件。
+//! - 当前只持久化主窗口宽高和主题偏好，不持久化窗口位置或最大化状态，避免跨显示器恢复造成窗口不可见。
 
 use std::{
     borrow::Cow,
@@ -28,9 +28,9 @@ use gpui::{
     KeyDownEvent, Keystroke, LayoutId, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Render, ScrollHandle,
     ScrollStrategy, SharedString, StatefulInteractiveElement, Style, Styled as _, StyledText,
-    TextRun, TitlebarOptions, UTF16Selection, UniformListScrollHandle, Window, WindowBounds,
-    WindowHandle, WindowKind, WindowOptions, actions, div, point, px, relative, rgb, size,
-    uniform_list,
+    TextRun, TitlebarOptions, UTF16Selection, UniformListScrollHandle, Window, WindowAppearance,
+    WindowBounds, WindowHandle, WindowKind, WindowOptions, actions, div, point, px, relative, rgb,
+    size, uniform_list,
 };
 use lucide_icons::{Icon, LUCIDE_FONT_BYTES};
 
@@ -39,7 +39,7 @@ mod log_content;
 mod log_loader;
 mod search;
 
-use highlighting::highlight_line;
+use highlighting::{SyntaxTheme, highlight_line};
 use log_content::{
     DecodedLogDocument, EncodingChoice, LogContentError, LogTextEncoding, decode_log_bytes,
     read_log_source_bytes,
@@ -89,6 +89,13 @@ const SMALL_SCREEN_MAXIMIZED_WIDTH_THRESHOLD: f32 = 1440.0;
 /// - 当前只保存主窗口宽高，不保存位置、最大化状态或其他设置，因此使用独立小文本文件即可。
 /// - 如果后续接入完整设置系统，应迁移到统一配置文件并保留兼容读取逻辑。
 const MAIN_WINDOW_SIZE_FILE_NAME: &str = "window-size.txt";
+
+/// 主题偏好文件名。
+///
+/// 业务意图：
+/// - 主题属于用户明确设置，必须和窗口大小一样跨启动保留。
+/// - 文件内容保持为简单英文枚举值，避免仅为单个配置新增 JSON/TOML 依赖。
+const THEME_PREFERENCE_FILE_NAME: &str = "theme-preference.txt";
 
 /// 可持久化的主窗口宽高。
 ///
@@ -324,13 +331,22 @@ fn write_main_window_size_preference(
 /// - Windows 使用 `%APPDATA%\LogClinic`，避免写入程序安装目录或当前工作目录。
 /// - 其他平台当前不是目标运行平台，返回 `None` 并退回默认窗口策略。
 fn main_window_size_preference_path() -> Option<PathBuf> {
+    app_config_dir().map(|dir| dir.join(MAIN_WINDOW_SIZE_FILE_NAME))
+}
+
+/// 获取当前平台的应用配置目录。
+///
+/// 跨平台约束：
+/// - macOS 使用 `$HOME/Library/Application Support/LogClinic`，符合普通桌面应用配置目录习惯。
+/// - Windows 使用 `%APPDATA%\LogClinic`，避免写入程序安装目录或当前工作目录。
+/// - 其他平台当前不是目标运行平台，返回 `None` 并退回内存默认值。
+fn app_config_dir() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         return env::var_os("HOME").map(PathBuf::from).map(|home| {
             home.join("Library")
                 .join("Application Support")
                 .join("LogClinic")
-                .join(MAIN_WINDOW_SIZE_FILE_NAME)
         });
     }
 
@@ -338,7 +354,7 @@ fn main_window_size_preference_path() -> Option<PathBuf> {
     {
         return env::var_os("APPDATA")
             .map(PathBuf::from)
-            .map(|app_data| app_data.join("LogClinic").join(MAIN_WINDOW_SIZE_FILE_NAME));
+            .map(|app_data| app_data.join("LogClinic"));
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -367,6 +383,69 @@ fn save_main_window_size_preference(size: MainWindowSizePreference) {
     };
     if let Err(error) = write_main_window_size_preference(&path, size) {
         eprintln!("保存主窗口尺寸偏好失败：{}：{}", path.display(), error);
+    }
+}
+
+/// 获取主题偏好文件路径。
+fn theme_preference_path() -> Option<PathBuf> {
+    app_config_dir().map(|dir| dir.join(THEME_PREFERENCE_FILE_NAME))
+}
+
+/// 解析主题偏好配置文本。
+///
+/// 边界条件：
+/// - 配置文件可能被用户手工修改或写入中断破坏；未知值统一视为 `None`，调用方回退到“跟随系统”。
+fn parse_theme_preference(raw: &str) -> Option<ThemePreference> {
+    match raw.trim() {
+        "light" => Some(ThemePreference::Light),
+        "dark" => Some(ThemePreference::Dark),
+        "system" => Some(ThemePreference::System),
+        _ => None,
+    }
+}
+
+/// 序列化主题偏好。
+fn serialize_theme_preference(preference: ThemePreference) -> String {
+    format!("{}\n", preference.as_config_value())
+}
+
+/// 从指定文件读取主题偏好。
+///
+/// 错误处理：
+/// - 文件缺失、读取失败或内容损坏都不阻止应用启动，统一由调用方回退到“跟随系统”。
+fn read_theme_preference(path: &Path) -> Option<ThemePreference> {
+    let raw = fs::read_to_string(path).ok()?;
+    parse_theme_preference(&raw)
+}
+
+/// 将主题偏好写入指定文件。
+fn write_theme_preference(path: &Path, preference: ThemePreference) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serialize_theme_preference(preference))
+}
+
+/// 读取主题偏好。
+///
+/// 业务意图：
+/// - 主题是设置窗口中明确提供的用户偏好，应跨启动恢复；配置不可用时默认跟随系统。
+fn load_theme_preference() -> ThemePreference {
+    theme_preference_path()
+        .and_then(|path| read_theme_preference(&path))
+        .unwrap_or(ThemePreference::System)
+}
+
+/// 保存主题偏好。
+///
+/// 错误处理：
+/// - 写入失败不影响当前会话的主题切换，仅在 stderr 输出诊断信息，避免配置目录权限问题阻断 UI 操作。
+fn save_theme_preference(preference: ThemePreference) {
+    let Some(path) = theme_preference_path() else {
+        return;
+    };
+    if let Err(error) = write_theme_preference(&path, preference) {
+        eprintln!("保存主题偏好失败：{}：{}", path.display(), error);
     }
 }
 
@@ -751,6 +830,26 @@ const SEARCH_DIALOG_WIDTH: f32 = 430.0;
 /// 边界条件：
 /// - 该窗口不可调整大小；如果后续增加搜索历史、正则等更多控件，应同步重新定义窗口高度策略。
 const SEARCH_DIALOG_WINDOW_HEIGHT: f32 = 286.0;
+
+/// 设置窗口默认宽度。
+///
+/// 业务意图：
+/// - 设置窗口需要容纳左侧页签和右侧设置项，固定宽度可以让独立窗口在 macOS 和 Windows 上保持稳定布局。
+/// - 当前只包含通用和模型两个页签，不需要随内容动态调整窗口宽度。
+const SETTINGS_WINDOW_WIDTH: f32 = 520.0;
+
+/// 设置窗口默认高度。
+///
+/// 业务意图：
+/// - 高度需要容纳通用页签中的主题选择，同时给后续模型设置预留基础空间。
+/// - 模型页签当前按需求留白，因此窗口高度不随页签切换变化，避免用户切换时窗口跳动。
+const SETTINGS_WINDOW_HEIGHT: f32 = 360.0;
+
+/// 设置窗口左侧页签栏宽度。
+///
+/// 业务意图：
+/// - 页签名称为中文短文本，固定宽度可以让右侧内容区宽度稳定，后续增加更多设置项时仍易于扫描。
+const SETTINGS_TAB_SIDEBAR_WIDTH: f32 = 132.0;
 
 /// 搜索输入框高度。
 ///
@@ -1199,6 +1298,8 @@ struct LogLineRenderData {
     /// - 调整搜索结果面板高度或拖动日志正文滚动条时，鼠标可能经过底层日志行；即使不应触发选区，GPUI hover 仍可能命中行。
     /// - 在渲染数据中显式携带禁用标记，可以让日志行完全不注册 hover 样式，避免拖动控件时底层正文闪动。
     suppress_hover: bool,
+    /// 当前主题调色板。
+    palette: AppThemePalette,
 }
 
 /// 日志正文自绘滚动条的方向。
@@ -1290,6 +1391,230 @@ enum SearchTextInputKind {
     Query,
     /// 当前目录搜索的目标目录输入框。
     DirectoryTarget,
+}
+
+/// 设置窗口当前激活的页签。
+///
+/// 业务意图：
+/// - 设置窗口按用户要求拆成“通用”和“模型”两个页签；状态放在主视图中，避免关闭窗口后当前会话选择丢失。
+/// - 当前页签状态只存在于进程内，不写入配置文件；后续若需要记忆页签，应先定义设置持久化策略。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsTab {
+    /// 通用设置页签，当前承载主题设置。
+    General,
+    /// 模型设置页签，当前按需求留白。
+    Model,
+}
+
+impl SettingsTab {
+    /// 返回设置页签固定展示顺序。
+    ///
+    /// 业务意图：
+    /// - 页签顺序是用户明确给出的“通用、模型”，集中定义避免渲染和测试出现顺序分歧。
+    fn all() -> &'static [Self] {
+        &[Self::General, Self::Model]
+    }
+
+    /// 返回页签中文标签。
+    fn label(self) -> &'static str {
+        match self {
+            Self::General => "通用",
+            Self::Model => "模型",
+        }
+    }
+
+    /// 返回页签图标。
+    ///
+    /// 业务意图：
+    /// - 独立设置窗口的页签入口使用图标加文本，帮助用户快速区分通用配置和模型配置。
+    fn icon(self) -> Icon {
+        match self {
+            Self::General => Icon::Settings,
+            Self::Model => Icon::MonitorCog,
+        }
+    }
+}
+
+/// 主题设置选项。
+///
+/// 业务意图：
+/// - 用户明确要求主题可选“明亮主题、暗色主题、跟随系统”。
+/// - 用户选择会通过应用调色板立即刷新主窗口、搜索窗口和设置窗口，并写入配置文件供下次启动恢复。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThemePreference {
+    /// 强制使用明亮主题。
+    Light,
+    /// 强制使用暗色主题。
+    Dark,
+    /// 跟随操作系统外观。
+    System,
+}
+
+impl ThemePreference {
+    /// 返回主题选项固定展示顺序。
+    fn all() -> &'static [Self] {
+        &[Self::Light, Self::Dark, Self::System]
+    }
+
+    /// 返回主题选项中文标签。
+    fn label(self) -> &'static str {
+        match self {
+            Self::Light => "明亮主题",
+            Self::Dark => "暗色主题",
+            Self::System => "跟随系统",
+        }
+    }
+
+    /// 返回主题选项图标。
+    fn icon(self) -> Icon {
+        match self {
+            Self::Light => Icon::Sun,
+            Self::Dark => Icon::Moon,
+            Self::System => Icon::Monitor,
+        }
+    }
+
+    /// 返回主题偏好的持久化文本。
+    ///
+    /// 业务意图：
+    /// - 配置文件使用稳定英文值，避免中文文案调整影响已经写入的用户配置。
+    fn as_config_value(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Dark => "dark",
+            Self::System => "system",
+        }
+    }
+}
+
+/// 当前实际生效的主题。
+///
+/// 业务意图：
+/// - 用户偏好中的“跟随系统”需要结合 GPUI 当前窗口外观才能决定最终使用明亮还是暗色调色板。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EffectiveTheme {
+    /// 当前实际使用明亮调色板。
+    Light,
+    /// 当前实际使用暗色调色板。
+    Dark,
+}
+
+impl EffectiveTheme {
+    /// 根据用户偏好和系统窗口外观计算实际主题。
+    ///
+    /// 边界条件：
+    /// - 强制明亮/暗色优先于系统外观。
+    /// - `VibrantLight` 和 `VibrantDark` 分别归入明亮和暗色，避免平台差异影响业务层判断。
+    fn resolve(preference: ThemePreference, appearance: WindowAppearance) -> Self {
+        match preference {
+            ThemePreference::Light => Self::Light,
+            ThemePreference::Dark => Self::Dark,
+            ThemePreference::System => match appearance {
+                WindowAppearance::Light | WindowAppearance::VibrantLight => Self::Light,
+                WindowAppearance::Dark | WindowAppearance::VibrantDark => Self::Dark,
+            },
+        }
+    }
+
+    /// 转换为日志语法高亮模块使用的主题枚举。
+    ///
+    /// 业务意图：
+    /// - UI 主题和语法高亮主题属于不同模块；这里做显式映射，避免高亮模块依赖主窗口调色板。
+    fn syntax_theme(self) -> SyntaxTheme {
+        match self {
+            Self::Light => SyntaxTheme::Light,
+            Self::Dark => SyntaxTheme::Dark,
+        }
+    }
+}
+
+/// 应用基础主题调色板。
+///
+/// 业务意图：
+/// - 当前 UI 大量直接使用颜色字面量；集中调色板可以让主窗口、搜索窗口和设置窗口共享同一套明暗色。
+/// - 字段使用 `u32` RGB 值，调用处继续通过 GPUI `rgb` 转换，避免引入新的颜色类型依赖。
+#[derive(Clone, Copy)]
+struct AppThemePalette {
+    /// 页面或窗口根背景色。
+    background: u32,
+    /// 面板背景色，例如工具栏、侧栏、tab 栏。
+    panel: u32,
+    /// 比面板更高一层的容器背景色，例如输入框、卡片、菜单。
+    surface: u32,
+    /// 悬浮背景色。
+    hover: u32,
+    /// 选中背景色。
+    selected: u32,
+    /// 主文本颜色。
+    text: u32,
+    /// 次级文本颜色。
+    muted_text: u32,
+    /// 边框和分割线颜色。
+    border: u32,
+    /// 品牌/交互强调色。
+    accent: u32,
+    /// 强调色悬浮态。
+    accent_hover: u32,
+    /// 强调按钮上的文本色。
+    on_accent: u32,
+    /// 输入框背景色。
+    input: u32,
+    /// 菜单背景色。
+    menu: u32,
+    /// 搜索命中或当前定位行背景色。
+    search_highlight: u32,
+    /// 错误文本颜色。
+    error: u32,
+    /// 滚动条滑块颜色。
+    scrollbar: u32,
+    /// 滚动条滑块悬浮色。
+    scrollbar_hover: u32,
+}
+
+impl AppThemePalette {
+    /// 返回指定实际主题的调色板。
+    fn for_theme(theme: EffectiveTheme) -> Self {
+        match theme {
+            EffectiveTheme::Light => Self {
+                background: 0xffffff,
+                panel: 0xf7f8fa,
+                surface: 0xffffff,
+                hover: 0xf6f8fa,
+                selected: 0xddf4ff,
+                text: 0x24292f,
+                muted_text: 0x57606a,
+                border: 0xd0d7de,
+                accent: 0x0969da,
+                accent_hover: 0x0757b8,
+                on_accent: 0xffffff,
+                input: 0xffffff,
+                menu: 0xffffff,
+                search_highlight: 0xfff8c5,
+                error: 0xcf222e,
+                scrollbar: 0xc9d1d9,
+                scrollbar_hover: 0x8c959f,
+            },
+            EffectiveTheme::Dark => Self {
+                background: 0x0d1117,
+                panel: 0x161b22,
+                surface: 0x0d1117,
+                hover: 0x21262d,
+                selected: 0x0c2d48,
+                text: 0xe6edf3,
+                muted_text: 0x8b949e,
+                border: 0x30363d,
+                accent: 0x58a6ff,
+                accent_hover: 0x79c0ff,
+                on_accent: 0x0d1117,
+                input: 0x010409,
+                menu: 0x161b22,
+                search_highlight: 0x3b2f00,
+                error: 0xff7b72,
+                scrollbar: 0x30363d,
+                scrollbar_hover: 0x6e7681,
+            },
+        }
+    }
 }
 
 /// 搜索对话框的交互状态。
@@ -1535,6 +1860,315 @@ enum SearchTarget {
     },
 }
 
+/// 设置窗口独立窗口根视图。
+///
+/// 业务意图：
+/// - 设置入口需要从主窗口工具栏弹出独立窗口，避免把配置界面挤占日志查看工作区。
+/// - 主题偏好写入独立文本配置，页签状态仍只保留在当前会话内，避免为临时导航状态固化文件格式。
+///
+/// 边界条件：
+/// - 模型页签按用户要求先留白；窗口仍保留页签入口，方便后续补充模型配置项。
+struct SettingsWindowView {
+    /// 主窗口视图实体。
+    ///
+    /// 业务意图：
+    /// - 设置窗口需要读写主窗口中的设置状态；状态放在主视图中可以在关闭再打开设置窗口后保留当前会话选择。
+    main_view: Entity<MainView>,
+    /// 主窗口状态变更订阅。
+    ///
+    /// 业务意图：
+    /// - 如果设置状态被其它入口更新，独立设置窗口需要跟随重绘；订阅句柄必须保存在视图中防止释放。
+    _main_view_subscription: gpui::Subscription,
+}
+
+impl SettingsWindowView {
+    /// 创建设置窗口根视图。
+    fn new(main_view: Entity<MainView>, context: &mut Context<Self>) -> Self {
+        let observed_main_view = main_view.clone();
+        let main_view_subscription = context.observe(&observed_main_view, |_, _, context| {
+            context.notify();
+        });
+
+        Self {
+            main_view,
+            _main_view_subscription: main_view_subscription,
+        }
+    }
+
+    /// 切换设置窗口页签。
+    ///
+    /// 业务意图：
+    /// - 页签状态保存在 `MainView`，让窗口关闭后再次打开仍停留在当前会话最后访问的页签。
+    fn select_tab(&mut self, tab: SettingsTab, context: &mut Context<Self>) {
+        self.main_view.update(context, |view, context| {
+            view.settings_active_tab = tab;
+            context.notify();
+        });
+        context.notify();
+    }
+
+    /// 切换主题选项。
+    ///
+    /// 业务意图：
+    /// - 用户在设置窗口中选择主题后应立即影响所有已打开窗口，并写入配置供下次启动恢复。
+    fn select_theme(&mut self, theme: ThemePreference, context: &mut Context<Self>) {
+        self.main_view.update(context, |view, context| {
+            view.theme_preference = theme;
+            save_theme_preference(theme);
+            context.notify();
+        });
+        context.notify();
+    }
+
+    /// 渲染左侧页签栏。
+    fn render_tab_sidebar(
+        &self,
+        active_tab: SettingsTab,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Div {
+        div()
+            .flex()
+            .flex_col()
+            .w(px(SETTINGS_TAB_SIDEBAR_WIDTH))
+            .h_full()
+            .p_2()
+            .border_r_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.panel))
+            .children(
+                SettingsTab::all()
+                    .iter()
+                    .copied()
+                    .map(|tab| self.render_tab_button(tab, active_tab, palette, context)),
+            )
+    }
+
+    /// 渲染单个设置页签按钮。
+    fn render_tab_button(
+        &self,
+        tab: SettingsTab,
+        active_tab: SettingsTab,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let selected = tab == active_tab;
+        div()
+            .id(SharedString::from(format!("settings-tab-{}", tab.label())))
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(34.0))
+            .px_2()
+            .mb_1()
+            .rounded(px(6.0))
+            .text_sm()
+            .font_weight(if selected {
+                FontWeight::SEMIBOLD
+            } else {
+                FontWeight::NORMAL
+            })
+            .text_color(rgb(if selected {
+                palette.accent
+            } else {
+                palette.muted_text
+            }))
+            .bg(rgb(if selected {
+                palette.selected
+            } else {
+                palette.panel
+            }))
+            .cursor_pointer()
+            .hover(move |button| button.bg(rgb(palette.hover)))
+            .child(MainView::render_lucide_icon(
+                Some(tab.icon()),
+                16.0,
+                15.0,
+                if selected {
+                    palette.accent
+                } else {
+                    palette.muted_text
+                },
+            ))
+            .child(tab.label())
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, _window, context| {
+                    view.select_tab(tab, context);
+                }),
+            )
+    }
+
+    /// 渲染设置内容区域。
+    fn render_content(
+        &self,
+        active_tab: SettingsTab,
+        theme: ThemePreference,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        match active_tab {
+            SettingsTab::General => self.render_general_tab(theme, palette, context),
+            SettingsTab::Model => self.render_model_tab(palette),
+        }
+    }
+
+    /// 渲染通用页签。
+    ///
+    /// 业务意图：
+    /// - 通用页签当前只承载主题设置，未来可继续加入语言、字体等全局体验类配置。
+    fn render_general_tab(
+        &self,
+        theme: ThemePreference,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("settings-general-tab")
+            .flex()
+            .flex_col()
+            .gap_3()
+            .size_full()
+            .p_4()
+            .bg(rgb(palette.background))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(palette.text))
+                    .child(MainView::render_lucide_icon(
+                        Some(Icon::Palette),
+                        16.0,
+                        16.0,
+                        palette.muted_text,
+                    ))
+                    .child("主题设置"),
+            )
+            .child(
+                div().flex().flex_col().gap_2().children(
+                    ThemePreference::all()
+                        .iter()
+                        .copied()
+                        .map(|option| self.render_theme_option(option, theme, palette, context)),
+                ),
+            )
+    }
+
+    /// 渲染单个主题选项。
+    fn render_theme_option(
+        &self,
+        option: ThemePreference,
+        selected_theme: ThemePreference,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let selected = option == selected_theme;
+        div()
+            .id(SharedString::from(format!(
+                "settings-theme-{}",
+                option.label()
+            )))
+            .flex()
+            .items_center()
+            .justify_between()
+            .h(px(40.0))
+            .px_3()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(if selected {
+                palette.accent
+            } else {
+                palette.border
+            }))
+            .bg(rgb(if selected {
+                palette.selected
+            } else {
+                palette.surface
+            }))
+            .cursor_pointer()
+            .hover(move |row| row.bg(rgb(palette.hover)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_sm()
+                    .text_color(rgb(palette.text))
+                    .child(MainView::render_lucide_icon(
+                        Some(option.icon()),
+                        16.0,
+                        15.0,
+                        palette.muted_text,
+                    ))
+                    .child(option.label()),
+            )
+            .child(MainView::render_lucide_icon(
+                Some(if selected {
+                    Icon::CheckCircle2
+                } else {
+                    Icon::Circle
+                }),
+                16.0,
+                15.0,
+                if selected {
+                    palette.accent
+                } else {
+                    palette.muted_text
+                },
+            ))
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, _window, context| {
+                    view.select_theme(option, context);
+                }),
+            )
+    }
+
+    /// 渲染模型页签。
+    ///
+    /// 业务意图：
+    /// - 用户要求模型页签先留白，因此这里仅保留空白内容区，不展示占位说明或未完成提示。
+    fn render_model_tab(&self, palette: AppThemePalette) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("settings-model-tab")
+            .size_full()
+            .bg(rgb(palette.background))
+    }
+}
+
+impl Render for SettingsWindowView {
+    /// 渲染独立设置窗口。
+    ///
+    /// 业务意图：
+    /// - 设置窗口内容由左侧页签和右侧内容组成，根节点填满独立窗口，避免系统标题栏下方出现未绘制区域。
+    fn render(&mut self, _window: &mut Window, context: &mut Context<Self>) -> impl IntoElement {
+        let (active_tab, theme, palette) = {
+            let main_view = self.main_view.read(context);
+            (
+                main_view.settings_active_tab,
+                main_view.theme_preference,
+                main_view.palette(),
+            )
+        };
+
+        div()
+            .id("settings-window")
+            .flex()
+            .size_full()
+            .bg(rgb(palette.background))
+            .child(self.render_tab_sidebar(active_tab, palette, context))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .child(self.render_content(active_tab, theme, palette, context)),
+            )
+    }
+}
+
 /// 搜索对话框独立窗口根视图。
 ///
 /// 业务意图：
@@ -1709,7 +2343,11 @@ impl SearchDialogWindowView {
     }
 
     /// 渲染搜索窗口标题栏。
-    fn render_header(&self, context: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    fn render_header(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         div()
             .id("search-dialog-window-header")
             .flex()
@@ -1718,7 +2356,7 @@ impl SearchDialogWindowView {
             .h(px(34.0))
             .px_3()
             .border_b_1()
-            .border_color(rgb(0xe5e7eb))
+            .border_color(rgb(palette.border))
             .cursor_move()
             .child(
                 div()
@@ -1727,12 +2365,12 @@ impl SearchDialogWindowView {
                     .gap_2()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(0x24292f))
+                    .text_color(rgb(palette.text))
                     .child(MainView::render_lucide_icon(
                         Some(Icon::Search),
                         15.0,
                         15.0,
-                        0x57606a,
+                        palette.muted_text,
                     ))
                     .child("搜索"),
             )
@@ -1746,12 +2384,12 @@ impl SearchDialogWindowView {
                     .h(px(22.0))
                     .rounded(px(4.0))
                     .cursor_pointer()
-                    .hover(|button| button.bg(rgb(0xf6f8fa)))
+                    .hover(move |button| button.bg(rgb(palette.hover)))
                     .child(MainView::render_lucide_icon(
                         Some(Icon::X),
                         13.0,
                         13.0,
-                        0x57606a,
+                        palette.muted_text,
                     ))
                     .on_click(
                         context.listener(|view, _event: &ClickEvent, window, context| {
@@ -1773,6 +2411,7 @@ impl SearchDialogWindowView {
         dialog: &SearchDialogState,
         focus_handle: gpui::FocusHandle,
         window: &Window,
+        palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let query = dialog.query.clone();
@@ -1789,8 +2428,8 @@ impl SearchDialogWindowView {
             .px_2()
             .rounded(px(5.0))
             .border_1()
-            .border_color(rgb(0xd0d7de))
-            .bg(rgb(0xffffff))
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.input))
             .track_focus(&focus_handle)
             .key_context("search-input")
             .on_key_down(context.listener(Self::handle_search_input_key_down))
@@ -1826,7 +2465,11 @@ impl SearchDialogWindowView {
                             .min_w_0()
                             .truncate()
                             .text_sm()
-                            .text_color(rgb(if is_empty { 0x8c959f } else { 0x24292f }))
+                            .text_color(rgb(if is_empty {
+                                palette.muted_text
+                            } else {
+                                palette.text
+                            }))
                             .child(if is_empty {
                                 "输入搜索关键字".to_string()
                             } else {
@@ -1844,14 +2487,25 @@ impl SearchDialogWindowView {
     fn render_scope_controls(
         &self,
         selected_scope: SearchScope,
+        palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Div {
         div()
             .flex()
             .items_center()
             .gap_1()
-            .child(self.render_scope_button(SearchScope::CurrentFile, selected_scope, context))
-            .child(self.render_scope_button(SearchScope::CurrentDirectory, selected_scope, context))
+            .child(self.render_scope_button(
+                SearchScope::CurrentFile,
+                selected_scope,
+                palette,
+                context,
+            ))
+            .child(self.render_scope_button(
+                SearchScope::CurrentDirectory,
+                selected_scope,
+                palette,
+                context,
+            ))
     }
 
     /// 渲染单个搜索范围按钮。
@@ -1859,6 +2513,7 @@ impl SearchDialogWindowView {
         &self,
         scope: SearchScope,
         selected_scope: SearchScope,
+        palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let selected = scope == selected_scope;
@@ -1874,10 +2529,18 @@ impl SearchDialogWindowView {
             .px_2()
             .rounded(px(4.0))
             .text_xs()
-            .text_color(rgb(if selected { 0x0969da } else { 0x57606a }))
-            .bg(rgb(if selected { 0xddf4ff } else { 0xf6f8fa }))
+            .text_color(rgb(if selected {
+                palette.accent
+            } else {
+                palette.muted_text
+            }))
+            .bg(rgb(if selected {
+                palette.selected
+            } else {
+                palette.panel
+            }))
             .cursor_pointer()
-            .hover(|button| button.bg(rgb(0xeaeef2)))
+            .hover(move |button| button.bg(rgb(palette.hover)))
             .child(scope.label())
             .on_click(
                 context.listener(move |view, _event: &ClickEvent, window, context| {
@@ -1892,6 +2555,7 @@ impl SearchDialogWindowView {
         dialog: &SearchDialogState,
         focus_handle: gpui::FocusHandle,
         window: &Window,
+        palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         if dialog.scope != SearchScope::CurrentDirectory {
@@ -1907,7 +2571,12 @@ impl SearchDialogWindowView {
             .flex()
             .flex_col()
             .gap_1()
-            .child(div().text_xs().text_color(rgb(0x57606a)).child("搜索目录"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(palette.muted_text))
+                    .child("搜索目录"),
+            )
             .child(
                 div()
                     .id("search-dialog-window-directory-input")
@@ -1919,8 +2588,8 @@ impl SearchDialogWindowView {
                     .px_2()
                     .rounded(px(5.0))
                     .border_1()
-                    .border_color(rgb(0xd0d7de))
-                    .bg(rgb(0xffffff))
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.input))
                     .track_focus(&focus_handle)
                     .key_context("search-directory-input")
                     .on_key_down(context.listener(Self::handle_search_directory_key_down))
@@ -1956,7 +2625,11 @@ impl SearchDialogWindowView {
                                     .min_w_0()
                                     .truncate()
                                     .text_xs()
-                                    .text_color(rgb(if is_empty { 0x8c959f } else { 0x24292f }))
+                                    .text_color(rgb(if is_empty {
+                                        palette.muted_text
+                                    } else {
+                                        palette.text
+                                    }))
                                     .child(if is_empty {
                                         "输入目录路径或子目录关键字".to_string()
                                     } else {
@@ -1972,7 +2645,7 @@ impl SearchDialogWindowView {
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x8c959f))
+                    .text_color(rgb(palette.muted_text))
                     .child("仅在已加载目录树内过滤，不会额外扫描磁盘"),
             )
     }
@@ -1982,6 +2655,7 @@ impl SearchDialogWindowView {
         &self,
         case_sensitive: bool,
         can_search: bool,
+        palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Div {
         div()
@@ -1994,10 +2668,10 @@ impl SearchDialogWindowView {
                     .items_center()
                     .gap_2()
                     .text_xs()
-                    .text_color(rgb(0x57606a))
+                    .text_color(rgb(palette.muted_text))
                     .id("search-dialog-window-case-sensitive-toggle")
                     .cursor_pointer()
-                    .child(MainView::render_checkbox(case_sensitive))
+                    .child(MainView::render_checkbox(case_sensitive, palette))
                     .child("区分大小写")
                     .on_click(
                         context.listener(|view, _event: &ClickEvent, _window, context| {
@@ -2016,19 +2690,23 @@ impl SearchDialogWindowView {
                     .px_3()
                     .rounded(px(5.0))
                     .text_xs()
-                    .text_color(rgb(0xffffff))
-                    .bg(rgb(if can_search { 0x0969da } else { 0x8c959f }))
+                    .text_color(rgb(palette.on_accent))
+                    .bg(rgb(if can_search {
+                        palette.accent
+                    } else {
+                        palette.muted_text
+                    }))
                     .when(can_search, |button| {
                         button
                             .cursor_pointer()
-                            .hover(|button| button.bg(rgb(0x0757b8)))
+                            .hover(move |button| button.bg(rgb(palette.accent_hover)))
                     })
                     .when(!can_search, |button| button.opacity(0.72))
                     .child(MainView::render_lucide_icon(
                         Some(Icon::Search),
                         12.0,
                         12.0,
-                        0xffffff,
+                        palette.on_accent,
                     ))
                     .child("搜索")
                     .on_click(
@@ -2047,19 +2725,21 @@ impl Render for SearchDialogWindowView {
     /// - 窗口只承载搜索条件、进度和关闭动作；结果仍显示在主窗口底部面板。
     /// - 根节点填满独立窗口，避免在无系统标题栏场景下出现透明或不可点击区域。
     fn render(&mut self, window: &mut Window, context: &mut Context<Self>) -> impl IntoElement {
-        let (dialog, can_search, search_focus, directory_focus) = {
+        let (dialog, can_search, search_focus, directory_focus, palette) = {
             let main_view = self.main_view.read(context);
             let Some(dialog) = main_view.search_dialog.clone() else {
+                let palette = main_view.palette();
                 return div()
                     .id("search-dialog-window-empty")
                     .size_full()
-                    .bg(rgb(0xffffff));
+                    .bg(rgb(palette.background));
             };
             (
                 dialog.clone(),
                 main_view.search_can_start(&dialog),
                 main_view.search_input_focus.clone(),
                 main_view.search_directory_focus.clone(),
+                main_view.palette(),
             )
         };
 
@@ -2070,27 +2750,44 @@ impl Render for SearchDialogWindowView {
             .size_full()
             .rounded(px(8.0))
             .border_1()
-            .border_color(rgb(0xd0d7de))
-            .bg(rgb(0xffffff))
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.background))
             .overflow_hidden()
-            .child(self.render_header(context))
+            .child(self.render_header(palette, context))
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .gap_2()
                     .p_3()
-                    .child(self.render_search_input(&dialog, search_focus, window, context))
-                    .child(self.render_scope_controls(dialog.scope, context))
-                    .child(self.render_directory_target(&dialog, directory_focus, window, context))
-                    .child(self.render_options_row(dialog.case_sensitive, can_search, context))
+                    .child(self.render_search_input(
+                        &dialog,
+                        search_focus,
+                        window,
+                        palette,
+                        context,
+                    ))
+                    .child(self.render_scope_controls(dialog.scope, palette, context))
+                    .child(self.render_directory_target(
+                        &dialog,
+                        directory_focus,
+                        window,
+                        palette,
+                        context,
+                    ))
+                    .child(self.render_options_row(
+                        dialog.case_sensitive,
+                        can_search,
+                        palette,
+                        context,
+                    ))
                     .child(
                         div()
                             .text_xs()
                             .text_color(rgb(if dialog.is_searching {
-                                0x0969da
+                                palette.accent
                             } else {
-                                0x6b7280
+                                palette.muted_text
                             }))
                             .child(dialog.message.clone()),
                     ),
@@ -2491,6 +3188,50 @@ struct MainView {
     /// - 如果用户通过系统方式关闭窗口，关闭回调必须把该字段清空，避免后续 `Ctrl+F` 尝试激活已关闭窗口。
     search_dialog_window: Option<WindowHandle<SearchDialogWindowView>>,
 
+    /// 设置窗口独立窗口句柄。
+    ///
+    /// 业务意图：
+    /// - 设置按钮会打开独立窗口；主窗口保存句柄用于重复点击时激活已有设置窗口，而不是创建多个重复窗口。
+    /// - 该句柄只服务当前会话，不参与持久化。
+    ///
+    /// 边界条件：
+    /// - 用户通过系统关闭按钮关闭设置窗口时，关闭回调必须清空该字段，避免后续点击设置按钮尝试激活失效窗口。
+    settings_window: Option<WindowHandle<SettingsWindowView>>,
+
+    /// 设置窗口打开请求是否已经排队到下一帧。
+    ///
+    /// 业务意图：
+    /// - 设置窗口创建同样需要延后到 `MainView` 更新结束后执行；该标记用于合并同一帧内的重复点击。
+    /// - 真实窗口状态仍以 `settings_window` 为准，该字段只描述一次待执行的打开动作。
+    settings_window_open_pending: bool,
+
+    /// 设置窗口当前激活页签。
+    ///
+    /// 业务意图：
+    /// - 当前设置窗口包含“通用”和“模型”两个页签，该字段保存当前会话内最后访问的页签。
+    /// - 默认打开“通用”，符合用户要求第一个页签先提供主题设置。
+    settings_active_tab: SettingsTab,
+
+    /// 当前主题偏好。
+    ///
+    /// 业务意图：
+    /// - 通用页签提供主题选择，字段驱动全应用基础调色板并在用户修改后写入配置文件。
+    /// - 配置缺失或损坏时默认“跟随系统”，避免在用户未主动选择前改变现有视觉表现。
+    theme_preference: ThemePreference,
+
+    /// 当前窗口系统外观。
+    ///
+    /// 业务意图：
+    /// - 当主题偏好为“跟随系统”时，需要用 GPUI 提供的窗口外观计算实际调色板。
+    /// - 该字段会随系统外观变化更新，驱动主窗口和独立窗口重绘。
+    system_window_appearance: WindowAppearance,
+
+    /// 主窗口外观变化订阅。
+    ///
+    /// 业务意图：
+    /// - GPUI 的窗口外观监听返回订阅句柄，必须保存在主视图中，否则监听会立即失效。
+    window_appearance_subscription: Option<gpui::Subscription>,
+
     /// 搜索对话框打开请求是否已经排队到下一帧。
     ///
     /// 业务意图：
@@ -2585,6 +3326,12 @@ impl MainView {
             log_tree_scrollbar_drag: None,
             search_dialog: None,
             search_dialog_window: None,
+            settings_window: None,
+            settings_window_open_pending: false,
+            settings_active_tab: SettingsTab::General,
+            theme_preference: load_theme_preference(),
+            system_window_appearance: WindowAppearance::Light,
+            window_appearance_subscription: None,
             search_dialog_open_pending: false,
             search_results_panel: None,
             search_results_resize_drag: None,
@@ -2598,16 +3345,42 @@ impl MainView {
         }
     }
 
+    /// 返回当前主视图实际生效的主题。
+    fn effective_theme(&self) -> EffectiveTheme {
+        EffectiveTheme::resolve(self.theme_preference, self.system_window_appearance)
+    }
+
+    /// 返回当前主视图调色板。
+    fn palette(&self) -> AppThemePalette {
+        AppThemePalette::for_theme(self.effective_theme())
+    }
+
+    /// 更新系统窗口外观。
+    ///
+    /// 业务意图：
+    /// - 当用户选择“跟随系统”时，系统外观变化应立即驱动当前窗口重绘。
+    /// - 即使用户强制选择明亮或暗色，也保存最新系统外观，方便之后切回“跟随系统”时立即正确。
+    fn set_system_window_appearance(
+        &mut self,
+        appearance: WindowAppearance,
+        context: &mut Context<Self>,
+    ) {
+        self.system_window_appearance = appearance;
+        context.notify();
+    }
+
     /// 构建顶部工具栏。
     ///
     /// 业务意图：
     /// - 将全局操作入口集中在窗口顶部，符合日志查看客户端的主要工作流。
-    /// - “加载日志”已经接入真实路径选择和目录树扫描；诊断和设置仍只保留入口。
+    /// - “加载日志”已经接入真实路径选择和目录树扫描；设置会打开独立设置窗口；诊断仍只保留入口。
     ///
     /// 边界条件：
     /// - 工具栏内容固定为单行，超窄窗口下的折叠、隐藏或溢出行为尚未定义。
-    /// - 诊断和设置按钮点击目前是空操作，后续实现具体功能时必须补充对应业务规则和错误处理。
+    /// - 诊断按钮当前只保留入口，后续实现具体业务时必须补充对应业务规则和错误处理。
     fn render_toolbar(&self, context: &mut Context<Self>) -> impl IntoElement {
+        let palette = self.palette();
+
         div()
             .flex()
             .items_center()
@@ -2615,12 +3388,13 @@ impl MainView {
             .h(px(TOOLBAR_HEIGHT))
             .pl(px(LOG_TREE_ROW_HORIZONTAL_PADDING))
             .pr_4()
-            .bg(rgb(0xf7f8fa))
+            .bg(rgb(palette.panel))
             .border_b_1()
-            .border_color(rgb(0xe1e4e8))
+            .border_color(rgb(palette.border))
             .child(self.render_load_toolbar_button(context))
             .child(self.render_search_toolbar_button(context))
-            .children(TOOLBAR_ACTIONS[2..].iter().map(Self::render_toolbar_button))
+            .child(Self::render_toolbar_button(&TOOLBAR_ACTIONS[2], palette))
+            .child(self.render_settings_toolbar_button(context))
     }
 
     /// 构建“加载日志”工具栏按钮。
@@ -2634,6 +3408,7 @@ impl MainView {
     /// - 当前通过 GPUI 的路径选择器同时请求文件和目录；Windows 混选能力需在后续真机验收中确认。
     fn render_load_toolbar_button(&self, context: &mut Context<Self>) -> impl IntoElement {
         let action = &TOOLBAR_ACTIONS[0];
+        let palette = self.palette();
 
         div()
             .id(SharedString::from(action.label))
@@ -2645,16 +3420,16 @@ impl MainView {
             .pr(px(TOOLBAR_BUTTON_HORIZONTAL_PADDING))
             .py(px(TOOLBAR_BUTTON_VERTICAL_PADDING))
             .text_sm()
-            .text_color(rgb(0x24292f))
+            .text_color(rgb(palette.text))
             .rounded(px(6.0))
             .cursor_pointer()
-            .hover(|button| button.text_color(rgb(0x0969da)))
+            .hover(move |button| button.text_color(rgb(palette.accent)))
             .active(|button| button.opacity(0.82))
             .child(Self::render_lucide_icon(
                 Some(action.icon),
                 TOOLBAR_BUTTON_ICON_WIDTH,
                 TOOLBAR_BUTTON_ICON_SIZE,
-                0x57606a,
+                palette.muted_text,
             ))
             .child(action.label)
             .on_click(context.listener(Self::open_log_sources_prompt))
@@ -2671,6 +3446,7 @@ impl MainView {
     /// - 如果日志正文已有选区，沿用快捷键入口的预填逻辑，把选中文本写入搜索关键字。
     fn render_search_toolbar_button(&self, context: &mut Context<Self>) -> impl IntoElement {
         let action = &TOOLBAR_ACTIONS[1];
+        let palette = self.palette();
 
         div()
             .id(SharedString::from(action.label))
@@ -2681,16 +3457,16 @@ impl MainView {
             .px(px(TOOLBAR_BUTTON_HORIZONTAL_PADDING))
             .py(px(TOOLBAR_BUTTON_VERTICAL_PADDING))
             .text_sm()
-            .text_color(rgb(0x24292f))
+            .text_color(rgb(palette.text))
             .rounded(px(6.0))
             .cursor_pointer()
-            .hover(|button| button.text_color(rgb(0x0969da)))
+            .hover(move |button| button.text_color(rgb(palette.accent)))
             .active(|button| button.opacity(0.82))
             .child(Self::render_lucide_icon(
                 Some(action.icon),
                 TOOLBAR_BUTTON_ICON_WIDTH,
                 TOOLBAR_BUTTON_ICON_SIZE,
-                0x57606a,
+                palette.muted_text,
             ))
             .child(action.label)
             .on_click(context.listener(Self::open_search_from_toolbar))
@@ -2703,9 +3479,9 @@ impl MainView {
     /// - 按钮使用“图标 + 中文文字”的文字按钮形态，满足轻量工具栏要求。
     ///
     /// 边界条件：
-    /// - 当前按钮没有真实业务动作，点击后不改变状态、不访问文件、不请求网络。
+    /// - 当前仅用于“智能诊断”占位入口；点击后不改变状态、不访问文件、不请求网络。
     /// - `id` 使用按钮标签生成，当前三个标签唯一；后续如果允许重复入口，需要改为稳定枚举 ID。
-    fn render_toolbar_button(action: &ToolbarAction) -> impl IntoElement {
+    fn render_toolbar_button(action: &ToolbarAction, palette: AppThemePalette) -> impl IntoElement {
         div()
             .id(SharedString::from(action.label))
             .flex()
@@ -2715,22 +3491,55 @@ impl MainView {
             .px(px(TOOLBAR_BUTTON_HORIZONTAL_PADDING))
             .py(px(TOOLBAR_BUTTON_VERTICAL_PADDING))
             .text_sm()
-            .text_color(rgb(0x24292f))
+            .text_color(rgb(palette.text))
             .rounded(px(6.0))
             .cursor_pointer()
-            .hover(|button| button.text_color(rgb(0x0969da)))
+            .hover(move |button| button.text_color(rgb(palette.accent)))
             .active(|button| button.opacity(0.82))
             .child(Self::render_lucide_icon(
                 Some(action.icon),
                 TOOLBAR_BUTTON_ICON_WIDTH,
                 TOOLBAR_BUTTON_ICON_SIZE,
-                0x57606a,
+                palette.muted_text,
             ))
             .child(action.label)
             .on_click(|_event, _window, _context| {
-                // 智能诊断和设置当前只要求保留入口，具体业务动作尚未定义。
+                // 智能诊断当前只要求保留入口，具体业务动作尚未定义。
                 // 后续实现时应按 AGENTS.md 先确认权限、数据边界和验收标准，再绑定真实处理逻辑。
             })
+    }
+
+    /// 构建“设置”工具栏按钮。
+    ///
+    /// 业务意图：
+    /// - 设置入口现在有真实独立窗口，重复点击应激活已有窗口，避免用户打开多个配置窗口后状态不一致。
+    /// - 视觉样式保持和其它工具栏按钮一致，避免设置入口因为已接入功能而破坏顶部工具栏节奏。
+    fn render_settings_toolbar_button(&self, context: &mut Context<Self>) -> impl IntoElement {
+        let action = &TOOLBAR_ACTIONS[3];
+        let palette = self.palette();
+
+        div()
+            .id(SharedString::from(action.label))
+            .flex()
+            .items_center()
+            .gap_1()
+            .flex_none()
+            .px(px(TOOLBAR_BUTTON_HORIZONTAL_PADDING))
+            .py(px(TOOLBAR_BUTTON_VERTICAL_PADDING))
+            .text_sm()
+            .text_color(rgb(palette.text))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .hover(move |button| button.text_color(rgb(palette.accent)))
+            .active(|button| button.opacity(0.82))
+            .child(Self::render_lucide_icon(
+                Some(action.icon),
+                TOOLBAR_BUTTON_ICON_WIDTH,
+                TOOLBAR_BUTTON_ICON_SIZE,
+                palette.muted_text,
+            ))
+            .child(action.label)
+            .on_click(context.listener(Self::open_settings_from_toolbar))
     }
 
     /// 打开日志来源选择器。
@@ -2760,6 +3569,38 @@ impl MainView {
         context: &mut Context<Self>,
     ) {
         self.schedule_open_search_dialog(window, context);
+    }
+
+    /// 从工具栏按钮打开设置窗口。
+    ///
+    /// 业务意图：
+    /// - 设置窗口会持有并观察 `MainView`，因此和搜索窗口一样延后到当前主视图更新结束后再创建。
+    /// - 这样可以避免在按钮点击的状态更新栈中同时读取同一个 `MainView`。
+    fn open_settings_from_toolbar(
+        &mut self,
+        _event: &ClickEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.schedule_open_settings_window(window, context);
+    }
+
+    /// 在当前主视图更新结束后打开设置窗口。
+    ///
+    /// 业务意图：
+    /// - 设置窗口会读取并观察 `MainView`，直接在按钮监听中创建会和当前更新租借冲突。
+    /// - 重复点击设置按钮时只排队一次，避免同一帧创建多个设置窗口。
+    fn schedule_open_settings_window(&mut self, window: &mut Window, context: &mut Context<Self>) {
+        if self.settings_window_open_pending {
+            return;
+        }
+
+        self.settings_window_open_pending = true;
+        let main_view = context.entity();
+        window.defer(context, move |_window, app| {
+            Self::open_settings_window_after_main_update(main_view, app);
+        });
+        context.notify();
     }
 
     /// 启动系统路径选择器，并在用户确认后异步扫描路径。
@@ -2894,11 +3735,13 @@ impl MainView {
     /// - 当前面板只负责目录树展示和节点点击入口，不直接读取正文；正文读取由 tab 工作区异步处理。
     /// - 真实节点支持展开/收起，行渲染交给虚拟列表处理；后续如需搜索或过滤树节点需要新增独立状态。
     fn render_log_tree_panel(&self, context: &mut Context<Self>) -> impl IntoElement {
+        let palette = self.palette();
+
         div()
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(0xf8fafc))
+            .bg(rgb(palette.panel))
             .child(self.render_log_tree_header())
             .child(self.render_log_tree_body(context))
     }
@@ -2912,6 +3755,7 @@ impl MainView {
     /// 边界条件：
     /// - 当前标题不显示真实绝对路径，避免在路径脱敏和悬浮提示规则未定义前挤压窄面板。
     fn render_log_tree_header(&self) -> impl IntoElement {
+        let palette = self.palette();
         let summary = match &self.load_state {
             LogTreeLoadState::Loaded(tree_state) => tree_state.summary().to_string(),
             LogTreeLoadState::Empty
@@ -2926,25 +3770,25 @@ impl MainView {
             .h(px(LOG_TREE_HEADER_HEIGHT))
             .px(px(LOG_TREE_ROW_HORIZONTAL_PADDING))
             .border_b_1()
-            .border_color(rgb(0xe5e7eb))
+            .border_color(rgb(palette.border))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_1()
                     .text_sm()
-                    .text_color(rgb(0x24292f))
+                    .text_color(rgb(palette.text))
                     .child(Self::render_lucide_icon(
                         Some(Icon::FolderTree),
                         LOG_TREE_ITEM_ICON_WIDTH,
                         LOG_TREE_ITEM_ICON_SIZE,
-                        0x57606a,
+                        palette.muted_text,
                     )),
             )
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x6b7280))
+                    .text_color(rgb(palette.muted_text))
                     .truncate()
                     .child(summary),
             )
@@ -3028,9 +3872,12 @@ impl MainView {
             .w(px(LOG_TREE_SCROLLBAR_WIDTH))
             .h(metrics.thumb_length)
             .rounded(px(LOG_TREE_SCROLLBAR_WIDTH / 2.0))
-            .bg(rgb(0xc9d1d9))
+            .bg(rgb(self.palette().scrollbar))
             .cursor_pointer()
-            .hover(|thumb| thumb.bg(rgb(0x8c959f)))
+            .hover({
+                let palette = self.palette();
+                move |thumb| thumb.bg(rgb(palette.scrollbar_hover))
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 context.listener(|view, event: &MouseDownEvent, _window, context| {
@@ -3130,7 +3977,8 @@ impl MainView {
         } else {
             None
         };
-        let (item_icon, icon_color) = Self::loaded_log_tree_icon(row.kind);
+        let palette = self.palette();
+        let (item_icon, icon_color) = Self::loaded_log_tree_icon(row.kind, palette);
 
         Self::render_log_tree_row(
             LogTreeRowRenderData {
@@ -3144,6 +3992,7 @@ impl MainView {
                 label: row.label.clone(),
                 meta: row.meta.clone(),
             },
+            palette,
             context,
         )
     }
@@ -3159,6 +4008,7 @@ impl MainView {
     /// - 文件来源来自加载层，不从展示文案反推真实路径，避免目录同名或压缩包路径分隔符差异导致误读。
     fn render_log_tree_row(
         row_data: LogTreeRowRenderData,
+        palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let LogTreeRowRenderData {
@@ -3185,13 +4035,13 @@ impl MainView {
             .pl(px(left_padding))
             .pr(px(LOG_TREE_ROW_HORIZONTAL_PADDING))
             .text_sm()
-            .text_color(rgb(0x24292f))
-            .hover(|tree_row| tree_row.bg(rgb(0xeef2f7)))
+            .text_color(rgb(palette.text))
+            .hover(move |tree_row| tree_row.bg(rgb(palette.hover)))
             .child(Self::render_lucide_icon(
                 expand_icon,
                 LOG_TREE_CHEVRON_WIDTH,
                 LOG_TREE_CHEVRON_SIZE,
-                0x6b7280,
+                palette.muted_text,
             ))
             .child(Self::render_lucide_icon(
                 Some(item_icon),
@@ -3207,7 +4057,7 @@ impl MainView {
                     .flex_1()
                     .min_w_0()
                     .child(div().min_w_0().truncate().child(label))
-                    .child(Self::render_log_tree_meta(meta.as_deref())),
+                    .child(Self::render_log_tree_meta(meta.as_deref(), palette)),
             );
 
         if let Some(source) = source {
@@ -3924,6 +4774,83 @@ impl MainView {
             .find(|record| record.job_id == job_id)
         {
             record.canceled = true;
+        }
+    }
+
+    /// 在 `MainView` 更新租借结束后打开设置窗口。
+    ///
+    /// 业务意图：
+    /// - 工具栏设置按钮通过该入口打开独立窗口，保证重复点击只激活已有窗口而不是创建多个窗口。
+    /// - 设置窗口只读写 `MainView` 中的设置状态，不访问文件系统、不请求网络，也不影响日志加载或搜索任务。
+    ///
+    /// 边界条件：
+    /// - 如果旧窗口句柄失效，清空后重新创建。
+    /// - 创建失败时仅清理 pending 状态；当前没有用户可见错误面板，避免把设置窗口失败混入日志内容区。
+    fn open_settings_window_after_main_update(main_view: Entity<MainView>, app: &mut App) {
+        let existing_settings_window = main_view.update(app, |view, context| {
+            view.settings_window_open_pending = false;
+            view.tab_context_menu = None;
+            view.encoding_dropdown_menu = None;
+            view.search_results_context_menu = None;
+            context.notify();
+            view.settings_window
+        });
+
+        if let Some(settings_window) = existing_settings_window {
+            if settings_window
+                .update(app, |_, window, _| {
+                    window.activate_window();
+                })
+                .is_ok()
+            {
+                return;
+            }
+            main_view.update(app, |view, _| {
+                view.settings_window = None;
+            });
+        }
+
+        let main_view_for_window = main_view.clone();
+        let main_view_for_close = main_view.clone();
+        let settings_window_options = WindowOptions {
+            titlebar: Some(TitlebarOptions {
+                title: Some("设置".into()),
+                ..Default::default()
+            }),
+            window_bounds: Some(WindowBounds::centered(
+                size(px(SETTINGS_WINDOW_WIDTH), px(SETTINGS_WINDOW_HEIGHT)),
+                app,
+            )),
+            is_resizable: false,
+            is_minimizable: true,
+            window_min_size: Some(size(px(SETTINGS_WINDOW_WIDTH), px(SETTINGS_WINDOW_HEIGHT))),
+            ..Default::default()
+        };
+
+        match app.open_window(settings_window_options, move |window, app| {
+            window.on_window_should_close(app, move |_, app| {
+                main_view_for_close.update(app, |view, context| {
+                    view.settings_window = None;
+                    view.settings_window_open_pending = false;
+                    context.notify();
+                });
+                true
+            });
+            app.new(|context| SettingsWindowView::new(main_view_for_window, context))
+        }) {
+            Ok(settings_window) => {
+                main_view.update(app, |view, context| {
+                    view.settings_window = Some(settings_window);
+                    context.notify();
+                });
+            }
+            Err(_error) => {
+                main_view.update(app, |view, context| {
+                    view.settings_window = None;
+                    view.settings_window_open_pending = false;
+                    context.notify();
+                });
+            }
         }
     }
 
@@ -4662,13 +5589,13 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 将类型到视觉符号的映射集中管理，后续新增节点类型时不会散落在多个渲染分支里。
-    fn loaded_log_tree_icon(kind: LogTreeEntryKind) -> (Icon, u32) {
+    fn loaded_log_tree_icon(kind: LogTreeEntryKind, palette: AppThemePalette) -> (Icon, u32) {
         match kind {
-            LogTreeEntryKind::Directory => (Icon::FolderOpen, 0x0969da),
-            LogTreeEntryKind::File => (Icon::FileText, 0x57606a),
+            LogTreeEntryKind::Directory => (Icon::FolderOpen, palette.accent),
+            LogTreeEntryKind::File => (Icon::FileText, palette.muted_text),
             LogTreeEntryKind::Archive => (Icon::FileArchive, 0x8250df),
-            LogTreeEntryKind::Symlink => (Icon::FolderSymlink, 0x6b7280),
-            LogTreeEntryKind::Error => (Icon::FileX, 0xcf222e),
+            LogTreeEntryKind::Symlink => (Icon::FolderSymlink, palette.muted_text),
+            LogTreeEntryKind::Error => (Icon::FileX, palette.error),
         }
     }
 
@@ -4681,11 +5608,11 @@ impl MainView {
     /// 边界条件：
     /// - 当前元信息不参与排序、过滤或诊断，只是短文本展示。
     /// - 后续若元信息可能很长，需要定义截断、悬浮提示和优先级规则。
-    fn render_log_tree_meta(meta: Option<&str>) -> gpui::Div {
+    fn render_log_tree_meta(meta: Option<&str>, palette: AppThemePalette) -> gpui::Div {
         let meta_element = div()
             .flex_none()
             .text_xs()
-            .text_color(rgb(0x8c959f))
+            .text_color(rgb(palette.muted_text))
             .child(meta.unwrap_or_default().to_string());
 
         if meta.is_some() {
@@ -4901,26 +5828,32 @@ impl MainView {
     /// - 加载中和加载失败也使用同一块主内容区提示，不提前显示左侧栏。
     /// - 当前提示不承载按钮，避免和顶部“加载日志”入口形成重复操作路径。
     fn render_primary_content_message(&self) -> impl IntoElement {
+        let palette = self.palette();
         let (icon, icon_color, title, description) = match &self.load_state {
             LogTreeLoadState::Empty => (
                 Icon::FileText,
-                0x57606a,
+                palette.muted_text,
                 "请先加载日志".to_string(),
                 "点击左上角“加载日志”，选择日志文件、目录或压缩包。".to_string(),
             ),
             LogTreeLoadState::Loading { message } => (
                 Icon::Loader,
-                0x57606a,
+                palette.muted_text,
                 "正在加载日志".to_string(),
                 message.clone(),
             ),
             LogTreeLoadState::Failed { message } => (
                 Icon::FileX,
-                0xcf222e,
+                palette.error,
                 "加载日志失败".to_string(),
                 message.clone(),
             ),
-            LogTreeLoadState::Loaded(_) => (Icon::FileText, 0x57606a, String::new(), String::new()),
+            LogTreeLoadState::Loaded(_) => (
+                Icon::FileText,
+                palette.muted_text,
+                String::new(),
+                String::new(),
+            ),
         };
 
         div()
@@ -4932,16 +5865,21 @@ impl MainView {
             .gap_2()
             .size_full()
             .px_4()
-            .bg(rgb(0xffffff))
+            .bg(rgb(palette.background))
             .child(Self::render_lucide_icon(Some(icon), 32.0, 28.0, icon_color))
             .child(
                 div()
                     .text_lg()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(rgb(0x24292f))
+                    .text_color(rgb(palette.text))
                     .child(title),
             )
-            .child(div().text_sm().text_color(rgb(0x6b7280)).child(description))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(palette.muted_text))
+                    .child(description),
+            )
     }
 
     /// 渲染右侧日志工作区。
@@ -5154,7 +6092,7 @@ impl MainView {
     }
 
     /// 渲染搜索选项复选框。
-    fn render_checkbox(checked: bool) -> gpui::Stateful<gpui::Div> {
+    fn render_checkbox(checked: bool, palette: AppThemePalette) -> gpui::Stateful<gpui::Div> {
         let checkbox = div()
             .id("search-checkbox")
             .flex()
@@ -5164,15 +6102,23 @@ impl MainView {
             .h(px(14.0))
             .rounded(px(3.0))
             .border_1()
-            .border_color(rgb(if checked { 0x0969da } else { 0xd0d7de }))
-            .bg(rgb(if checked { 0x0969da } else { 0xffffff }));
+            .border_color(rgb(if checked {
+                palette.accent
+            } else {
+                palette.border
+            }))
+            .bg(rgb(if checked {
+                palette.accent
+            } else {
+                palette.input
+            }));
 
         if checked {
             checkbox.child(Self::render_lucide_icon(
                 Some(Icon::Check),
                 10.0,
                 10.0,
-                0xffffff,
+                palette.on_accent,
             ))
         } else {
             checkbox
@@ -5199,6 +6145,7 @@ impl MainView {
         let row_count = panel.rows.len();
         let panel_height = panel.height;
         let scroll_handle = panel.scroll_handle.clone();
+        let palette = self.palette();
 
         div()
             .id("search-results-panel")
@@ -5209,8 +6156,8 @@ impl MainView {
             .flex()
             .flex_col()
             .border_t_1()
-            .border_color(rgb(0xd0d7de))
-            .bg(rgb(0xffffff))
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.surface))
             .shadow_lg()
             .on_mouse_down(
                 MouseButton::Right,
@@ -5223,9 +6170,9 @@ impl MainView {
                 }),
             )
             .child(self.render_search_results_resizer(context))
-            .child(self.render_search_results_header(panel, context))
+            .child(self.render_search_results_header(panel, palette, context))
             .child(if row_count == 0 {
-                self.render_search_results_empty(panel)
+                self.render_search_results_empty(panel, palette)
             } else {
                 div()
                     .id("search-results-list-wrapper")
@@ -5261,7 +6208,12 @@ impl MainView {
                         .size_full()
                         .track_scroll(scroll_handle.clone()),
                     )
-                    .child(self.render_search_results_scrollbar(&scroll_handle, row_count, context))
+                    .child(self.render_search_results_scrollbar(
+                        &scroll_handle,
+                        row_count,
+                        palette,
+                        context,
+                    ))
             })
     }
 
@@ -5274,6 +6226,7 @@ impl MainView {
         &self,
         scroll_handle: &UniformListScrollHandle,
         row_count: usize,
+        palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let Some(metrics) = Self::search_results_scrollbar_metrics(scroll_handle)
@@ -5290,9 +6243,9 @@ impl MainView {
             .w(px(SEARCH_RESULTS_SCROLLBAR_WIDTH))
             .h(metrics.thumb_length)
             .rounded(px(SEARCH_RESULTS_SCROLLBAR_WIDTH / 2.0))
-            .bg(rgb(0xc9d1d9))
+            .bg(rgb(palette.scrollbar))
             .cursor_pointer()
-            .hover(|thumb| thumb.bg(rgb(0x8c959f)))
+            .hover(move |thumb| thumb.bg(rgb(palette.scrollbar_hover)))
             .on_mouse_down(
                 MouseButton::Left,
                 context.listener(|view, event: &MouseDownEvent, _window, context| {
@@ -5551,6 +6504,7 @@ impl MainView {
         let Some(menu) = &self.search_results_context_menu else {
             return div().id("search-results-context-menu-empty").hidden();
         };
+        let palette = self.palette();
 
         div()
             .id("search-results-context-menu")
@@ -5561,17 +6515,19 @@ impl MainView {
             .py_1()
             .rounded(px(6.0))
             .border_1()
-            .border_color(rgb(0xd0d7de))
-            .bg(rgb(0xffffff))
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.menu))
             .shadow_lg()
             .child(self.render_search_results_context_menu_item(
                 SearchResultsContextMenuAction::ExpandAll,
                 "展开全部",
+                palette,
                 context,
             ))
             .child(self.render_search_results_context_menu_item(
                 SearchResultsContextMenuAction::CollapseAll,
                 "收起全部",
+                palette,
                 context,
             ))
     }
@@ -5584,6 +6540,7 @@ impl MainView {
         &self,
         action: SearchResultsContextMenuAction,
         label: &'static str,
+        palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> impl IntoElement {
         div()
@@ -5593,9 +6550,9 @@ impl MainView {
             .h(px(SEARCH_RESULTS_CONTEXT_MENU_ITEM_HEIGHT))
             .px_3()
             .text_sm()
-            .text_color(rgb(0x24292f))
+            .text_color(rgb(palette.text))
             .cursor_pointer()
-            .hover(|item| item.bg(rgb(0xf6f8fa)))
+            .hover(move |item| item.bg(rgb(palette.hover)))
             .child(label)
             .on_click(
                 context.listener(move |view, _event: &ClickEvent, _window, context| {
@@ -5683,6 +6640,7 @@ impl MainView {
     fn render_search_results_header(
         &self,
         panel: &SearchResultsPanelState,
+        palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let search_count = panel.records.len();
@@ -5722,8 +6680,8 @@ impl MainView {
             .pt(px(SEARCH_RESULTS_PANEL_HEADER_TOP_PADDING))
             .px_3()
             .border_b_1()
-            .border_color(rgb(0xe5e7eb))
-            .bg(rgb(0xf6f8fa))
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.panel))
             .child(
                 div()
                     .flex()
@@ -5734,7 +6692,7 @@ impl MainView {
                         Some(Icon::ListFilter),
                         14.0,
                         14.0,
-                        0x57606a,
+                        palette.muted_text,
                     ))
                     .child(
                         div()
@@ -5742,14 +6700,14 @@ impl MainView {
                             .truncate()
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(0x24292f))
+                            .text_color(rgb(palette.text))
                             .child("搜索结果"),
                     )
                     .child(
                         div()
                             .flex_none()
                             .text_xs()
-                            .text_color(rgb(0x57606a))
+                            .text_color(rgb(palette.muted_text))
                             .child(summary),
                     ),
             )
@@ -5763,12 +6721,12 @@ impl MainView {
                     .h(px(24.0))
                     .rounded(px(4.0))
                     .cursor_pointer()
-                    .hover(|button| button.bg(rgb(0xf6f8fa)))
+                    .hover(move |button| button.bg(rgb(palette.hover)))
                     .child(Self::render_lucide_icon(
                         Some(Icon::X),
                         13.0,
                         13.0,
-                        0x57606a,
+                        palette.muted_text,
                     ))
                     .on_click(
                         context.listener(|view, _event: &ClickEvent, _window, context| {
@@ -5786,6 +6744,7 @@ impl MainView {
     fn render_search_results_empty(
         &self,
         panel: &SearchResultsPanelState,
+        palette: AppThemePalette,
     ) -> gpui::Stateful<gpui::Div> {
         let message = if panel.records.is_empty() {
             "暂无搜索记录"
@@ -5802,12 +6761,12 @@ impl MainView {
             .gap_2()
             .flex_1()
             .text_sm()
-            .text_color(rgb(0x6b7280))
+            .text_color(rgb(palette.muted_text))
             .child(Self::render_lucide_icon(
                 Some(Icon::SearchX),
                 26.0,
                 24.0,
-                0x8c959f,
+                palette.muted_text,
             ))
             .child(message)
     }
@@ -5849,6 +6808,7 @@ impl MainView {
             record.errors.len()
         );
         let expanded = record.expanded;
+        let palette = self.palette();
 
         div()
             .id(SharedString::from(format!(
@@ -5861,10 +6821,14 @@ impl MainView {
             .h(px(SEARCH_RESULT_ROW_HEIGHT))
             .px_3()
             .border_b_1()
-            .border_color(rgb(0xeaeef2))
-            .bg(rgb(if expanded { 0xf6f8fa } else { 0xffffff }))
+            .border_color(rgb(palette.border))
+            .bg(rgb(if expanded {
+                palette.selected
+            } else {
+                palette.surface
+            }))
             .cursor_pointer()
-            .hover(|row| row.bg(rgb(0xf6f8fa)))
+            .hover(move |row| row.bg(rgb(palette.hover)))
             .child(Self::render_lucide_icon(
                 Some(if expanded {
                     Icon::ChevronDown
@@ -5873,7 +6837,7 @@ impl MainView {
                 }),
                 14.0,
                 14.0,
-                0x57606a,
+                palette.muted_text,
             ))
             .child(
                 div()
@@ -5883,7 +6847,7 @@ impl MainView {
                     .truncate()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(0x24292f))
+                    .text_color(rgb(palette.text))
                     .child(record.query.clone()),
             )
             .child(
@@ -5892,7 +6856,7 @@ impl MainView {
                     .flex_1()
                     .truncate()
                     .text_xs()
-                    .text_color(rgb(0x6b7280))
+                    .text_color(rgb(palette.muted_text))
                     .child(summary),
             )
             .child(
@@ -5901,7 +6865,7 @@ impl MainView {
                     .flex()
                     .items_center()
                     .text_xs()
-                    .text_color(rgb(0x57606a))
+                    .text_color(rgb(palette.muted_text))
                     .child(count_label),
             )
             .on_click(
@@ -5936,6 +6900,7 @@ impl MainView {
             .and_then(|panel| panel.records.get(record_index))
             .is_some_and(|record| record.expanded_file_keys.contains(&source_key));
         let source_key_for_click = source_key.clone();
+        let palette = self.palette();
 
         div()
             .id(SharedString::from(format!(
@@ -5950,10 +6915,10 @@ impl MainView {
             .pl(px(30.0))
             .pr_3()
             .border_b_1()
-            .border_color(rgb(0xf0f2f4))
-            .bg(rgb(0xffffff))
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.surface))
             .cursor_pointer()
-            .hover(|row| row.bg(rgb(0xf6f8fa)))
+            .hover(move |row| row.bg(rgb(palette.hover)))
             .child(Self::render_lucide_icon(
                 Some(if expanded {
                     Icon::ChevronDown
@@ -5962,13 +6927,13 @@ impl MainView {
                 }),
                 13.0,
                 13.0,
-                0x57606a,
+                palette.muted_text,
             ))
             .child(Self::render_lucide_icon(
                 Some(Icon::FileText),
                 14.0,
                 14.0,
-                0x57606a,
+                palette.muted_text,
             ))
             .child(
                 div()
@@ -5976,14 +6941,14 @@ impl MainView {
                     .flex_1()
                     .truncate()
                     .text_sm()
-                    .text_color(rgb(0x24292f))
+                    .text_color(rgb(palette.text))
                     .child(full_path),
             )
             .child(
                 div()
                     .flex_none()
                     .text_xs()
-                    .text_color(rgb(0x6b7280))
+                    .text_color(rgb(palette.muted_text))
                     .child(format!("{result_count} 条")),
             )
             .on_click(
@@ -6017,8 +6982,9 @@ impl MainView {
             &result.line_text,
             result.match_range.clone(),
         );
+        let palette = self.palette();
         let highlight_style = gpui::HighlightStyle {
-            color: Some(rgb(0xcf222e).into()),
+            color: Some(rgb(palette.error).into()),
             font_weight: Some(FontWeight::SEMIBOLD),
             background_color: None,
             ..Default::default()
@@ -6040,19 +7006,25 @@ impl MainView {
             .pl(px(58.0))
             .pr_3()
             .border_b_1()
-            .border_color(rgb(0xf0f2f4))
+            .border_color(rgb(palette.border))
             .cursor_pointer()
-            .hover(|row| row.bg(rgb(0xf6f8fa)))
+            .hover(move |row| row.bg(rgb(palette.hover)))
             .child(
                 div()
                     .flex_none()
                     .w(px(48.0))
                     .text_right()
                     .text_xs()
-                    .text_color(rgb(0x6b7280))
+                    .text_color(rgb(palette.muted_text))
                     .child(line_number.to_string()),
             )
-            .child(div().flex_none().w(px(1.0)).h(px(18.0)).bg(rgb(0xe5e7eb)))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(1.0))
+                    .h(px(18.0))
+                    .bg(rgb(palette.border)),
+            )
             .child(
                 div()
                     .flex_1()
@@ -6060,7 +7032,7 @@ impl MainView {
                     .truncate()
                     .text_size(px(LOG_VIEWER_FONT_SIZE))
                     .font_family(LOG_VIEWER_FONT_FAMILY)
-                    .text_color(rgb(0x24292f))
+                    .text_color(rgb(palette.text))
                     .child(StyledText::new(preview_text).with_highlights(highlights)),
             )
             .on_click(
@@ -6111,6 +7083,8 @@ impl MainView {
         record_index: usize,
         error: SearchFileError,
     ) -> gpui::Stateful<gpui::Div> {
+        let palette = self.palette();
+
         div()
             .id(SharedString::from(format!(
                 "search-error-{record_index}-{}",
@@ -6124,12 +7098,12 @@ impl MainView {
             .pl(px(32.0))
             .pr_3()
             .border_b_1()
-            .border_color(rgb(0xf0f2f4))
+            .border_color(rgb(palette.border))
             .child(Self::render_lucide_icon(
                 Some(Icon::FileX),
                 14.0,
                 14.0,
-                0xcf222e,
+                palette.error,
             ))
             .child(
                 div()
@@ -6137,7 +7111,7 @@ impl MainView {
                     .flex_none()
                     .truncate()
                     .text_sm()
-                    .text_color(rgb(0x24292f))
+                    .text_color(rgb(palette.text))
                     .child(error.file_name),
             )
             .child(
@@ -6146,7 +7120,7 @@ impl MainView {
                     .min_w_0()
                     .truncate()
                     .text_xs()
-                    .text_color(rgb(0xcf222e))
+                    .text_color(rgb(palette.error))
                     .child(error.message),
             )
     }
@@ -6157,6 +7131,7 @@ impl MainView {
         record_index: usize,
         record: &SearchHistoryRecord,
     ) -> gpui::Stateful<gpui::Div> {
+        let palette = self.palette();
         let message = if record.canceled {
             "搜索已取消，取消前没有产生匹配结果"
         } else if record.progress.searched_files < record.progress.total_files {
@@ -6177,14 +7152,14 @@ impl MainView {
             .pl(px(32.0))
             .pr_3()
             .border_b_1()
-            .border_color(rgb(0xf0f2f4))
+            .border_color(rgb(palette.border))
             .text_sm()
-            .text_color(rgb(0x6b7280))
+            .text_color(rgb(palette.muted_text))
             .child(Self::render_lucide_icon(
                 Some(Icon::SearchX),
                 14.0,
                 14.0,
-                0x8c959f,
+                palette.muted_text,
             ))
             .child(message)
     }
@@ -6246,6 +7221,7 @@ impl MainView {
     /// 业务意图：
     /// - 用户完成“加载日志”后，下一步是从左侧树选择具体日志文件，右侧需要明确指引当前空态。
     fn render_loaded_right_empty_message(&self) -> impl IntoElement {
+        let palette = self.palette();
         div()
             .id("loaded-right-empty-message")
             .flex()
@@ -6255,24 +7231,24 @@ impl MainView {
             .gap_2()
             .size_full()
             .px_4()
-            .bg(rgb(0xffffff))
+            .bg(rgb(palette.background))
             .child(Self::render_lucide_icon(
                 Some(Icon::FileSearch),
                 34.0,
                 30.0,
-                0x57606a,
+                palette.muted_text,
             ))
             .child(
                 div()
                     .text_lg()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(0x24292f))
+                    .text_color(rgb(palette.text))
                     .child("点击左侧日志文件查看内容"),
             )
             .child(
                 div()
                     .text_sm()
-                    .text_color(rgb(0x6b7280))
+                    .text_color(rgb(palette.muted_text))
                     .child("支持普通日志文件和压缩包内日志文件。"),
             )
     }
@@ -6308,9 +7284,9 @@ impl MainView {
             .h(px(LOG_TAB_BAR_HEIGHT))
             .flex_none()
             .overflow_hidden()
-            .bg(rgb(0xf6f8fa))
+            .bg(rgb(self.palette().panel))
             .border_b_1()
-            .border_color(rgb(0xd0d7de))
+            .border_color(rgb(self.palette().border))
             .child(self.render_tab_scroll_button(Icon::ChevronLeft, -LOG_TAB_SCROLL_STEP, context))
             .child(
                 div()
@@ -6339,6 +7315,7 @@ impl MainView {
         delta: f32,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        let palette = self.palette();
         div()
             .id(SharedString::from(format!("tab-scroll-{}", delta)))
             .flex()
@@ -6347,14 +7324,23 @@ impl MainView {
             .h_full()
             .w(px(LOG_TAB_SCROLL_BUTTON_WIDTH))
             .flex_none()
-            .border_color(rgb(0xd0d7de))
-            .bg(rgb(0xf6f8fa))
-            .text_color(rgb(0x57606a))
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.panel))
+            .text_color(rgb(palette.muted_text))
             .cursor_pointer()
-            .hover(|button| button.bg(rgb(0xffffff)).text_color(rgb(0x0969da)))
+            .hover(move |button| {
+                button
+                    .bg(rgb(palette.surface))
+                    .text_color(rgb(palette.accent))
+            })
             .when(delta < 0.0, |button| button.border_r_1())
             .when(delta > 0.0, |button| button.border_l_1())
-            .child(Self::render_lucide_icon(Some(icon), 14.0, 14.0, 0x57606a))
+            .child(Self::render_lucide_icon(
+                Some(icon),
+                14.0,
+                14.0,
+                palette.muted_text,
+            ))
             .on_click(
                 context.listener(move |view, _event: &ClickEvent, _window, context| {
                     view.scroll_tab_bar(delta, context);
@@ -6390,7 +7376,12 @@ impl MainView {
         active: bool,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let background = if active { 0xffffff } else { 0xf6f8fa };
+        let palette = self.palette();
+        let background = if active {
+            palette.background
+        } else {
+            palette.panel
+        };
         div()
             .id(SharedString::from(format!("log-tab-{}", tab_id)))
             .flex()
@@ -6401,17 +7392,21 @@ impl MainView {
             .px_3()
             .gap_1()
             .border_r_1()
-            .border_color(rgb(0xd0d7de))
+            .border_color(rgb(palette.border))
             .bg(rgb(background))
             .text_sm()
-            .text_color(rgb(if active { 0x24292f } else { 0x57606a }))
+            .text_color(rgb(if active {
+                palette.text
+            } else {
+                palette.muted_text
+            }))
             .cursor_pointer()
-            .hover(|tab| tab.bg(rgb(0xffffff)))
+            .hover(move |tab| tab.bg(rgb(palette.surface)))
             .child(Self::render_lucide_icon(
                 Some(Icon::FileText),
                 14.0,
                 13.0,
-                0x57606a,
+                palette.muted_text,
             ))
             .child(div().flex_none().whitespace_nowrap().child(title))
             .child(self.render_tab_close_button(tab_id, context))
@@ -6446,6 +7441,7 @@ impl MainView {
         tab_id: usize,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        let palette = self.palette();
         div()
             .id(SharedString::from(format!("log-tab-close-{}", tab_id)))
             .flex()
@@ -6455,13 +7451,13 @@ impl MainView {
             .h(px(LOG_TAB_CLOSE_BUTTON_WIDTH))
             .flex_none()
             .rounded(px(3.0))
-            .text_color(rgb(0x6b7280))
-            .hover(|button| button.bg(rgb(0xeaeef2)).text_color(rgb(0x24292f)))
+            .text_color(rgb(palette.muted_text))
+            .hover(move |button| button.bg(rgb(palette.hover)).text_color(rgb(palette.text)))
             .child(Self::render_lucide_icon(
                 Some(Icon::X),
                 12.0,
                 12.0,
-                0x6b7280,
+                palette.muted_text,
             ))
             .on_click(
                 context.listener(move |view, _event: &ClickEvent, _window, context| {
@@ -6544,6 +7540,7 @@ impl MainView {
             LogTabState::Loading { .. } => "正在处理".to_string(),
             LogTabState::Failed { .. } => "需要选择正确编码或重新加载".to_string(),
         };
+        let palette = self.palette();
 
         div()
             .id("log-document-toolbar")
@@ -6554,9 +7551,9 @@ impl MainView {
             .flex_none()
             .px_3()
             .gap_2()
-            .bg(rgb(0xffffff))
+            .bg(rgb(palette.panel))
             .border_b_1()
-            .border_color(rgb(0xe5e7eb))
+            .border_color(rgb(palette.border))
             .child(
                 div()
                     .id("log-document-status-group")
@@ -6567,16 +7564,17 @@ impl MainView {
                     .flex_1()
                     .min_w_0()
                     .text_xs()
-                    .text_color(rgb(0x6b7280))
+                    .text_color(rgb(palette.muted_text))
                     .child(div().flex_none().child(source_kind))
-                    .child(Self::render_status_separator())
+                    .child(Self::render_status_separator(palette))
                     .child(self.render_encoding_selector(
                         tab.id,
                         encoding_button_label,
                         tab.raw_bytes.is_some(),
+                        palette,
                         context,
                     ))
-                    .child(Self::render_status_separator())
+                    .child(Self::render_status_separator(palette))
                     .child(div().min_w_0().truncate().child(status)),
             )
     }
@@ -6592,6 +7590,7 @@ impl MainView {
         tab_id: usize,
         display_label: &'static str,
         enabled: bool,
+        palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         div()
@@ -6613,14 +7612,20 @@ impl MainView {
                     .px_2()
                     .rounded(px(4.0))
                     .border_1()
-                    .border_color(rgb(0xd0d7de))
-                    .bg(rgb(0xffffff))
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.input))
                     .text_xs()
-                    .text_color(rgb(if enabled { 0x24292f } else { 0x8c959f }))
+                    .text_color(rgb(if enabled {
+                        palette.text
+                    } else {
+                        palette.muted_text
+                    }))
                     .when(enabled, |button| {
-                        button
-                            .cursor_pointer()
-                            .hover(|button| button.border_color(rgb(0x0969da)).bg(rgb(0xf6f8fa)))
+                        button.cursor_pointer().hover(move |button| {
+                            button
+                                .border_color(rgb(palette.accent))
+                                .bg(rgb(palette.hover))
+                        })
                     })
                     .when(!enabled, |button| button.opacity(0.62))
                     .child(display_label)
@@ -6628,7 +7633,7 @@ impl MainView {
                         Some(Icon::ChevronDown),
                         12.0,
                         12.0,
-                        0x57606a,
+                        palette.muted_text,
                     ))
                     .on_click(context.listener(
                         move |view, event: &ClickEvent, _window, context| {
@@ -6651,8 +7656,11 @@ impl MainView {
     /// 业务意图：
     /// - 来源、编码选择器、识别方式和行数属于同一组状态信息，用轻量分隔符维持可读性。
     /// - 单独函数可以避免多个位置重复硬编码颜色和文本。
-    fn render_status_separator() -> gpui::Div {
-        div().flex_none().text_color(rgb(0x8c959f)).child("·")
+    fn render_status_separator(palette: AppThemePalette) -> gpui::Div {
+        div()
+            .flex_none()
+            .text_color(rgb(palette.muted_text))
+            .child("·")
     }
 
     /// 切换编码下拉框展开状态。
@@ -6752,6 +7760,7 @@ impl MainView {
         };
         let tab_id = tab.id;
         let selected_choice = tab.encoding_choice;
+        let palette = self.palette();
         let menu_items = Self::encoding_choices()
             .into_iter()
             .map(|choice| {
@@ -6759,6 +7768,7 @@ impl MainView {
                     tab_id,
                     choice,
                     choice == selected_choice,
+                    palette,
                     context,
                 )
             })
@@ -6773,8 +7783,8 @@ impl MainView {
             .py_1()
             .rounded(px(6.0))
             .border_1()
-            .border_color(rgb(0xd0d7de))
-            .bg(rgb(0xffffff))
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.menu))
             .shadow_lg()
             .children(menu_items)
     }
@@ -6788,6 +7798,7 @@ impl MainView {
         tab_id: usize,
         choice: EncodingChoice,
         selected: bool,
+        palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let item = div()
@@ -6802,10 +7813,18 @@ impl MainView {
             .h(px(ENCODING_DROPDOWN_ITEM_HEIGHT))
             .px_2()
             .text_xs()
-            .text_color(rgb(if selected { 0x0969da } else { 0x24292f }))
-            .bg(rgb(if selected { 0xddf4ff } else { 0xffffff }))
+            .text_color(rgb(if selected {
+                palette.accent
+            } else {
+                palette.text
+            }))
+            .bg(rgb(if selected {
+                palette.selected
+            } else {
+                palette.menu
+            }))
             .cursor_pointer()
-            .hover(|item| item.bg(rgb(0xf6f8fa)).text_color(rgb(0x0969da)))
+            .hover(move |item| item.bg(rgb(palette.hover)).text_color(rgb(palette.accent)))
             .child(choice.label());
 
         let item = if selected {
@@ -6813,7 +7832,7 @@ impl MainView {
                 Some(Icon::Check),
                 12.0,
                 12.0,
-                0x0969da,
+                palette.accent,
             ))
         } else {
             item
@@ -6835,13 +7854,20 @@ impl MainView {
         tab: &OpenLogTab,
         context: &mut Context<Self>,
     ) -> impl IntoElement {
+        let palette = self.palette();
         match &tab.state {
-            LogTabState::Loading { message } => {
-                self.render_log_tab_state_message(Icon::Loader, 0x57606a, "正在打开日志", message)
-            }
-            LogTabState::Failed { message } => {
-                self.render_log_tab_state_message(Icon::FileX, 0xcf222e, "日志打开失败", message)
-            }
+            LogTabState::Loading { message } => self.render_log_tab_state_message(
+                Icon::Loader,
+                palette.muted_text,
+                "正在打开日志",
+                message,
+            ),
+            LogTabState::Failed { message } => self.render_log_tab_state_message(
+                Icon::FileX,
+                palette.error,
+                "日志打开失败",
+                message,
+            ),
             LogTabState::Ready { document } => {
                 self.render_log_document_viewer(tab, document, context)
             }
@@ -6859,6 +7885,7 @@ impl MainView {
         title: &str,
         message: &str,
     ) -> gpui::Stateful<gpui::Div> {
+        let palette = self.palette();
         div()
             .id("log-tab-state-message")
             .flex()
@@ -6869,19 +7896,19 @@ impl MainView {
             .flex_1()
             .size_full()
             .px_4()
-            .bg(rgb(0xffffff))
+            .bg(rgb(palette.background))
             .child(Self::render_lucide_icon(Some(icon), 32.0, 28.0, icon_color))
             .child(
                 div()
                     .text_lg()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(0x24292f))
+                    .text_color(rgb(palette.text))
                     .child(title.to_string()),
             )
             .child(
                 div()
                     .text_sm()
-                    .text_color(rgb(0x6b7280))
+                    .text_color(rgb(palette.muted_text))
                     .text_center()
                     .child(message.to_string()),
             )
@@ -6904,6 +7931,8 @@ impl MainView {
         let line_number_width = Self::log_viewer_line_number_width(line_count);
         let horizontal_measure_line_index = document.longest_line_index;
         let row_scroll_handle = scroll_handle.clone();
+        let palette = self.palette();
+        let syntax_theme = self.effective_theme().syntax_theme();
 
         let viewer = div()
             .id(SharedString::from(format!("log-viewer-{}", tab_id)))
@@ -6911,7 +7940,7 @@ impl MainView {
             .flex_col()
             .flex_1()
             .overflow_hidden()
-            .bg(rgb(0xffffff));
+            .bg(rgb(palette.background));
 
         let viewer = if let Some(warning) = &document.warning {
             viewer.child(
@@ -6920,10 +7949,14 @@ impl MainView {
                     .px_3()
                     .py_1()
                     .text_xs()
-                    .text_color(rgb(0x9a6700))
-                    .bg(rgb(0xfff8c5))
+                    .text_color(rgb(if self.effective_theme() == EffectiveTheme::Dark {
+                        0xffd33d
+                    } else {
+                        0x9a6700
+                    }))
+                    .bg(rgb(palette.search_highlight))
                     .border_b_1()
-                    .border_color(rgb(0xf0d98c))
+                    .border_color(rgb(palette.border))
                     .child(warning.clone()),
             )
         } else {
@@ -6937,7 +7970,7 @@ impl MainView {
                 .flex()
                 .flex_1()
                 .overflow_hidden()
-                .bg(rgb(0xffffff))
+                .bg(rgb(palette.background))
                 .child(
                     div()
                         .absolute()
@@ -6945,9 +7978,9 @@ impl MainView {
                         .top(px(0.0))
                         .h_full()
                         .w(px(line_number_width))
-                        .bg(rgb(0xf6f8fa))
+                        .bg(rgb(palette.panel))
                         .border_r_1()
-                        .border_color(rgb(0xe5e7eb)),
+                        .border_color(rgb(palette.border)),
                 )
                 .child(
                     uniform_list(
@@ -6977,6 +8010,9 @@ impl MainView {
                                                     let precomputed = document
                                                         .precomputed_highlights
                                                         .as_ref()
+                                                        .filter(|_| {
+                                                            syntax_theme == SyntaxTheme::Light
+                                                        })
                                                         .and_then(|highlights| {
                                                             highlights.lines.get(index)
                                                         });
@@ -6984,6 +8020,7 @@ impl MainView {
                                                         document.highlight_mode,
                                                         line,
                                                         precomputed,
+                                                        syntax_theme,
                                                     );
                                                     if let Some(selection) = &text_selection
                                                         && let Some(range) =
@@ -7030,6 +8067,7 @@ impl MainView {
                                             search_highlighted,
                                             suppress_hover: view.search_results_resize_drag.is_some()
                                                 || view.log_scrollbar_drag.is_some(),
+                                            palette: view.palette(),
                                         }, context)
                                     })
                                     .collect::<Vec<_>>()
@@ -7082,6 +8120,7 @@ impl MainView {
         line_count: usize,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        let palette = self.palette();
         let Some(metrics) = Self::log_vertical_scrollbar_metrics(scroll_handle)
             .or_else(|| Self::fallback_log_vertical_scrollbar_metrics(line_count))
         else {
@@ -7099,9 +8138,9 @@ impl MainView {
             .w(px(LOG_VIEWER_SCROLLBAR_WIDTH))
             .h(metrics.thumb_length)
             .rounded(px(LOG_VIEWER_SCROLLBAR_WIDTH / 2.0))
-            .bg(rgb(0xc9d1d9))
+            .bg(rgb(palette.scrollbar))
             .cursor_pointer()
-            .hover(|thumb| thumb.bg(rgb(0x8c959f)))
+            .hover(move |thumb| thumb.bg(rgb(palette.scrollbar_hover)))
             .on_mouse_down(
                 MouseButton::Left,
                 context.listener(move |view, event: &MouseDownEvent, _window, context| {
@@ -7128,6 +8167,7 @@ impl MainView {
         line_number_width: f32,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        let palette = self.palette();
         let Some(metrics) =
             Self::log_horizontal_scrollbar_metrics(scroll_handle, line_number_width)
         else {
@@ -7145,9 +8185,9 @@ impl MainView {
             .w(metrics.thumb_length)
             .h(px(LOG_VIEWER_SCROLLBAR_WIDTH))
             .rounded(px(LOG_VIEWER_SCROLLBAR_WIDTH / 2.0))
-            .bg(rgb(0xc9d1d9))
+            .bg(rgb(palette.scrollbar))
             .cursor_pointer()
-            .hover(|thumb| thumb.bg(rgb(0x8c959f)))
+            .hover(move |thumb| thumb.bg(rgb(palette.scrollbar_hover)))
             .on_mouse_down(
                 MouseButton::Left,
                 context.listener(move |view, event: &MouseDownEvent, _window, context| {
@@ -7736,6 +8776,7 @@ impl MainView {
             horizontal_line_number_offset,
             search_highlighted,
             suppress_hover,
+            palette,
         } = input;
         let line_for_mouse_down = line.clone();
         let line_for_mouse_move = line.clone();
@@ -7750,9 +8791,11 @@ impl MainView {
             .text_size(px(LOG_VIEWER_FONT_SIZE))
             .line_height(px(LOG_VIEWER_ROW_HEIGHT))
             .font_family(LOG_VIEWER_FONT_FAMILY)
-            .when(search_highlighted, |row| row.bg(rgb(0xfff8c5)))
+            .when(search_highlighted, |row| {
+                row.bg(rgb(palette.search_highlight))
+            })
             .when(!search_highlighted && !suppress_hover, |row| {
-                row.hover(|row| row.bg(rgb(0xf6f8fa)))
+                row.hover(move |row| row.bg(rgb(palette.hover)))
             })
             .child(
                 div()
@@ -7763,7 +8806,7 @@ impl MainView {
                     .pl(px(line_number_width + LOG_VIEWER_TEXT_LEFT_PADDING))
                     .pr_2()
                     .whitespace_nowrap()
-                    .text_color(rgb(0x24292f))
+                    .text_color(rgb(palette.text))
                     .child(StyledText::new(line).with_highlights(highlights)),
             )
             .child(
@@ -7778,14 +8821,14 @@ impl MainView {
                     .w(px(line_number_width))
                     .pr_2()
                     .text_right()
-                    .text_color(rgb(0x8c959f))
+                    .text_color(rgb(palette.muted_text))
                     .bg(rgb(if search_highlighted {
-                        0xfff8c5
+                        palette.search_highlight
                     } else {
-                        0xf6f8fa
+                        palette.panel
                     }))
                     .border_r_1()
-                    .border_color(rgb(0xe5e7eb))
+                    .border_color(rgb(palette.border))
                     .child((line_index + 1).to_string()),
             )
             .on_mouse_down(
@@ -7850,6 +8893,7 @@ impl MainView {
             return div().id("tab-context-menu-empty").hidden();
         };
         let tab_id = menu.tab_id;
+        let palette = self.palette();
 
         div()
             .id("tab-context-menu")
@@ -7860,25 +8904,28 @@ impl MainView {
             .py_1()
             .rounded(px(6.0))
             .border_1()
-            .border_color(rgb(0xd0d7de))
-            .bg(rgb(0xffffff))
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.menu))
             .shadow_lg()
             .child(self.render_tab_context_menu_item(
                 tab_id,
                 TabContextMenuAction::Current,
                 "关闭当前",
+                palette,
                 context,
             ))
             .child(self.render_tab_context_menu_item(
                 tab_id,
                 TabContextMenuAction::OtherTabs,
                 "关闭其他",
+                palette,
                 context,
             ))
             .child(self.render_tab_context_menu_item(
                 tab_id,
                 TabContextMenuAction::AllTabs,
                 "关闭所有",
+                palette,
                 context,
             ))
     }
@@ -7892,6 +8939,7 @@ impl MainView {
         tab_id: usize,
         action: TabContextMenuAction,
         label: &'static str,
+        palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> impl IntoElement {
         div()
@@ -7901,9 +8949,9 @@ impl MainView {
             .h(px(TAB_CONTEXT_MENU_ITEM_HEIGHT))
             .px_3()
             .text_sm()
-            .text_color(rgb(0x24292f))
+            .text_color(rgb(palette.text))
             .cursor_pointer()
-            .hover(|item| item.bg(rgb(0xf6f8fa)))
+            .hover(move |item| item.bg(rgb(palette.hover)))
             .child(label)
             .on_click(
                 context.listener(move |view, _event: &ClickEvent, _window, context| {
@@ -8018,13 +9066,14 @@ impl MainView {
     /// - 没有打开任何日志 tab 时，右侧只显示下一步提示，不创建空白占位 tab。
     /// - 当前分割宽度仅在内存中生效，不跨启动保存。
     fn render_content(&self, context: &mut Context<Self>) -> impl IntoElement {
+        let palette = self.palette();
         if !matches!(self.load_state, LogTreeLoadState::Loaded(_)) {
             return div()
                 .id("log-content-empty-state")
                 .flex()
                 .flex_1()
                 .size_full()
-                .bg(rgb(0xffffff))
+                .bg(rgb(palette.background))
                 .child(self.render_primary_content_message());
         }
 
@@ -8033,7 +9082,7 @@ impl MainView {
             .flex()
             .flex_1()
             .size_full()
-            .bg(rgb(0xffffff))
+            .bg(rgb(palette.background))
             .on_mouse_move(context.listener(Self::handle_content_mouse_move))
             .on_mouse_up(
                 MouseButton::Left,
@@ -8059,7 +9108,7 @@ impl MainView {
                     .relative()
                     .h_full()
                     .flex_1()
-                    .bg(rgb(0xffffff))
+                    .bg(rgb(palette.background))
                     .overflow_hidden()
                     .child(self.render_right_log_panel(context))
                     .child(self.render_splitter_hit_overlay(context)),
@@ -8080,7 +9129,7 @@ impl MainView {
         let line_color = if self.is_resizing_splitter {
             0x94a3b8
         } else {
-            0xd0d7de
+            self.palette().border
         };
 
         div()
@@ -8275,12 +9324,14 @@ impl Render for MainView {
     /// - 顶部工具栏提供全局入口，内容区提供左右分栏和左侧日志目录树。
     /// - 右侧主内容区仍不放占位文案，避免用户误以为日志正文、诊断或设置功能已经完成。
     fn render(&mut self, _window: &mut Window, context: &mut Context<Self>) -> impl IntoElement {
+        let palette = self.palette();
+
         div()
             .relative()
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(0xffffff))
+            .bg(rgb(palette.background))
             .track_focus(&self.root_focus_handle)
             .on_action(
                 context.listener(|view, _: &OpenSearchDialog, window, context| {
@@ -8343,7 +9394,17 @@ fn main() {
 
         let main_view = app
             .open_window(window_options, |window, app| {
-                let view = app.new(MainView::new);
+                let view = app.new(|context| {
+                    let mut view = MainView::new(context);
+                    view.system_window_appearance = window.appearance();
+                    view.window_appearance_subscription = Some(context.observe_window_appearance(
+                        window,
+                        |view, window, context| {
+                            view.set_system_window_appearance(window.appearance(), context);
+                        },
+                    ));
+                    view
+                });
                 // 主窗口关闭时只保存宽高，不保存位置或最大化状态。
                 // 保存失败不阻止关闭，避免配置目录权限问题影响日志查看客户端退出。
                 window.on_window_should_close(app, |window, _app| {
@@ -8410,6 +9471,18 @@ mod tests {
     fn test_window_size_file_path(name: &str) -> PathBuf {
         env::temp_dir().join(format!(
             "logclinic3-window-size-test-{}-{}",
+            std::process::id(),
+            name
+        ))
+    }
+
+    /// 构造唯一的主题配置测试路径。
+    ///
+    /// 业务意图：
+    /// - 主题配置和窗口尺寸配置共用“简单文本文件”策略，但测试文件名分开，避免读写往返互相污染。
+    fn test_theme_preference_file_path(name: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "logclinic3-theme-test-{}-{}",
             std::process::id(),
             name
         ))
@@ -8559,6 +9632,116 @@ mod tests {
         if let Some(parent) = broken_path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
+    }
+
+    /// 验证主题配置文本只接受稳定的三种持久化值。
+    ///
+    /// 业务意图：
+    /// - 设置窗口显示中文文案，但配置文件必须使用 `light`、`dark`、`system`，避免 UI 文案调整破坏历史配置。
+    /// - 损坏文本、空文本和未知值应回退到默认“跟随系统”，因此解析层返回 `None`。
+    #[test]
+    fn 主题配置文本解析合法值和损坏值() {
+        assert_eq!(
+            parse_theme_preference("light\n"),
+            Some(ThemePreference::Light)
+        );
+        assert_eq!(parse_theme_preference("dark"), Some(ThemePreference::Dark));
+        assert_eq!(
+            parse_theme_preference("system"),
+            Some(ThemePreference::System)
+        );
+        assert_eq!(parse_theme_preference(""), None);
+        assert_eq!(parse_theme_preference("unknown"), None);
+    }
+
+    /// 验证主题配置文件可以完成写入和读取往返。
+    ///
+    /// 边界条件：
+    /// - 写入函数需要自动创建父目录，保证首次修改主题时配置目录不存在也能保存。
+    #[test]
+    fn 主题配置可以读写往返() {
+        let path = test_theme_preference_file_path("roundtrip").join(THEME_PREFERENCE_FILE_NAME);
+
+        write_theme_preference(&path, ThemePreference::Dark).expect("主题配置应能写入临时目录");
+        assert_eq!(read_theme_preference(&path), Some(ThemePreference::Dark));
+
+        write_theme_preference(&path, ThemePreference::System)
+            .expect("主题配置应能覆盖写入临时目录");
+        assert_eq!(read_theme_preference(&path), Some(ThemePreference::System));
+
+        let _ = fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    /// 验证主题配置缺失、损坏或目录不可用时不会阻断应用启动。
+    ///
+    /// 业务意图：
+    /// - 主题偏好只是界面体验配置，任何文件系统异常都应回退到“跟随系统”，不能影响日志查看主流程。
+    #[test]
+    fn 主题配置异常会被忽略() {
+        let missing_path =
+            test_theme_preference_file_path("missing").join(THEME_PREFERENCE_FILE_NAME);
+        assert_eq!(read_theme_preference(&missing_path), None);
+
+        let broken_path =
+            test_theme_preference_file_path("broken").join(THEME_PREFERENCE_FILE_NAME);
+        fs::create_dir_all(broken_path.parent().expect("测试路径应包含父目录"))
+            .expect("测试目录应能创建");
+        fs::write(&broken_path, "broken-theme").expect("测试损坏配置应能写入");
+        assert_eq!(read_theme_preference(&broken_path), None);
+
+        let directory_path = test_theme_preference_file_path("directory");
+        fs::create_dir_all(&directory_path).expect("测试目录应能创建");
+        assert_eq!(read_theme_preference(&directory_path), None);
+        assert!(write_theme_preference(&directory_path, ThemePreference::Light).is_err());
+
+        let _ = fs::remove_file(&broken_path);
+        if let Some(parent) = broken_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+        let _ = fs::remove_dir_all(&directory_path);
+    }
+
+    /// 验证用户强制主题优先于系统外观。
+    ///
+    /// 业务意图：
+    /// - 用户选择明亮或暗色后，系统外观变化不能覆盖该选择，避免设置窗口显示的偏好和实际界面不一致。
+    #[test]
+    fn 强制主题优先于系统外观() {
+        assert_eq!(
+            EffectiveTheme::resolve(ThemePreference::Light, WindowAppearance::Dark),
+            EffectiveTheme::Light
+        );
+        assert_eq!(
+            EffectiveTheme::resolve(ThemePreference::Dark, WindowAppearance::Light),
+            EffectiveTheme::Dark
+        );
+    }
+
+    /// 验证跟随系统会按 GPUI 窗口外观计算实际主题。
+    ///
+    /// 边界条件：
+    /// - macOS 可能上报 `VibrantLight` 或 `VibrantDark`，这些外观必须分别归入明亮和暗色调色板。
+    #[test]
+    fn 跟随系统根据窗口外观计算实际主题() {
+        assert_eq!(
+            EffectiveTheme::resolve(ThemePreference::System, WindowAppearance::Light),
+            EffectiveTheme::Light
+        );
+        assert_eq!(
+            EffectiveTheme::resolve(ThemePreference::System, WindowAppearance::VibrantLight),
+            EffectiveTheme::Light
+        );
+        assert_eq!(
+            EffectiveTheme::resolve(ThemePreference::System, WindowAppearance::Dark),
+            EffectiveTheme::Dark
+        );
+        assert_eq!(
+            EffectiveTheme::resolve(ThemePreference::System, WindowAppearance::VibrantDark),
+            EffectiveTheme::Dark
+        );
     }
 
     /// 构造测试用目录树行。

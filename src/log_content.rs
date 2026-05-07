@@ -25,7 +25,9 @@ use flate2::read::GzDecoder;
 use tar::Archive as TarArchive;
 use zip::ZipArchive;
 
-use crate::highlighting::{HighlightMode, PrecomputedHighlights, prepare_highlighting};
+use crate::highlighting::{
+    HighlightMode, PrecomputedHighlights, SyntaxTheme, prepare_highlighting,
+};
 use crate::log_loader::{ArchiveFormat, LogFileSource, normalize_archive_member_path};
 
 /// 单个日志 tab 允许缓存的最大原始字节数。
@@ -1024,7 +1026,15 @@ fn decode_with_encoding(
 
     let lines = split_decoded_lines(&decoded.text);
     let longest_line_index = longest_log_line_index(&lines);
-    let highlight_plan = prepare_highlighting(source_name, &decoded.text, &lines, raw_bytes.len());
+    // 解码发生在后台任务中，无法读取当前窗口主题；这里使用明亮主题预计算作为启动期默认。
+    // UI 渲染阶段会根据当前实际主题对可见行重新生成语法样式，避免暗色主题优化破坏明亮主题可读性。
+    let highlight_plan = prepare_highlighting(
+        source_name,
+        &decoded.text,
+        &lines,
+        raw_bytes.len(),
+        SyntaxTheme::Light,
+    );
 
     Ok(DecodedLogDocument {
         encoding,
