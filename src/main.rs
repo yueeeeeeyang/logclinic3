@@ -16,14 +16,15 @@ use std::{
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Animation, AnimationExt as _, App, AppContext, Application, Bounds, ClickEvent, ClipboardItem,
-    Context, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, FontWeight,
-    GlobalElementId, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, Keystroke,
-    LayoutId, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Render, ScrollHandle, ScrollStrategy,
-    SharedString, StatefulInteractiveElement, Style, Styled as _, StyledText, TextRun,
-    TitlebarOptions, UTF16Selection, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
-    actions, div, point, px, relative, rgb, size, uniform_list,
+    Animation, AnimationExt as _, AnyWindowHandle, App, AppContext, Application, Bounds,
+    ClickEvent, ClipboardItem, Context, Element, ElementId, ElementInputHandler, Entity,
+    EntityInputHandler, FontWeight, GlobalElementId, InteractiveElement, IntoElement, KeyBinding,
+    KeyDownEvent, Keystroke, LayoutId, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Render, ScrollHandle,
+    ScrollStrategy, SharedString, StatefulInteractiveElement, Style, Styled as _, StyledText,
+    TextRun, TitlebarOptions, UTF16Selection, UniformListScrollHandle, Window, WindowBounds,
+    WindowHandle, WindowKind, WindowOptions, actions, div, point, px, relative, rgb, size,
+    uniform_list,
 };
 use lucide_icons::{Icon, LUCIDE_FONT_BYTES};
 
@@ -423,21 +424,34 @@ const TAB_CONTEXT_MENU_WIDTH: f32 = 132.0;
 /// - 菜单项只显示单行中文命令，不承载图标或快捷键。
 const TAB_CONTEXT_MENU_ITEM_HEIGHT: f32 = 30.0;
 
+/// 搜索结果右键菜单宽度。
+///
+/// 业务意图：
+/// - 搜索结果菜单只承载展开/收起两类批量操作，固定宽度可以和 tab 菜单保持一致的视觉节奏。
+const SEARCH_RESULTS_CONTEXT_MENU_WIDTH: f32 = 132.0;
+
+/// 搜索结果右键菜单单项高度。
+///
+/// 边界条件：
+/// - 菜单项只显示单行中文命令，不承载二级菜单。
+const SEARCH_RESULTS_CONTEXT_MENU_ITEM_HEIGHT: f32 = 30.0;
+
 /// 搜索对话框默认宽度。
 ///
 /// 业务意图：
-/// - 对话框需要同时容纳查询输入、范围切换和大小写开关，宽度固定可以让拖动和定位行为稳定。
-/// - 该对话框是浮层，不参与右侧日志正文布局，因此保持紧凑，避免遮挡过多日志内容。
+/// - 对话框需要同时容纳查询输入、范围切换和大小写开关，宽度固定可以让独立窗口尺寸稳定。
+/// - 搜索对话框已经从主窗口浮层迁移为独立浮动窗口，因此不再参与右侧日志正文布局。
 const SEARCH_DIALOG_WIDTH: f32 = 430.0;
 
-/// 搜索对话框打开时距离窗口左侧的默认位置。
+/// 搜索对话框独立窗口默认高度。
+///
+/// 业务意图：
+/// - 独立窗口需要一次性容纳“当前文件”和“当前目录”两种搜索模式下的控件，避免切换范围时窗口高度跳变。
+/// - 当前目录模式会额外显示目标目录输入框，因此高度按较高形态预留。
 ///
 /// 边界条件：
-/// - 实际打开时会结合当前左侧栏宽度计算，让对话框默认出现在右侧内容区域内。
-const SEARCH_DIALOG_DEFAULT_RIGHT_OFFSET: f32 = 48.0;
-
-/// 搜索对话框打开时距离工具栏底部的默认位置。
-const SEARCH_DIALOG_DEFAULT_TOP_OFFSET: f32 = 48.0;
+/// - 该窗口不可调整大小；如果后续增加搜索历史、正则等更多控件，应同步重新定义窗口高度策略。
+const SEARCH_DIALOG_WINDOW_HEIGHT: f32 = 286.0;
 
 /// 搜索输入框高度。
 ///
@@ -466,11 +480,43 @@ const SEARCH_RESULTS_PANEL_MAX_RATIO: f32 = 0.6;
 /// 搜索结果面板拖拽条高度。
 const SEARCH_RESULTS_PANEL_RESIZER_HEIGHT: f32 = 8.0;
 
+/// 搜索结果标题栏顶部视觉留白。
+///
+/// 业务意图：
+/// - 拖拽命中区需要保持足够高度，方便用户调整面板；但标题内容不应因此显得上边距过大。
+/// - 将视觉留白和拖拽命中区拆开，标题栏能保持紧凑，同时顶部仍保留可拖动热区。
+const SEARCH_RESULTS_PANEL_HEADER_TOP_PADDING: f32 = 3.0;
+
 /// 搜索结果行固定高度。
 ///
 /// 业务意图：
 /// - 结果列表使用虚拟列表，固定行高可以避免大量命中时创建全部行元素。
-const SEARCH_RESULT_ROW_HEIGHT: f32 = 46.0;
+const SEARCH_RESULT_ROW_HEIGHT: f32 = 34.0;
+
+/// 搜索结果面板滚动条可见宽度。
+///
+/// 业务意图：
+/// - 搜索结果可能包含大量历史记录、文件分组和命中明细，面板也需要像日志正文一样提供稳定可见的滚动位置提示。
+/// - 宽度沿用日志正文滚动条的视觉尺度，避免底部面板看起来像另一套控件体系。
+const SEARCH_RESULTS_SCROLLBAR_WIDTH: f32 = 6.0;
+
+/// 搜索结果面板滚动条最小滑块长度。
+///
+/// 边界条件：
+/// - 大量结果会让按比例计算的滑块非常短，最小长度保证用户仍能稳定点击和拖动。
+const SEARCH_RESULTS_SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 36.0;
+
+/// 搜索结果面板滚动条距离列表边缘的内缩。
+///
+/// 业务意图：
+/// - 右侧保留轻微内缩，让滚动条不贴边，并和日志正文、左侧目录树滚动条的视觉位置保持一致。
+const SEARCH_RESULTS_SCROLLBAR_PADDING: f32 = 3.0;
+
+/// `Ctrl+C` 在部分 macOS 输入路径下对应的 ASCII 控制字符。
+///
+/// 业务意图：
+/// - 日志正文复制和搜索快捷键使用同一套全局键盘入口；复制也需要兼容 Control 字母键被平台编码成控制字符的情况。
+const CONTROL_C_CODE: &str = "\u{3}";
 
 /// 顶部工具栏按钮的声明式配置。
 ///
@@ -500,6 +546,7 @@ struct ToolbarAction {
 ///
 /// 业务意图：
 /// - “加载日志”使用 `FileText`，表达日志文本文件入口。
+/// - “搜索”使用 `Search`，提供鼠标入口打开搜索窗口，避免快捷键异常时用户无法触达搜索能力。
 /// - “智能诊断”使用 `Stethoscope`，表达对日志问题进行诊断和定位，比脑回路图标更贴近按钮语义。
 /// - “设置”使用 `Settings`，表达配置入口。
 ///
@@ -509,6 +556,10 @@ const TOOLBAR_ACTIONS: &[ToolbarAction] = &[
     ToolbarAction {
         icon: Icon::FileText,
         label: "加载日志",
+    },
+    ToolbarAction {
+        icon: Icon::Search,
+        label: "搜索",
     },
     ToolbarAction {
         icon: Icon::Stethoscope,
@@ -843,6 +894,12 @@ struct LogLineRenderData {
     horizontal_line_number_offset: Pixels,
     /// 当前行是否是搜索结果跳转后的目标行。
     search_highlighted: bool,
+    /// 是否临时禁用行 hover 样式。
+    ///
+    /// 业务意图：
+    /// - 调整搜索结果面板高度或拖动日志正文滚动条时，鼠标可能经过底层日志行；即使不应触发选区，GPUI hover 仍可能命中行。
+    /// - 在渲染数据中显式携带禁用标记，可以让日志行完全不注册 hover 样式，避免拖动控件时底层正文闪动。
+    suppress_hover: bool,
 }
 
 /// 日志正文自绘滚动条的方向。
@@ -909,6 +966,20 @@ struct LogTreeScrollbarDrag {
     cursor_offset: Pixels,
 }
 
+/// 搜索结果面板滚动条正在被拖动时的临时状态。
+///
+/// 业务意图：
+/// - 搜索结果面板使用虚拟列表承载历史记录和命中明细，滚动条拖动需要保存鼠标按下点在滑块内的偏移。
+/// - 只保存偏移而不保存列表内容，避免拖动过程和搜索结果数据生命周期耦合。
+///
+/// 边界条件：
+/// - 该状态只在鼠标左键拖动期间有效；关闭结果面板、释放鼠标或列表测量失效时都会清空。
+#[derive(Clone, Copy)]
+struct SearchResultsScrollbarDrag {
+    /// 鼠标按下点相对滑块顶部的偏移。
+    cursor_offset: Pixels,
+}
+
 /// 搜索对话框中的文本输入槽位。
 ///
 /// 业务意图：
@@ -962,10 +1033,6 @@ struct SearchDialogState {
     directory_marked_range: Option<Range<usize>>,
     /// 是否区分大小写。
     case_sensitive: bool,
-    /// 对话框左上角在窗口内容坐标中的横坐标。
-    x: f32,
-    /// 对话框左上角在窗口内容坐标中的纵坐标。
-    y: f32,
     /// 当前是否有后台搜索任务仍在运行。
     is_searching: bool,
     /// 当前搜索任务的进度快照。
@@ -977,18 +1044,6 @@ struct SearchDialogState {
     /// 业务意图：
     /// - 用户快速连续搜索时，旧后台任务可能晚于新任务返回；任务 ID 用于丢弃过期更新。
     job_id: usize,
-}
-
-/// 搜索对话框拖动状态。
-///
-/// 业务意图：
-/// - 对话框可以自由拖动，拖动时需要保存鼠标按下点和对话框左上角之间的偏移，避免按下瞬间跳动。
-#[derive(Clone, Copy)]
-struct SearchDialogDrag {
-    /// 鼠标按下点相对对话框左上角的横向偏移。
-    cursor_offset_x: Pixels,
-    /// 鼠标按下点相对对话框左上角的纵向偏移。
-    cursor_offset_y: Pixels,
 }
 
 /// 单次搜索历史记录。
@@ -1125,6 +1180,27 @@ struct SearchResultsPanelState {
     scroll_handle: UniformListScrollHandle,
 }
 
+/// 搜索结果面板右键菜单状态。
+///
+/// 业务意图：
+/// - 结果面板可能包含多次搜索和大量文件分组，用户需要批量展开或收起以快速调整信息密度。
+/// - GPUI 0.2.2 没有适合该场景的现成上下文菜单，因此保存右键位置并自绘菜单。
+struct SearchResultsContextMenu {
+    /// 菜单左上角相对右侧日志工作区的横坐标。
+    x: f32,
+    /// 菜单左上角相对右侧日志工作区的纵坐标。
+    y: f32,
+}
+
+/// 搜索结果面板右键菜单命令。
+#[derive(Clone, Copy)]
+enum SearchResultsContextMenuAction {
+    /// 展开所有搜索历史记录和文件分组。
+    ExpandAll,
+    /// 收起所有搜索历史记录和文件分组。
+    CollapseAll,
+}
+
 /// 搜索结果面板高度拖动状态。
 ///
 /// 业务意图：
@@ -1158,6 +1234,569 @@ enum SearchTarget {
         /// 当前目录下所有可打开文件来源。
         sources: Vec<LogFileSource>,
     },
+}
+
+/// 搜索对话框独立窗口根视图。
+///
+/// 业务意图：
+/// - 搜索对话框需要自由拖动，但如果继续放在主窗口浮层内，鼠标移动和 hover 状态仍可能影响后面的日志正文。
+/// - 独立窗口由操作系统隔离鼠标命中，用户拖动、输入和点击搜索框时不会再把状态透传给主窗口日志行。
+///
+/// 边界条件：
+/// - 搜索条件、进度和任务 ID 仍保存在 `MainView`，避免重写现有搜索任务、结果面板、tab 和目录树逻辑。
+/// - 本视图只负责渲染和转发交互；关闭窗口时会同步清理 `MainView` 的搜索对话框状态。
+struct SearchDialogWindowView {
+    /// 主窗口视图实体。
+    ///
+    /// 实现原因：
+    /// - 搜索窗口需要读取和修改主窗口中的搜索状态，同时保持结果面板仍由主窗口渲染。
+    main_view: Entity<MainView>,
+    /// 主窗口状态变更订阅。
+    ///
+    /// 业务意图：
+    /// - 后台目录搜索会持续更新进度；搜索窗口必须跟随 `MainView::notify` 重绘，否则进度文案会停留在旧值。
+    /// - 订阅句柄必须保存在视图中，避免创建后立即释放导致观察失效。
+    _main_view_subscription: gpui::Subscription,
+}
+
+impl SearchDialogWindowView {
+    /// 创建搜索对话框窗口根视图。
+    fn new(main_view: Entity<MainView>, context: &mut Context<Self>) -> Self {
+        let observed_main_view = main_view.clone();
+        let main_view_subscription = context.observe(&observed_main_view, |_, _, context| {
+            context.notify();
+        });
+
+        Self {
+            main_view,
+            _main_view_subscription: main_view_subscription,
+        }
+    }
+
+    /// 关闭搜索对话框窗口。
+    ///
+    /// 业务意图：
+    /// - 关闭按钮和 `Esc` 都应复用主视图的搜索取消逻辑，保证后台任务、历史记录和窗口句柄状态一致。
+    fn close_dialog(&mut self, window: &mut Window, context: &mut Context<Self>) {
+        self.main_view.update(context, |view, context| {
+            view.close_search_dialog(window, context);
+        });
+        context.notify();
+    }
+
+    /// 开始拖动搜索窗口。
+    ///
+    /// 业务意图：
+    /// - 搜索对话框现在是独立窗口，拖动应交给平台窗口系统处理，而不是在主窗口里维护浮层坐标。
+    /// - 这样鼠标移动不会再触发主窗口日志行 hover 或选择状态。
+    fn start_window_drag(&mut self, window: &mut Window, context: &mut Context<Self>) {
+        window.start_window_move();
+        self.main_view.update(context, |view, context| {
+            view.stop_log_text_selection(context);
+            view.tab_context_menu = None;
+            view.encoding_dropdown_menu = None;
+            view.search_results_context_menu = None;
+            context.notify();
+        });
+    }
+
+    /// 把搜索输入框按键转发给主视图状态。
+    fn handle_search_input_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.main_view.update(context, |view, context| {
+            view.handle_search_text_key_down(SearchTextInputKind::Query, event, context);
+        });
+        context.notify();
+    }
+
+    /// 把目录目标输入框按键转发给主视图状态。
+    fn handle_search_directory_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.main_view.update(context, |view, context| {
+            view.handle_search_text_key_down(SearchTextInputKind::DirectoryTarget, event, context);
+        });
+        context.notify();
+    }
+
+    /// 切换搜索范围。
+    fn select_search_scope(
+        &mut self,
+        scope: SearchScope,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let focus_handle = self.main_view.update(context, |view, context| {
+            let default_directory_target = (scope == SearchScope::CurrentDirectory)
+                .then(|| view.active_search_directory_label())
+                .flatten();
+            if let Some(dialog) = view.search_dialog.as_mut() {
+                dialog.scope = scope;
+                if let Some(target) = default_directory_target
+                    && dialog.directory_target.trim().is_empty()
+                {
+                    dialog.directory_target = target;
+                }
+                if scope == SearchScope::CurrentDirectory {
+                    let cursor = dialog.directory_target.len();
+                    dialog.directory_selection_range = cursor..cursor;
+                    dialog.directory_marked_range = None;
+                }
+                dialog.message = "输入关键字后按 Enter 或点击搜索".to_string();
+            }
+            context.notify();
+            if scope == SearchScope::CurrentDirectory {
+                view.search_directory_focus.clone()
+            } else {
+                view.search_input_focus.clone()
+            }
+        });
+        window.focus(&focus_handle);
+        context.notify();
+    }
+
+    /// 切换大小写匹配选项。
+    fn toggle_case_sensitive(&mut self, context: &mut Context<Self>) {
+        self.main_view.update(context, |view, context| {
+            if let Some(dialog) = view.search_dialog.as_mut() {
+                dialog.case_sensitive = !dialog.case_sensitive;
+            }
+            context.notify();
+        });
+        context.notify();
+    }
+
+    /// 启动搜索任务。
+    fn start_search(&mut self, context: &mut Context<Self>) {
+        self.main_view.update(context, |view, context| {
+            view.start_search(context);
+        });
+        context.notify();
+    }
+
+    /// 聚焦搜索关键字输入框并把光标放到末尾。
+    fn focus_query_input(&mut self, window: &mut Window, context: &mut Context<Self>) {
+        let focus_handle = self.main_view.update(context, |view, context| {
+            if let Some(dialog) = view.search_dialog.as_mut() {
+                let cursor = dialog.query.len();
+                dialog.selection_range = cursor..cursor;
+            }
+            context.notify();
+            view.search_input_focus.clone()
+        });
+        window.focus(&focus_handle);
+        context.notify();
+    }
+
+    /// 聚焦目录目标输入框并把光标放到末尾。
+    fn focus_directory_input(&mut self, window: &mut Window, context: &mut Context<Self>) {
+        let focus_handle = self.main_view.update(context, |view, context| {
+            if let Some(dialog) = view.search_dialog.as_mut() {
+                let cursor = dialog.directory_target.len();
+                dialog.directory_selection_range = cursor..cursor;
+            }
+            context.notify();
+            view.search_directory_focus.clone()
+        });
+        window.focus(&focus_handle);
+        context.notify();
+    }
+
+    /// 渲染搜索窗口标题栏。
+    fn render_header(&self, context: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("search-dialog-window-header")
+            .flex()
+            .items_center()
+            .justify_between()
+            .h(px(34.0))
+            .px_3()
+            .border_b_1()
+            .border_color(rgb(0xe5e7eb))
+            .cursor_move()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(0x24292f))
+                    .child(MainView::render_lucide_icon(
+                        Some(Icon::Search),
+                        15.0,
+                        15.0,
+                        0x57606a,
+                    ))
+                    .child("搜索"),
+            )
+            .child(
+                div()
+                    .id("search-dialog-window-close")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(22.0))
+                    .h(px(22.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .hover(|button| button.bg(rgb(0xf6f8fa)))
+                    .child(MainView::render_lucide_icon(
+                        Some(Icon::X),
+                        13.0,
+                        13.0,
+                        0x57606a,
+                    ))
+                    .on_click(
+                        context.listener(|view, _event: &ClickEvent, window, context| {
+                            view.close_dialog(window, context);
+                        }),
+                    ),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|view, _event: &MouseDownEvent, window, context| {
+                    view.start_window_drag(window, context);
+                }),
+            )
+    }
+
+    /// 渲染搜索关键字输入框。
+    fn render_search_input(
+        &self,
+        dialog: &SearchDialogState,
+        focus_handle: gpui::FocusHandle,
+        window: &Window,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let query = dialog.query.clone();
+        let is_empty = query.is_empty();
+        let input_focused = focus_handle.is_focused(window);
+
+        div()
+            .id("search-dialog-window-input")
+            .relative()
+            .flex()
+            .items_center()
+            .h(px(SEARCH_INPUT_HEIGHT))
+            .w_full()
+            .px_2()
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(rgb(0xd0d7de))
+            .bg(rgb(0xffffff))
+            .track_focus(&focus_handle)
+            .key_context("search-input")
+            .on_key_down(context.listener(Self::handle_search_input_key_down))
+            .on_click(
+                context.listener(|view, _event: &ClickEvent, window, context| {
+                    view.focus_query_input(window, context);
+                }),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(0.0))
+                    .top(px(0.0))
+                    .size_full()
+                    .child(SearchInputImeElement {
+                        view: self.main_view.clone(),
+                        focus_handle: focus_handle.clone(),
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .min_w_0()
+                    .max_w_full()
+                    .overflow_hidden()
+                    .child(MainView::render_search_cursor(
+                        input_focused && is_empty,
+                        "search-query-cursor-empty",
+                    ))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .text_color(rgb(if is_empty { 0x8c959f } else { 0x24292f }))
+                            .child(if is_empty {
+                                "输入搜索关键字".to_string()
+                            } else {
+                                query
+                            }),
+                    )
+                    .child(MainView::render_search_cursor(
+                        input_focused && !is_empty,
+                        "search-query-cursor-text",
+                    )),
+            )
+    }
+
+    /// 渲染搜索范围切换控件。
+    fn render_scope_controls(
+        &self,
+        selected_scope: SearchScope,
+        context: &mut Context<Self>,
+    ) -> gpui::Div {
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(self.render_scope_button(SearchScope::CurrentFile, selected_scope, context))
+            .child(self.render_scope_button(SearchScope::CurrentDirectory, selected_scope, context))
+    }
+
+    /// 渲染单个搜索范围按钮。
+    fn render_scope_button(
+        &self,
+        scope: SearchScope,
+        selected_scope: SearchScope,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let selected = scope == selected_scope;
+        div()
+            .id(SharedString::from(format!(
+                "search-dialog-window-scope-{}",
+                scope.label()
+            )))
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(26.0))
+            .px_2()
+            .rounded(px(4.0))
+            .text_xs()
+            .text_color(rgb(if selected { 0x0969da } else { 0x57606a }))
+            .bg(rgb(if selected { 0xddf4ff } else { 0xf6f8fa }))
+            .cursor_pointer()
+            .hover(|button| button.bg(rgb(0xeaeef2)))
+            .child(scope.label())
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, window, context| {
+                    view.select_search_scope(scope, window, context);
+                }),
+            )
+    }
+
+    /// 渲染当前目录搜索目标输入区域。
+    fn render_directory_target(
+        &self,
+        dialog: &SearchDialogState,
+        focus_handle: gpui::FocusHandle,
+        window: &Window,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        if dialog.scope != SearchScope::CurrentDirectory {
+            return div().id("search-dialog-window-directory-hidden").hidden();
+        }
+
+        let target = dialog.directory_target.clone();
+        let is_empty = target.is_empty();
+        let input_focused = focus_handle.is_focused(window);
+
+        div()
+            .id("search-dialog-window-directory")
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(div().text_xs().text_color(rgb(0x57606a)).child("搜索目录"))
+            .child(
+                div()
+                    .id("search-dialog-window-directory-input")
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .h(px(SEARCH_INPUT_HEIGHT))
+                    .w_full()
+                    .px_2()
+                    .rounded(px(5.0))
+                    .border_1()
+                    .border_color(rgb(0xd0d7de))
+                    .bg(rgb(0xffffff))
+                    .track_focus(&focus_handle)
+                    .key_context("search-directory-input")
+                    .on_key_down(context.listener(Self::handle_search_directory_key_down))
+                    .on_click(
+                        context.listener(|view, _event: &ClickEvent, window, context| {
+                            view.focus_directory_input(window, context);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(0.0))
+                            .top(px(0.0))
+                            .size_full()
+                            .child(SearchInputImeElement {
+                                view: self.main_view.clone(),
+                                focus_handle: focus_handle.clone(),
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .min_w_0()
+                            .max_w_full()
+                            .overflow_hidden()
+                            .child(MainView::render_search_cursor(
+                                input_focused && is_empty,
+                                "search-directory-cursor-empty",
+                            ))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(rgb(if is_empty { 0x8c959f } else { 0x24292f }))
+                                    .child(if is_empty {
+                                        "输入目录路径或子目录关键字".to_string()
+                                    } else {
+                                        target
+                                    }),
+                            )
+                            .child(MainView::render_search_cursor(
+                                input_focused && !is_empty,
+                                "search-directory-cursor-text",
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x8c959f))
+                    .child("仅在已加载目录树内过滤，不会额外扫描磁盘"),
+            )
+    }
+
+    /// 渲染大小写选项和搜索按钮。
+    fn render_options_row(
+        &self,
+        case_sensitive: bool,
+        can_search: bool,
+        context: &mut Context<Self>,
+    ) -> gpui::Div {
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(rgb(0x57606a))
+                    .id("search-dialog-window-case-sensitive-toggle")
+                    .cursor_pointer()
+                    .child(MainView::render_checkbox(case_sensitive))
+                    .child("区分大小写")
+                    .on_click(
+                        context.listener(|view, _event: &ClickEvent, _window, context| {
+                            view.toggle_case_sensitive(context);
+                        }),
+                    ),
+            )
+            .child(
+                div()
+                    .id("search-dialog-window-submit")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap_1()
+                    .h(px(28.0))
+                    .px_3()
+                    .rounded(px(5.0))
+                    .text_xs()
+                    .text_color(rgb(0xffffff))
+                    .bg(rgb(if can_search { 0x0969da } else { 0x8c959f }))
+                    .when(can_search, |button| {
+                        button
+                            .cursor_pointer()
+                            .hover(|button| button.bg(rgb(0x0757b8)))
+                    })
+                    .when(!can_search, |button| button.opacity(0.72))
+                    .child(MainView::render_lucide_icon(
+                        Some(Icon::Search),
+                        12.0,
+                        12.0,
+                        0xffffff,
+                    ))
+                    .child("搜索")
+                    .on_click(
+                        context.listener(|view, _event: &ClickEvent, _window, context| {
+                            view.start_search(context);
+                        }),
+                    ),
+            )
+    }
+}
+
+impl Render for SearchDialogWindowView {
+    /// 渲染独立搜索窗口。
+    ///
+    /// 业务意图：
+    /// - 窗口只承载搜索条件、进度和关闭动作；结果仍显示在主窗口底部面板。
+    /// - 根节点填满独立窗口，避免在无系统标题栏场景下出现透明或不可点击区域。
+    fn render(&mut self, window: &mut Window, context: &mut Context<Self>) -> impl IntoElement {
+        let (dialog, can_search, search_focus, directory_focus) = {
+            let main_view = self.main_view.read(context);
+            let Some(dialog) = main_view.search_dialog.clone() else {
+                return div()
+                    .id("search-dialog-window-empty")
+                    .size_full()
+                    .bg(rgb(0xffffff));
+            };
+            (
+                dialog.clone(),
+                main_view.search_can_start(&dialog),
+                main_view.search_input_focus.clone(),
+                main_view.search_directory_focus.clone(),
+            )
+        };
+
+        div()
+            .id("search-dialog-window")
+            .flex()
+            .flex_col()
+            .size_full()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(rgb(0xd0d7de))
+            .bg(rgb(0xffffff))
+            .overflow_hidden()
+            .child(self.render_header(context))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_3()
+                    .child(self.render_search_input(&dialog, search_focus, window, context))
+                    .child(self.render_scope_controls(dialog.scope, context))
+                    .child(self.render_directory_target(&dialog, directory_focus, window, context))
+                    .child(self.render_options_row(dialog.case_sensitive, can_search, context))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(if dialog.is_searching {
+                                0x0969da
+                            } else {
+                                0x6b7280
+                            }))
+                            .child(dialog.message.clone()),
+                    ),
+            )
+    }
 }
 
 /// 搜索输入框的 IME 注册元素。
@@ -1543,11 +2182,25 @@ struct MainView {
     /// - 搜索条件只保留在内存中，不写入磁盘，避免在隐私规则未定义前保存用户查询词。
     search_dialog: Option<SearchDialogState>,
 
-    /// 搜索对话框拖动状态。
+    /// 搜索对话框独立窗口句柄。
+    ///
+    /// 业务意图：
+    /// - 搜索对话框已经迁移为独立窗口，主窗口需要保存句柄用于快捷键重复唤起、搜索完成自动关闭和取消搜索。
+    /// - 句柄只代表当前会话内的临时工具窗口，不参与持久化。
     ///
     /// 边界条件：
-    /// - 只在鼠标左键按住标题栏期间有效；释放鼠标或关闭对话框时必须清空。
-    search_dialog_drag: Option<SearchDialogDrag>,
+    /// - 如果用户通过系统方式关闭窗口，关闭回调必须把该字段清空，避免后续 `Ctrl+F` 尝试激活已关闭窗口。
+    search_dialog_window: Option<WindowHandle<SearchDialogWindowView>>,
+
+    /// 搜索对话框打开请求是否已经排队到下一帧。
+    ///
+    /// 业务意图：
+    /// - macOS 的 `Cmd+F` / `Ctrl+F` 会先进入原生 key equivalent 回调，不能在该回调栈中直接创建独立窗口。
+    /// - 快捷键可能因为按键重复或平台重放在短时间内触发多次，因此用该标记合并同一帧内的重复打开请求。
+    ///
+    /// 边界条件：
+    /// - 该字段只描述“打开搜索窗口”这一瞬时任务，不代表窗口是否已经打开；真实窗口状态仍以 `search_dialog_window` 为准。
+    search_dialog_open_pending: bool,
 
     /// 搜索结果底部面板状态。
     ///
@@ -1561,6 +2214,20 @@ struct MainView {
     /// 边界条件：
     /// - 如果用户关闭结果面板或鼠标释放，拖动状态必须清空，避免下一次鼠标移动继续改变高度。
     search_results_resize_drag: Option<SearchResultsResizeDrag>,
+
+    /// 搜索结果面板滚动条拖动状态。
+    ///
+    /// 业务意图：
+    /// - 结果面板内容较多时，用户可以直接拖动滚动条快速定位，而不是只能依赖滚轮。
+    /// - 该状态独立于面板高度拖动，避免滚动和 resize 两类交互互相覆盖。
+    search_results_scrollbar_drag: Option<SearchResultsScrollbarDrag>,
+
+    /// 当前打开的搜索结果右键菜单。
+    ///
+    /// 业务意图：
+    /// - 搜索结果面板支持右键批量展开/收起，菜单状态独立于 tab 菜单和编码下拉框。
+    /// - 关闭面板、点击空白或执行菜单命令时必须清理该状态。
+    search_results_context_menu: Option<SearchResultsContextMenu>,
 
     /// 下一个搜索任务 ID。
     ///
@@ -1585,15 +2252,15 @@ struct MainView {
     /// 全局键盘监听订阅。
     ///
     /// 业务意图：
-    /// - GPUI 的全局快捷键监听返回订阅句柄，必须跟随主视图保存，否则订阅被释放后 `Ctrl+F` 将不再生效。
-    /// - 该订阅只服务当前窗口生命周期，窗口关闭后随视图释放即可。
+    /// - GPUI 的全局快捷键拦截器返回订阅句柄，必须跟随主视图保存，否则订阅被释放后 `Ctrl+F` 将不再生效。
+    /// - 使用拦截器而不是事后观察器，是为了在 macOS key equivalent 和输入控件提前消费事件前捕获搜索快捷键。
     global_keystroke_subscription: Option<gpui::Subscription>,
 
     /// 主界面根节点焦点句柄。
     ///
     /// 业务意图：
-    /// - GPUI 快捷键绑定需要存在稳定的焦点路径，根节点持有焦点后 `Ctrl+F` / `Cmd+F` 可以由 Action 系统可靠分发。
-    /// - 搜索对话框关闭后可把焦点还给根节点，避免焦点停在已经隐藏的搜索输入框上导致后续快捷键无响应。
+    /// - 主窗口需要存在稳定焦点路径，搜索对话框关闭后可以把焦点恢复到根节点，后续全局快捷键和普通鼠标操作才能继续落到主界面。
+    /// - 搜索对话框关闭后可把焦点还给根节点，避免焦点停在已经关闭的搜索窗口上导致后续快捷键无响应。
     root_focus_handle: gpui::FocusHandle,
 }
 
@@ -1618,9 +2285,12 @@ impl MainView {
             log_scrollbar_drag: None,
             log_tree_scrollbar_drag: None,
             search_dialog: None,
-            search_dialog_drag: None,
+            search_dialog_window: None,
+            search_dialog_open_pending: false,
             search_results_panel: None,
             search_results_resize_drag: None,
+            search_results_scrollbar_drag: None,
+            search_results_context_menu: None,
             next_search_job_id: 1,
             search_input_focus: context.focus_handle(),
             search_directory_focus: context.focus_handle(),
@@ -1650,7 +2320,8 @@ impl MainView {
             .border_b_1()
             .border_color(rgb(0xe1e4e8))
             .child(self.render_load_toolbar_button(context))
-            .children(TOOLBAR_ACTIONS[1..].iter().map(Self::render_toolbar_button))
+            .child(self.render_search_toolbar_button(context))
+            .children(TOOLBAR_ACTIONS[2..].iter().map(Self::render_toolbar_button))
     }
 
     /// 构建“加载日志”工具栏按钮。
@@ -1688,6 +2359,42 @@ impl MainView {
             ))
             .child(action.label)
             .on_click(context.listener(Self::open_log_sources_prompt))
+    }
+
+    /// 构建“搜索”工具栏按钮。
+    ///
+    /// 业务意图：
+    /// - 搜索除了快捷键外必须有可见入口，用户在 macOS/Windows 快捷键被系统或输入法拦截时仍能打开搜索窗口。
+    /// - 搜索按钮放在“加载日志”和“智能诊断”之间，符合先加载、再搜索、再诊断的排障流程顺序。
+    ///
+    /// 边界条件：
+    /// - 点击按钮来自鼠标事件，不处于 macOS key equivalent 回调栈中，因此可以直接打开或激活独立搜索窗口。
+    /// - 如果日志正文已有选区，沿用快捷键入口的预填逻辑，把选中文本写入搜索关键字。
+    fn render_search_toolbar_button(&self, context: &mut Context<Self>) -> impl IntoElement {
+        let action = &TOOLBAR_ACTIONS[1];
+
+        div()
+            .id(SharedString::from(action.label))
+            .flex()
+            .items_center()
+            .gap_1()
+            .flex_none()
+            .px(px(TOOLBAR_BUTTON_HORIZONTAL_PADDING))
+            .py(px(TOOLBAR_BUTTON_VERTICAL_PADDING))
+            .text_sm()
+            .text_color(rgb(0x24292f))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .hover(|button| button.text_color(rgb(0x0969da)))
+            .active(|button| button.opacity(0.82))
+            .child(Self::render_lucide_icon(
+                Some(action.icon),
+                TOOLBAR_BUTTON_ICON_WIDTH,
+                TOOLBAR_BUTTON_ICON_SIZE,
+                0x57606a,
+            ))
+            .child(action.label)
+            .on_click(context.listener(Self::open_search_from_toolbar))
     }
 
     /// 构建一个顶部工具栏按钮。
@@ -1739,6 +2446,21 @@ impl MainView {
         context: &mut Context<Self>,
     ) {
         self.begin_path_prompt(LoadPromptKind::LogSources, context);
+    }
+
+    /// 从工具栏按钮打开搜索窗口。
+    ///
+    /// 业务意图：
+    /// - 该入口和 `Ctrl+F` / `Cmd+F` 使用同一套 `open_search_dialog` 状态初始化逻辑，保证查询词预填、目录目标和已有窗口激活行为一致。
+    /// - GPUI 的点击监听执行时 `MainView` 仍处于更新租借中；搜索窗口创建会观察并读取 `MainView`，
+    ///   因此这里也必须排到下一帧执行，避免“cannot read MainView while it is already being updated”。
+    fn open_search_from_toolbar(
+        &mut self,
+        _event: &ClickEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.schedule_open_search_dialog(window, context);
     }
 
     /// 启动系统路径选择器，并在用户确认后异步扫描路径。
@@ -2571,6 +3293,7 @@ impl MainView {
     /// 业务意图：
     /// - 搜索是日志查看器的核心工作流，需要即使焦点停在日志正文或目录树上也能通过 `Ctrl+F` 打开。
     /// - macOS 用户通常使用 `Cmd+F`，因此在保留用户要求的 `Ctrl+F` 同时支持平台键。
+    /// - 该函数返回是否消费了快捷键，调用方据此阻止事件继续传给平台菜单或底层输入控件。
     ///
     /// 边界条件：
     /// - 这里不处理普通字符输入，避免全局监听截获搜索框或未来编辑控件的文本输入。
@@ -2580,30 +3303,46 @@ impl MainView {
         keystroke: Keystroke,
         window: &mut Window,
         context: &mut Context<Self>,
-    ) {
+    ) -> bool {
         if Self::is_copy_keystroke(&keystroke) && self.copy_selected_log_text(context) {
-            return;
-        }
-
-        if Self::is_open_search_keystroke(&keystroke) {
-            self.open_search_dialog(window, context);
-            return;
+            return true;
         }
 
         if self.search_dialog.is_some() && keystroke.key == "enter" {
             self.start_search(context);
-            return;
+            return true;
         }
 
         if self.search_dialog.is_some() && keystroke.key == "escape" {
             self.close_search_dialog(window, context);
+            return true;
         }
+
+        false
     }
 
-    /// 判断是否为打开搜索对话框的快捷键。
-    fn is_open_search_keystroke(keystroke: &Keystroke) -> bool {
-        keystroke.key.eq_ignore_ascii_case("f")
-            && (keystroke.modifiers.control || keystroke.modifiers.platform)
+    /// 延迟打开搜索对话框。
+    ///
+    /// 业务意图：
+    /// - macOS 会把 `Cmd+F`、`Ctrl+F` 这类快捷键先作为 key equivalent 分发；如果在该原生回调栈里直接创建窗口，
+    ///   GPUI 或平台窗口系统内部一旦 panic，就会跨 `extern "C"` 边界触发不可恢复 abort。
+    /// - 这里使用 `Window::defer` 而不是 `Context::defer_in`：前者回调拿到的是 `App`，不会自动重新租借
+    ///   `MainView`；后者会在闭包外包一层 `MainView::update`，导致搜索窗口读取 `MainView` 时发生重复借用。
+    ///
+    /// 边界条件：
+    /// - 延迟执行仍读取当前日志选区，因此用户按下快捷键时已有的选中文本会正常预填到搜索框。
+    /// - 同一帧内重复触发只保留一个打开请求，避免按键重放创建多个搜索窗口。
+    fn schedule_open_search_dialog(&mut self, window: &mut Window, context: &mut Context<Self>) {
+        if self.search_dialog_open_pending {
+            return;
+        }
+
+        self.search_dialog_open_pending = true;
+        let main_view = context.entity();
+        window.defer(context, move |window, app| {
+            Self::open_search_dialog_after_main_update(main_view, window, app);
+        });
+        context.notify();
     }
 
     /// 判断是否为复制日志选中文本的快捷键。
@@ -2612,8 +3351,37 @@ impl MainView {
     /// - macOS 用户习惯 `Cmd+C`，Windows 用户习惯 `Ctrl+C`，两者都应复制当前日志正文选区。
     /// - 当前只在日志正文有非空选择时消费该快捷键；没有选择时保持后续控件自己的复制行为空间。
     fn is_copy_keystroke(keystroke: &Keystroke) -> bool {
-        keystroke.key.eq_ignore_ascii_case("c")
-            && (keystroke.modifiers.control || keystroke.modifiers.platform)
+        Self::keystroke_matches_letter_or_control_code(keystroke, "c", CONTROL_C_CODE)
+            && (keystroke.modifiers.control
+                || keystroke.modifiers.platform
+                || Self::keystroke_matches_control_code(keystroke, CONTROL_C_CODE))
+    }
+
+    /// 判断按键是否匹配指定字母或该字母的 ASCII 控制字符。
+    ///
+    /// 业务意图：
+    /// - GPUI 的 `Keystroke::key` 和 `key_char` 在不同平台输入路径下可能保存不同形态：
+    ///   普通 `Cmd+F` 通常表现为 `key = "f"`，而 `Ctrl+F` 可能表现为 `"\u{6}"`。
+    /// - 把匹配逻辑集中在这里，可以让搜索和复制快捷键都兼容真实键盘、AppleScript 自动化和不同键盘布局。
+    ///
+    /// 边界条件：
+    /// - 该函数只用于带控制键语义的快捷键，不参与普通文本输入，避免把不可见控制字符误写入搜索框。
+    fn keystroke_matches_letter_or_control_code(
+        keystroke: &Keystroke,
+        letter: &str,
+        control_code: &str,
+    ) -> bool {
+        keystroke.key.eq_ignore_ascii_case(letter)
+            || Self::keystroke_matches_control_code(keystroke, control_code)
+            || keystroke
+                .key_char
+                .as_deref()
+                .is_some_and(|key_char| key_char.eq_ignore_ascii_case(letter))
+    }
+
+    /// 判断按键是否是指定 ASCII 控制字符。
+    fn keystroke_matches_control_code(keystroke: &Keystroke, control_code: &str) -> bool {
+        keystroke.key == control_code || keystroke.key_char.as_deref() == Some(control_code)
     }
 
     /// 复制当前激活日志 tab 的选中文本。
@@ -2860,20 +3628,18 @@ impl MainView {
         }
     }
 
-    /// 打开搜索对话框并聚焦输入框。
+    /// 准备搜索对话框状态。
     ///
     /// 业务意图：
     /// - 如果日志正文当前存在选区，打开或再次唤起搜索框时用选中文本预填关键字，减少复制再搜索的重复操作。
     /// - 如果对话框已经打开但没有日志选区，再次按快捷键只重新聚焦输入框，不重置查询词和搜索范围。
-    /// - 初次打开位置优先落在右侧内容区，避免遮挡左侧目录树。
-    fn open_search_dialog(&mut self, window: &mut Window, context: &mut Context<Self>) {
+    ///
+    /// 实现原因：
+    /// - 这里只修改 `MainView` 自身状态，不创建窗口；独立搜索窗口会在 `MainView::update` 返回后再创建。
+    /// - 这样可以避免搜索窗口根视图初始化或渲染时读取 `MainView`，和当前 `MainView` 更新租借发生重叠。
+    fn prepare_search_dialog_state(&mut self) {
         let selected_query = self.selected_log_text_for_search_query();
         if self.search_dialog.is_none() {
-            let default_x = if matches!(self.load_state, LogTreeLoadState::Loaded(_)) {
-                self.left_panel_width + SPLITTER_VISIBLE_WIDTH + SEARCH_DIALOG_DEFAULT_RIGHT_OFFSET
-            } else {
-                SEARCH_DIALOG_DEFAULT_RIGHT_OFFSET
-            };
             let directory_target = self.active_search_directory_label().unwrap_or_default();
             let query = selected_query.clone().unwrap_or_default();
             let query_cursor = query.len();
@@ -2886,8 +3652,6 @@ impl MainView {
                 directory_selection_range: 0..0,
                 directory_marked_range: None,
                 case_sensitive: false,
-                x: default_x,
-                y: TOOLBAR_HEIGHT + SEARCH_DIALOG_DEFAULT_TOP_OFFSET,
                 is_searching: false,
                 progress: SearchProgress::default(),
                 message: if selected_query.is_some() {
@@ -2909,8 +3673,91 @@ impl MainView {
 
         self.tab_context_menu = None;
         self.encoding_dropdown_menu = None;
-        window.focus(&self.search_input_focus);
-        context.notify();
+    }
+
+    /// 在 `MainView` 更新租借结束后打开搜索对话框。
+    ///
+    /// 业务意图：
+    /// - 工具栏按钮、`Ctrl+F` 和 `Cmd+F` 都通过该入口打开搜索窗口，避免不同入口出现不同状态规则。
+    /// - 搜索窗口是独立 GPUI 窗口，它的根视图会读取并观察 `MainView`；因此窗口创建必须发生在 `MainView::update` 闭包外。
+    ///
+    /// 边界条件：
+    /// - 如果已有搜索窗口仍有效，则只激活并聚焦输入框。
+    /// - 如果旧句柄已经失效，则清空后重新创建；创建失败时把错误写回搜索对话框状态。
+    fn open_search_dialog_after_main_update(
+        main_view: Entity<MainView>,
+        _current_window: &mut Window,
+        app: &mut App,
+    ) {
+        let (search_input_focus, existing_search_window) =
+            main_view.update(app, |view, context| {
+                view.search_dialog_open_pending = false;
+                view.prepare_search_dialog_state();
+                context.notify();
+                (view.search_input_focus.clone(), view.search_dialog_window)
+            });
+
+        if let Some(search_window) = existing_search_window {
+            if search_window
+                .update(app, |_, window, _| {
+                    window.activate_window();
+                    window.focus(&search_input_focus);
+                })
+                .is_ok()
+            {
+                return;
+            }
+            main_view.update(app, |view, _| {
+                view.search_dialog_window = None;
+            });
+        }
+
+        let main_view_for_window = main_view.clone();
+        let main_view_for_close = main_view.clone();
+        let search_window_options = WindowOptions {
+            titlebar: None,
+            window_bounds: Some(WindowBounds::centered(
+                size(px(SEARCH_DIALOG_WIDTH), px(SEARCH_DIALOG_WINDOW_HEIGHT)),
+                app,
+            )),
+            kind: WindowKind::Floating,
+            is_resizable: false,
+            is_minimizable: false,
+            window_min_size: Some(size(
+                px(SEARCH_DIALOG_WIDTH),
+                px(SEARCH_DIALOG_WINDOW_HEIGHT),
+            )),
+            ..Default::default()
+        };
+
+        match app.open_window(search_window_options, move |window, app| {
+            window.focus(&search_input_focus);
+            window.on_window_should_close(app, move |_, app| {
+                main_view_for_close.update(app, |view, context| {
+                    view.search_dialog_window = None;
+                    view.clear_search_dialog_state(true, context);
+                });
+                true
+            });
+            app.new(|context| SearchDialogWindowView::new(main_view_for_window, context))
+        }) {
+            Ok(search_window) => {
+                main_view.update(app, |view, context| {
+                    view.search_dialog_window = Some(search_window);
+                    context.notify();
+                });
+            }
+            Err(error) => {
+                main_view.update(app, |view, context| {
+                    view.search_dialog_window = None;
+                    if let Some(dialog) = view.search_dialog.as_mut() {
+                        dialog.message = format!("打开搜索窗口失败：{error}");
+                        dialog.is_searching = false;
+                    }
+                    context.notify();
+                });
+            }
+        }
     }
 
     /// 关闭搜索对话框并让当前后台搜索任务失效。
@@ -2919,18 +3766,43 @@ impl MainView {
     /// - 用户关闭对话框时表示不再关注当前搜索过程；旧任务即使稍后返回，也不应继续更新进度或结果。
     /// - 结果面板不在这里清空，方便用户保留已完成的结果上下文；如果任务仍在运行，则标记为已取消，避免面板永远停留在进行中。
     fn close_search_dialog(&mut self, window: &mut Window, context: &mut Context<Self>) {
+        let search_window = self.search_dialog_window.take();
+        let current_window_is_search = search_window
+            .map(AnyWindowHandle::from)
+            .is_some_and(|search_window| search_window == window.window_handle());
+        self.clear_search_dialog_state(true, context);
+        if current_window_is_search {
+            window.remove_window();
+        } else if let Some(search_window) = search_window {
+            let _ = search_window.update(context, |_, window, _| {
+                window.remove_window();
+            });
+            window.focus(&self.root_focus_handle);
+        } else {
+            window.focus(&self.root_focus_handle);
+        }
+        context.notify();
+    }
+
+    /// 清理搜索对话框状态。
+    ///
+    /// 业务意图：
+    /// - 关闭搜索窗口、搜索完成自动收起和系统窗口关闭都需要同一套状态清理规则。
+    /// - 取消关闭时需要标记正在运行的记录为已取消；正常完成时只清空对话框，不改变结果记录终态。
+    fn clear_search_dialog_state(&mut self, cancel_running: bool, context: &mut Context<Self>) {
         let running_job_id = self
             .search_dialog
             .as_ref()
-            .filter(|dialog| dialog.is_searching)
+            .filter(|dialog| cancel_running && dialog.is_searching)
             .map(|dialog| dialog.job_id);
+        if self.search_dialog.is_none() {
+            return;
+        }
         self.search_dialog = None;
-        self.search_dialog_drag = None;
         self.next_search_job_id += 1;
         if let Some(job_id) = running_job_id {
             self.mark_search_record_canceled(job_id);
         }
-        window.focus(&self.root_focus_handle);
         context.notify();
     }
 
@@ -3109,7 +3981,7 @@ impl MainView {
 
                 view.update(app, |view, context| {
                     view.apply_search_file_result(job_id, Ok(results), 1);
-                    view.finish_search_job(job_id);
+                    view.finish_search_job(job_id, context);
                     context.notify();
                 })
                 .ok();
@@ -3154,7 +4026,7 @@ impl MainView {
                 }
 
                 view.update(app, |view, context| {
-                    view.finish_search_job(job_id);
+                    view.finish_search_job(job_id, context);
                     context.notify();
                 })
                 .ok();
@@ -3251,7 +4123,7 @@ impl MainView {
     /// 业务意图：
     /// - 搜索对话框只负责输入条件和展示进行中进度；任务完成后应自动收起，把空间让给正文和底部结果面板。
     /// - 结果面板保留历史记录和明细，用户可以继续查看、展开和点击定位。
-    fn finish_search_job(&mut self, job_id: usize) {
+    fn finish_search_job(&mut self, job_id: usize, context: &mut Context<Self>) {
         if !self.is_current_search_job(job_id) {
             return;
         }
@@ -3265,7 +4137,11 @@ impl MainView {
             record.canceled = false;
         }
         self.search_dialog = None;
-        self.search_dialog_drag = None;
+        if let Some(search_window) = self.search_dialog_window.take() {
+            let _ = search_window.update(context, |_, window, _| {
+                window.remove_window();
+            });
+        }
     }
 
     /// 判断后台回调是否属于当前仍有效的搜索任务。
@@ -3314,7 +4190,8 @@ impl MainView {
     /// 处理根视图鼠标移动。
     ///
     /// 业务意图：
-    /// - 搜索对话框拖动和结果面板高度调整都可能跨过右侧正文、左侧树或工具栏区域，因此放到根视图统一处理。
+    /// - 结果面板高度调整和结果面板滚动条拖动都可能跨过右侧正文、左侧树或工具栏区域，因此放到根视图统一处理。
+    /// - 搜索对话框已经改为独立窗口，不再需要主窗口接管拖动过程。
     /// - 现有左右分割线和滚动条拖动仍在内容区处理，避免扩大它们的鼠标命中范围。
     fn handle_root_mouse_move(
         &mut self,
@@ -3322,68 +4199,26 @@ impl MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
-        self.update_search_dialog_drag(event, window, context);
         self.update_search_results_resize_drag(event, window, context);
+        self.update_search_results_scrollbar_drag(event, context);
     }
 
     /// 处理根视图鼠标释放。
     ///
     /// 业务意图：
-    /// - 搜索浮层拖动和结果面板 resize 都依赖鼠标释放清理临时状态。
+    /// - 结果面板 resize 和结果面板滚动条拖动都依赖鼠标释放清理临时状态。
     fn handle_root_mouse_up(
         &mut self,
         _event: &MouseUpEvent,
         _window: &mut Window,
         context: &mut Context<Self>,
     ) {
-        let had_drag = self.search_dialog_drag.take().is_some()
-            || self.search_results_resize_drag.take().is_some();
+        let had_drag = self.search_results_resize_drag.take().is_some();
+        let had_scrollbar_drag = self.search_results_scrollbar_drag.take().is_some();
         self.stop_log_text_selection(context);
-        if had_drag {
+        if had_drag || had_scrollbar_drag {
             context.notify();
         }
-    }
-
-    /// 开始拖动搜索对话框。
-    fn start_search_dialog_drag(&mut self, event: &MouseDownEvent) {
-        let Some(dialog) = &self.search_dialog else {
-            return;
-        };
-        self.search_dialog_drag = Some(SearchDialogDrag {
-            cursor_offset_x: event.position.x - px(dialog.x),
-            cursor_offset_y: event.position.y - px(dialog.y),
-        });
-        self.tab_context_menu = None;
-        self.encoding_dropdown_menu = None;
-    }
-
-    /// 根据鼠标移动更新搜索对话框位置。
-    fn update_search_dialog_drag(
-        &mut self,
-        event: &MouseMoveEvent,
-        window: &mut Window,
-        context: &mut Context<Self>,
-    ) {
-        let Some(drag) = self.search_dialog_drag else {
-            return;
-        };
-        if !event.dragging() {
-            self.search_dialog_drag = None;
-            context.notify();
-            return;
-        }
-
-        let Some(dialog) = self.search_dialog.as_mut() else {
-            self.search_dialog_drag = None;
-            context.notify();
-            return;
-        };
-        let viewport = window.viewport_size();
-        let max_x = (f32::from(viewport.width) - SEARCH_DIALOG_WIDTH).max(0.0);
-        let max_y = (f32::from(viewport.height) - 120.0).max(0.0);
-        dialog.x = f32::from(event.position.x - drag.cursor_offset_x).clamp(0.0, max_x);
-        dialog.y = f32::from(event.position.y - drag.cursor_offset_y).clamp(0.0, max_y);
-        context.notify();
     }
 
     /// 开始调整搜索结果面板高度。
@@ -3395,6 +4230,7 @@ impl MainView {
             start_y: event.position.y,
             start_height: panel.height,
         });
+        self.search_results_scrollbar_drag = None;
         self.tab_context_menu = None;
         self.encoding_dropdown_menu = None;
     }
@@ -3425,6 +4261,101 @@ impl MainView {
             (content_height * SEARCH_RESULTS_PANEL_MAX_RATIO).max(SEARCH_RESULTS_PANEL_MIN_HEIGHT);
         let next_height = drag.start_height + f32::from(drag.start_y - event.position.y);
         panel.height = next_height.clamp(SEARCH_RESULTS_PANEL_MIN_HEIGHT, max_height);
+        context.notify();
+    }
+
+    /// 开始拖动搜索结果面板滚动条滑块。
+    ///
+    /// 业务意图：
+    /// - 搜索结果面板可能包含大量历史记录和命中行，需要支持直接拖动滚动条快速定位。
+    /// - 拖动开始时记录鼠标在滑块内的偏移，避免滑块突然跳到鼠标中心。
+    ///
+    /// 边界条件：
+    /// - 如果结果面板未打开、列表尚未完成测量或内容不足以滚动，则忽略本次按下。
+    fn start_search_results_scrollbar_drag(
+        &mut self,
+        event: &MouseDownEvent,
+        context: &mut Context<Self>,
+    ) {
+        let Some(panel) = &self.search_results_panel else {
+            return;
+        };
+        let Some(metrics) = Self::search_results_scrollbar_metrics(&panel.scroll_handle) else {
+            return;
+        };
+        if metrics.max_scroll <= px(0.0) {
+            return;
+        }
+        let Some(viewport_top) = Self::uniform_list_viewport_axis_origin(
+            &panel.scroll_handle,
+            LogScrollbarAxis::Vertical,
+        ) else {
+            return;
+        };
+
+        self.search_results_scrollbar_drag = Some(SearchResultsScrollbarDrag {
+            cursor_offset: event.position.y - viewport_top - metrics.thumb_start,
+        });
+        self.search_results_resize_drag = None;
+        self.search_results_context_menu = None;
+        self.tab_context_menu = None;
+        self.encoding_dropdown_menu = None;
+        self.stop_log_text_selection(context);
+    }
+
+    /// 根据鼠标移动更新搜索结果面板滚动条拖动结果。
+    ///
+    /// 业务意图：
+    /// - 自绘滚动条拖动必须写回搜索结果虚拟列表的底层滚动偏移，才能和滚轮滚动、虚拟渲染保持一致。
+    /// - 只在鼠标左键仍按下时更新；如果释放发生在其它区域，也会在下一次移动时清理拖动状态。
+    fn update_search_results_scrollbar_drag(
+        &mut self,
+        event: &MouseMoveEvent,
+        context: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.search_results_scrollbar_drag else {
+            return;
+        };
+        if !event.dragging() {
+            self.search_results_scrollbar_drag = None;
+            context.notify();
+            return;
+        }
+        let Some(panel) = self.search_results_panel.as_ref() else {
+            self.search_results_scrollbar_drag = None;
+            context.notify();
+            return;
+        };
+        let Some(metrics) = Self::search_results_scrollbar_metrics(&panel.scroll_handle) else {
+            self.search_results_scrollbar_drag = None;
+            context.notify();
+            return;
+        };
+        let Some(viewport_top) = Self::uniform_list_viewport_axis_origin(
+            &panel.scroll_handle,
+            LogScrollbarAxis::Vertical,
+        ) else {
+            self.search_results_scrollbar_drag = None;
+            context.notify();
+            return;
+        };
+
+        let movable_length = (metrics.track_length - metrics.thumb_length).max(px(0.0));
+        if metrics.max_scroll <= px(0.0) || movable_length <= px(0.0) {
+            return;
+        }
+
+        let requested_thumb_start = event.position.y - viewport_top - drag.cursor_offset;
+        let thumb_start =
+            requested_thumb_start.clamp(metrics.track_start, metrics.track_start + movable_length);
+        let scroll_offset =
+            metrics.max_scroll * ((thumb_start - metrics.track_start) / movable_length);
+        let base_scroll_handle = {
+            // `UniformListScrollHandle` 包装了真正的 `ScrollHandle`；克隆后再写入，避免持有 RefCell 借用时触发嵌套借用。
+            panel.scroll_handle.0.borrow().base_handle.clone()
+        };
+        let current_offset = base_scroll_handle.offset();
+        base_scroll_handle.set_offset(point(current_offset.x, -scroll_offset));
         context.notify();
     }
 
@@ -3752,212 +4683,8 @@ impl MainView {
             .child(self.render_search_results_panel(context))
             .child(self.render_popup_dismiss_overlay(context))
             .child(self.render_tab_context_menu(context))
+            .child(self.render_search_results_context_menu(context))
             .child(self.render_encoding_dropdown_menu(context))
-    }
-
-    /// 渲染搜索对话框浮层。
-    ///
-    /// 业务意图：
-    /// - 搜索对话框由快捷键打开，独立于日志正文布局，可以自由拖动。
-    /// - 对话框中直接展示搜索进度，让用户知道目录搜索仍在推进而不是界面卡住。
-    fn render_search_dialog(
-        &self,
-        window: &Window,
-        context: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let Some(dialog) = &self.search_dialog else {
-            return div().id("search-dialog-empty").hidden();
-        };
-        let can_search = self.search_can_start(dialog);
-
-        div()
-            .id("search-dialog")
-            .absolute()
-            .left(px(dialog.x))
-            .top(px(dialog.y))
-            .w(px(SEARCH_DIALOG_WIDTH))
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(rgb(0xd0d7de))
-            .bg(rgb(0xffffff))
-            .shadow_lg()
-            .child(self.render_search_dialog_header(context))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .p_3()
-                    .child(self.render_search_input(window, context))
-                    .child(self.render_search_scope_controls(dialog.scope, context))
-                    .child(self.render_search_directory_target(window, context))
-                    .child(self.render_search_options_row(
-                        dialog.case_sensitive,
-                        can_search,
-                        context,
-                    ))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(if dialog.is_searching {
-                                0x0969da
-                            } else {
-                                0x6b7280
-                            }))
-                            .child(dialog.message.clone()),
-                    ),
-            )
-    }
-
-    /// 渲染搜索对话框标题栏。
-    ///
-    /// 业务意图：
-    /// - 标题栏承担拖动命中区；关闭按钮只关闭对话框，不清空结果面板。
-    fn render_search_dialog_header(
-        &self,
-        context: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        div()
-            .id("search-dialog-header")
-            .flex()
-            .items_center()
-            .justify_between()
-            .h(px(34.0))
-            .px_3()
-            .border_b_1()
-            .border_color(rgb(0xe5e7eb))
-            .cursor_move()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(0x24292f))
-                    .child(Self::render_lucide_icon(
-                        Some(Icon::Search),
-                        15.0,
-                        15.0,
-                        0x57606a,
-                    ))
-                    .child("搜索"),
-            )
-            .child(
-                div()
-                    .id("search-dialog-close")
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(22.0))
-                    .h(px(22.0))
-                    .rounded(px(4.0))
-                    .cursor_pointer()
-                    .hover(|button| button.bg(rgb(0xf6f8fa)))
-                    .child(Self::render_lucide_icon(
-                        Some(Icon::X),
-                        13.0,
-                        13.0,
-                        0x57606a,
-                    ))
-                    .on_click(
-                        context.listener(|view, _event: &ClickEvent, window, context| {
-                            view.close_search_dialog(window, context);
-                        }),
-                    ),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                context.listener(|view, event: &MouseDownEvent, _window, _context| {
-                    view.start_search_dialog_drag(event);
-                }),
-            )
-    }
-
-    /// 渲染搜索输入框。
-    ///
-    /// 业务意图：
-    /// - 第一版只支持单行普通文本查询；输入框聚焦时处理字符、退格和删除。
-    /// - 中文输入在 GPUI 平台层提交为 `key_char` 时会按完整字符串追加，范围高亮仍使用 UTF-8 边界。
-    /// - 光标必须和文本放在同一个无间距 flex 容器中，不能依赖父容器 `gap`；否则光标和内容之间会出现
-    ///   类似空格的视觉间隔，让用户误以为搜索词末尾多了字符。
-    fn render_search_input(
-        &self,
-        window: &Window,
-        context: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let query = self
-            .search_dialog
-            .as_ref()
-            .map(|dialog| dialog.query.clone())
-            .unwrap_or_default();
-        let is_empty = query.is_empty();
-        let input_focused = self.search_input_focus.is_focused(window);
-
-        div()
-            .id("search-input")
-            .relative()
-            .flex()
-            .items_center()
-            .h(px(SEARCH_INPUT_HEIGHT))
-            .w_full()
-            .px_2()
-            .rounded(px(5.0))
-            .border_1()
-            .border_color(rgb(0xd0d7de))
-            .bg(rgb(0xffffff))
-            .track_focus(&self.search_input_focus)
-            .key_context("search-input")
-            .on_key_down(context.listener(Self::handle_search_input_key_down))
-            .on_click(
-                context.listener(|view, _event: &ClickEvent, window, context| {
-                    if let Some(dialog) = view.search_dialog.as_mut() {
-                        let cursor = dialog.query.len();
-                        dialog.selection_range = cursor..cursor;
-                    }
-                    window.focus(&view.search_input_focus);
-                    context.notify();
-                }),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(0.0))
-                    .top(px(0.0))
-                    .size_full()
-                    .child(SearchInputImeElement {
-                        view: context.entity(),
-                        focus_handle: self.search_input_focus.clone(),
-                    }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .min_w_0()
-                    .max_w_full()
-                    .overflow_hidden()
-                    .child(Self::render_search_cursor(
-                        input_focused && is_empty,
-                        "search-query-cursor-empty",
-                    ))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_sm()
-                            .text_color(rgb(if is_empty { 0x8c959f } else { 0x24292f }))
-                            .child(if is_empty {
-                                "输入搜索关键字".to_string()
-                            } else {
-                                query
-                            }),
-                    )
-                    .child(Self::render_search_cursor(
-                        input_focused && !is_empty,
-                        "search-query-cursor-text",
-                    )),
-            )
     }
 
     /// 渲染搜索输入框光标。
@@ -3982,135 +4709,6 @@ impl MainView {
         } else {
             cursor.hidden().into_any_element()
         }
-    }
-
-    /// 渲染当前目录搜索目标输入区域。
-    ///
-    /// 业务意图：
-    /// - 用户选择“当前目录”搜索时，需要明确看到搜索会落在哪个目录，并能把目标改成加载树中的子目录片段。
-    /// - 该输入框只在目录搜索范围下显示，避免当前文件搜索时出现无意义的路径控件。
-    /// - 目录输入与搜索关键字输入共用自绘光标布局，同样需要避免文本和光标之间出现额外 gap。
-    fn render_search_directory_target(
-        &self,
-        window: &Window,
-        context: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let Some(dialog) = self.search_dialog.as_ref() else {
-            return div().id("search-directory-target-empty").hidden();
-        };
-        if dialog.scope != SearchScope::CurrentDirectory {
-            return div().id("search-directory-target-hidden").hidden();
-        }
-
-        let target = dialog.directory_target.clone();
-        let is_empty = target.is_empty();
-        let input_focused = self.search_directory_focus.is_focused(window);
-
-        div()
-            .id("search-directory-target")
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(div().text_xs().text_color(rgb(0x57606a)).child("搜索目录"))
-            .child(
-                div()
-                    .id("search-directory-input")
-                    .relative()
-                    .flex()
-                    .items_center()
-                    .h(px(SEARCH_INPUT_HEIGHT))
-                    .w_full()
-                    .px_2()
-                    .rounded(px(5.0))
-                    .border_1()
-                    .border_color(rgb(0xd0d7de))
-                    .bg(rgb(0xffffff))
-                    .track_focus(&self.search_directory_focus)
-                    .key_context("search-directory-input")
-                    .on_key_down(context.listener(Self::handle_search_directory_key_down))
-                    .on_click(
-                        context.listener(|view, _event: &ClickEvent, window, context| {
-                            if let Some(dialog) = view.search_dialog.as_mut() {
-                                let cursor = dialog.directory_target.len();
-                                dialog.directory_selection_range = cursor..cursor;
-                            }
-                            window.focus(&view.search_directory_focus);
-                            context.notify();
-                        }),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(0.0))
-                            .top(px(0.0))
-                            .size_full()
-                            .child(SearchInputImeElement {
-                                view: context.entity(),
-                                focus_handle: self.search_directory_focus.clone(),
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .min_w_0()
-                            .max_w_full()
-                            .overflow_hidden()
-                            .child(Self::render_search_cursor(
-                                input_focused && is_empty,
-                                "search-directory-cursor-empty",
-                            ))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(rgb(if is_empty { 0x8c959f } else { 0x24292f }))
-                                    .child(if is_empty {
-                                        "输入目录路径或子目录关键字".to_string()
-                                    } else {
-                                        target
-                                    }),
-                            )
-                            .child(Self::render_search_cursor(
-                                input_focused && !is_empty,
-                                "search-directory-cursor-text",
-                            )),
-                    ),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x8c959f))
-                    .child("仅在已加载目录树内过滤，不会额外扫描磁盘"),
-            )
-    }
-
-    /// 处理搜索输入框按键。
-    ///
-    /// 边界条件：
-    /// - 组合键不写入查询词，避免 `Ctrl+F`、复制粘贴快捷键等被当作普通文本。
-    /// - 输入中的换行会被忽略，搜索框只保存单行查询。
-    fn handle_search_input_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        _window: &mut Window,
-        context: &mut Context<Self>,
-    ) {
-        self.handle_search_text_key_down(SearchTextInputKind::Query, event, context);
-    }
-
-    /// 处理搜索目录输入框按键。
-    ///
-    /// 业务意图：
-    /// - 目录目标支持退格删除和 IME 提交；Enter 仍启动搜索，Esc 仍关闭对话框。
-    fn handle_search_directory_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        _window: &mut Window,
-        context: &mut Context<Self>,
-    ) {
-        self.handle_search_text_key_down(SearchTextInputKind::DirectoryTarget, event, context);
     }
 
     /// 处理搜索对话框中任一文本输入框的基础编辑按键。
@@ -4256,147 +4854,6 @@ impl MainView {
         text.replace(['\n', '\r'], "")
     }
 
-    /// 渲染搜索范围切换控件。
-    fn render_search_scope_controls(
-        &self,
-        selected_scope: SearchScope,
-        context: &mut Context<Self>,
-    ) -> gpui::Div {
-        div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .child(self.render_search_scope_button(
-                SearchScope::CurrentFile,
-                selected_scope,
-                context,
-            ))
-            .child(self.render_search_scope_button(
-                SearchScope::CurrentDirectory,
-                selected_scope,
-                context,
-            ))
-    }
-
-    /// 渲染单个搜索范围按钮。
-    fn render_search_scope_button(
-        &self,
-        scope: SearchScope,
-        selected_scope: SearchScope,
-        context: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let selected = scope == selected_scope;
-        div()
-            .id(SharedString::from(format!(
-                "search-scope-{}",
-                scope.label()
-            )))
-            .flex()
-            .items_center()
-            .justify_center()
-            .h(px(26.0))
-            .px_2()
-            .rounded(px(4.0))
-            .text_xs()
-            .text_color(rgb(if selected { 0x0969da } else { 0x57606a }))
-            .bg(rgb(if selected { 0xddf4ff } else { 0xf6f8fa }))
-            .cursor_pointer()
-            .hover(|button| button.bg(rgb(0xeaeef2)))
-            .child(scope.label())
-            .on_click(
-                context.listener(move |view, _event: &ClickEvent, window, context| {
-                    let default_directory_target = (scope == SearchScope::CurrentDirectory)
-                        .then(|| view.active_search_directory_label())
-                        .flatten();
-                    if let Some(dialog) = view.search_dialog.as_mut() {
-                        dialog.scope = scope;
-                        if let Some(target) = default_directory_target
-                            && dialog.directory_target.trim().is_empty()
-                        {
-                            dialog.directory_target = target;
-                        }
-                        if scope == SearchScope::CurrentDirectory {
-                            let cursor = dialog.directory_target.len();
-                            dialog.directory_selection_range = cursor..cursor;
-                            dialog.directory_marked_range = None;
-                        }
-                        dialog.message = "输入关键字后按 Enter 或点击搜索".to_string();
-                    }
-                    if scope == SearchScope::CurrentDirectory {
-                        window.focus(&view.search_directory_focus);
-                    } else {
-                        window.focus(&view.search_input_focus);
-                    }
-                    context.notify();
-                }),
-            )
-    }
-
-    /// 渲染大小写选项和搜索按钮。
-    fn render_search_options_row(
-        &self,
-        case_sensitive: bool,
-        can_search: bool,
-        context: &mut Context<Self>,
-    ) -> gpui::Div {
-        div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(rgb(0x57606a))
-                    .id("search-case-sensitive-toggle")
-                    .cursor_pointer()
-                    .child(Self::render_checkbox(case_sensitive))
-                    .child("区分大小写")
-                    .on_click(
-                        context.listener(|view, _event: &ClickEvent, _window, context| {
-                            if let Some(dialog) = view.search_dialog.as_mut() {
-                                dialog.case_sensitive = !dialog.case_sensitive;
-                            }
-                            context.notify();
-                        }),
-                    ),
-            )
-            .child(
-                div()
-                    .id("search-submit-button")
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap_1()
-                    .h(px(28.0))
-                    .px_3()
-                    .rounded(px(5.0))
-                    .text_xs()
-                    .text_color(rgb(0xffffff))
-                    .bg(rgb(if can_search { 0x0969da } else { 0x8c959f }))
-                    .when(can_search, |button| {
-                        button
-                            .cursor_pointer()
-                            .hover(|button| button.bg(rgb(0x0757b8)))
-                    })
-                    .when(!can_search, |button| button.opacity(0.72))
-                    .child(Self::render_lucide_icon(
-                        Some(Icon::Search),
-                        12.0,
-                        12.0,
-                        0xffffff,
-                    ))
-                    .child("搜索")
-                    .on_click(
-                        context.listener(|view, _event: &ClickEvent, _window, context| {
-                            view.start_search(context);
-                        }),
-                    ),
-            )
-    }
-
     /// 渲染搜索选项复选框。
     fn render_checkbox(checked: bool) -> gpui::Stateful<gpui::Div> {
         let checkbox = div()
@@ -4446,6 +4903,7 @@ impl MainView {
 
         div()
             .id("search-results-panel")
+            .relative()
             .h(px(panel_height))
             .w_full()
             .flex_none()
@@ -4455,6 +4913,16 @@ impl MainView {
             .border_color(rgb(0xd0d7de))
             .bg(rgb(0xffffff))
             .shadow_lg()
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(|view, event: &MouseDownEvent, _window, context| {
+                    view.open_search_results_context_menu(
+                        f32::from(event.position.x),
+                        f32::from(event.position.y),
+                        context,
+                    );
+                }),
+            )
             .child(self.render_search_results_resizer(context))
             .child(self.render_search_results_header(panel, context))
             .child(if row_count == 0 {
@@ -4462,6 +4930,7 @@ impl MainView {
             } else {
                 div()
                     .id("search-results-list-wrapper")
+                    .relative()
                     .flex()
                     .flex_1()
                     .w_full()
@@ -4491,9 +4960,101 @@ impl MainView {
                             ),
                         )
                         .size_full()
-                        .track_scroll(scroll_handle),
+                        .track_scroll(scroll_handle.clone()),
                     )
+                    .child(self.render_search_results_scrollbar(&scroll_handle, row_count, context))
             })
+    }
+
+    /// 渲染搜索结果面板的纵向可见滚动条。
+    ///
+    /// 业务意图：
+    /// - 结果面板中的命中可能远多于可见区域，滚动条既提示当前位置，也提供直接拖动入口。
+    /// - 滑块和结果虚拟列表共享同一个滚动句柄，避免维护第二份滚动状态。
+    fn render_search_results_scrollbar(
+        &self,
+        scroll_handle: &UniformListScrollHandle,
+        row_count: usize,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let Some(metrics) = Self::search_results_scrollbar_metrics(scroll_handle)
+            .or_else(|| Self::fallback_search_results_scrollbar_metrics(row_count))
+        else {
+            return div().id("search-results-scrollbar-empty").hidden();
+        };
+
+        div()
+            .id("search-results-scrollbar")
+            .absolute()
+            .top(metrics.thumb_start)
+            .right(px(SEARCH_RESULTS_SCROLLBAR_PADDING))
+            .w(px(SEARCH_RESULTS_SCROLLBAR_WIDTH))
+            .h(metrics.thumb_length)
+            .rounded(px(SEARCH_RESULTS_SCROLLBAR_WIDTH / 2.0))
+            .bg(rgb(0xc9d1d9))
+            .cursor_pointer()
+            .hover(|thumb| thumb.bg(rgb(0x8c959f)))
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|view, event: &MouseDownEvent, _window, context| {
+                    view.start_search_results_scrollbar_drag(event, context);
+                    context.notify();
+                }),
+            )
+    }
+
+    /// 计算搜索结果面板纵向滚动条滑块位置和高度。
+    ///
+    /// 业务意图：
+    /// - 使用搜索结果虚拟列表的真实测量结果，保证滚轮滚动、结果展开/收起和滑块位置同源。
+    /// - 内容高度不超过视口时不显示滚动条，避免空态或少量结果出现无效控件。
+    fn search_results_scrollbar_metrics(
+        scroll_handle: &UniformListScrollHandle,
+    ) -> Option<LogScrollbarMetrics> {
+        let state = scroll_handle.0.borrow();
+        let size = state.last_item_size?;
+        let viewport_height = size.item.height;
+        let content_height = size.contents.height;
+        if viewport_height <= px(0.0) || content_height <= viewport_height {
+            return None;
+        }
+
+        let max_scroll = content_height - viewport_height;
+        let scroll_top = (-state.base_handle.offset().y).clamp(px(0.0), max_scroll);
+        let track_start = px(SEARCH_RESULTS_SCROLLBAR_PADDING);
+        let track_length = (viewport_height - track_start * 2.0).max(px(1.0));
+        let min_thumb_length = px(SEARCH_RESULTS_SCROLLBAR_MIN_THUMB_HEIGHT).min(track_length);
+        let thumb_length = (viewport_height * (viewport_height / content_height))
+            .clamp(min_thumb_length, track_length);
+        let movable_length = (track_length - thumb_length).max(px(0.0));
+        let thumb_start = track_start + movable_length * (scroll_top / max_scroll);
+
+        Some(LogScrollbarMetrics {
+            thumb_start,
+            thumb_length,
+            track_start,
+            track_length,
+            max_scroll,
+        })
+    }
+
+    /// 在搜索结果列表首帧尚未写入布局测量时提供临时滚动条提示。
+    ///
+    /// 业务意图：
+    /// - 大量搜索结果刚渲染出来时，虚拟列表需要一帧后才有真实测量；临时滑块能立即提示结果区域可滚动。
+    /// - 该结果只用于视觉提示，`max_scroll` 为 0，因此不会参与拖动换算；真实测量完成后会被替换。
+    fn fallback_search_results_scrollbar_metrics(row_count: usize) -> Option<LogScrollbarMetrics> {
+        if row_count <= 8 {
+            return None;
+        }
+
+        Some(LogScrollbarMetrics {
+            thumb_start: px(SEARCH_RESULTS_SCROLLBAR_PADDING),
+            thumb_length: px(SEARCH_RESULTS_SCROLLBAR_MIN_THUMB_HEIGHT),
+            track_start: px(SEARCH_RESULTS_SCROLLBAR_PADDING),
+            track_length: px(SEARCH_RESULTS_SCROLLBAR_MIN_THUMB_HEIGHT),
+            max_scroll: px(0.0),
+        })
     }
 
     /// 将搜索历史记录展平成虚拟列表行。
@@ -4588,6 +5149,28 @@ impl MainView {
         }
     }
 
+    /// 打开搜索结果面板右键菜单。
+    ///
+    /// 业务意图：
+    /// - 右键菜单位置需要贴近用户点击处，便于在大量结果中快速执行批量展开/收起。
+    /// - 菜单渲染在右侧工作区内部，因此需要把窗口坐标转换成右侧局部坐标。
+    fn open_search_results_context_menu(
+        &mut self,
+        window_x: f32,
+        window_y: f32,
+        context: &mut Context<Self>,
+    ) {
+        let panel_x = (window_x - self.left_panel_width - SPLITTER_VISIBLE_WIDTH).max(0.0);
+        let panel_y = (window_y - TOOLBAR_HEIGHT).max(0.0);
+        self.search_results_context_menu = Some(SearchResultsContextMenu {
+            x: panel_x,
+            y: panel_y,
+        });
+        self.tab_context_menu = None;
+        self.encoding_dropdown_menu = None;
+        context.notify();
+    }
+
     /// 渲染搜索结果面板中的一行。
     ///
     /// 边界条件：
@@ -4657,6 +5240,125 @@ impl MainView {
         }
     }
 
+    /// 渲染搜索结果面板右键菜单。
+    ///
+    /// 业务意图：
+    /// - 搜索结果支持多层展开，右键菜单提供批量操作，避免用户逐条点击文件分组。
+    /// - 菜单风格与 tab 右键菜单保持一致，避免在同一应用中出现两套交互语言。
+    fn render_search_results_context_menu(
+        &self,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let Some(menu) = &self.search_results_context_menu else {
+            return div().id("search-results-context-menu-empty").hidden();
+        };
+
+        div()
+            .id("search-results-context-menu")
+            .absolute()
+            .left(px(menu.x))
+            .top(px(menu.y))
+            .w(px(SEARCH_RESULTS_CONTEXT_MENU_WIDTH))
+            .py_1()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(0xd0d7de))
+            .bg(rgb(0xffffff))
+            .shadow_lg()
+            .child(self.render_search_results_context_menu_item(
+                SearchResultsContextMenuAction::ExpandAll,
+                "展开全部",
+                context,
+            ))
+            .child(self.render_search_results_context_menu_item(
+                SearchResultsContextMenuAction::CollapseAll,
+                "收起全部",
+                context,
+            ))
+    }
+
+    /// 渲染搜索结果右键菜单单项。
+    ///
+    /// 业务意图：
+    /// - 菜单项点击后立即执行批量操作并收起菜单，保持和 tab 菜单一致的即时反馈。
+    fn render_search_results_context_menu_item(
+        &self,
+        action: SearchResultsContextMenuAction,
+        label: &'static str,
+        context: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(SharedString::from(format!("search-results-menu-{label}")))
+            .flex()
+            .items_center()
+            .h(px(SEARCH_RESULTS_CONTEXT_MENU_ITEM_HEIGHT))
+            .px_3()
+            .text_sm()
+            .text_color(rgb(0x24292f))
+            .cursor_pointer()
+            .hover(|item| item.bg(rgb(0xf6f8fa)))
+            .child(label)
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, _window, context| {
+                    view.handle_search_results_context_menu_action(action, context);
+                }),
+            )
+    }
+
+    /// 执行搜索结果右键菜单命令。
+    ///
+    /// 业务意图：
+    /// - 展开/收起会影响历史记录和文件分组两层状态，集中处理可以保证行缓存同步重建。
+    fn handle_search_results_context_menu_action(
+        &mut self,
+        action: SearchResultsContextMenuAction,
+        context: &mut Context<Self>,
+    ) {
+        match action {
+            SearchResultsContextMenuAction::ExpandAll => self.expand_all_search_results(),
+            SearchResultsContextMenuAction::CollapseAll => self.collapse_all_search_results(),
+        }
+        self.search_results_context_menu = None;
+        context.notify();
+    }
+
+    /// 展开搜索结果面板内所有历史记录和文件分组。
+    ///
+    /// 业务意图：
+    /// - 用户在需要快速浏览全部命中时，可以一次性展开所有层级，不必逐个文件打开。
+    /// - 展开后重建虚拟列表行缓存，保持滚动路径仍为 O(可见行数)。
+    fn expand_all_search_results(&mut self) {
+        let Some(panel) = self.search_results_panel.as_mut() else {
+            return;
+        };
+
+        for record in &mut panel.records {
+            record.expanded = true;
+            record.expanded_file_keys = record
+                .results
+                .iter()
+                .map(|result| result.source_key.clone())
+                .collect();
+        }
+        panel.rows = Self::search_results_panel_rows_from_records(&panel.records);
+    }
+
+    /// 收起搜索结果面板内所有历史记录和文件分组。
+    ///
+    /// 业务意图：
+    /// - 当搜索结果过多造成扫描困难时，用户可以一次回到只有历史摘要的紧凑视图。
+    fn collapse_all_search_results(&mut self) {
+        let Some(panel) = self.search_results_panel.as_mut() else {
+            return;
+        };
+
+        for record in &mut panel.records {
+            record.expanded = false;
+            record.expanded_file_keys.clear();
+        }
+        panel.rows = Self::search_results_panel_rows_from_records(&panel.records);
+    }
+
     /// 渲染搜索结果面板顶部拖拽条。
     fn render_search_results_resizer(
         &self,
@@ -4715,11 +5417,14 @@ impl MainView {
             .flex()
             .items_center()
             .justify_between()
-            .h(px(38.0))
-            .pt(px(SEARCH_RESULTS_PANEL_RESIZER_HEIGHT))
+            .h(px(
+                SEARCH_RESULT_ROW_HEIGHT + SEARCH_RESULTS_PANEL_HEADER_TOP_PADDING
+            ))
+            .pt(px(SEARCH_RESULTS_PANEL_HEADER_TOP_PADDING))
             .px_3()
             .border_b_1()
             .border_color(rgb(0xe5e7eb))
+            .bg(rgb(0xf6f8fa))
             .child(
                 div()
                     .flex()
@@ -4745,7 +5450,7 @@ impl MainView {
                         div()
                             .flex_none()
                             .text_xs()
-                            .text_color(rgb(0x6b7280))
+                            .text_color(rgb(0x57606a))
                             .child(summary),
                     ),
             )
@@ -4770,6 +5475,8 @@ impl MainView {
                         context.listener(|view, _event: &ClickEvent, _window, context| {
                             view.search_results_panel = None;
                             view.search_results_resize_drag = None;
+                            view.search_results_scrollbar_drag = None;
+                            view.search_results_context_menu = None;
                             context.notify();
                         }),
                     ),
@@ -4829,13 +5536,16 @@ impl MainView {
             .map(|target| format!(" · {}", target))
             .unwrap_or_default();
         let summary = format!(
-            "{}{} · {} · {} · {}/{} 个文件 · {} 条命中 · {} 个错误",
+            "{}{} · {} · {} · {}/{} 文件",
             record.scope.label(),
             target_label,
             case_label,
             record.state_label(),
             record.progress.searched_files,
-            record.progress.total_files,
+            record.progress.total_files
+        );
+        let count_label = format!(
+            "{} 命中 · {} 错误",
             record.results.len(),
             record.errors.len()
         );
@@ -4869,25 +5579,31 @@ impl MainView {
             .child(
                 div()
                     .min_w_0()
+                    .w(px(280.0))
+                    .flex_none()
+                    .truncate()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(0x24292f))
+                    .child(record.query.clone()),
+            )
+            .child(
+                div()
+                    .min_w_0()
                     .flex_1()
+                    .truncate()
+                    .text_xs()
+                    .text_color(rgb(0x6b7280))
+                    .child(summary),
+            )
+            .child(
+                div()
+                    .flex_none()
                     .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .truncate()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(0x24292f))
-                            .child(record.query.clone()),
-                    )
-                    .child(
-                        div()
-                            .truncate()
-                            .text_xs()
-                            .text_color(rgb(0x6b7280))
-                            .child(summary),
-                    ),
+                    .items_center()
+                    .text_xs()
+                    .text_color(rgb(0x57606a))
+                    .child(count_label),
             )
             .on_click(
                 context.listener(move |view, _event: &ClickEvent, _window, context| {
@@ -4896,7 +5612,6 @@ impl MainView {
                     {
                         record.expanded = !record.expanded;
                         panel.rows = Self::search_results_panel_rows_from_records(&panel.records);
-                        panel.scroll_handle = UniformListScrollHandle::new();
                     }
                     context.notify();
                 }),
@@ -4933,7 +5648,7 @@ impl MainView {
             .gap_2()
             .w_full()
             .h(px(SEARCH_RESULT_ROW_HEIGHT))
-            .pl(px(28.0))
+            .pl(px(30.0))
             .pr_3()
             .border_b_1()
             .border_color(rgb(0xf0f2f4))
@@ -4960,24 +5675,17 @@ impl MainView {
                 div()
                     .min_w_0()
                     .flex_1()
-                    .flex()
-                    .items_center()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .whitespace_nowrap()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(0x24292f))
-                            .child(full_path),
-                    ),
+                    .truncate()
+                    .text_sm()
+                    .text_color(rgb(0x24292f))
+                    .child(full_path),
             )
             .child(
                 div()
                     .flex_none()
                     .text_xs()
                     .text_color(rgb(0x6b7280))
-                    .child(format!("{result_count} 条命中")),
+                    .child(format!("{result_count} 条")),
             )
             .on_click(
                 context.listener(move |view, _event: &ClickEvent, _window, context| {
@@ -4990,7 +5698,6 @@ impl MainView {
                                 .insert(source_key_for_click.clone());
                         }
                         panel.rows = Self::search_results_panel_rows_from_records(&panel.records);
-                        panel.scroll_handle = UniformListScrollHandle::new();
                     }
                     context.notify();
                 }),
@@ -5031,7 +5738,7 @@ impl MainView {
             .gap_2()
             .w_full()
             .h(px(SEARCH_RESULT_ROW_HEIGHT))
-            .pl(px(56.0))
+            .pl(px(58.0))
             .pr_3()
             .border_b_1()
             .border_color(rgb(0xf0f2f4))
@@ -5040,11 +5747,13 @@ impl MainView {
             .child(
                 div()
                     .flex_none()
-                    .w(px(70.0))
+                    .w(px(48.0))
+                    .text_right()
                     .text_xs()
                     .text_color(rgb(0x6b7280))
-                    .child(format!("第 {} 行", line_number)),
+                    .child(line_number.to_string()),
             )
+            .child(div().flex_none().w(px(1.0)).h(px(18.0)).bg(rgb(0xe5e7eb)))
             .child(
                 div()
                     .flex_1()
@@ -5190,7 +5899,10 @@ impl MainView {
         &self,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        if self.tab_context_menu.is_none() && self.encoding_dropdown_menu.is_none() {
+        if self.tab_context_menu.is_none()
+            && self.encoding_dropdown_menu.is_none()
+            && self.search_results_context_menu.is_none()
+        {
             return div().id("popup-dismiss-overlay-empty").hidden();
         }
 
@@ -5204,6 +5916,7 @@ impl MainView {
                 context.listener(|view, _event: &ClickEvent, _window, context| {
                     view.tab_context_menu = None;
                     view.encoding_dropdown_menu = None;
+                    view.search_results_context_menu = None;
                     context.notify();
                 }),
             )
@@ -5663,6 +6376,7 @@ impl MainView {
             // 编码菜单必须等原始字节可用后才能打开，避免用户在加载过程中选择编码但无法立即解析。
             self.encoding_dropdown_menu = None;
             self.tab_context_menu = None;
+            self.search_results_context_menu = None;
             context.notify();
             return;
         }
@@ -5681,6 +6395,7 @@ impl MainView {
             })
         };
         self.tab_context_menu = None;
+        self.search_results_context_menu = None;
         context.notify();
     }
 
@@ -6014,6 +6729,8 @@ impl MainView {
                                             line_number_width,
                                             horizontal_line_number_offset,
                                             search_highlighted,
+                                            suppress_hover: view.search_results_resize_drag.is_some()
+                                                || view.log_scrollbar_drag.is_some(),
                                         }, context)
                                     })
                                     .collect::<Vec<_>>()
@@ -6089,7 +6806,12 @@ impl MainView {
             .on_mouse_down(
                 MouseButton::Left,
                 context.listener(move |view, event: &MouseDownEvent, _window, context| {
-                    view.start_log_scrollbar_drag(tab_id, LogScrollbarAxis::Vertical, event);
+                    view.start_log_scrollbar_drag(
+                        tab_id,
+                        LogScrollbarAxis::Vertical,
+                        event,
+                        context,
+                    );
                     context.notify();
                 }),
             )
@@ -6130,7 +6852,12 @@ impl MainView {
             .on_mouse_down(
                 MouseButton::Left,
                 context.listener(move |view, event: &MouseDownEvent, _window, context| {
-                    view.start_log_scrollbar_drag(tab_id, LogScrollbarAxis::Horizontal, event);
+                    view.start_log_scrollbar_drag(
+                        tab_id,
+                        LogScrollbarAxis::Horizontal,
+                        event,
+                        context,
+                    );
                     context.notify();
                 }),
             )
@@ -6244,6 +6971,7 @@ impl MainView {
         tab_id: usize,
         axis: LogScrollbarAxis,
         event: &MouseDownEvent,
+        context: &mut Context<Self>,
     ) {
         let Some(tab) = self.open_tabs.iter().find(|tab| tab.id == tab_id) else {
             return;
@@ -6272,6 +7000,7 @@ impl MainView {
         });
         self.tab_context_menu = None;
         self.encoding_dropdown_menu = None;
+        self.stop_log_text_selection(context);
     }
 
     /// 根据鼠标移动更新日志正文滚动条拖动结果。
@@ -6359,6 +7088,7 @@ impl MainView {
     /// 边界条件：
     /// - 只响应当前仍存在且已解码的 tab；加载中或失败状态没有可选择的正文。
     /// - 单击会形成空选择，视觉上不高亮，但会清理上一次选择，符合常见文本查看器行为。
+    /// - 如果正在拖动日志滚动条或搜索结果面板高度，则正文不应进入选区模式，避免控件拖动被误解为文本拖选。
     fn start_log_text_selection(
         &mut self,
         tab_id: usize,
@@ -6368,6 +7098,10 @@ impl MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
+        if self.search_results_resize_drag.is_some() || self.log_scrollbar_drag.is_some() {
+            return;
+        }
+
         let Some(position) =
             self.log_text_position_from_pointer(tab_id, line_index, line, event.position.x, window)
         else {
@@ -6501,6 +7235,8 @@ impl MainView {
     /// 业务意图：
     /// - 拖动过程中锚点保持不变，只更新焦点位置，从而支持任意方向选择。
     /// - 该函数只更新可见行上的拖动结果；虚拟列表外自动滚动选择后续需要单独定义交互规则。
+    /// - 结果面板调高时，鼠标可能经过日志行，此时必须忽略底层正文选择，避免事件穿透造成误选。
+    /// - 拖动日志正文滚动条时也必须忽略正文选择，避免滚动条拖动过程中出现选区和 hover 闪动。
     fn update_log_text_selection(
         &mut self,
         tab_id: usize,
@@ -6510,6 +7246,11 @@ impl MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
+        if self.search_results_resize_drag.is_some() || self.log_scrollbar_drag.is_some() {
+            self.stop_log_text_selection(context);
+            return;
+        }
+
         if !event.dragging() {
             self.stop_log_text_selection(context);
             return;
@@ -6695,6 +7436,7 @@ impl MainView {
             line_number_width,
             horizontal_line_number_offset,
             search_highlighted,
+            suppress_hover,
         } = input;
         let line_for_mouse_down = line.clone();
         let line_for_mouse_move = line.clone();
@@ -6710,7 +7452,7 @@ impl MainView {
             .line_height(px(LOG_VIEWER_ROW_HEIGHT))
             .font_family(LOG_VIEWER_FONT_FAMILY)
             .when(search_highlighted, |row| row.bg(rgb(0xfff8c5)))
-            .when(!search_highlighted, |row| {
+            .when(!search_highlighted && !suppress_hover, |row| {
                 row.hover(|row| row.bg(rgb(0xf6f8fa)))
             })
             .child(
@@ -6795,6 +7537,8 @@ impl MainView {
             x: panel_x,
             y: panel_y,
         });
+        self.search_results_context_menu = None;
+        self.encoding_dropdown_menu = None;
         context.notify();
     }
 
@@ -7231,7 +7975,7 @@ impl Render for MainView {
     /// 实现原因：
     /// - 顶部工具栏提供全局入口，内容区提供左右分栏和左侧日志目录树。
     /// - 右侧主内容区仍不放占位文案，避免用户误以为日志正文、诊断或设置功能已经完成。
-    fn render(&mut self, window: &mut Window, context: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, context: &mut Context<Self>) -> impl IntoElement {
         div()
             .relative()
             .flex()
@@ -7241,7 +7985,7 @@ impl Render for MainView {
             .track_focus(&self.root_focus_handle)
             .on_action(
                 context.listener(|view, _: &OpenSearchDialog, window, context| {
-                    view.open_search_dialog(window, context);
+                    view.schedule_open_search_dialog(window, context);
                 }),
             )
             .on_mouse_move(context.listener(Self::handle_root_mouse_move))
@@ -7255,7 +7999,6 @@ impl Render for MainView {
             )
             .child(self.render_toolbar(context))
             .child(self.render_content(context))
-            .child(self.render_search_dialog(window, context))
     }
 }
 
@@ -7308,12 +8051,21 @@ fn main() {
             })
             .expect("创建 LogClinic 主窗口失败，应用无法继续启动");
         let main_view_for_keys = main_view;
-        let subscription = app.observe_keystrokes(move |event, window, app| {
-            main_view_for_keys
-                .update(app, |view, _window, context| {
-                    view.handle_global_keystroke(event.keystroke.clone(), window, context);
-                })
-                .ok();
+        let subscription = app.intercept_keystrokes(move |event, window, app| {
+            // GPUI 0.2.2 在 macOS 上会从 Objective-C `keyEquivalent` 回调进入这里；该回调不能让 Rust panic
+            // 继续向外 unwind，否则运行时会直接 abort。快捷键处理本身不是不可恢复业务，因此这里在边界处兜住
+            // 我们自己的状态更新异常，并让事件继续按默认路径传播，避免一次快捷键输入击穿整个进程。
+            let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                main_view_for_keys
+                    .update(app, |view, _window, context| {
+                        view.handle_global_keystroke(event.keystroke.clone(), window, context)
+                    })
+                    .unwrap_or(false)
+            }))
+            .unwrap_or(false);
+            if handled {
+                app.stop_propagation();
+            }
         });
         main_view
             .update(app, |view, _window, _context| {
