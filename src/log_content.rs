@@ -138,7 +138,8 @@ pub struct DecodedLogDocument {
     ///
     /// 边界条件：
     /// - 行尾 `\n` 会被移除，Windows 行尾中的 `\r` 也会被去掉，便于右侧按行渲染。
-    pub lines: Vec<String>,
+    /// - 行集合可能来自 200MB 级别日志，使用 `Arc` 共享给当前文件搜索任务，避免 UI 线程复制整份日志。
+    pub lines: Arc<Vec<String>>,
     /// 字符数量最多的日志行下标，用于右侧虚拟列表测量横向内容宽度。
     ///
     /// 业务意图：
@@ -1028,7 +1029,7 @@ fn decode_with_encoding(
     Ok(DecodedLogDocument {
         encoding,
         detected_automatically,
-        lines,
+        lines: Arc::new(lines),
         longest_line_index,
         highlight_mode: highlight_plan.mode,
         precomputed_highlights: highlight_plan.precomputed,
