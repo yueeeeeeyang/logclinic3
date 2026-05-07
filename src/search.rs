@@ -157,6 +157,43 @@ pub fn search_lines(
         .collect()
 }
 
+/// 统计已解码行集合中查询词的总出现次数。
+///
+/// 业务意图：
+/// - 搜索窗口需要在用户输入关键字时即时显示“当前文件命中次数”，这个计数以片段出现次数为单位，
+///   不等同于结果面板当前第一版采用的“命中行数”。
+/// - 计数只消费已经打开并解码的当前文件行集合，不读取磁盘、不扫描目录，避免扩大搜索窗口的同步开销。
+///
+/// 边界条件：
+/// - 空查询返回 0，调用方可决定是否展示占位。
+/// - 同一行内多次出现会累计；匹配采用非重叠语义，和普通文本查找工具保持一致。
+/// - 不区分大小写时使用 `to_lowercase`，与 `search_lines` 的匹配规则保持一致。
+pub fn count_query_occurrences(lines: &[String], options: &SearchOptions) -> usize {
+    if options.is_empty_query() {
+        return 0;
+    }
+
+    lines
+        .iter()
+        .map(|line| count_query_occurrences_in_line(line, &options.query, options.case_sensitive))
+        .sum()
+}
+
+/// 统计单行中的查询词出现次数。
+fn count_query_occurrences_in_line(line_text: &str, query: &str, case_sensitive: bool) -> usize {
+    if query.is_empty() {
+        return 0;
+    }
+
+    if case_sensitive {
+        return line_text.matches(query).count();
+    }
+
+    let folded_line = line_text.to_lowercase();
+    let folded_query = query.to_lowercase();
+    folded_line.matches(&folded_query).count()
+}
+
 /// 在单行文本中查找查询词并返回原始行内的字节范围。
 ///
 /// 业务意图：
@@ -429,6 +466,41 @@ mod tests {
         assert!(results[0].line_text.is_char_boundary(range.start));
         assert!(results[0].line_text.is_char_boundary(range.end));
         assert_eq!(&results[0].line_text[range], "启动");
+    }
+
+    /// 当前文件计数会累计同一行内的多次命中。
+    ///
+    /// 业务意图：
+    /// - 搜索窗口“计数”按钮展示的是关键字出现次数，而不是搜索结果面板当前使用的命中行数。
+    /// - 同一行多次出现需要全部计入，才能让用户正确判断当前文件的匹配规模。
+    #[test]
+    fn 当前文件计数累计同一行多次命中() {
+        let lines = vec![
+            "error error".to_string(),
+            "ERROR once".to_string(),
+            "ok".to_string(),
+        ];
+
+        assert_eq!(
+            count_query_occurrences(
+                &lines,
+                &SearchOptions {
+                    query: "error".to_string(),
+                    case_sensitive: false,
+                },
+            ),
+            3
+        );
+        assert_eq!(
+            count_query_occurrences(
+                &lines,
+                &SearchOptions {
+                    query: "error".to_string(),
+                    case_sensitive: true,
+                },
+            ),
+            2
+        );
     }
 
     /// 本地当前目录搜索应递归收集子目录文件，但不越过当前目录边界。

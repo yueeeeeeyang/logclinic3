@@ -17,20 +17,20 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Animation, AnimationExt as _, AnyWindowHandle, App, AppContext, Application, Bounds,
-    ClickEvent, ClipboardItem, Context, DisplayId, Element, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FontWeight, GlobalElementId, InteractiveElement, IntoElement, KeyBinding,
-    KeyDownEvent, Keystroke, LayoutId, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Render, ScrollHandle,
-    ScrollStrategy, SharedString, StatefulInteractiveElement, Style, Styled as _, StyledText,
-    TextRun, TitlebarOptions, UTF16Selection, UniformListScrollHandle, Window, WindowAppearance,
-    WindowBounds, WindowHandle, WindowKind, WindowOptions, actions, div, point, px, relative, rgb,
-    size, uniform_list,
+    AnyWindowHandle, App, AppContext, Application, Bounds, ClickEvent, ClipboardItem, Context,
+    DisplayId, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, FontWeight,
+    GlobalElementId, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, Keystroke,
+    LayoutId, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PaintQuad, ParentElement, PathPromptOptions, Pixels, Point, Render, ScrollHandle,
+    ScrollStrategy, ShapedLine, SharedString, StatefulInteractiveElement, Style, Styled as _,
+    StyledText, TextRun, TitlebarOptions, UTF16Selection, UnderlineStyle, UniformListScrollHandle,
+    Window, WindowAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, actions, div,
+    fill, point, px, relative, rgb, size, uniform_list,
 };
 use lucide_icons::{Icon, LUCIDE_FONT_BYTES};
 
@@ -50,7 +50,8 @@ use log_loader::{
 };
 use search::{
     SearchFileError, SearchOptions, SearchProgress, SearchResultItem, SearchScope,
-    collect_current_directory_sources, search_lines, source_location_label,
+    collect_current_directory_sources, count_query_occurrences, search_lines,
+    source_location_label,
 };
 
 actions!(logclinic, [OpenSearchDialog]);
@@ -916,6 +917,13 @@ const SEARCH_RESULTS_SCROLLBAR_PADDING: f32 = 3.0;
 /// - 日志正文复制和搜索快捷键使用同一套全局键盘入口；复制也需要兼容 Control 字母键被平台编码成控制字符的情况。
 const CONTROL_C_CODE: &str = "\u{3}";
 
+/// `Ctrl+A` 在部分平台输入路径下对应的 ASCII 控制字符。
+///
+/// 业务意图：
+/// - 搜索关键字和目录输入框需要支持全选；不同系统可能把 `Ctrl+A` 表示为字母 `a` 或控制字符。
+/// - 与复制快捷键保持同一套兼容策略，避免 Windows/macOS 键盘路径出现只在某个平台生效的问题。
+const CONTROL_A_CODE: &str = "\u{1}";
+
 /// 顶部工具栏按钮的声明式配置。
 ///
 /// 业务意图：
@@ -1657,6 +1665,15 @@ struct SearchDialogState {
     directory_marked_range: Option<Range<usize>>,
     /// 是否区分大小写。
     case_sensitive: bool,
+    /// 当前关键字在当前激活文件中的出现次数。
+    ///
+    /// 业务意图：
+    /// - 搜索窗口需要即时反馈关键字在当前文件中的命中次数，帮助用户决定是否继续执行完整搜索。
+    /// - 该字段是缓存值，避免光标闪烁导致窗口频繁重绘时反复扫描大日志。
+    ///
+    /// 边界条件：
+    /// - `None` 表示没有关键字、没有当前文件、当前文件仍在加载或打开失败；UI 应展示占位而不是误报 0。
+    current_file_match_count: Option<usize>,
     /// 当前是否有后台搜索任务仍在运行。
     is_searching: bool,
     /// 当前搜索任务的进度快照。
@@ -2300,8 +2317,17 @@ impl SearchDialogWindowView {
         self.main_view.update(context, |view, context| {
             if let Some(dialog) = view.search_dialog.as_mut() {
                 dialog.case_sensitive = !dialog.case_sensitive;
+                dialog.current_file_match_count = None;
             }
             context.notify();
+        });
+        context.notify();
+    }
+
+    /// 统计当前关键字在当前文件中的出现次数。
+    fn count_current_file_matches(&mut self, context: &mut Context<Self>) {
+        self.main_view.update(context, |view, context| {
+            view.count_search_query_in_current_file(context);
         });
         context.notify();
     }
@@ -2314,31 +2340,61 @@ impl SearchDialogWindowView {
         context.notify();
     }
 
-    /// 聚焦搜索关键字输入框并把光标放到末尾。
-    fn focus_query_input(&mut self, window: &mut Window, context: &mut Context<Self>) {
+    /// 处理搜索关键字输入框鼠标按下。
+    ///
+    /// 业务意图：
+    /// - GPUI 当前版本的文本输入能力通过自定义元素注册到平台输入协议；鼠标事件仍需要回写到业务状态。
+    /// - 单击定位光标，双击选中当前词，三连击选中整段输入，符合常见系统文本框习惯。
+    fn handle_query_input_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
         let focus_handle = self.main_view.update(context, |view, context| {
-            if let Some(dialog) = view.search_dialog.as_mut() {
-                let cursor = dialog.query.len();
-                dialog.selection_range = cursor..cursor;
-            }
-            context.notify();
+            view.start_search_text_mouse_selection(SearchTextInputKind::Query, event, context);
             view.search_input_focus.clone()
         });
         window.focus(&focus_handle);
         context.notify();
     }
 
-    /// 聚焦目录目标输入框并把光标放到末尾。
-    fn focus_directory_input(&mut self, window: &mut Window, context: &mut Context<Self>) {
+    /// 处理目录目标输入框鼠标按下。
+    fn handle_directory_input_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
         let focus_handle = self.main_view.update(context, |view, context| {
-            if let Some(dialog) = view.search_dialog.as_mut() {
-                let cursor = dialog.directory_target.len();
-                dialog.directory_selection_range = cursor..cursor;
-            }
-            context.notify();
+            view.start_search_text_mouse_selection(
+                SearchTextInputKind::DirectoryTarget,
+                event,
+                context,
+            );
             view.search_directory_focus.clone()
         });
         window.focus(&focus_handle);
+        context.notify();
+    }
+
+    /// 拖动扩展当前搜索文本输入框的选择范围。
+    fn handle_search_text_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        context: &mut Context<Self>,
+    ) {
+        self.main_view.update(context, |view, context| {
+            view.update_search_text_mouse_selection(event.position, context);
+        });
+        context.notify();
+    }
+
+    /// 结束搜索文本输入框的鼠标选择。
+    fn handle_search_text_mouse_up(&mut self, context: &mut Context<Self>) {
+        self.main_view.update(context, |view, context| {
+            view.finish_search_text_mouse_selection(context);
+        });
         context.notify();
     }
 
@@ -2408,16 +2464,12 @@ impl SearchDialogWindowView {
     /// 渲染搜索关键字输入框。
     fn render_search_input(
         &self,
-        dialog: &SearchDialogState,
+        _dialog: &SearchDialogState,
         focus_handle: gpui::FocusHandle,
-        window: &Window,
+        _window: &Window,
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let query = dialog.query.clone();
-        let is_empty = query.is_empty();
-        let input_focused = focus_handle.is_focused(window);
-
         div()
             .id("search-dialog-window-input")
             .relative()
@@ -2433,53 +2485,47 @@ impl SearchDialogWindowView {
             .track_focus(&focus_handle)
             .key_context("search-input")
             .on_key_down(context.listener(Self::handle_search_input_key_down))
-            .on_click(
-                context.listener(|view, _event: &ClickEvent, window, context| {
-                    view.focus_query_input(window, context);
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|view, event: &MouseDownEvent, window, context| {
+                    view.handle_query_input_mouse_down(event, window, context);
                 }),
             )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(0.0))
-                    .top(px(0.0))
-                    .size_full()
-                    .child(SearchInputImeElement {
-                        view: self.main_view.clone(),
-                        focus_handle: focus_handle.clone(),
-                    }),
+            .on_mouse_move(
+                context.listener(|view, event: &MouseMoveEvent, _window, context| {
+                    view.handle_search_text_mouse_move(event, context);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                context.listener(|view, _event: &MouseUpEvent, _window, context| {
+                    view.handle_search_text_mouse_up(context);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                context.listener(|view, _event: &MouseUpEvent, _window, context| {
+                    view.handle_search_text_mouse_up(context);
+                }),
             )
             .child(
                 div()
                     .flex()
                     .items_center()
+                    .h_full()
+                    .w_full()
                     .min_w_0()
-                    .max_w_full()
                     .overflow_hidden()
-                    .child(MainView::render_search_cursor(
-                        input_focused && is_empty,
-                        "search-query-cursor-empty",
-                    ))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_sm()
-                            .text_color(rgb(if is_empty {
-                                palette.muted_text
-                            } else {
-                                palette.text
-                            }))
-                            .child(if is_empty {
-                                "输入搜索关键字".to_string()
-                            } else {
-                                query
-                            }),
-                    )
-                    .child(MainView::render_search_cursor(
-                        input_focused && !is_empty,
-                        "search-query-cursor-text",
-                    )),
+                    .line_height(px(20.0))
+                    .text_size(px(14.0))
+                    .text_color(rgb(palette.text))
+                    .child(SearchTextInputElement {
+                        view: self.main_view.clone(),
+                        input_kind: SearchTextInputKind::Query,
+                        focus_handle,
+                        placeholder: "输入搜索关键字",
+                        palette,
+                    }),
             )
     }
 
@@ -2554,17 +2600,13 @@ impl SearchDialogWindowView {
         &self,
         dialog: &SearchDialogState,
         focus_handle: gpui::FocusHandle,
-        window: &Window,
+        _window: &Window,
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         if dialog.scope != SearchScope::CurrentDirectory {
             return div().id("search-dialog-window-directory-hidden").hidden();
         }
-
-        let target = dialog.directory_target.clone();
-        let is_empty = target.is_empty();
-        let input_focused = focus_handle.is_focused(window);
 
         div()
             .id("search-dialog-window-directory")
@@ -2593,53 +2635,47 @@ impl SearchDialogWindowView {
                     .track_focus(&focus_handle)
                     .key_context("search-directory-input")
                     .on_key_down(context.listener(Self::handle_search_directory_key_down))
-                    .on_click(
-                        context.listener(|view, _event: &ClickEvent, window, context| {
-                            view.focus_directory_input(window, context);
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        context.listener(|view, event: &MouseDownEvent, window, context| {
+                            view.handle_directory_input_mouse_down(event, window, context);
                         }),
                     )
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(0.0))
-                            .top(px(0.0))
-                            .size_full()
-                            .child(SearchInputImeElement {
-                                view: self.main_view.clone(),
-                                focus_handle: focus_handle.clone(),
-                            }),
+                    .on_mouse_move(context.listener(
+                        |view, event: &MouseMoveEvent, _window, context| {
+                            view.handle_search_text_mouse_move(event, context);
+                        },
+                    ))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        context.listener(|view, _event: &MouseUpEvent, _window, context| {
+                            view.handle_search_text_mouse_up(context);
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        context.listener(|view, _event: &MouseUpEvent, _window, context| {
+                            view.handle_search_text_mouse_up(context);
+                        }),
                     )
                     .child(
                         div()
                             .flex()
                             .items_center()
+                            .h_full()
+                            .w_full()
                             .min_w_0()
-                            .max_w_full()
                             .overflow_hidden()
-                            .child(MainView::render_search_cursor(
-                                input_focused && is_empty,
-                                "search-directory-cursor-empty",
-                            ))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(rgb(if is_empty {
-                                        palette.muted_text
-                                    } else {
-                                        palette.text
-                                    }))
-                                    .child(if is_empty {
-                                        "输入目录路径或子目录关键字".to_string()
-                                    } else {
-                                        target
-                                    }),
-                            )
-                            .child(MainView::render_search_cursor(
-                                input_focused && !is_empty,
-                                "search-directory-cursor-text",
-                            )),
+                            .line_height(px(18.0))
+                            .text_size(px(12.0))
+                            .text_color(rgb(palette.text))
+                            .child(SearchTextInputElement {
+                                view: self.main_view.clone(),
+                                input_kind: SearchTextInputKind::DirectoryTarget,
+                                focus_handle,
+                                placeholder: "输入目录路径或子目录关键字",
+                                palette,
+                            }),
                     ),
             )
             .child(
@@ -2650,32 +2686,88 @@ impl SearchDialogWindowView {
             )
     }
 
-    /// 渲染大小写选项和搜索按钮。
+    /// 渲染大小写选项。
     fn render_options_row(
         &self,
         case_sensitive: bool,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Div {
+        div().flex().items_center().justify_start().child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_xs()
+                .text_color(rgb(palette.muted_text))
+                .id("search-dialog-window-case-sensitive-toggle")
+                .cursor_pointer()
+                .child(MainView::render_checkbox(case_sensitive, palette))
+                .child("区分大小写")
+                .on_click(
+                    context.listener(|view, _event: &ClickEvent, _window, context| {
+                        view.toggle_case_sensitive(context);
+                    }),
+                ),
+        )
+    }
+
+    /// 渲染搜索窗口右下角操作按钮。
+    ///
+    /// 业务意图：
+    /// - 计数和搜索都是执行类动作，放到窗口右下角更符合常见对话框布局。
+    /// - 计数按钮文案固定为“计数”，计数结果只写入状态提示，避免按钮宽度随结果变化导致布局跳动。
+    fn render_action_buttons(
+        &self,
         can_search: bool,
+        can_count: bool,
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Div {
         div()
             .flex()
             .items_center()
-            .justify_between()
+            .justify_end()
+            .gap_2()
             .child(
                 div()
+                    .id("search-dialog-window-count-current-file")
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .justify_center()
+                    .gap_1()
+                    .h(px(28.0))
+                    .px_3()
+                    .rounded(px(5.0))
                     .text_xs()
-                    .text_color(rgb(palette.muted_text))
-                    .id("search-dialog-window-case-sensitive-toggle")
-                    .cursor_pointer()
-                    .child(MainView::render_checkbox(case_sensitive, palette))
-                    .child("区分大小写")
+                    .text_color(rgb(if can_count {
+                        palette.accent
+                    } else {
+                        palette.muted_text
+                    }))
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.panel))
+                    .when(can_count, |button| {
+                        button
+                            .cursor_pointer()
+                            .hover(move |button| button.bg(rgb(palette.hover)))
+                    })
+                    .when(!can_count, |button| button.opacity(0.72))
+                    .child(MainView::render_lucide_icon(
+                        Some(Icon::Search),
+                        12.0,
+                        12.0,
+                        if can_count {
+                            palette.accent
+                        } else {
+                            palette.muted_text
+                        },
+                    ))
+                    .child("计数")
                     .on_click(
                         context.listener(|view, _event: &ClickEvent, _window, context| {
-                            view.toggle_case_sensitive(context);
+                            view.count_current_file_matches(context);
                         }),
                     ),
             )
@@ -2725,7 +2817,7 @@ impl Render for SearchDialogWindowView {
     /// - 窗口只承载搜索条件、进度和关闭动作；结果仍显示在主窗口底部面板。
     /// - 根节点填满独立窗口，避免在无系统标题栏场景下出现透明或不可点击区域。
     fn render(&mut self, window: &mut Window, context: &mut Context<Self>) -> impl IntoElement {
-        let (dialog, can_search, search_focus, directory_focus, palette) = {
+        let (dialog, can_search, can_count, search_focus, directory_focus, palette) = {
             let main_view = self.main_view.read(context);
             let Some(dialog) = main_view.search_dialog.clone() else {
                 let palette = main_view.palette();
@@ -2737,6 +2829,7 @@ impl Render for SearchDialogWindowView {
             (
                 dialog.clone(),
                 main_view.search_can_start(&dialog),
+                main_view.search_can_count_current_file(&dialog),
                 main_view.search_input_focus.clone(),
                 main_view.search_directory_focus.clone(),
                 main_view.palette(),
@@ -2753,6 +2846,25 @@ impl Render for SearchDialogWindowView {
             .border_color(rgb(palette.border))
             .bg(rgb(palette.background))
             .overflow_hidden()
+            .on_mouse_move(
+                context.listener(|view, event: &MouseMoveEvent, _window, context| {
+                    // 输入框拖拽选择一旦从输入框内开始，后续鼠标可能移到标题栏、范围按钮或空白区域。
+                    // 根节点继续接收窗口内移动事件，可让选区稳定扩展到开头或末尾，而不是离开输入框后停住。
+                    view.handle_search_text_mouse_move(event, context);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                context.listener(|view, _event: &MouseUpEvent, _window, context| {
+                    view.handle_search_text_mouse_up(context);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                context.listener(|view, _event: &MouseUpEvent, _window, context| {
+                    view.handle_search_text_mouse_up(context);
+                }),
+            )
             .child(self.render_header(palette, context))
             .child(
                 div()
@@ -2775,12 +2887,7 @@ impl Render for SearchDialogWindowView {
                         palette,
                         context,
                     ))
-                    .child(self.render_options_row(
-                        dialog.case_sensitive,
-                        can_search,
-                        palette,
-                        context,
-                    ))
+                    .child(self.render_options_row(dialog.case_sensitive, palette, context))
                     .child(
                         div()
                             .text_xs()
@@ -2792,26 +2899,57 @@ impl Render for SearchDialogWindowView {
                             .child(dialog.message.clone()),
                     ),
             )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .justify_end()
+                    .p_3()
+                    .pt_0()
+                    .child(self.render_action_buttons(can_search, can_count, palette, context)),
+            )
     }
 }
 
-/// 搜索输入框的 IME 注册元素。
+/// 搜索输入框文本元素的预绘制结果。
 ///
 /// 业务意图：
-/// - GPUI 的中文输入法、候选词窗口和组合文本必须通过 `Window::handle_input` 接入平台输入系统。
-/// - 普通 `div().on_key_down(...)` 只能处理按键事件，无法可靠接收 macOS/Windows IME 提交文本。
-///
-/// 实现原因：
-/// - 该元素不绘制任何像素，只在 paint 阶段把当前搜索框的边界和 `MainView` 输入处理器注册给窗口。
-/// - 可见输入框仍由外层 `div` 渲染，避免为了输入协议重写整套搜索框视觉样式。
-struct SearchInputImeElement {
-    /// 主视图实体，用于把平台输入回写到搜索对话框状态。
-    view: Entity<MainView>,
-    /// 搜索输入框焦点句柄，只有该焦点激活时平台才会把文本输入发送给本元素。
-    focus_handle: gpui::FocusHandle,
+/// - GPUI 的官方输入示例会在 `prepaint` 阶段完成文本排版、选区矩形和光标矩形计算。
+/// - 搜索关键字和目录目标输入框沿用这一路径，避免自绘文本再用估算字符宽度处理鼠标命中。
+struct SearchTextInputPrepaint {
+    /// 当前帧的单行字形布局，用于绘制文本并回写给 `MainView` 供鼠标命中测试。
+    line: ShapedLine,
+    /// 当前选择范围对应的高亮矩形；无选择时为空。
+    selection: Option<PaintQuad>,
+    /// 当前光标矩形；有非空选择时为空。
+    cursor: Option<PaintQuad>,
 }
 
-impl IntoElement for SearchInputImeElement {
+/// 搜索输入框的 GPUI 文本输入元素。
+///
+/// 业务意图：
+/// - GPUI 0.2.2 没有公开导出的现成 `TextInput` 控件，但官方示例提供的做法是自定义 `Element`，
+///   在绘制阶段调用 `Window::handle_input`，并使用 GPUI 文本系统 `shape_line` 管理光标和选区。
+/// - 该元素把搜索关键字和目录目标输入框改为同一套 GPUI 文本输入实现，支持中文 IME、全选、双击选词和三连击全选。
+///
+/// 边界条件：
+/// - 输入框仍只支持单行文本；平台提交的换行会在 `EntityInputHandler` 中清理。
+/// - 该元素只负责文本绘制和平台输入注册，搜索业务状态仍保存在 `MainView.search_dialog` 中。
+struct SearchTextInputElement {
+    /// 主视图实体，用于读取和写回搜索输入状态。
+    view: Entity<MainView>,
+    /// 当前元素对应的输入槽位。
+    input_kind: SearchTextInputKind,
+    /// 该输入框的焦点句柄。
+    focus_handle: gpui::FocusHandle,
+    /// 输入为空时显示的占位文案。
+    placeholder: &'static str,
+    /// 当前主题调色板，用于绘制文本、占位、选区和光标。
+    palette: AppThemePalette,
+}
+
+impl IntoElement for SearchTextInputElement {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {
@@ -2819,9 +2957,9 @@ impl IntoElement for SearchInputImeElement {
     }
 }
 
-impl Element for SearchInputImeElement {
+impl Element for SearchTextInputElement {
     type RequestLayoutState = ();
-    type PrepaintState = ();
+    type PrepaintState = Option<SearchTextInputPrepaint>;
 
     fn id(&self) -> Option<ElementId> {
         None
@@ -2840,7 +2978,9 @@ impl Element for SearchInputImeElement {
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut style = Style::default();
         style.size.width = relative(1.0).into();
-        style.size.height = relative(1.0).into();
+        // GPUI 文本元素需要在布局阶段拿到明确行高；如果使用相对高度，父级 flex 布局在某些窗口
+        // 尺寸计算路径下会给出 0 高度，导致文字、光标和选区都完成状态更新但没有可见绘制区域。
+        style.size.height = window.line_height().into();
         (window.request_layout(style, [], context), ())
     }
 
@@ -2848,11 +2988,118 @@ impl Element for SearchInputImeElement {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&gpui::InspectorElementId>,
-        _bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
-        _window: &mut Window,
-        _context: &mut App,
+        window: &mut Window,
+        context: &mut App,
     ) -> Self::PrepaintState {
+        let Some((text, selection_range, marked_range, cursor_visible_by_activity)) = ({
+            let view = self.view.read(context);
+            view.search_text_snapshot(self.input_kind).map(
+                |(text, selection_range, marked_range)| {
+                    (
+                        text,
+                        selection_range,
+                        marked_range,
+                        view.search_text_cursor_visible(),
+                    )
+                },
+            )
+        }) else {
+            return None;
+        };
+        let style = window.text_style();
+        let display_text = if text.is_empty() {
+            SharedString::from(self.placeholder)
+        } else {
+            SharedString::from(text.clone())
+        };
+        let text_color = if text.is_empty() {
+            rgb(self.palette.muted_text).into()
+        } else {
+            style.color
+        };
+        let base_run = TextRun {
+            len: display_text.len(),
+            font: style.font(),
+            color: text_color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let runs = if !text.is_empty() {
+            if let Some(marked_range) = marked_range {
+                vec![
+                    TextRun {
+                        len: marked_range.start,
+                        ..base_run.clone()
+                    },
+                    TextRun {
+                        len: marked_range.end.saturating_sub(marked_range.start),
+                        underline: Some(UnderlineStyle {
+                            color: Some(base_run.color),
+                            thickness: px(1.0),
+                            wavy: false,
+                        }),
+                        ..base_run.clone()
+                    },
+                    TextRun {
+                        len: display_text.len().saturating_sub(marked_range.end),
+                        ..base_run
+                    },
+                ]
+                .into_iter()
+                .filter(|run| run.len > 0)
+                .collect()
+            } else {
+                vec![base_run]
+            }
+        } else {
+            vec![base_run]
+        };
+
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let line = window
+            .text_system()
+            .shape_line(display_text, font_size, &runs, None);
+        let focused = self.focus_handle.is_focused(window);
+        let selection_range = MainView::clamp_search_text_range(&text, selection_range);
+        let has_selection =
+            focused && !text.is_empty() && selection_range.start < selection_range.end;
+        let cursor_index = selection_range.end;
+        let selection = has_selection.then(|| {
+            let mut selection_color = rgb(self.palette.accent);
+            selection_color.a = 0.32;
+            fill(
+                Bounds::from_corners(
+                    point(
+                        bounds.left() + line.x_for_index(selection_range.start),
+                        bounds.top(),
+                    ),
+                    point(
+                        bounds.left() + line.x_for_index(selection_range.end),
+                        bounds.bottom(),
+                    ),
+                ),
+                selection_color,
+            )
+        });
+        let cursor_visible = focused && !has_selection && cursor_visible_by_activity;
+        let cursor = cursor_visible.then(|| {
+            fill(
+                Bounds::new(
+                    point(bounds.left() + line.x_for_index(cursor_index), bounds.top()),
+                    size(px(1.5), bounds.bottom() - bounds.top()),
+                ),
+                rgb(self.palette.accent),
+            )
+        });
+
+        Some(SearchTextInputPrepaint {
+            line,
+            selection,
+            cursor,
+        })
     }
 
     fn paint(
@@ -2861,7 +3108,7 @@ impl Element for SearchInputImeElement {
         _inspector_id: Option<&gpui::InspectorElementId>,
         bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
-        _prepaint: &mut Self::PrepaintState,
+        prepaint: &mut Self::PrepaintState,
         window: &mut Window,
         context: &mut App,
     ) {
@@ -2870,6 +3117,26 @@ impl Element for SearchInputImeElement {
             ElementInputHandler::new(bounds, self.view.clone()),
             context,
         );
+        let Some(prepaint) = prepaint.take() else {
+            return;
+        };
+        if let Some(selection) = prepaint.selection {
+            window.paint_quad(selection);
+        }
+        prepaint
+            .line
+            .paint(bounds.origin, window.line_height(), window, context)
+            .ok();
+        if let Some(cursor) = prepaint.cursor {
+            window.paint_quad(cursor);
+        }
+        if self.focus_handle.is_focused(window) {
+            // 光标闪烁不依赖业务状态变化；只要输入框仍聚焦，就请求下一帧重绘，由时间片决定当前帧是否显示光标。
+            window.request_animation_frame();
+        }
+        self.view.update(context, |view, _context| {
+            view.store_search_text_layout(self.input_kind, prepaint.line, bounds);
+        });
     }
 }
 
@@ -3289,6 +3556,45 @@ struct MainView {
     /// - 不与关键字输入框共用焦点，避免用户编辑目录时误把文本写入查询词。
     search_directory_focus: gpui::FocusHandle,
 
+    /// 搜索关键字输入框最近一次由 GPUI 文本系统排版得到的单行布局。
+    ///
+    /// 业务意图：
+    /// - 关键字输入框需要单击定位、拖拽选择、双击选词和三连击全选。
+    /// - GPUI 当前版本没有公开导出的现成 `TextInput` 控件，官方示例也通过保存 `ShapedLine` 来完成精确命中，
+    ///   因此这里缓存布局结果，避免使用固定字符宽度导致中文、英文和路径字符命中不准。
+    search_query_last_layout: Option<ShapedLine>,
+
+    /// 搜索关键字输入框最近一次绘制时的窗口坐标边界。
+    ///
+    /// 边界条件：
+    /// - 窗口缩放、主题切换或内容变化都会在下一次绘制时刷新该值；绘制前为空时鼠标命中退化到文本末尾。
+    search_query_last_bounds: Option<Bounds<Pixels>>,
+
+    /// 目录目标输入框最近一次由 GPUI 文本系统排版得到的单行布局。
+    ///
+    /// 业务意图：
+    /// - 目录路径可能包含中文、空格和平台分隔符，必须用真实字形布局计算点击位置。
+    search_directory_last_layout: Option<ShapedLine>,
+
+    /// 目录目标输入框最近一次绘制时的窗口坐标边界。
+    search_directory_last_bounds: Option<Bounds<Pixels>>,
+
+    /// 当前正在拖拽选择的搜索文本输入槽位。
+    ///
+    /// 边界条件：
+    /// - 只在鼠标左键按下并移动期间有效；鼠标释放、关闭搜索窗口或切换输入框时都应清空。
+    search_text_selection_drag: Option<(SearchTextInputKind, usize)>,
+
+    /// 搜索输入框最近一次光标活动时间。
+    ///
+    /// 业务意图：
+    /// - 用户移动光标、点击定位或输入文本的当前帧应立即显示光标，避免操作反馈落在闪烁隐藏帧。
+    /// - 活动停止后直接进入闪烁状态，不再保留额外延迟。
+    ///
+    /// 边界条件：
+    /// - 该字段只服务当前会话内的搜索窗口，不写入配置；系统休眠恢复后 `Instant` 仍适合做相对时间判断。
+    search_text_cursor_last_activity: Instant,
+
     /// 全局键盘监听订阅。
     ///
     /// 业务意图：
@@ -3340,6 +3646,12 @@ impl MainView {
             next_search_job_id: 1,
             search_input_focus: context.focus_handle(),
             search_directory_focus: context.focus_handle(),
+            search_query_last_layout: None,
+            search_query_last_bounds: None,
+            search_directory_last_layout: None,
+            search_directory_last_bounds: None,
+            search_text_selection_drag: None,
+            search_text_cursor_last_activity: Instant::now(),
             global_keystroke_subscription: None,
             root_focus_handle: context.focus_handle(),
         }
@@ -4188,6 +4500,7 @@ impl MainView {
         self.active_tab_id = Some(tab_id);
         self.tab_context_menu = None;
         self.encoding_dropdown_menu = None;
+        self.clear_search_current_file_match_count();
         self.scroll_tab_bar_to_tab(tab_id);
     }
 
@@ -4306,6 +4619,7 @@ impl MainView {
 
         if self.active_tab_id == Some(tab_id) {
             self.scroll_tab_bar_to_tab(tab_id);
+            self.clear_search_current_file_match_count();
         }
         if let Some(line_index) = pending_scroll_to_line {
             self.scroll_log_tab_to_line(tab_id, line_index);
@@ -4434,6 +4748,7 @@ impl MainView {
 
         if self.active_tab_id == Some(tab_id) {
             self.scroll_tab_bar_to_tab(tab_id);
+            self.clear_search_current_file_match_count();
         }
     }
 
@@ -4878,6 +5193,7 @@ impl MainView {
                 directory_selection_range: 0..0,
                 directory_marked_range: None,
                 case_sensitive: false,
+                current_file_match_count: None,
                 is_searching: false,
                 progress: SearchProgress::default(),
                 message: if selected_query.is_some() {
@@ -4894,9 +5210,9 @@ impl MainView {
             dialog.query = selected_query;
             dialog.selection_range = cursor..cursor;
             dialog.marked_range = None;
+            dialog.current_file_match_count = None;
             dialog.message = "已填入选中文本，按 Enter 或点击搜索".to_string();
         }
-
         self.tab_context_menu = None;
         self.encoding_dropdown_menu = None;
     }
@@ -5924,28 +6240,213 @@ impl MainView {
             .child(self.render_encoding_dropdown_menu(context))
     }
 
-    /// 渲染搜索输入框光标。
+    /// 读取搜索输入框当前文本、选择范围和组合文本范围的快照。
     ///
     /// 业务意图：
-    /// - 自绘输入框没有系统文本光标，必须提供明确的聚焦反馈。
-    /// - 空输入时光标应位于占位提示前，而不是跟在提示文字后；非空时光标跟随当前文本末尾。
-    ///
-    /// 实现原因：
-    /// - GPUI 当前没有复用系统输入控件，这里通过循环动画控制透明度，模拟常见编辑器光标闪烁。
-    fn render_search_cursor(visible: bool, animation_id: &'static str) -> gpui::AnyElement {
-        let cursor = div().flex_none().w(px(1.0)).h(px(16.0)).bg(rgb(0x0969da));
+    /// - `SearchTextInputElement` 在 GPUI 绘制阶段只拿到 `App` 上下文，不能直接借用搜索窗口视图状态。
+    /// - 通过主视图提供只读快照，保证绘制、命中测试和 IME 状态都来自同一份业务状态。
+    fn search_text_snapshot(
+        &self,
+        input_kind: SearchTextInputKind,
+    ) -> Option<(String, Range<usize>, Option<Range<usize>>)> {
+        let dialog = self.search_dialog.as_ref()?;
+        let (text, selection_range, marked_range) = Self::search_text_state(dialog, input_kind);
+        Some((text.to_string(), selection_range, marked_range))
+    }
 
-        if visible {
-            cursor
-                .with_animation(
-                    animation_id,
-                    Animation::new(Duration::from_millis(1000)).repeat(),
-                    |cursor, delta| cursor.opacity(if delta < 0.55 { 1.0 } else { 0.0 }),
-                )
-                .into_any_element()
-        } else {
-            cursor.hidden().into_any_element()
+    /// 保存搜索输入框最近一次 GPUI 文本排版结果。
+    ///
+    /// 业务意图：
+    /// - 鼠标点击和拖拽必须根据真实字形宽度转换成文本下标；缓存 `ShapedLine` 后可以复用 GPUI 的命中算法。
+    /// - 分开保存关键字和目录输入框，避免两个输入框在同一帧绘制后互相覆盖命中数据。
+    fn store_search_text_layout(
+        &mut self,
+        input_kind: SearchTextInputKind,
+        line: ShapedLine,
+        bounds: Bounds<Pixels>,
+    ) {
+        match input_kind {
+            SearchTextInputKind::Query => {
+                self.search_query_last_layout = Some(line);
+                self.search_query_last_bounds = Some(bounds);
+            }
+            SearchTextInputKind::DirectoryTarget => {
+                self.search_directory_last_layout = Some(line);
+                self.search_directory_last_bounds = Some(bounds);
+            }
         }
+    }
+
+    /// 开始搜索输入框的鼠标选择。
+    ///
+    /// 业务意图：
+    /// - 单击定位光标，Shift+单击扩展当前选择，双击选择当前词，三连击选中整段输入。
+    /// - 选择逻辑写在 `MainView` 中，保证搜索关键字和目录目标输入框行为一致。
+    fn start_search_text_mouse_selection(
+        &mut self,
+        input_kind: SearchTextInputKind,
+        event: &MouseDownEvent,
+        context: &mut Context<Self>,
+    ) {
+        let index = self.search_text_index_for_point(input_kind, event.position);
+        let Some(dialog) = self.search_dialog.as_mut() else {
+            return;
+        };
+        let (text, selection_range, marked_range) = Self::search_text_state_mut(dialog, input_kind);
+        *marked_range = None;
+        match event.click_count {
+            0 | 1 => {
+                if event.modifiers.shift {
+                    selection_range.end = index;
+                    *selection_range = Self::clamp_search_text_range(text, selection_range.clone());
+                } else {
+                    *selection_range = index..index;
+                }
+                self.search_text_selection_drag = Some((input_kind, selection_range.start));
+            }
+            2 => {
+                *selection_range = Self::search_text_word_range_for_index(text, index);
+                self.search_text_selection_drag = None;
+            }
+            _ => {
+                *selection_range = 0..text.len();
+                self.search_text_selection_drag = None;
+            }
+        }
+        self.touch_search_text_cursor_activity();
+        context.notify();
+    }
+
+    /// 鼠标拖拽时更新搜索输入框选区终点。
+    fn update_search_text_mouse_selection(
+        &mut self,
+        position: Point<Pixels>,
+        context: &mut Context<Self>,
+    ) {
+        let Some((input_kind, anchor)) = self.search_text_selection_drag else {
+            return;
+        };
+        let index = self.search_text_index_for_point(input_kind, position);
+        if let Some(dialog) = self.search_dialog.as_mut() {
+            let (text, selection_range, marked_range) =
+                Self::search_text_state_mut(dialog, input_kind);
+            *marked_range = None;
+            *selection_range = Self::clamp_search_text_range(text, anchor..index);
+            self.touch_search_text_cursor_activity();
+            context.notify();
+        }
+    }
+
+    /// 结束搜索输入框鼠标拖拽选择。
+    fn finish_search_text_mouse_selection(&mut self, context: &mut Context<Self>) {
+        if self.search_text_selection_drag.take().is_some() {
+            context.notify();
+        }
+    }
+
+    /// 根据鼠标窗口坐标返回搜索输入框中的 UTF-8 字节下标。
+    ///
+    /// 边界条件：
+    /// - 如果输入框尚未完成首次绘制，没有可用字形布局，则回退到文本末尾，避免点击导致越界。
+    /// - 如果点击发生在文本区域上下之外，分别夹到开头和末尾，符合单行系统输入框的常见行为。
+    fn search_text_index_for_point(
+        &self,
+        input_kind: SearchTextInputKind,
+        position: Point<Pixels>,
+    ) -> usize {
+        let Some((text, _, _)) = self.search_text_snapshot(input_kind) else {
+            return 0;
+        };
+        let (layout, bounds) = match input_kind {
+            SearchTextInputKind::Query => (
+                self.search_query_last_layout.as_ref(),
+                self.search_query_last_bounds.as_ref(),
+            ),
+            SearchTextInputKind::DirectoryTarget => (
+                self.search_directory_last_layout.as_ref(),
+                self.search_directory_last_bounds.as_ref(),
+            ),
+        };
+        let (Some(layout), Some(bounds)) = (layout, bounds) else {
+            return text.len();
+        };
+        if position.y < bounds.top() {
+            return 0;
+        }
+        if position.y > bounds.bottom() {
+            return text.len();
+        }
+        layout
+            .closest_index_for_x(position.x - bounds.left())
+            .min(text.len())
+    }
+
+    /// 返回双击时应选择的输入词范围。
+    ///
+    /// 业务意图：
+    /// - 搜索关键字和目录路径中都可能出现中文、英文、数字和路径分隔符；双击选择连续非空白片段更符合搜索场景。
+    /// - 如果点击在空白上，则选择连续空白，和常见文本输入框行为保持一致。
+    fn search_text_word_range_for_index(text: &str, index: usize) -> Range<usize> {
+        if text.is_empty() {
+            return 0..0;
+        }
+        let index = Self::clamp_search_text_range(text, index..index).start;
+        let current = text[index..]
+            .chars()
+            .next()
+            .or_else(|| text[..index].chars().next_back());
+        let Some(current) = current else {
+            return 0..0;
+        };
+        let select_whitespace = current.is_whitespace();
+        let mut start = 0usize;
+        for (byte_index, character) in text[..index].char_indices().rev() {
+            if character.is_whitespace() != select_whitespace {
+                start = byte_index + character.len_utf8();
+                break;
+            }
+        }
+        let mut end = text.len();
+        for (relative_index, character) in text[index..].char_indices() {
+            if character.is_whitespace() != select_whitespace {
+                end = index + relative_index;
+                break;
+            }
+        }
+        start..end
+    }
+
+    /// 标记搜索输入框光标刚发生用户活动。
+    ///
+    /// 业务意图：
+    /// - 输入、点击定位、拖拽和方向键移动都会改变用户对光标位置的关注点；这些动作之后光标需要保持常亮 1 秒。
+    /// - 集中更新时间戳，避免键盘、鼠标和 IME 提交路径出现不同的闪烁节奏。
+    fn touch_search_text_cursor_activity(&mut self) {
+        self.search_text_cursor_last_activity = Instant::now();
+    }
+
+    /// 判断当前输入框光标在本帧是否应显示。
+    ///
+    /// 业务意图：
+    /// - 搜索输入框现在由 GPUI 文本元素绘制，不再使用普通 `div().with_animation(...)` 光标。
+    /// - 输入或移动发生后的极短时间内保持可见，随后立即按 500ms 亮、500ms 灭的节奏闪烁。
+    ///
+    /// 边界条件：
+    /// - `Instant` 是单调时间，适合处理系统时间调整、时区变化或休眠恢复后的相对时间判断。
+    fn search_text_cursor_visible(&self) -> bool {
+        let elapsed = self.search_text_cursor_last_activity.elapsed();
+        Self::search_text_cursor_visible_for_elapsed(elapsed)
+    }
+
+    /// 根据距离最近一次光标活动的时间计算光标可见性。
+    ///
+    /// 业务意图：
+    /// - 将时间规则拆成纯函数，便于单元测试锁定“活动后 1 秒常亮，之后闪烁”的产品行为。
+    fn search_text_cursor_visible_for_elapsed(elapsed: Duration) -> bool {
+        if elapsed < Duration::from_millis(120) {
+            return true;
+        }
+        elapsed.as_millis() % 1000 < 500
     }
 
     /// 处理搜索对话框中任一文本输入框的基础编辑按键。
@@ -5964,7 +6465,63 @@ impl MainView {
         };
         let (text, selection_range, marked_range) = Self::search_text_state_mut(dialog, input_kind);
 
+        if Self::is_select_all_keystroke(&event.keystroke) {
+            *marked_range = None;
+            *selection_range = 0..text.len();
+            self.touch_search_text_cursor_activity();
+            context.stop_propagation();
+            context.notify();
+            return;
+        }
+
         match event.keystroke.key.as_str() {
+            "left" => {
+                *marked_range = None;
+                if event.keystroke.modifiers.shift {
+                    selection_range.end =
+                        Self::previous_search_text_boundary(text, selection_range.end);
+                    *selection_range = Self::clamp_search_text_range(text, selection_range.clone());
+                } else if selection_range.start != selection_range.end {
+                    *selection_range = selection_range.start..selection_range.start;
+                } else {
+                    let cursor = Self::previous_search_text_boundary(text, selection_range.end);
+                    *selection_range = cursor..cursor;
+                }
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "right" => {
+                *marked_range = None;
+                if event.keystroke.modifiers.shift {
+                    selection_range.end =
+                        Self::next_search_text_boundary(text, selection_range.end);
+                    *selection_range = Self::clamp_search_text_range(text, selection_range.clone());
+                } else if selection_range.start != selection_range.end {
+                    *selection_range = selection_range.end..selection_range.end;
+                } else {
+                    let cursor = Self::next_search_text_boundary(text, selection_range.end);
+                    *selection_range = cursor..cursor;
+                }
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "up" => {
+                *marked_range = None;
+                *selection_range = 0..0;
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "down" => {
+                *marked_range = None;
+                let cursor = text.len();
+                *selection_range = cursor..cursor;
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
             "backspace" => {
                 if let Some(range) = marked_range.take().or_else(|| {
                     (selection_range.start != selection_range.end).then(|| selection_range.clone())
@@ -5977,11 +6534,33 @@ impl MainView {
                     text.replace_range(previous_index..selection_range.end, "");
                     *selection_range = previous_index..previous_index;
                 }
+                if input_kind == SearchTextInputKind::Query {
+                    self.clear_search_current_file_match_count();
+                }
+                self.touch_search_text_cursor_activity();
                 context.stop_propagation();
                 context.notify();
             }
             "delete" => {
+                if let Some(range) = marked_range.take().or_else(|| {
+                    (selection_range.start != selection_range.end).then(|| selection_range.clone())
+                }) {
+                    text.replace_range(range.clone(), "");
+                    *selection_range = range.start..range.start;
+                } else if let Some((next_index, next_character)) =
+                    text[selection_range.end..].char_indices().next()
+                {
+                    let start = selection_range.end + next_index;
+                    let end = start + next_character.len_utf8();
+                    text.replace_range(start..end, "");
+                    *selection_range = start..start;
+                }
+                if input_kind == SearchTextInputKind::Query {
+                    self.clear_search_current_file_match_count();
+                }
+                self.touch_search_text_cursor_activity();
                 context.stop_propagation();
+                context.notify();
             }
             "enter" | "escape" => {
                 // Enter 和 Escape 由全局快捷键处理，保持搜索框只负责文本编辑。
@@ -6029,6 +6608,67 @@ impl MainView {
                 dialog.directory_marked_range.clone(),
             ),
         }
+    }
+
+    /// 判断是否为搜索输入框全选快捷键。
+    ///
+    /// 业务意图：
+    /// - macOS 使用 `Cmd+A`，Windows 使用 `Ctrl+A`，部分输入路径会把 `Ctrl+A` 编码成 ASCII 控制字符。
+    /// - 搜索关键字和目录输入框必须统一识别这些形态，避免只能输入却不能选择已有内容。
+    fn is_select_all_keystroke(keystroke: &Keystroke) -> bool {
+        Self::keystroke_matches_letter_or_control_code(keystroke, "a", CONTROL_A_CODE)
+            && (keystroke.modifiers.control
+                || keystroke.modifiers.platform
+                || Self::keystroke_matches_control_code(keystroke, CONTROL_A_CODE))
+    }
+
+    /// 将搜索输入框内部 UTF-8 范围夹到合法字符边界。
+    ///
+    /// 边界条件：
+    /// - 鼠标命中、平台输入和快捷键都可能给出超过文本长度或反向的范围。
+    /// - Rust `String::replace_range` 只能接受 UTF-8 字符边界，因此这里统一转换为最近的安全边界。
+    fn clamp_search_text_range(text: &str, range: Range<usize>) -> Range<usize> {
+        let start = Self::search_input_clamp_byte_index(text, range.start);
+        let end = Self::search_input_clamp_byte_index(text, range.end);
+        start.min(end)..start.max(end)
+    }
+
+    /// 将任意字节下标夹到搜索输入文本的 UTF-8 字符边界。
+    fn search_input_clamp_byte_index(text: &str, index: usize) -> usize {
+        if index >= text.len() {
+            return text.len();
+        }
+        if text.is_char_boundary(index) {
+            return index;
+        }
+        text.char_indices()
+            .map(|(byte_index, _)| byte_index)
+            .take_while(|byte_index| *byte_index < index)
+            .last()
+            .unwrap_or(0)
+    }
+
+    /// 返回当前光标左侧的前一个 UTF-8 字符边界。
+    ///
+    /// 业务意图：
+    /// - 方向键移动必须按用户可见字符边界前进，不能把中文、emoji 或其它多字节字符切成非法 `String` 范围。
+    fn previous_search_text_boundary(text: &str, offset: usize) -> usize {
+        let offset = Self::search_input_clamp_byte_index(text, offset);
+        text[..offset]
+            .char_indices()
+            .next_back()
+            .map(|(index, _)| index)
+            .unwrap_or(0)
+    }
+
+    /// 返回当前光标右侧的下一个 UTF-8 字符边界。
+    fn next_search_text_boundary(text: &str, offset: usize) -> usize {
+        let offset = Self::search_input_clamp_byte_index(text, offset);
+        text[offset..]
+            .char_indices()
+            .nth(1)
+            .map(|(index, _)| offset + index)
+            .unwrap_or(text.len())
     }
 
     /// 根据当前窗口焦点判断平台输入应写入哪个搜索文本框。
@@ -6128,6 +6768,67 @@ impl MainView {
     /// 判断搜索按钮是否具备基本启动条件。
     fn search_can_start(&self, dialog: &SearchDialogState) -> bool {
         !dialog.query.trim().is_empty() && self.active_tab_id.is_some()
+    }
+
+    /// 判断当前文件计数按钮是否可用。
+    ///
+    /// 业务意图：
+    /// - 计数按钮只统计当前已经打开并成功解码的活动文件，不触发后台读取，也不扫描当前目录。
+    /// - 空关键字没有统计意义；加载中或失败 tab 也不能提供可靠计数。
+    fn search_can_count_current_file(&self, dialog: &SearchDialogState) -> bool {
+        !dialog.query.trim().is_empty() && self.active_log_tab_document_lines().is_some()
+    }
+
+    /// 返回当前激活 tab 的已解码行集合。
+    ///
+    /// 边界条件：
+    /// - 没有活动 tab、tab 已关闭、仍在加载或打开失败时都返回 `None`，调用方据此展示不可用状态。
+    fn active_log_tab_document_lines(&self) -> Option<Arc<Vec<String>>> {
+        let active_tab_id = self.active_tab_id?;
+        let active_tab = self.open_tabs.iter().find(|tab| tab.id == active_tab_id)?;
+        match &active_tab.state {
+            LogTabState::Ready { document } => Some(Arc::clone(&document.lines)),
+            LogTabState::Loading { .. } | LogTabState::Failed { .. } => None,
+        }
+    }
+
+    /// 清空当前文件计数缓存。
+    ///
+    /// 业务意图：
+    /// - 查询词、大小写选项、活动 tab 或解码内容变化后，旧计数不再代表当前条件，必须清空。
+    fn clear_search_current_file_match_count(&mut self) {
+        if let Some(dialog) = self.search_dialog.as_mut() {
+            dialog.current_file_match_count = None;
+        }
+    }
+
+    /// 统计搜索关键字在当前文件中的出现次数。
+    ///
+    /// 业务意图：
+    /// - 该动作由搜索窗口“计数”按钮触发，只针对当前激活文件的已解码内容，给用户一个轻量的命中规模反馈。
+    /// - 计数结果以片段出现次数为单位，同一行多次出现会累加；完整搜索按钮仍负责生成结果面板和跳转明细。
+    fn count_search_query_in_current_file(&mut self, context: &mut Context<Self>) {
+        let Some(dialog) = self.search_dialog.as_ref() else {
+            return;
+        };
+        let options = SearchOptions {
+            query: dialog.query.trim().to_string(),
+            case_sensitive: dialog.case_sensitive,
+        };
+        if options.is_empty_query() {
+            self.update_search_dialog_message("请输入要计数的关键字", context);
+            return;
+        }
+        let Some(lines) = self.active_log_tab_document_lines() else {
+            self.update_search_dialog_message("当前文件未打开完成，无法计数", context);
+            return;
+        };
+        let count = count_query_occurrences(&lines, &options);
+        if let Some(dialog) = self.search_dialog.as_mut() {
+            dialog.current_file_match_count = Some(count);
+            dialog.message = format!("当前文件命中 {count} 次");
+        }
+        context.notify();
     }
 
     /// 渲染右侧底部搜索结果面板。
@@ -9000,6 +9701,7 @@ impl MainView {
                         .and_then(|previous| self.open_tabs.get(previous))
                 })
                 .map(|tab| tab.id);
+            self.clear_search_current_file_match_count();
         }
         if let Some(active_tab_id) = self.active_tab_id {
             self.scroll_tab_bar_to_tab(active_tab_id);
@@ -9026,6 +9728,7 @@ impl MainView {
     fn close_other_tabs(&mut self, tab_id: usize) {
         self.open_tabs.retain(|tab| tab.id == tab_id);
         self.active_tab_id = self.open_tabs.first().map(|tab| tab.id);
+        self.clear_search_current_file_match_count();
         self.tab_bar_scroll_handle
             .set_offset(point(px(0.0), px(0.0)));
         if self
@@ -9053,6 +9756,7 @@ impl MainView {
         self.encoding_dropdown_menu = None;
         self.log_scrollbar_drag = None;
         self.tab_bar_scroll_handle = ScrollHandle::new();
+        self.clear_search_current_file_match_count();
     }
 
     /// 渲染左右分栏内容区域。
@@ -9231,11 +9935,15 @@ impl EntityInputHandler for MainView {
             .map(|range| Self::search_input_range_from_utf16(target_text, range))
             .or_else(|| marked_range.clone())
             .unwrap_or_else(|| selection_range.clone());
-        let range = range.start.min(target_text.len())..range.end.min(target_text.len());
+        let range = Self::clamp_search_text_range(target_text, range);
         target_text.replace_range(range.clone(), &replacement);
         let cursor = range.start + replacement.len();
         *selection_range = cursor..cursor;
         *marked_range = None;
+        if input_kind == SearchTextInputKind::Query {
+            self.clear_search_current_file_match_count();
+        }
+        self.touch_search_text_cursor_activity();
         context.notify();
     }
 
@@ -9263,7 +9971,7 @@ impl EntityInputHandler for MainView {
             .map(|range| Self::search_input_range_from_utf16(target_text, range))
             .or_else(|| marked_range.clone())
             .unwrap_or_else(|| selection_range.clone());
-        let range = range.start.min(target_text.len())..range.end.min(target_text.len());
+        let range = Self::clamp_search_text_range(target_text, range);
         target_text.replace_range(range.clone(), &replacement);
 
         if replacement.is_empty() {
@@ -9282,38 +9990,64 @@ impl EntityInputHandler for MainView {
                 cursor..cursor
             });
         *selection_range = selected_range;
+        if input_kind == SearchTextInputKind::Query {
+            self.clear_search_current_file_match_count();
+        }
+        self.touch_search_text_cursor_activity();
         context.notify();
     }
 
-    /// 返回指定文本范围在屏幕上的近似边界，用于放置 IME 候选窗口。
+    /// 返回指定文本范围在屏幕上的边界，用于放置 IME 候选窗口。
     ///
     /// 实现原因：
-    /// - 当前搜索框使用普通 `div` 绘制文本，没有保存精确字形布局。
-    /// - 返回输入框整体边界可保证候选窗口贴近搜索框，优先满足跨平台可用性。
+    /// - 搜索输入框采用 GPUI 官方示例的自定义文本元素实现，最近一次 `ShapedLine` 可以提供真实字符位置。
+    /// - 如果首次绘制前布局不可用，则回退到输入框整体边界，保证候选窗口仍贴近控件。
     fn bounds_for_range(
         &mut self,
-        _range_utf16: Range<usize>,
+        range_utf16: Range<usize>,
         element_bounds: Bounds<Pixels>,
-        _window: &mut Window,
+        window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        Some(element_bounds)
+        let input_kind = self.active_search_text_input_kind(window);
+        let dialog = self.search_dialog.as_ref()?;
+        let (text, _, _) = Self::search_text_state(dialog, input_kind);
+        let range = Self::search_input_range_from_utf16(text, range_utf16);
+        let layout = match input_kind {
+            SearchTextInputKind::Query => self.search_query_last_layout.as_ref(),
+            SearchTextInputKind::DirectoryTarget => self.search_directory_last_layout.as_ref(),
+        };
+        let Some(layout) = layout else {
+            return Some(element_bounds);
+        };
+        Some(Bounds::from_corners(
+            point(
+                element_bounds.left() + layout.x_for_index(range.start),
+                element_bounds.top(),
+            ),
+            point(
+                element_bounds.left() + layout.x_for_index(range.end),
+                element_bounds.bottom(),
+            ),
+        ))
     }
 
     /// 根据鼠标位置返回文本插入点。
     ///
     /// 边界条件：
-    /// - 第一版搜索框不实现鼠标选择和精确点击定位，因此始终返回文本末尾。
+    /// - 平台 IME 可能通过该入口查询鼠标位置对应的字符；这里复用 GPUI 文本布局命中逻辑。
+    /// - 如果布局尚不可用，则回退到文本末尾，避免平台输入协议收到非法下标。
     fn character_index_for_point(
         &mut self,
-        _point: gpui::Point<Pixels>,
+        point: gpui::Point<Pixels>,
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<usize> {
         let input_kind = self.active_search_text_input_kind(window);
         let dialog = self.search_dialog.as_ref()?;
         let (text, _, _) = Self::search_text_state(dialog, input_kind);
-        Some(Self::search_input_utf16_offset_from_byte(text, text.len()))
+        let utf8_index = self.search_text_index_for_point(input_kind, point);
+        Some(Self::search_input_utf16_offset_from_byte(text, utf8_index))
     }
 }
 
@@ -9632,6 +10366,66 @@ mod tests {
         if let Some(parent) = broken_path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
+    }
+
+    /// 验证搜索输入框双击选择连续非空白片段。
+    ///
+    /// 业务意图：
+    /// - 关键字输入框和目录输入框共用双击选词规则；搜索场景中路径、类名和普通关键字都应作为连续 token 选中。
+    /// - 空白只作为 token 分隔符，避免双击路径分隔符或点号时只选中一个标点，导致复制和替换不方便。
+    #[test]
+    fn 搜索输入双击选择连续非空白片段() {
+        assert_eq!(
+            MainView::search_text_word_range_for_index("foo.bar baz", 2),
+            0..7
+        );
+        assert_eq!(
+            MainView::search_text_word_range_for_index("foo  bar", 4),
+            3..5
+        );
+    }
+
+    /// 验证搜索输入框范围会夹到合法 UTF-8 边界。
+    ///
+    /// 边界条件：
+    /// - 鼠标命中和平台输入协议都可能给出非字符边界的字节下标；中文路径或中文关键字不能因此触发切片 panic。
+    #[test]
+    fn 搜索输入范围保持_utf8_边界() {
+        assert_eq!(MainView::clamp_search_text_range("a中b", 2..99), 1..5);
+        assert_eq!(MainView::clamp_search_text_range("a中b", 4..0), 0..4);
+    }
+
+    /// 验证搜索输入框方向键按 UTF-8 字符边界移动。
+    ///
+    /// 业务意图：
+    /// - 搜索关键字和目录路径都可能包含中文；方向键移动光标时必须一次跨过完整中文字符。
+    /// - 如果按字节移动，后续删除、替换或 IME 组合文本提交都会因为非法边界而存在崩溃风险。
+    #[test]
+    fn 搜索输入方向键移动保持_utf8_边界() {
+        let text = "a中b";
+
+        assert_eq!(MainView::next_search_text_boundary(text, 0), 1);
+        assert_eq!(MainView::next_search_text_boundary(text, 1), 4);
+        assert_eq!(MainView::previous_search_text_boundary(text, 4), 1);
+        assert_eq!(MainView::previous_search_text_boundary(text, 1), 0);
+    }
+
+    /// 验证搜索输入框光标活动后立即进入闪烁节奏。
+    ///
+    /// 业务意图：
+    /// - 用户要求去除 1 秒延迟，停止移动后直接闪烁；该规则影响键盘编辑时的位置反馈。
+    /// - 测试使用纯时间差，避免依赖真实时钟导致用例不稳定。
+    #[test]
+    fn 搜索输入光标活动后直接闪烁() {
+        assert!(MainView::search_text_cursor_visible_for_elapsed(
+            Duration::from_millis(119)
+        ));
+        assert!(!MainView::search_text_cursor_visible_for_elapsed(
+            Duration::from_millis(500)
+        ));
+        assert!(MainView::search_text_cursor_visible_for_elapsed(
+            Duration::from_millis(1000)
+        ));
     }
 
     /// 验证主题配置文本只接受稳定的三种持久化值。
