@@ -11,13 +11,19 @@
 //! - 当前不持久化窗口位置或尺寸，避免在尚未定义配置目录和权限规则前写入用户文件。
 
 use std::{
-    borrow::Cow, collections::HashSet, ops::Range, path::PathBuf, sync::Arc, time::Duration,
+    borrow::Cow,
+    collections::HashSet,
+    env, fs, io,
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
 };
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
     Animation, AnimationExt as _, AnyWindowHandle, App, AppContext, Application, Bounds,
-    ClickEvent, ClipboardItem, Context, Element, ElementId, ElementInputHandler, Entity,
+    ClickEvent, ClipboardItem, Context, DisplayId, Element, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FontWeight, GlobalElementId, InteractiveElement, IntoElement, KeyBinding,
     KeyDownEvent, Keystroke, LayoutId, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Render, ScrollHandle,
@@ -59,17 +65,310 @@ const MAIN_WINDOW_TITLE: &str = "LogClinic";
 /// 主窗口的默认宽度。
 ///
 /// 业务约束：
-/// - 用户明确要求默认窗口宽度调整为 1400px，以便日志 tab 和正文区域在首次打开时有更多横向空间。
+/// - 用户明确要求大屏默认窗口宽度固定为 1600px，以便日志 tab 和正文区域在首次打开时有更多横向空间。
 /// - 这里使用浮点字面量是为了匹配 GPUI `px` 的尺寸 API，避免在调用处反复转换。
-const MAIN_WINDOW_WIDTH: f32 = 1400.0;
+const MAIN_WINDOW_WIDTH: f32 = 1600.0;
 
 /// 主窗口的默认高度。
 ///
 /// 边界说明：
-/// - 用户要求默认高度从 900 调整为 800，因此这里是窗口启动时的初始高度。
-/// - 当前不设置最小尺寸和最大尺寸，因为本阶段只要求默认大小。
-/// - 如果后续添加复杂布局，必须再定义小屏幕、缩放比例和窗口尺寸变化的验收标准。
-const MAIN_WINDOW_HEIGHT: f32 = 800.0;
+/// - 用户明确要求大屏默认窗口高度固定为 900px，保证日志正文首屏拥有稳定的可视行数。
+/// - 当前不设置最小尺寸和最大尺寸，因为本阶段只要求默认大小和用户手动调整后的尺寸记忆。
+const MAIN_WINDOW_HEIGHT: f32 = 900.0;
+
+/// 小屏电脑的主显示器宽度阈值。
+///
+/// 业务意图：
+/// - 用户明确要求按逻辑像素宽度 `< 1440px` 判定小屏电脑。
+/// - 这里使用 GPUI 暴露的显示器逻辑像素，由框架负责处理 macOS Retina 和 Windows 缩放比例差异。
+const SMALL_SCREEN_MAXIMIZED_WIDTH_THRESHOLD: f32 = 1440.0;
+
+/// 主窗口尺寸偏好文件名。
+///
+/// 业务意图：
+/// - 当前只保存主窗口宽高，不保存位置、最大化状态或其他设置，因此使用独立小文本文件即可。
+/// - 如果后续接入完整设置系统，应迁移到统一配置文件并保留兼容读取逻辑。
+const MAIN_WINDOW_SIZE_FILE_NAME: &str = "window-size.txt";
+
+/// 可持久化的主窗口宽高。
+///
+/// 业务意图：
+/// - 该结构只表达用户最后调整过的窗口内容宽高，启动时会重新居中，不恢复历史位置。
+/// - 宽高使用 GPUI 逻辑像素，避免把平台物理像素、DPI 缩放或窗口装饰尺寸写入业务配置。
+///
+/// 边界条件：
+/// - 宽高必须是有限正数；零、负数、NaN 和无穷大都视为损坏配置并丢弃。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MainWindowSizePreference {
+    /// 主窗口宽度，单位为 GPUI 逻辑像素。
+    width: f32,
+    /// 主窗口高度，单位为 GPUI 逻辑像素。
+    height: f32,
+}
+
+impl MainWindowSizePreference {
+    /// 创建合法的主窗口宽高偏好。
+    ///
+    /// 业务意图：
+    /// - 所有读入、测试和关闭保存路径都经过同一个校验入口，避免损坏配置在下次启动时造成不可见窗口。
+    /// - 当前只按“有限正数”校验；如果后续定义最小窗口尺寸，应在这里统一收紧规则。
+    fn new(width: f32, height: f32) -> Option<Self> {
+        if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 {
+            Some(Self { width, height })
+        } else {
+            None
+        }
+    }
+}
+
+/// 主窗口首次启动时的尺寸策略。
+///
+/// 业务意图：
+/// - 该枚举把“是否有历史尺寸”和“小屏默认最大化”的产品规则拆成纯数据，便于单元测试覆盖。
+/// - 真正转换为 GPUI `WindowBounds` 时再依赖 `App`，避免测试环境必须启动真实窗口系统。
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MainWindowStartupDecision {
+    /// 使用用户上次保存的宽高，窗口启动时仍重新居中。
+    Remembered(MainWindowSizePreference),
+    /// 使用固定 1600x900 居中窗口，适用于大屏或无法读取显示器信息的场景。
+    DefaultWindowed,
+    /// 使用系统最大化窗口，适用于首次在小屏电脑启动。
+    DefaultMaximized,
+}
+
+/// 根据历史宽高和主显示器宽度决定主窗口启动策略。
+///
+/// 业务意图：
+/// - 历史宽高代表用户明确调整过窗口大小，优先级高于小屏默认最大化。
+/// - 没有历史宽高时，才按主显示器逻辑像素宽度判断是否最大化。
+///
+/// 边界条件：
+/// - 显示器宽度读取失败时按大屏窗口化处理，避免在图形环境信息不完整时强行最大化。
+fn decide_main_window_startup(
+    saved_size: Option<MainWindowSizePreference>,
+    primary_display_width: Option<f32>,
+) -> MainWindowStartupDecision {
+    if let Some(saved_size) = saved_size {
+        return MainWindowStartupDecision::Remembered(saved_size);
+    }
+
+    if primary_display_width.is_some_and(|width| width < SMALL_SCREEN_MAXIMIZED_WIDTH_THRESHOLD) {
+        MainWindowStartupDecision::DefaultMaximized
+    } else {
+        MainWindowStartupDecision::DefaultWindowed
+    }
+}
+
+/// 把主窗口启动策略转换成 GPUI 窗口边界。
+///
+/// 业务意图：
+/// - 历史宽高和大屏默认都以“水平居中、垂直贴住屏幕顶部”的窗口打开，不恢复上次位置。
+/// - 小屏默认最大化时仍把 1600x900 作为恢复尺寸交给 GPUI，用户退出最大化后能得到稳定默认宽高。
+fn main_window_bounds_for_decision(
+    decision: MainWindowStartupDecision,
+    display_id: Option<DisplayId>,
+    app: &App,
+) -> WindowBounds {
+    match decision {
+        MainWindowStartupDecision::Remembered(saved_size) => {
+            WindowBounds::Windowed(main_window_top_aligned_bounds(
+                display_id,
+                size(px(saved_size.width), px(saved_size.height)),
+                app,
+            ))
+        }
+        MainWindowStartupDecision::DefaultWindowed => {
+            WindowBounds::Windowed(main_window_top_aligned_bounds(
+                display_id,
+                size(px(MAIN_WINDOW_WIDTH), px(MAIN_WINDOW_HEIGHT)),
+                app,
+            ))
+        }
+        MainWindowStartupDecision::DefaultMaximized => WindowBounds::Maximized(Bounds::centered(
+            display_id,
+            size(px(MAIN_WINDOW_WIDTH), px(MAIN_WINDOW_HEIGHT)),
+            app,
+        )),
+    }
+}
+
+/// 计算主窗口“水平居中、垂直贴顶”的启动边界。
+///
+/// 业务意图：
+/// - 日志查看窗口是工作台式界面，用户希望固定高度时顶部贴住系统顶部栏，底部自然留给 Dock 或任务栏区域。
+/// - 仅调整窗口化模式；小屏最大化仍交给操作系统处理可用工作区。
+///
+/// 跨平台约束：
+/// - macOS 和 Windows 的多屏坐标原点可能不同，因此必须基于 GPUI 当前显示器 bounds 的 origin 计算。
+/// - 如果启动早期无法读取显示器，回退到 `(0, 0)`，至少保证窗口不会被纵向居中到下方。
+fn main_window_top_aligned_bounds(
+    display_id: Option<DisplayId>,
+    window_size: gpui::Size<Pixels>,
+    app: &App,
+) -> Bounds<Pixels> {
+    let display_bounds = display_id
+        .and_then(|id| app.find_display(id))
+        .or_else(|| app.primary_display())
+        .map(|display| display.bounds());
+
+    top_aligned_window_bounds_for_display(display_bounds, window_size)
+}
+
+/// 根据显示器边界计算“水平居中、垂直贴顶”的窗口边界。
+///
+/// 业务意图：
+/// - 把几何计算拆成纯函数，避免窗口位置规则只能通过真实图形环境人工验证。
+/// - 这里不裁剪宽高；如果用户保存的宽高超过当前屏幕，仍尊重用户宽高，只负责给出顶部对齐的起点。
+fn top_aligned_window_bounds_for_display(
+    display_bounds: Option<Bounds<Pixels>>,
+    window_size: gpui::Size<Pixels>,
+) -> Bounds<Pixels> {
+    if let Some(display_bounds) = display_bounds {
+        let horizontal_offset = (display_bounds.size.width - window_size.width) * 0.5;
+        Bounds::new(
+            point(
+                display_bounds.origin.x + horizontal_offset,
+                display_bounds.origin.y,
+            ),
+            window_size,
+        )
+    } else {
+        Bounds::new(point(px(0.0), px(0.0)), window_size)
+    }
+}
+
+/// 读取当前主显示器的逻辑像素宽度。
+///
+/// 跨平台约束：
+/// - GPUI 负责把 macOS Retina、Windows 缩放和平台显示器坐标转换为逻辑像素。
+/// - 如果应用启动早期无法取得主显示器，则返回 `None`，由启动策略回退到固定窗口化。
+fn primary_display_width(app: &App) -> Option<f32> {
+    app.primary_display()
+        .map(|display| display.bounds().size.width / px(1.0))
+}
+
+/// 读取当前主显示器 ID。
+///
+/// 业务意图：
+/// - GPUI 创建窗口和计算居中位置都支持 display id；显式使用同一个主显示器可以避免多屏环境下
+///   “按一个屏幕计算中心、实际在另一个屏幕打开”导致窗口看起来靠左。
+fn primary_display_id(app: &App) -> Option<DisplayId> {
+    app.primary_display().map(|display| display.id())
+}
+
+/// 构造主窗口启动边界。
+///
+/// 业务意图：
+/// - 主入口只需要调用这个函数即可获得完整窗口策略，避免把配置读取、显示器判断和 GPUI 边界构造散落在 `main` 中。
+fn build_main_window_bounds(app: &App) -> WindowBounds {
+    let saved_size = load_main_window_size_preference();
+    let decision = decide_main_window_startup(saved_size, primary_display_width(app));
+    main_window_bounds_for_decision(decision, primary_display_id(app), app)
+}
+
+/// 解析主窗口宽高偏好文件内容。
+///
+/// 文件格式：
+/// - 第一列为宽度，第二列为高度，中间使用空白字符分隔。
+/// - 不使用 JSON/TOML 是为了避免仅为一个内部小配置新增依赖。
+///
+/// 边界条件：
+/// - 格式错误、缺少字段、多余字段、非法浮点数或非正尺寸都返回 `None`，让启动流程回退默认策略。
+fn parse_main_window_size_preference(raw: &str) -> Option<MainWindowSizePreference> {
+    let mut parts = raw.split_whitespace();
+    let width = parts.next()?.parse::<f32>().ok()?;
+    let height = parts.next()?.parse::<f32>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    MainWindowSizePreference::new(width, height)
+}
+
+/// 序列化主窗口宽高偏好。
+///
+/// 业务意图：
+/// - 固定使用简单空格分隔，便于人工排查配置损坏，也便于测试按文本断言。
+fn serialize_main_window_size_preference(size: MainWindowSizePreference) -> String {
+    format!("{} {}\n", size.width.round(), size.height.round())
+}
+
+/// 从指定文件读取主窗口宽高偏好。
+///
+/// 错误处理：
+/// - 配置文件缺失、无权限读取或内容损坏都不阻止应用启动。
+/// - 启动窗口大小不是核心日志查看能力，因此错误统一视为无历史尺寸。
+fn read_main_window_size_preference(path: &Path) -> Option<MainWindowSizePreference> {
+    let raw = fs::read_to_string(path).ok()?;
+    parse_main_window_size_preference(&raw)
+}
+
+/// 将主窗口宽高偏好写入指定文件。
+///
+/// 错误处理：
+/// - 调用者可以选择忽略错误，因为窗口关闭阶段不应因配置目录权限问题阻止退出。
+/// - 这里仍返回 `io::Result`，方便测试覆盖目录创建和文件写入失败的边界。
+fn write_main_window_size_preference(
+    path: &Path,
+    size: MainWindowSizePreference,
+) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serialize_main_window_size_preference(size))
+}
+
+/// 获取当前平台的主窗口宽高偏好文件路径。
+///
+/// 跨平台约束：
+/// - macOS 使用 `$HOME/Library/Application Support/LogClinic`，符合普通桌面应用配置目录习惯。
+/// - Windows 使用 `%APPDATA%\LogClinic`，避免写入程序安装目录或当前工作目录。
+/// - 其他平台当前不是目标运行平台，返回 `None` 并退回默认窗口策略。
+fn main_window_size_preference_path() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        return env::var_os("HOME").map(PathBuf::from).map(|home| {
+            home.join("Library")
+                .join("Application Support")
+                .join("LogClinic")
+                .join(MAIN_WINDOW_SIZE_FILE_NAME)
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|app_data| app_data.join("LogClinic").join(MAIN_WINDOW_SIZE_FILE_NAME));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        None
+    }
+}
+
+/// 读取主窗口宽高偏好。
+///
+/// 业务意图：
+/// - 该函数作为主入口的读配置边界，隔离平台路径选择和配置文件损坏处理。
+fn load_main_window_size_preference() -> Option<MainWindowSizePreference> {
+    let path = main_window_size_preference_path()?;
+    read_main_window_size_preference(&path)
+}
+
+/// 保存主窗口宽高偏好。
+///
+/// 错误处理：
+/// - 保存失败不会影响用户关闭应用；该偏好只是体验优化，不属于日志读取、解析或展示的核心数据。
+/// - 开发调试时通过 stderr 暴露失败原因，便于定位权限或路径环境变量问题。
+fn save_main_window_size_preference(size: MainWindowSizePreference) {
+    let Some(path) = main_window_size_preference_path() else {
+        return;
+    };
+    if let Err(error) = write_main_window_size_preference(&path, size) {
+        eprintln!("保存主窗口尺寸偏好失败：{}：{}", path.display(), error);
+    }
+}
 
 /// 顶部工具栏的固定高度。
 ///
@@ -8027,6 +8326,7 @@ fn main() {
             ])
             .expect("注册内置字体失败，工具栏图标或日志正文等宽字体无法可靠渲染");
 
+        let main_display_id = primary_display_id(app);
         let window_options = WindowOptions {
             // 显式设置系统标题栏标题，保证 macOS 和 Windows 的原生窗口标题都使用产品名。
             // 后续如果标题需要包含文件名或状态，应在业务规则明确后统一修改这里的标题策略。
@@ -8034,18 +8334,27 @@ fn main() {
                 title: Some(MAIN_WINDOW_TITLE.into()),
                 ..Default::default()
             }),
-            // 使用 GPUI 提供的居中窗口边界 API，由框架根据主显示器计算平台窗口坐标。
-            // 当前不持久化位置，避免在配置目录和权限规则未定义前写入用户环境。
-            window_bounds: Some(WindowBounds::centered(
-                size(px(MAIN_WINDOW_WIDTH), px(MAIN_WINDOW_HEIGHT)),
-                app,
-            )),
+            // 使用统一启动策略决定主窗口边界：历史宽高优先，其次小屏最大化，最后大屏固定 1600x900 居中。
+            // 这里不恢复历史位置，并且显式绑定主显示器，避免多屏环境下计算居中和实际打开使用不同屏幕。
+            window_bounds: Some(build_main_window_bounds(app)),
+            display_id: main_display_id,
             ..Default::default()
         };
 
         let main_view = app
             .open_window(window_options, |window, app| {
                 let view = app.new(MainView::new);
+                // 主窗口关闭时只保存宽高，不保存位置或最大化状态。
+                // 保存失败不阻止关闭，避免配置目录权限问题影响日志查看客户端退出。
+                window.on_window_should_close(app, |window, _app| {
+                    let bounds = window.window_bounds().get_bounds();
+                    let width = bounds.size.width / px(1.0);
+                    let height = bounds.size.height / px(1.0);
+                    if let Some(size) = MainWindowSizePreference::new(width, height) {
+                        save_main_window_size_preference(size);
+                    }
+                    true
+                });
                 window.focus(&view.read(app).root_focus_handle);
                 view
             })
@@ -8084,6 +8393,173 @@ mod tests {
     //! - 本模块只验证不需要窗口系统的行为，避免测试环境依赖 macOS 或 Windows 图形能力。
 
     use super::*;
+
+    /// 构造测试用窗口尺寸。
+    ///
+    /// 业务意图：
+    /// - 测试用例只关心合法尺寸是否被策略识别，集中构造可以避免重复 unwrap 逻辑分散在各个断言里。
+    fn test_window_size(width: f32, height: f32) -> MainWindowSizePreference {
+        MainWindowSizePreference::new(width, height).expect("测试尺寸应为合法正数")
+    }
+
+    /// 构造唯一的测试临时文件路径。
+    ///
+    /// 边界条件：
+    /// - 测试只验证读写函数本身，不依赖 macOS 或 Windows 的真实配置目录。
+    /// - 路径包含进程 ID，避免并行测试或重复运行时互相覆盖。
+    fn test_window_size_file_path(name: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "logclinic3-window-size-test-{}-{}",
+            std::process::id(),
+            name
+        ))
+    }
+
+    /// 验证小屏首次启动会使用最大化窗口。
+    ///
+    /// 业务意图：
+    /// - 用户明确要求主显示器逻辑宽度 `< 1440px` 时默认最大化，1439 是阈值下方的边界样本。
+    #[test]
+    fn 小屏无历史尺寸时默认最大化() {
+        let decision = decide_main_window_startup(None, Some(1439.0));
+
+        assert_eq!(decision, MainWindowStartupDecision::DefaultMaximized);
+    }
+
+    /// 验证 1440px 及以上不再按小屏处理。
+    ///
+    /// 业务意图：
+    /// - 阈值规则是严格小于 1440，等于 1440 的屏幕应走固定 1600x900 居中窗口策略。
+    #[test]
+    fn 屏幕宽度等于阈值时默认窗口化() {
+        let decision = decide_main_window_startup(None, Some(1440.0));
+
+        assert_eq!(decision, MainWindowStartupDecision::DefaultWindowed);
+    }
+
+    /// 验证用户历史宽高优先于小屏最大化规则。
+    ///
+    /// 业务意图：
+    /// - 一旦用户手动调整过窗口，下次启动应尊重用户选择，而不是继续套用首次启动的小屏默认行为。
+    #[test]
+    fn 历史尺寸优先于小屏默认最大化() {
+        let saved_size = test_window_size(1200.0, 700.0);
+        let decision = decide_main_window_startup(Some(saved_size), Some(1024.0));
+
+        assert_eq!(decision, MainWindowStartupDecision::Remembered(saved_size));
+    }
+
+    /// 验证窗口化启动位置水平居中但垂直贴住显示器顶部。
+    ///
+    /// 业务意图：
+    /// - 固定宽高窗口用于工作台主界面，顶部应贴近系统顶部栏，避免纵向居中造成上方空白。
+    /// - 显示器可能位于非零坐标，多屏环境下必须保留显示器自身 origin。
+    #[test]
+    fn 窗口化启动位置水平居中并贴顶() {
+        let display_bounds = Bounds::new(point(px(100.0), px(50.0)), size(px(2000.0), px(1200.0)));
+
+        let bounds = top_aligned_window_bounds_for_display(
+            Some(display_bounds),
+            size(px(1600.0), px(900.0)),
+        );
+
+        assert_eq!(bounds.origin, point(px(300.0), px(50.0)));
+        assert_eq!(bounds.size, size(px(1600.0), px(900.0)));
+    }
+
+    /// 验证显示器信息缺失时窗口回退到左上角。
+    ///
+    /// 边界条件：
+    /// - 图形环境启动早期可能拿不到显示器；此时贴顶优先于纵向居中，避免窗口出现在屏幕中下方。
+    #[test]
+    fn 窗口化启动缺少显示器时回退左上角() {
+        let bounds = top_aligned_window_bounds_for_display(None, size(px(1600.0), px(900.0)));
+
+        assert_eq!(bounds.origin, point(px(0.0), px(0.0)));
+        assert_eq!(bounds.size, size(px(1600.0), px(900.0)));
+    }
+
+    /// 验证非法历史尺寸不会被接受。
+    ///
+    /// 边界条件：
+    /// - 配置文件可能被用户手工修改或写入中断破坏；零、负数、NaN 和无穷大都必须回退默认策略。
+    #[test]
+    fn 非法历史尺寸会回退默认策略() {
+        assert_eq!(MainWindowSizePreference::new(0.0, 900.0), None);
+        assert_eq!(MainWindowSizePreference::new(1600.0, -1.0), None);
+        assert_eq!(MainWindowSizePreference::new(f32::NAN, 900.0), None);
+        assert_eq!(MainWindowSizePreference::new(1600.0, f32::INFINITY), None);
+
+        assert_eq!(
+            parse_main_window_size_preference("not-a-size"),
+            None,
+            "非数字配置应被丢弃"
+        );
+        assert_eq!(
+            parse_main_window_size_preference("1600 0"),
+            None,
+            "零高度配置应被丢弃"
+        );
+        assert_eq!(
+            parse_main_window_size_preference("1600 900 extra"),
+            None,
+            "多余字段表示格式不符合约定，应被丢弃"
+        );
+    }
+
+    /// 验证合法配置文本可以解析为窗口宽高。
+    ///
+    /// 业务意图：
+    /// - 配置文件采用简单空白分隔格式，读取时需要兼容结尾换行。
+    #[test]
+    fn 合法窗口尺寸配置可以解析() {
+        assert_eq!(
+            parse_main_window_size_preference("1600 900\n"),
+            Some(test_window_size(1600.0, 900.0))
+        );
+    }
+
+    /// 验证窗口尺寸配置文件可以完成写入和读取往返。
+    ///
+    /// 边界条件：
+    /// - 写入函数需要自动创建父目录，避免首次启动关闭时配置目录不存在导致保存失败。
+    #[test]
+    fn 窗口尺寸配置可以读写往返() {
+        let path = test_window_size_file_path("roundtrip").join(MAIN_WINDOW_SIZE_FILE_NAME);
+        let size = test_window_size(1234.4, 678.6);
+
+        write_main_window_size_preference(&path, size).expect("测试配置应能写入临时目录");
+        let restored = read_main_window_size_preference(&path).expect("刚写入的配置应能读取");
+
+        assert_eq!(restored, test_window_size(1234.0, 679.0));
+
+        let _ = fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    /// 验证缺失或损坏的配置文件不会阻断默认启动策略。
+    ///
+    /// 业务意图：
+    /// - 窗口大小记忆只是体验优化，文件不存在或损坏时应视为无历史尺寸，而不是影响应用启动。
+    #[test]
+    fn 缺失和损坏的窗口尺寸配置会被忽略() {
+        let missing_path = test_window_size_file_path("missing").join(MAIN_WINDOW_SIZE_FILE_NAME);
+        assert_eq!(read_main_window_size_preference(&missing_path), None);
+
+        let broken_path = test_window_size_file_path("broken").join(MAIN_WINDOW_SIZE_FILE_NAME);
+        fs::create_dir_all(broken_path.parent().expect("测试路径应包含父目录"))
+            .expect("测试目录应能创建");
+        fs::write(&broken_path, "broken size").expect("测试损坏配置应能写入");
+
+        assert_eq!(read_main_window_size_preference(&broken_path), None);
+
+        let _ = fs::remove_file(&broken_path);
+        if let Some(parent) = broken_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
 
     /// 构造测试用目录树行。
     ///
