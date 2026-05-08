@@ -244,7 +244,7 @@ fn decide_main_window_startup(
 /// 把主窗口启动策略转换成 GPUI 窗口边界。
 ///
 /// 业务意图：
-/// - 历史宽高和大屏默认都以“水平居中、垂直贴住屏幕顶部”的窗口打开，不恢复上次位置。
+/// - 历史宽高和大屏默认都以居中窗口打开，不恢复上次位置。
 /// - 小屏默认最大化时仍把 1600x900 作为恢复尺寸交给 GPUI，用户退出最大化后能得到稳定默认宽高。
 fn main_window_bounds_for_decision(
     decision: MainWindowStartupDecision,
@@ -253,69 +253,22 @@ fn main_window_bounds_for_decision(
 ) -> WindowBounds {
     match decision {
         MainWindowStartupDecision::Remembered(saved_size) => {
-            WindowBounds::Windowed(main_window_top_aligned_bounds(
+            WindowBounds::Windowed(Bounds::centered(
                 display_id,
                 size(px(saved_size.width), px(saved_size.height)),
                 app,
             ))
         }
-        MainWindowStartupDecision::DefaultWindowed => {
-            WindowBounds::Windowed(main_window_top_aligned_bounds(
-                display_id,
-                size(px(MAIN_WINDOW_WIDTH), px(MAIN_WINDOW_HEIGHT)),
-                app,
-            ))
-        }
+        MainWindowStartupDecision::DefaultWindowed => WindowBounds::Windowed(Bounds::centered(
+            display_id,
+            size(px(MAIN_WINDOW_WIDTH), px(MAIN_WINDOW_HEIGHT)),
+            app,
+        )),
         MainWindowStartupDecision::DefaultMaximized => WindowBounds::Maximized(Bounds::centered(
             display_id,
             size(px(MAIN_WINDOW_WIDTH), px(MAIN_WINDOW_HEIGHT)),
             app,
         )),
-    }
-}
-
-/// 计算主窗口“水平居中、垂直贴顶”的启动边界。
-///
-/// 业务意图：
-/// - 日志查看窗口是工作台式界面，用户希望固定高度时顶部贴住系统顶部栏，底部自然留给 Dock 或任务栏区域。
-/// - 仅调整窗口化模式；小屏最大化仍交给操作系统处理可用工作区。
-///
-/// 跨平台约束：
-/// - macOS 和 Windows 的多屏坐标原点可能不同，因此必须基于 GPUI 当前显示器 bounds 的 origin 计算。
-/// - 如果启动早期无法读取显示器，回退到 `(0, 0)`，至少保证窗口不会被纵向居中到下方。
-fn main_window_top_aligned_bounds(
-    display_id: Option<DisplayId>,
-    window_size: gpui::Size<Pixels>,
-    app: &App,
-) -> Bounds<Pixels> {
-    let display_bounds = display_id
-        .and_then(|id| app.find_display(id))
-        .or_else(|| app.primary_display())
-        .map(|display| display.bounds());
-
-    top_aligned_window_bounds_for_display(display_bounds, window_size)
-}
-
-/// 根据显示器边界计算“水平居中、垂直贴顶”的窗口边界。
-///
-/// 业务意图：
-/// - 把几何计算拆成纯函数，避免窗口位置规则只能通过真实图形环境人工验证。
-/// - 这里不裁剪宽高；如果用户保存的宽高超过当前屏幕，仍尊重用户宽高，只负责给出顶部对齐的起点。
-fn top_aligned_window_bounds_for_display(
-    display_bounds: Option<Bounds<Pixels>>,
-    window_size: gpui::Size<Pixels>,
-) -> Bounds<Pixels> {
-    if let Some(display_bounds) = display_bounds {
-        let horizontal_offset = (display_bounds.size.width - window_size.width) * 0.5;
-        Bounds::new(
-            point(
-                display_bounds.origin.x + horizontal_offset,
-                display_bounds.origin.y,
-            ),
-            window_size,
-        )
-    } else {
-        Bounds::new(point(px(0.0), px(0.0)), window_size)
     }
 }
 
@@ -1081,6 +1034,17 @@ struct LoadedLogTreeState {
     /// - 文件很多时不能把完整树每一行都渲染成 GPUI 元素，否则滚动会卡顿。
     /// - 先按展开状态算出可见行，再交给 `uniform_list` 按可视区间懒渲染。
     visible_rows: Vec<LoadedLogTreeRow>,
+
+    /// 当前加载结果是否只包含一个可打开日志来源。
+    ///
+    /// 业务意图：
+    /// - 用户加载单个日志时应直接进入右侧浏览，不再显示只有一个文件的左侧树。
+    /// - 目录或压缩包内部如果最终只有一个可读日志，也按同一规则处理；多文件仍保留树用于选择。
+    ///
+    /// 边界条件：
+    /// - 加载过程中出现错误时不隐藏树，避免错误节点被自动打开流程吞掉，用户仍能看到失败原因。
+    /// - 只统计 `File` 节点且必须带有 `LogFileSource`，目录、压缩包容器、符号链接和错误节点不算可打开日志。
+    single_log_source: Option<LogFileSource>,
 }
 
 impl LoadedLogTreeState {
@@ -1096,14 +1060,54 @@ impl LoadedLogTreeState {
             .filter(|row| row.has_children && row.depth < LOG_TREE_DEFAULT_EXPANDED_DEPTH)
             .map(|row| row.id)
             .collect();
+        let single_log_source = Self::single_log_source_for_tree(&tree);
 
         let mut state = Self {
             tree,
             expanded_node_ids,
             visible_rows: Vec::new(),
+            single_log_source,
         };
         state.rebuild_visible_rows();
         state
+    }
+
+    /// 返回整棵加载树中唯一可打开日志来源。
+    ///
+    /// 业务意图：
+    /// - 加载单个普通文件、只含一个日志的目录、只含一个日志成员的压缩包时，主界面可以跳过左侧树并自动打开日志。
+    ///
+    /// 边界条件：
+    /// - 如果存在扫描错误，保持 `None`，让左侧树继续展示错误行，避免用户误以为目录已完整加载。
+    /// - 如果发现两个及以上可打开文件，立即返回 `None`，避免自动打开其中任意一个造成选择歧义。
+    fn single_log_source_for_tree(tree: &LoadedLogTree) -> Option<LogFileSource> {
+        if tree.error_count > 0 {
+            return None;
+        }
+
+        let mut single_source: Option<LogFileSource> = None;
+        for row in &tree.rows {
+            if row.kind != LogTreeEntryKind::File {
+                continue;
+            }
+
+            let Some(source) = row.source.clone() else {
+                continue;
+            };
+            if single_source.replace(source).is_some() {
+                return None;
+            }
+        }
+
+        single_source
+    }
+
+    /// 返回当前加载结果中唯一可打开日志来源。
+    ///
+    /// 业务意图：
+    /// - 该值在构建 UI 状态时缓存，渲染每一帧不需要重新遍历大目录树。
+    fn single_log_source(&self) -> Option<LogFileSource> {
+        self.single_log_source.clone()
     }
 
     /// 返回标题区域展示的加载摘要。
@@ -5142,7 +5146,19 @@ impl MainView {
                             view.log_tree_context_menu = None;
                             view.log_tree_selected_node_ids.clear();
                             view.log_tree_selection_anchor = None;
-                            LogTreeLoadState::Loaded(LoadedLogTreeState::new(tree))
+                            let tree_state = LoadedLogTreeState::new(tree);
+                            let single_log_source = tree_state.single_log_source();
+                            let load_state = LogTreeLoadState::Loaded(tree_state);
+
+                            // 加载结果只有一个日志时直接打开正文，左侧树由渲染层隐藏。
+                            // 这里仍然保留 `Loaded` 状态，搜索当前目录等功能可以继续复用完整来源树。
+                            if let Some(source) = single_log_source {
+                                view.load_state = load_state;
+                                view.open_log_file(source, context);
+                                return;
+                            }
+
+                            load_state
                         }
                         Err(error) => LogTreeLoadState::Failed {
                             message: error.to_string(),
@@ -8443,18 +8459,33 @@ impl MainView {
     /// - 当前提示不承载按钮，避免和顶部“加载日志”入口形成重复操作路径。
     fn render_primary_content_message(&self) -> impl IntoElement {
         let palette = self.palette();
+        if let LogTreeLoadState::Loading { message } = &self.load_state {
+            return div()
+                .id("primary-content-loading-message")
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .size_full()
+                .px_4()
+                .bg(rgb(palette.background))
+                .child(Self::render_loading_spinner(palette.accent))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(palette.muted_text))
+                        .text_center()
+                        .child(message.clone()),
+                );
+        }
+
         let (icon, icon_color, title, description) = match &self.load_state {
             LogTreeLoadState::Empty => (
                 Icon::FileText,
                 palette.muted_text,
                 "请先加载日志".to_string(),
                 "点击左上角“加载日志”，选择日志文件、目录或压缩包。".to_string(),
-            ),
-            LogTreeLoadState::Loading { message } => (
-                Icon::Loader,
-                palette.muted_text,
-                "正在加载日志".to_string(),
-                message.clone(),
             ),
             LogTreeLoadState::Failed { message } => (
                 Icon::FileX,
@@ -8468,6 +8499,7 @@ impl MainView {
                 String::new(),
                 String::new(),
             ),
+            LogTreeLoadState::Loading { .. } => unreachable!("加载态已在上方提前返回"),
         };
 
         div()
@@ -8500,7 +8532,7 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 加载日志后但尚未打开任何文件时，右侧给出“点击左侧日志文件查看内容”的友好提示。
-    /// - 打开文件后显示 tab 栏、编码切换工具条和只读日志正文。
+    /// - 打开文件后显示 tab 栏、编码切换工具条和只读日志正文；单日志模式隐藏 tab 栏，把空间留给正文。
     /// - 搜索结果面板打开后作为底部分栏参与布局，日志正文和滚动条高度会自动扣除面板高度。
     ///
     /// 边界条件：
@@ -8513,6 +8545,14 @@ impl MainView {
                 .flex_1()
                 .size_full()
                 .child(self.render_loaded_right_empty_message())
+        } else if self.should_hide_log_tree_panel() {
+            div()
+                .id("right-log-panel-single-tab")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .size_full()
+                .child(self.render_active_log_tab(context))
         } else {
             div()
                 .id("right-log-panel-tabs")
@@ -9416,7 +9456,7 @@ impl MainView {
         window_y: f32,
         context: &mut Context<Self>,
     ) {
-        let panel_x = (window_x - self.left_panel_width - SPLITTER_VISIBLE_WIDTH).max(0.0);
+        let panel_x = (window_x - self.right_panel_left_offset()).max(0.0);
         let panel_y = (window_y - TOOLBAR_HEIGHT).max(0.0);
         self.search_results_context_menu = Some(SearchResultsContextMenu {
             x: panel_x,
@@ -10719,7 +10759,7 @@ impl MainView {
         } else {
             Some(EncodingDropdownMenu {
                 tab_id,
-                x: Self::encoding_dropdown_menu_x(self.left_panel_width, window_x),
+                x: self.encoding_dropdown_menu_x(window_x),
                 y: Self::encoding_dropdown_menu_y(window_y),
             })
         };
@@ -10736,8 +10776,8 @@ impl MainView {
     ///
     /// 边界条件：
     /// - 点击按钮文字或箭头会带来几个像素的偏差，但菜单仍紧邻编码按钮，不会回到旧版左侧固定位置。
-    fn encoding_dropdown_menu_x(left_panel_width: f32, window_x: f32) -> f32 {
-        let panel_x = (window_x - left_panel_width - SPLITTER_VISIBLE_WIDTH).max(0.0);
+    fn encoding_dropdown_menu_x(&self, window_x: f32) -> f32 {
+        let panel_x = (window_x - self.right_panel_left_offset()).max(0.0);
         (panel_x - ENCODING_DROPDOWN_BUTTON_WIDTH / 2.0).max(0.0)
     }
 
@@ -11997,7 +12037,7 @@ impl MainView {
     ) {
         // GPUI 鼠标事件给出的是窗口内容坐标，而右键菜单作为右侧面板内部的绝对定位元素渲染。
         // 这里把坐标转换到右侧面板局部坐标，避免菜单因为左侧目录树和顶部工具栏的偏移而显示到错误位置。
-        let panel_x = (window_x - self.left_panel_width - SPLITTER_VISIBLE_WIDTH).max(0.0);
+        let panel_x = (window_x - self.right_panel_left_offset()).max(0.0);
         let panel_y = (window_y - TOOLBAR_HEIGHT).max(0.0);
         self.activate_tab(tab_id);
         self.tab_context_menu = Some(TabContextMenu {
@@ -12059,7 +12099,8 @@ impl MainView {
     /// 渲染 tab 右键菜单单项。
     ///
     /// 业务意图：
-    /// - 菜单项点击后立即执行关闭命令并收起菜单。
+    /// - 菜单项在鼠标按下时立即执行关闭命令并收起菜单，和左侧目录树右键菜单保持一致。
+    /// - 自绘弹层同时存在透明关闭遮罩，使用 `mouse_down` 可以避免 `click` 在菜单收起或鼠标轻微移动后丢失。
     fn render_tab_context_menu_item(
         &self,
         tab_id: usize,
@@ -12079,9 +12120,11 @@ impl MainView {
             .cursor_pointer()
             .hover(move |item| item.bg(rgb(palette.hover)))
             .child(label)
-            .on_click(
-                context.listener(move |view, _event: &ClickEvent, _window, context| {
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(move |view, _event: &MouseDownEvent, _window, context| {
                     view.handle_tab_context_menu_action(tab_id, action, context);
+                    context.stop_propagation();
                 }),
             )
     }
@@ -12096,13 +12139,15 @@ impl MainView {
         action: TabContextMenuAction,
         context: &mut Context<Self>,
     ) {
+        // 先收起所有右侧弹层，再执行关闭动作，避免“关闭所有”后旧菜单仍参与下一帧命中测试。
+        self.tab_context_menu = None;
+        self.encoding_dropdown_menu = None;
+        self.search_results_context_menu = None;
         match action {
             TabContextMenuAction::Current => self.close_tab(tab_id),
             TabContextMenuAction::OtherTabs => self.close_other_tabs(tab_id),
             TabContextMenuAction::AllTabs => self.close_all_tabs(),
         }
-        self.tab_context_menu = None;
-        self.encoding_dropdown_menu = None;
         context.notify();
     }
 
@@ -12190,7 +12235,9 @@ impl MainView {
         }
         self.open_tabs.clear();
         self.active_tab_id = None;
+        self.tab_context_menu = None;
         self.encoding_dropdown_menu = None;
+        self.search_results_context_menu = None;
         self.log_scrollbar_drag = None;
         self.tab_bar_scroll_handle = ScrollHandle::new();
         self.clear_search_current_file_match_count();
@@ -12234,6 +12281,25 @@ impl MainView {
                 .child(self.render_primary_content_message());
         }
 
+        if self.should_hide_log_tree_panel() {
+            return div()
+                .id("log-content-single-log-view")
+                .flex()
+                .flex_1()
+                .size_full()
+                .bg(rgb(palette.background))
+                .child(
+                    div()
+                        .id("right-log-panel-single-log")
+                        .relative()
+                        .h_full()
+                        .flex_1()
+                        .bg(rgb(palette.background))
+                        .overflow_hidden()
+                        .child(self.render_right_log_panel(context)),
+                );
+        }
+
         div()
             .id("log-content-split-view")
             .flex()
@@ -12270,6 +12336,31 @@ impl MainView {
                     .child(self.render_right_log_panel(context))
                     .child(self.render_splitter_hit_overlay(context)),
             )
+    }
+
+    /// 判断当前加载结果是否应隐藏左侧目录树。
+    ///
+    /// 业务意图：
+    /// - 当用户加载的内容最终只有一个可打开日志时，左侧树没有选择价值，应把完整空间留给日志浏览。
+    /// - 多文件目录或压缩包仍显示左侧树，便于用户选择、右键保存和线程分析。
+    fn should_hide_log_tree_panel(&self) -> bool {
+        matches!(
+            &self.load_state,
+            LogTreeLoadState::Loaded(tree_state) if tree_state.single_log_source().is_some()
+        )
+    }
+
+    /// 返回右侧日志工作区相对窗口内容区左侧的横向偏移。
+    ///
+    /// 业务意图：
+    /// - 右键菜单和编码下拉菜单由窗口坐标转换到右侧面板局部坐标，必须和当前布局是否隐藏左侧树保持一致。
+    /// - 单日志模式没有左侧树和分割线，偏移为 0；多文件模式仍扣除左侧树宽度和分割线宽度。
+    fn right_panel_left_offset(&self) -> f32 {
+        if self.should_hide_log_tree_panel() {
+            0.0
+        } else {
+            self.left_panel_width + SPLITTER_VISIBLE_WIDTH
+        }
     }
 
     /// 渲染左右两栏之间的可拖动分割线。
@@ -12716,36 +12807,6 @@ mod tests {
         assert_eq!(decision, MainWindowStartupDecision::Remembered(saved_size));
     }
 
-    /// 验证窗口化启动位置水平居中但垂直贴住显示器顶部。
-    ///
-    /// 业务意图：
-    /// - 固定宽高窗口用于工作台主界面，顶部应贴近系统顶部栏，避免纵向居中造成上方空白。
-    /// - 显示器可能位于非零坐标，多屏环境下必须保留显示器自身 origin。
-    #[test]
-    fn 窗口化启动位置水平居中并贴顶() {
-        let display_bounds = Bounds::new(point(px(100.0), px(50.0)), size(px(2000.0), px(1200.0)));
-
-        let bounds = top_aligned_window_bounds_for_display(
-            Some(display_bounds),
-            size(px(1600.0), px(900.0)),
-        );
-
-        assert_eq!(bounds.origin, point(px(300.0), px(50.0)));
-        assert_eq!(bounds.size, size(px(1600.0), px(900.0)));
-    }
-
-    /// 验证显示器信息缺失时窗口回退到左上角。
-    ///
-    /// 边界条件：
-    /// - 图形环境启动早期可能拿不到显示器；此时贴顶优先于纵向居中，避免窗口出现在屏幕中下方。
-    #[test]
-    fn 窗口化启动缺少显示器时回退左上角() {
-        let bounds = top_aligned_window_bounds_for_display(None, size(px(1600.0), px(900.0)));
-
-        assert_eq!(bounds.origin, point(px(0.0), px(0.0)));
-        assert_eq!(bounds.size, size(px(1600.0), px(900.0)));
-    }
-
     /// 验证非法历史尺寸不会被接受。
     ///
     /// 边界条件：
@@ -13051,6 +13112,16 @@ mod tests {
             archive_path: PathBuf::from("logs.zip"),
             archive_format: log_loader::ArchiveFormat::Zip,
             member_path: member_path.to_string(),
+        }
+    }
+
+    /// 构造测试用本地日志来源。
+    ///
+    /// 边界条件：
+    /// - 测试只比较来源是否被识别为唯一日志，不访问真实磁盘路径。
+    fn test_local_file(path: &str) -> LogFileSource {
+        LogFileSource::LocalFile {
+            path: PathBuf::from(path),
         }
     }
 
@@ -13614,6 +13685,80 @@ mod tests {
         let state = LoadedLogTreeState::new(tree);
 
         assert_eq!(state.single_file_source_for_archive(0), Some(source));
+    }
+
+    /// 验证整棵加载树只有一个日志时会记录唯一来源，供主界面隐藏左侧树并自动打开。
+    ///
+    /// 业务意图：
+    /// - 普通单文件和只含一个日志的目录都应走单日志浏览模式，避免左侧树占用空间。
+    #[test]
+    fn 单日志加载结果返回唯一来源() {
+        let source = test_local_file("/tmp/app.log");
+        let tree = LoadedLogTree {
+            summary: "1 个节点".to_string(),
+            rows: vec![test_tree_row(
+                0,
+                0,
+                LogTreeEntryKind::File,
+                false,
+                Some(source.clone()),
+            )],
+            error_count: 0,
+        };
+        let state = LoadedLogTreeState::new(tree);
+
+        assert_eq!(state.single_log_source(), Some(source));
+    }
+
+    /// 验证多日志或存在扫描错误时不会隐藏左侧树。
+    ///
+    /// 业务意图：
+    /// - 多文件目录需要用户从左侧树中选择；存在错误时也要展示错误节点，不能被自动打开流程遮蔽。
+    #[test]
+    fn 多日志或错误加载结果不返回唯一来源() {
+        let multi_tree = LoadedLogTree {
+            summary: "2 个节点".to_string(),
+            rows: vec![
+                test_tree_row(
+                    0,
+                    0,
+                    LogTreeEntryKind::File,
+                    false,
+                    Some(test_local_file("/tmp/a.log")),
+                ),
+                test_tree_row(
+                    1,
+                    0,
+                    LogTreeEntryKind::File,
+                    false,
+                    Some(test_local_file("/tmp/b.log")),
+                ),
+            ],
+            error_count: 0,
+        };
+        let error_tree = LoadedLogTree {
+            summary: "2 个节点，1 个错误".to_string(),
+            rows: vec![
+                test_tree_row(
+                    0,
+                    0,
+                    LogTreeEntryKind::File,
+                    false,
+                    Some(test_local_file("/tmp/a.log")),
+                ),
+                test_tree_row(1, 0, LogTreeEntryKind::Error, false, None),
+            ],
+            error_count: 1,
+        };
+
+        assert_eq!(
+            LoadedLogTreeState::new(multi_tree).single_log_source(),
+            None
+        );
+        assert_eq!(
+            LoadedLogTreeState::new(error_tree).single_log_source(),
+            None
+        );
     }
 
     /// 验证多文件压缩包不会被绑定到单个成员，仍应保留展开/收起目录树的行为。
