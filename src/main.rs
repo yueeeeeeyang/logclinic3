@@ -34,15 +34,21 @@ use gpui::{
 };
 use lucide_icons::{Icon, LUCIDE_FONT_BYTES};
 
+mod archive_materializer;
 mod highlighting;
+mod large_log;
+mod line_index;
 mod log_content;
 mod log_loader;
+mod paged_document;
 mod search;
+mod stream_search;
 
+use archive_materializer::{cleanup_materialized_file, cleanup_stale_large_log_cache};
 use highlighting::{SyntaxTheme, highlight_line};
+use large_log::{LargeLogOpenResult, LogTabDocument, open_log_source_for_tab};
 use log_content::{
-    DecodedLogDocument, EncodingChoice, LogContentError, LogTextEncoding, decode_log_bytes,
-    read_log_source_bytes,
+    EncodingChoice, LogContentError, LogTextEncoding, decode_log_bytes, read_log_source_bytes,
 };
 use log_loader::{
     LoadedLogTree, LogFileSource, LogTreeEntryKind, LogTreeRow as LoadedLogTreeRow,
@@ -53,6 +59,7 @@ use search::{
     collect_current_directory_sources, count_query_occurrences, search_lines,
     source_location_label,
 };
+use stream_search::{count_query_occurrences_paged, search_paged_document};
 
 actions!(logclinic, [OpenSearchDialog]);
 
@@ -2116,11 +2123,11 @@ enum SearchTarget {
     CurrentFile {
         /// 当前文件来源。
         source: LogFileSource,
-        /// 当前文件已解码行。
+        /// 当前文件文档。
         ///
         /// 业务意图：
-        /// - 搜索大文件时不能在 UI 线程克隆整份日志，使用 `Arc` 共享解码结果，让后台任务只增加引用计数。
-        lines: Arc<Vec<String>>,
+        /// - 小文件共享已解码行集合，超大文件共享分页文档，避免搜索路径重新把大文件载入内存。
+        document: LogTabDocument,
     },
     /// 搜索当前目录递归来源。
     CurrentDirectory {
@@ -4179,7 +4186,10 @@ enum LogTabState {
     /// 已成功解码。
     Ready {
         /// 可供右侧虚拟列表渲染的日志文档。
-        document: DecodedLogDocument,
+        ///
+        /// 业务意图：
+        /// - 小文件保存完整解码文档，超大文件保存分页文档；UI 渲染层通过统一枚举读取行数和可见文本。
+        document: LogTabDocument,
     },
     /// 读取或解码失败。
     Failed {
@@ -4196,9 +4206,9 @@ enum LogTabLoadResult {
     /// 读取和自动解码都成功。
     Ready {
         /// 原始字节，用于后续手动切换编码。
-        raw_bytes: Arc<Vec<u8>>,
+        raw_bytes: Option<Arc<Vec<u8>>>,
         /// 自动解码后的文档。
-        document: DecodedLogDocument,
+        document: LogTabDocument,
     },
     /// 原始字节读取成功，但自动检测或解码失败。
     DecodeFailed {
@@ -4227,7 +4237,7 @@ enum LogTabDecodeResult {
         /// - 用户快速连续切换编码时，较早的后台任务可能晚返回；合并阶段需要用该字段识别并丢弃过期结果。
         encoding_choice: EncodingChoice,
         /// 新编码下的日志文档。
-        document: DecodedLogDocument,
+        document: LogTabDocument,
     },
     /// 解码失败。
     Failed {
@@ -5155,6 +5165,9 @@ impl MainView {
     /// - 搜索窗口本身不强制关闭，保留用户输入的关键字；但正在运行的搜索会被置为无效，旧后台回调无法继续写回结果面板。
     /// - 只清理会引用旧日志来源的数据，不重置主题、窗口、左侧宽度等会话级偏好。
     fn clear_workspace_for_new_log_load(&mut self) {
+        for tab in &self.open_tabs {
+            Self::cleanup_tab_paged_resources(tab);
+        }
         self.open_tabs.clear();
         self.active_tab_id = None;
         self.tab_context_menu = None;
@@ -6742,21 +6755,21 @@ impl MainView {
                 let result = app
                     .background_executor()
                     .spawn(async move {
-                        match read_log_source_bytes(&source) {
-                            Ok(raw_bytes) => {
-                                match decode_log_bytes(
-                                    &raw_bytes,
-                                    EncodingChoice::Auto,
-                                    &source_name,
-                                ) {
-                                    Ok(document) => LogTabLoadResult::Ready {
-                                        raw_bytes,
-                                        document,
-                                    },
-                                    Err(error) => LogTabLoadResult::DecodeFailed {
-                                        raw_bytes,
-                                        message: error.to_string(),
-                                    },
+                        match open_log_source_for_tab(source, EncodingChoice::Auto, &source_name) {
+                            Ok(LargeLogOpenResult::InMemoryReady {
+                                raw_bytes,
+                                document,
+                            }) => LogTabLoadResult::Ready {
+                                raw_bytes: Some(raw_bytes),
+                                document: LogTabDocument::InMemory(document),
+                            },
+                            Ok(LargeLogOpenResult::InMemoryDecodeFailed { raw_bytes, message }) => {
+                                LogTabLoadResult::DecodeFailed { raw_bytes, message }
+                            }
+                            Ok(LargeLogOpenResult::PagedReady { document }) => {
+                                LogTabLoadResult::Ready {
+                                    raw_bytes: None,
+                                    document: LogTabDocument::Paged(document),
                                 }
                             }
                             Err(error) => LogTabLoadResult::ReadFailed {
@@ -6794,7 +6807,7 @@ impl MainView {
                     raw_bytes,
                     document,
                 } => {
-                    tab.raw_bytes = Some(raw_bytes);
+                    tab.raw_bytes = raw_bytes;
                     tab.state = LogTabState::Ready { document };
                     pending_scroll_to_line = tab.pending_scroll_to_line.take();
                 }
@@ -6835,14 +6848,25 @@ impl MainView {
             return;
         };
 
-        let Some(raw_bytes) = tab.raw_bytes.clone() else {
-            // 原始字节尚未读取完成时不能提前写入编码选择，否则后台自动加载完成后会出现
+        let raw_bytes = tab.raw_bytes.clone();
+        let paged_document = match &tab.state {
+            LogTabState::Ready {
+                document: LogTabDocument::Paged(document),
+            } => Some(document.clone()),
+            LogTabState::Ready {
+                document: LogTabDocument::InMemory(_),
+            }
+            | LogTabState::Loading { .. }
+            | LogTabState::Failed { .. } => None,
+        };
+        if raw_bytes.is_none() && paged_document.is_none() {
+            // 原始字节或分页文档尚未读取完成时不能提前写入编码选择，否则后台自动加载完成后会出现
             // “下拉框显示手动编码、正文却来自自动识别”的状态不一致。
             self.tab_context_menu = None;
             self.encoding_dropdown_menu = None;
             context.notify();
             return;
-        };
+        }
 
         tab.encoding_choice = encoding_choice;
         tab.scroll_handle = UniformListScrollHandle::new();
@@ -6863,7 +6887,11 @@ impl MainView {
             self.log_scrollbar_drag = None;
         }
         context.notify();
-        self.spawn_log_tab_decode(tab_id, raw_bytes, encoding_choice, source_name, context);
+        if let Some(raw_bytes) = raw_bytes {
+            self.spawn_log_tab_decode(tab_id, raw_bytes, encoding_choice, source_name, context);
+        } else if let Some(document) = paged_document {
+            self.spawn_paged_log_tab_decode(tab_id, document, encoding_choice, context);
+        }
     }
 
     /// 启动日志 tab 的后台重新解码任务。
@@ -6886,9 +6914,48 @@ impl MainView {
                         decode_log_bytes(&raw_bytes, encoding_choice, &source_name)
                             .map(|document| LogTabDecodeResult::Ready {
                                 encoding_choice,
-                                document,
+                                document: LogTabDocument::InMemory(document),
                             })
                             .unwrap_or_else(|error: LogContentError| LogTabDecodeResult::Failed {
+                                encoding_choice,
+                                message: error.to_string(),
+                            })
+                    })
+                    .await;
+
+                view.update(app, |view, context| {
+                    view.apply_log_tab_decode_result(tab_id, result);
+                    context.notify();
+                })
+                .ok();
+            })
+            .detach();
+    }
+
+    /// 启动分页日志 tab 的后台编码切换任务。
+    ///
+    /// 业务意图：
+    /// - 超大日志切换编码时不能重新读取压缩包或重建行索引，只更新分页文档的解码策略并清理可见行缓存。
+    /// - 该操作仍放到后台执行，避免自动检测编码样本读取影响 UI 响应。
+    fn spawn_paged_log_tab_decode(
+        &self,
+        tab_id: usize,
+        document: paged_document::PagedLogDocument,
+        encoding_choice: EncodingChoice,
+        context: &mut Context<Self>,
+    ) {
+        context
+            .spawn(async move |view, app| {
+                let result = app
+                    .background_executor()
+                    .spawn(async move {
+                        document
+                            .with_encoding(encoding_choice)
+                            .map(|document| LogTabDecodeResult::Ready {
+                                encoding_choice,
+                                document: LogTabDocument::Paged(document),
+                            })
+                            .unwrap_or_else(|error| LogTabDecodeResult::Failed {
                                 encoding_choice,
                                 message: error.to_string(),
                             })
@@ -7076,29 +7143,30 @@ impl MainView {
         };
 
         let (start, end) = selection.normalized();
-        if document.lines.is_empty() || start.line_index >= document.lines.len() {
+        let line_count = document.line_count();
+        if line_count == 0 || start.line_index >= line_count {
             return None;
         }
-        let end_line_index = end.line_index.min(document.lines.len().saturating_sub(1));
+        let end_line_index = end.line_index.min(line_count.saturating_sub(1));
         if start.line_index > end_line_index {
             return None;
         }
 
         let mut selected_text = String::new();
         for line_index in start.line_index..=end_line_index {
-            let Some(line) = document.lines.get(line_index) else {
+            let Some(line) = Self::log_document_line_text(document, line_index) else {
                 continue;
             };
             if line_index > start.line_index {
                 selected_text.push('\n');
             }
             let Some((start_column, end_column)) =
-                Self::selection_columns_for_line(selection, line_index, line)
+                Self::selection_columns_for_line(selection, line_index, &line)
             else {
                 continue;
             };
-            let start_byte = Self::byte_index_for_char_column(line, start_column);
-            let end_byte = Self::byte_index_for_char_column(line, end_column);
+            let start_byte = Self::byte_index_for_char_column(&line, start_column);
+            let end_byte = Self::byte_index_for_char_column(&line, end_column);
             if start_byte < end_byte {
                 selected_text.push_str(&line[start_byte..end_byte]);
             }
@@ -7121,6 +7189,22 @@ impl MainView {
                     .map(ToOwned::to_owned)
             })
             .filter(|query| !query.is_empty())
+    }
+
+    /// 按统一文档模型读取指定行文本。
+    ///
+    /// 业务意图：
+    /// - 小文件行文本来自内存 `Vec<String>`，超大文件行文本来自分页 seek 读取；复制、渲染和命中定位需要共享同一入口。
+    /// - 分页读取失败时返回 `None`，避免复制或临时渲染路径因单行 I/O 错误直接崩溃；真正的打开错误仍在后台任务阶段展示。
+    fn log_document_line_text(document: &LogTabDocument, line_index: usize) -> Option<String> {
+        match document {
+            LogTabDocument::InMemory(document) => document.lines.get(line_index).cloned(),
+            LogTabDocument::Paged(document) => document
+                .read_line(line_index)
+                .ok()
+                .flatten()
+                .map(|line| line.text),
+        }
     }
 
     /// 返回某一行被当前选择覆盖的字符列范围。
@@ -7579,7 +7663,7 @@ impl MainView {
             SearchScope::CurrentFile => match &active_tab.state {
                 LogTabState::Ready { document } => SearchTarget::CurrentFile {
                     source: active_tab.source.clone(),
-                    lines: Arc::clone(&document.lines),
+                    document: document.clone(),
                 },
                 LogTabState::Loading { .. } => {
                     self.update_search_dialog_message("当前文件仍在加载，完成后再搜索", context);
@@ -7673,8 +7757,8 @@ impl MainView {
         context.notify();
 
         match search_target {
-            SearchTarget::CurrentFile { source, lines } => {
-                self.spawn_current_file_search(job_id, source, lines, options, context);
+            SearchTarget::CurrentFile { source, document } => {
+                self.spawn_current_file_search(job_id, source, document, options, context);
             }
             SearchTarget::CurrentDirectory { sources } => {
                 self.spawn_current_directory_search(job_id, sources, options, context);
@@ -7704,7 +7788,7 @@ impl MainView {
         &self,
         job_id: usize,
         source: LogFileSource,
-        lines: Arc<Vec<String>>,
+        document: LogTabDocument,
         options: SearchOptions,
         context: &mut Context<Self>,
     ) {
@@ -7712,7 +7796,18 @@ impl MainView {
             .spawn(async move |view, app| {
                 let results = app
                     .background_executor()
-                    .spawn(async move { search_lines(&source, lines.as_ref(), &options) })
+                    .spawn(async move {
+                        match document {
+                            LogTabDocument::InMemory(document) => {
+                                search_lines(&source, document.lines.as_ref(), &options)
+                            }
+                            LogTabDocument::Paged(document) => {
+                                let outcome = search_paged_document(&document, &options);
+                                let _ = outcome.truncated;
+                                outcome.results
+                            }
+                        }
+                    })
                     .await;
 
                 view.update(app, |view, context| {
@@ -7780,19 +7875,28 @@ impl MainView {
         options: SearchOptions,
     ) -> Result<Vec<SearchResultItem>, SearchFileError> {
         let file_name = source.display_name();
-        let raw_bytes = read_log_source_bytes(&source).map_err(|error| SearchFileError {
-            file_name: file_name.clone(),
-            message: error.to_string(),
-        })?;
-        let document =
-            decode_log_bytes(&raw_bytes, EncodingChoice::Auto, &file_name).map_err(|error| {
-                SearchFileError {
-                    file_name: file_name.clone(),
-                    message: error.to_string(),
-                }
+        let opened = open_log_source_for_tab(source.clone(), EncodingChoice::Auto, &file_name)
+            .map_err(|error| SearchFileError {
+                file_name: file_name.clone(),
+                message: error.to_string(),
             })?;
 
-        Ok(search_lines(&source, &document.lines, &options))
+        match opened {
+            LargeLogOpenResult::InMemoryReady { document, .. } => {
+                Ok(search_lines(&source, &document.lines, &options))
+            }
+            LargeLogOpenResult::InMemoryDecodeFailed { message, .. } => {
+                Err(SearchFileError { file_name, message })
+            }
+            LargeLogOpenResult::PagedReady { document } => {
+                let outcome = search_paged_document(&document, &options);
+                let _ = outcome.truncated;
+                if let Some(temp_path) = document.materialized_temp_path.as_deref() {
+                    cleanup_materialized_file(temp_path);
+                }
+                Ok(outcome.results)
+            }
+        }
     }
 
     /// 合并单个文件的搜索结果并返回任务是否仍然有效。
@@ -8970,18 +9074,18 @@ impl MainView {
     /// - 计数按钮只统计当前已经打开并成功解码的活动文件，不触发后台读取，也不扫描当前目录。
     /// - 空关键字没有统计意义；加载中或失败 tab 也不能提供可靠计数。
     fn search_can_count_current_file(&self, dialog: &SearchDialogState) -> bool {
-        !dialog.query.trim().is_empty() && self.active_log_tab_document_lines().is_some()
+        !dialog.query.trim().is_empty() && self.active_log_tab_document().is_some()
     }
 
-    /// 返回当前激活 tab 的已解码行集合。
+    /// 返回当前激活 tab 的文档。
     ///
     /// 边界条件：
     /// - 没有活动 tab、tab 已关闭、仍在加载或打开失败时都返回 `None`，调用方据此展示不可用状态。
-    fn active_log_tab_document_lines(&self) -> Option<Arc<Vec<String>>> {
+    fn active_log_tab_document(&self) -> Option<LogTabDocument> {
         let active_tab_id = self.active_tab_id?;
         let active_tab = self.open_tabs.iter().find(|tab| tab.id == active_tab_id)?;
         match &active_tab.state {
-            LogTabState::Ready { document } => Some(Arc::clone(&document.lines)),
+            LogTabState::Ready { document } => Some(document.clone()),
             LogTabState::Loading { .. } | LogTabState::Failed { .. } => None,
         }
     }
@@ -9013,11 +9117,16 @@ impl MainView {
             self.update_search_dialog_message("请输入要计数的关键字", context);
             return;
         }
-        let Some(lines) = self.active_log_tab_document_lines() else {
+        let Some(document) = self.active_log_tab_document() else {
             self.update_search_dialog_message("当前文件未打开完成，无法计数", context);
             return;
         };
-        let count = count_query_occurrences(&lines, &options);
+        let count = match document {
+            LogTabDocument::InMemory(document) => {
+                count_query_occurrences(&document.lines, &options)
+            }
+            LogTabDocument::Paged(document) => count_query_occurrences_paged(&document, &options),
+        };
         if let Some(dialog) = self.search_dialog.as_mut() {
             dialog.current_file_match_count = Some(count);
             dialog.message = format!("当前文件命中 {count} 次");
@@ -10412,20 +10521,20 @@ impl MainView {
         let status = match &tab.state {
             LogTabState::Ready { document } => {
                 // 状态栏展示编码来源和行数；实际编码本身由右侧内联编码选择器负责显示和切换。
-                let encoding_source = if document.detected_automatically {
+                let encoding_source = if document.detected_automatically() {
                     "自动识别"
                 } else {
                     "手动选择"
                 };
-                let replacement_warning = if document.had_replacements {
+                let replacement_warning = if document.had_replacements() {
                     " · 含替换字符"
                 } else {
                     ""
                 };
                 format!(
-                    "{} · {} 行{}",
+                    "{} · {}{}",
                     encoding_source,
-                    document.line_count(),
+                    document.status_line_label(),
                     replacement_warning
                 )
             }
@@ -10462,7 +10571,7 @@ impl MainView {
                     .child(self.render_encoding_selector(
                         tab.id,
                         encoding_button_label,
-                        tab.raw_bytes.is_some(),
+                        matches!(tab.state, LogTabState::Ready { .. }) || tab.raw_bytes.is_some(),
                         palette,
                         context,
                     ))
@@ -10483,7 +10592,7 @@ impl MainView {
     fn log_tab_encoding_selector_label(tab: &OpenLogTab) -> &'static str {
         match tab.encoding_choice {
             EncodingChoice::Auto => match &tab.state {
-                LogTabState::Ready { document } => document.encoding.label(),
+                LogTabState::Ready { document } => document.encoding_label(),
                 LogTabState::Loading { .. } | LogTabState::Failed { .. } => {
                     EncodingChoice::Auto.label()
                 }
@@ -10591,9 +10700,9 @@ impl MainView {
         if !self
             .open_tabs
             .iter()
-            .any(|tab| tab.id == tab_id && tab.raw_bytes.is_some())
+            .any(|tab| tab.id == tab_id && matches!(tab.state, LogTabState::Ready { .. }))
         {
-            // 编码菜单必须等原始字节可用后才能打开，避免用户在加载过程中选择编码但无法立即解析。
+            // 编码菜单必须等内存原始字节或分页文档可用后才能打开，避免用户在加载过程中选择编码但无法立即解析。
             self.encoding_dropdown_menu = None;
             self.tab_context_menu = None;
             self.search_results_context_menu = None;
@@ -10914,14 +11023,14 @@ impl MainView {
     fn render_log_document_viewer(
         &self,
         tab: &OpenLogTab,
-        document: &DecodedLogDocument,
+        document: &LogTabDocument,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let tab_id = tab.id;
         let line_count = document.line_count();
         let scroll_handle = tab.scroll_handle.clone();
         let line_number_width = Self::log_viewer_line_number_width(line_count);
-        let horizontal_measure_line_index = document.longest_line_index;
+        let horizontal_measure_line_index = document.longest_line_index();
         let row_scroll_handle = scroll_handle.clone();
         let palette = self.palette();
         let syntax_theme = self.effective_theme().syntax_theme();
@@ -10934,7 +11043,7 @@ impl MainView {
             .overflow_hidden()
             .bg(rgb(palette.background));
 
-        let viewer = if let Some(warning) = &document.warning {
+        let viewer = if let Some(warning) = document.warning() {
             viewer.child(
                 div()
                     .flex_none()
@@ -10949,7 +11058,7 @@ impl MainView {
                     .bg(rgb(palette.search_highlight))
                     .border_b_1()
                     .border_color(rgb(palette.border))
-                    .child(warning.clone()),
+                    .child(warning.to_string()),
             )
         } else {
             viewer
@@ -10985,21 +11094,37 @@ impl MainView {
                                     .iter()
                                     .find(|tab| tab.id == tab_id)
                                     .and_then(|tab| match &tab.state {
-                                        LogTabState::Ready { document } => {
-                                            Some((
-                                                document,
-                                                tab.highlighted_search_line,
-                                                tab.text_selection.clone(),
-                                            ))
-                                        }
+                                        LogTabState::Ready { document } => Some((
+                                            document,
+                                            tab.highlighted_search_line,
+                                            tab.text_selection.clone(),
+                                        )),
                                         LogTabState::Loading { .. }
                                         | LogTabState::Failed { .. } => None,
                                     })
                                     .map(|(document, highlighted_search_line, text_selection)| {
                                         range
                                             .filter_map(|index| {
-                                                document.lines.get(index).map(|line| {
-                                                    let precomputed = document
+                                                let line = match document {
+                                                    LogTabDocument::InMemory(document) => document
+                                                        .lines
+                                                        .get(index)
+                                                        .cloned(),
+                                                    LogTabDocument::Paged(document) => document
+                                                        .read_line(index)
+                                                        .ok()
+                                                        .flatten()
+                                                        .map(|line| {
+                                                            let _ = (
+                                                                line.line_number,
+                                                                line.byte_offset,
+                                                                line.had_replacements,
+                                                            );
+                                                            line.text
+                                                        }),
+                                                }?;
+                                                let precomputed = match document {
+                                                    LogTabDocument::InMemory(document) => document
                                                         .precomputed_highlights
                                                         .as_ref()
                                                         .filter(|_| {
@@ -11007,17 +11132,27 @@ impl MainView {
                                                         })
                                                         .and_then(|highlights| {
                                                             highlights.lines.get(index)
-                                                        });
+                                                        }),
+                                                    LogTabDocument::Paged(_) => None,
+                                                };
+                                                let highlight_mode = match document {
+                                                    LogTabDocument::InMemory(document) => {
+                                                        document.highlight_mode
+                                                    }
+                                                    LogTabDocument::Paged(document) => {
+                                                        document.highlight_mode
+                                                    }
+                                                };
                                                     let mut line_highlights = highlight_line(
-                                                        document.highlight_mode,
-                                                        line,
+                                                        highlight_mode,
+                                                        &line,
                                                         precomputed,
                                                         syntax_theme,
                                                     );
                                                     if let Some(selection) = &text_selection
                                                         && let Some(range) =
                                                             Self::selected_byte_range_for_line(
-                                                                selection, index, line,
+                                                                selection, index, &line,
                                                             )
                                                     {
                                                         // `StyledText::with_highlights` 要求传入的高亮范围有序且不重叠。
@@ -11032,13 +11167,12 @@ impl MainView {
                                                         )
                                                         .collect();
                                                     }
-                                                    (
+                                                    Some((
                                                         index,
-                                                        line.clone(),
+                                                        line,
                                                         line_highlights,
                                                         highlighted_search_line == Some(index),
-                                                    )
-                                                })
+                                                    ))
                                             })
                                             .collect::<Vec<_>>()
                                     })
@@ -11980,7 +12114,8 @@ impl MainView {
         let Some(index) = self.open_tabs.iter().position(|tab| tab.id == tab_id) else {
             return;
         };
-        self.open_tabs.remove(index);
+        let closed_tab = self.open_tabs.remove(index);
+        Self::cleanup_tab_paged_resources(&closed_tab);
 
         if self.active_tab_id == Some(tab_id) {
             self.active_tab_id = self
@@ -12017,7 +12152,15 @@ impl MainView {
     /// 业务意图：
     /// - 保留右键点击的 tab，并把它设为当前激活 tab。
     fn close_other_tabs(&mut self, tab_id: usize) {
-        self.open_tabs.retain(|tab| tab.id == tab_id);
+        let mut retained = Vec::new();
+        for tab in self.open_tabs.drain(..) {
+            if tab.id == tab_id {
+                retained.push(tab);
+            } else {
+                Self::cleanup_tab_paged_resources(&tab);
+            }
+        }
+        self.open_tabs = retained;
         self.active_tab_id = self.open_tabs.first().map(|tab| tab.id);
         self.clear_search_current_file_match_count();
         self.tab_bar_scroll_handle
@@ -12042,12 +12185,31 @@ impl MainView {
     /// 业务意图：
     /// - 清空右侧工作区后回到“点击左侧日志文件查看内容”的友好提示。
     fn close_all_tabs(&mut self) {
+        for tab in &self.open_tabs {
+            Self::cleanup_tab_paged_resources(tab);
+        }
         self.open_tabs.clear();
         self.active_tab_id = None;
         self.encoding_dropdown_menu = None;
         self.log_scrollbar_drag = None;
         self.tab_bar_scroll_handle = ScrollHandle::new();
         self.clear_search_current_file_match_count();
+    }
+
+    /// 清理 tab 关联的分页临时文件。
+    ///
+    /// 业务意图：
+    /// - 压缩包内超大日志会物化到应用临时目录，tab 关闭后应立即释放磁盘空间。
+    /// - 普通本地大文件没有 `materialized_temp_path`，不会被误删。
+    fn cleanup_tab_paged_resources(tab: &OpenLogTab) {
+        if let LogTabState::Ready {
+            document: LogTabDocument::Paged(document),
+        } = &tab.state
+        {
+            if let Some(temp_path) = document.materialized_temp_path.as_deref() {
+                cleanup_materialized_file(temp_path);
+            }
+        }
     }
 
     /// 渲染左右分栏内容区域。
@@ -12389,6 +12551,8 @@ impl Render for MainView {
 ///   窗口系统、图形环境或 GPUI 初始化问题；普通业务错误后续不得采用这种处理方式。
 fn main() {
     Application::new().run(|app| {
+        // 清理异常退出遗留的超大日志物化目录，避免压缩包大成员长期占用系统临时磁盘。
+        cleanup_stale_large_log_cache();
         app.bind_keys([
             KeyBinding::new("ctrl-f", OpenSearchDialog, None),
             KeyBinding::new("cmd-f", OpenSearchDialog, None),
@@ -13422,7 +13586,9 @@ mod tests {
             title: "access.log".to_string(),
             encoding_choice: EncodingChoice::Manual(LogTextEncoding::Gbk),
             raw_bytes: Some(Arc::new(b"hello".to_vec())),
-            state: LogTabState::Ready { document },
+            state: LogTabState::Ready {
+                document: LogTabDocument::InMemory(document),
+            },
             scroll_handle: UniformListScrollHandle::new(),
             pending_scroll_to_line: None,
             highlighted_search_line: None,

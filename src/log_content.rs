@@ -115,7 +115,7 @@ impl LogTextEncoding {
     ///
     /// 边界条件：
     /// - UTF-8 BOM 和 UTF-8 使用同一个底层 UTF-8 解码器；BOM 的处理在调用方按字节前缀完成。
-    fn encoding(self) -> &'static Encoding {
+    pub(crate) fn encoding(self) -> &'static Encoding {
         match self {
             Self::Utf8 | Self::Utf8Bom => UTF_8,
             Self::Gbk => GBK,
@@ -380,7 +380,7 @@ fn read_single_file_archive_from_bytes(
 ///
 /// 业务意图：
 /// - 本地压缩包可以先扫描目录项确认只有一个文件，再复用现有按成员读取的流式实现。
-fn single_file_archive_member_path_from_path(
+pub(crate) fn single_file_archive_member_path_from_path(
     archive_path: &Path,
     archive_format: ArchiveFormat,
     label: &str,
@@ -912,7 +912,7 @@ fn ensure_buffer_within_limit(size: usize, label: &str) -> Result<(), LogContent
 /// 业务意图：
 /// - 优先使用确定性更强的 BOM 和 UTF-8 校验，再使用 chardetng 的统计检测。
 /// - 自动检测只返回支持集合内的编码，并且必须可以无替换字符解码。
-fn detect_log_encoding(raw_bytes: &[u8]) -> Result<LogTextEncoding, LogContentError> {
+pub(crate) fn detect_log_encoding(raw_bytes: &[u8]) -> Result<LogTextEncoding, LogContentError> {
     if raw_bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         return Ok(LogTextEncoding::Utf8Bom);
     }
@@ -1052,18 +1052,18 @@ fn decode_with_encoding(
 ///
 /// 业务意图：
 /// - 将解码文本和替换字符标记放在一起，避免检测流程和 UI 流程各自调用编码库导致行为不一致。
-struct DecodeAttempt {
+pub(crate) struct DecodeAttempt {
     /// 解码后的完整文本。
-    text: String,
+    pub(crate) text: String,
     /// 是否出现替换字符。
-    had_errors: bool,
+    pub(crate) had_errors: bool,
 }
 
 /// 使用指定编码解码原始字节。
 ///
 /// 边界条件：
 /// - UTF-8 BOM 选项会去掉开头 BOM；其它编码不做 BOM 特殊处理。
-fn decode_lossy(
+pub(crate) fn decode_lossy(
     raw_bytes: &[u8],
     encoding: LogTextEncoding,
 ) -> Result<DecodeAttempt, LogContentError> {
@@ -1085,7 +1085,7 @@ fn decode_lossy(
 /// 业务意图：
 /// - 右侧查看器使用固定行高虚拟列表，每个元素对应一行。
 /// - 去掉换行符和 Windows 行尾中的 `\r`，避免行内出现不可见控制字符影响高亮和宽度计算。
-fn split_decoded_lines(text: &str) -> Vec<String> {
+pub(crate) fn split_decoded_lines(text: &str) -> Vec<String> {
     if text.is_empty() {
         return vec![String::new()];
     }
@@ -1104,7 +1104,7 @@ fn split_decoded_lines(text: &str) -> Vec<String> {
 /// 边界条件：
 /// - 等宽字体下字符数和视觉宽度基本一致；包含宽字符的日志仍可通过横向滚动访问内容，后续如需像素级精度再引入文本测量缓存。
 /// - 行列表为空时返回 0，调用方传给 `uniform_list` 时会被 GPUI 按 item 数量保护，不会越界。
-fn longest_log_line_index(lines: &[String]) -> usize {
+pub(crate) fn longest_log_line_index(lines: &[String]) -> usize {
     lines
         .iter()
         .enumerate()
