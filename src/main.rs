@@ -2021,7 +2021,7 @@ struct ThreadStateSamplePending {
 ///
 /// 业务意图：
 /// - 状态枚举驱动时间线色块，未知状态仍保留为 `Other`，避免新 JVM 文案导致整份分析失败。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum ThreadStateKind {
     /// RUNNABLE。
     Runnable,
@@ -2152,6 +2152,12 @@ struct ThreadAnalysisWindowView {
     /// - 气泡跟随用户最近一次单击的色块展示线程详情；窗口重绘或滚动时不重新解析日志。
     /// - `None` 表示尚未选择色块或分析数据已被替换。
     cell_popup: Option<ThreadAnalysisCellPopup>,
+    /// 当前线程分析图中允许显示的线程状态集合。
+    ///
+    /// 业务意图：
+    /// - 右上角图例同时作为状态过滤器；用户可以按状态隐藏无关线程和色块，默认只关注 RUNNABLE 线程。
+    /// - 集合为空时表示用户主动隐藏全部状态，时间线列表应展示为空，而不是自动回退为全部显示。
+    visible_state_kinds: HashSet<ThreadStateKind>,
     /// 主窗口状态变更订阅。
     _main_view_subscription: gpui::Subscription,
 }
@@ -2199,6 +2205,7 @@ impl ThreadAnalysisWindowView {
             scroll_handle: UniformListScrollHandle::new(),
             scrollbar_drag: None,
             cell_popup: None,
+            visible_state_kinds: Self::default_visible_state_kinds(),
             _main_view_subscription: main_view_subscription,
         }
     }
@@ -2212,27 +2219,44 @@ impl ThreadAnalysisWindowView {
         self.scroll_handle = UniformListScrollHandle::new();
         self.scrollbar_drag = None;
         self.cell_popup = None;
+        self.visible_state_kinds = Self::default_visible_state_kinds();
         context.notify();
     }
 
     /// 渲染线程状态图例。
-    fn render_legend(&self, palette: AppThemePalette, theme: EffectiveTheme) -> gpui::Div {
-        div().flex().items_center().gap_3().children(
-            [
-                ThreadStateKind::Runnable,
-                ThreadStateKind::Blocked,
-                ThreadStateKind::Waiting,
-                ThreadStateKind::TimedWaiting,
-                ThreadStateKind::Other,
-            ]
-            .into_iter()
-            .map(|state| {
+    fn render_legend(
+        &self,
+        palette: AppThemePalette,
+        theme: EffectiveTheme,
+        context: &mut Context<Self>,
+    ) -> gpui::Div {
+        div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .children(Self::legend_state_kinds().into_iter().map(|state| {
+                let visible = self.visible_state_kinds.contains(&state);
                 div()
                     .flex()
                     .items_center()
                     .gap_1()
+                    .px_1()
+                    .py_1()
+                    .rounded(px(4.0))
                     .text_xs()
-                    .text_color(rgb(palette.muted_text))
+                    .text_color(rgb(if visible {
+                        palette.text
+                    } else {
+                        palette.muted_text
+                    }))
+                    .bg(rgb(if visible {
+                        palette.selected
+                    } else {
+                        palette.panel
+                    }))
+                    .opacity(if visible { 1.0 } else { 0.48 })
+                    .cursor_pointer()
+                    .hover(move |legend_item| legend_item.bg(rgb(palette.hover)))
                     .child(
                         div()
                             .w(px(10.0))
@@ -2241,8 +2265,50 @@ impl ThreadAnalysisWindowView {
                             .bg(rgb(state.color(theme))),
                     )
                     .child(state.label())
-            }),
-        )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        context.listener(move |view, _event: &MouseDownEvent, _window, context| {
+                            view.toggle_visible_state_kind(state, context);
+                            context.stop_propagation();
+                        }),
+                    )
+            }))
+    }
+
+    /// 返回线程分析图例中展示的状态顺序。
+    ///
+    /// 业务意图：
+    /// - 图例顺序需要稳定，避免用户每次打开分析窗口时过滤按钮位置变化。
+    fn legend_state_kinds() -> [ThreadStateKind; 5] {
+        [
+            ThreadStateKind::Runnable,
+            ThreadStateKind::Blocked,
+            ThreadStateKind::Waiting,
+            ThreadStateKind::TimedWaiting,
+            ThreadStateKind::Other,
+        ]
+    }
+
+    /// 返回线程分析窗口默认显示的状态集合。
+    ///
+    /// 业务意图：
+    /// - 用户要求默认只显示 RUNNABLE 状态线程，便于优先定位正在运行或占用 CPU 的线程。
+    fn default_visible_state_kinds() -> HashSet<ThreadStateKind> {
+        HashSet::from([ThreadStateKind::Runnable])
+    }
+
+    /// 切换某个线程状态是否显示。
+    ///
+    /// 业务意图：
+    /// - 图例项既是说明也是过滤按钮；切换后重置滚动和气泡，避免旧滚动位置或旧详情指向已隐藏行。
+    fn toggle_visible_state_kind(&mut self, state: ThreadStateKind, context: &mut Context<Self>) {
+        if !self.visible_state_kinds.remove(&state) {
+            self.visible_state_kinds.insert(state);
+        }
+        self.scroll_handle = UniformListScrollHandle::new();
+        self.scrollbar_drag = None;
+        self.cell_popup = None;
+        context.notify();
     }
 
     /// 渲染单个线程的时间线行。
@@ -2250,6 +2316,7 @@ impl ThreadAnalysisWindowView {
         &self,
         thread_name: String,
         cells: &[Option<Arc<ThreadTimelineCell>>],
+        visible_state_kinds: &HashSet<ThreadStateKind>,
         palette: AppThemePalette,
         theme: EffectiveTheme,
         context: &mut Context<Self>,
@@ -2274,9 +2341,13 @@ impl ThreadAnalysisWindowView {
             .children(cells.iter().enumerate().map(|(cell_index, cell)| {
                 let color = cell
                     .as_ref()
+                    .filter(|cell| visible_state_kinds.contains(&cell.state))
                     .map(|cell| cell.state.color(theme))
                     .unwrap_or(palette.surface);
-                let block = if let Some(cell) = cell.as_ref() {
+                let block = if let Some(cell) = cell
+                    .as_ref()
+                    .filter(|cell| visible_state_kinds.contains(&cell.state))
+                {
                     let cell_for_click = Arc::clone(cell);
                     div()
                         .id(SharedString::from(format!(
@@ -2485,12 +2556,34 @@ impl ThreadAnalysisWindowView {
         )
     }
 
-    /// 返回线程分析虚拟列表总行数。
+    /// 返回当前过滤条件下可见的线程行下标。
     ///
     /// 业务意图：
-    /// - 横轴时间不再显示，因此虚拟列表只包含线程行，不额外渲染表头行。
-    fn timeline_row_count(&self) -> usize {
-        self.analysis.thread_names.len()
+    /// - 状态过滤发生在线程行维度；只要某个线程在任一快照中出现了已勾选状态，该线程就保留在纵轴中。
+    fn visible_thread_indexes(&self) -> Vec<usize> {
+        Self::visible_thread_indexes_for_state_kinds(&self.analysis, &self.visible_state_kinds)
+    }
+
+    /// 根据状态集合计算可见线程行下标。
+    ///
+    /// 业务意图：
+    /// - 拆成纯函数便于测试默认 RUNNABLE 过滤规则，避免 UI 事件和虚拟列表影响业务判断。
+    fn visible_thread_indexes_for_state_kinds(
+        analysis: &ThreadAnalysisData,
+        visible_state_kinds: &HashSet<ThreadStateKind>,
+    ) -> Vec<usize> {
+        analysis
+            .matrix
+            .iter()
+            .enumerate()
+            .filter_map(|(row_index, cells)| {
+                cells
+                    .iter()
+                    .flatten()
+                    .any(|cell| visible_state_kinds.contains(&cell.state))
+                    .then_some(row_index)
+            })
+            .collect()
     }
 
     /// 渲染线程分析纵向滚动条。
@@ -2674,7 +2767,9 @@ impl Render for ThreadAnalysisWindowView {
             (main_view.palette(), main_view.effective_theme())
         };
         let _snapshot_count = self.analysis.snapshots.len();
-        let row_count = self.timeline_row_count();
+        let visible_thread_indexes = self.visible_thread_indexes();
+        let row_count = visible_thread_indexes.len();
+        let visible_state_kinds = self.visible_state_kinds.clone();
         let scroll_handle = self.scroll_handle.clone();
 
         div()
@@ -2738,7 +2833,7 @@ impl Render for ThreadAnalysisWindowView {
                                     .child(self.analysis.summary.clone()),
                             ),
                     )
-                    .child(self.render_legend(palette, theme)),
+                    .child(self.render_legend(palette, theme, context)),
             )
             .child(
                 div()
@@ -2757,18 +2852,29 @@ impl Render for ThreadAnalysisWindowView {
                                             let thread_name = view
                                                 .analysis
                                                 .thread_names
-                                                .get(row_index)
+                                                .get(
+                                                    visible_thread_indexes
+                                                        .get(row_index)
+                                                        .copied()
+                                                        .unwrap_or(usize::MAX),
+                                                )
                                                 .cloned()
                                                 .unwrap_or_default();
                                             let cells = view
                                                 .analysis
                                                 .matrix
-                                                .get(row_index)
+                                                .get(
+                                                    visible_thread_indexes
+                                                        .get(row_index)
+                                                        .copied()
+                                                        .unwrap_or(usize::MAX),
+                                                )
                                                 .map(Vec::as_slice)
                                                 .unwrap_or(&[]);
                                             view.render_timeline_row(
                                                 thread_name,
                                                 cells,
+                                                &visible_state_kinds,
                                                 palette,
                                                 theme,
                                                 _context,
@@ -12720,6 +12826,13 @@ mod tests {
         assert_eq!(
             analysis.matrix[1][0].as_ref().map(|cell| cell.state),
             Some(ThreadStateKind::Waiting)
+        );
+        assert_eq!(
+            ThreadAnalysisWindowView::visible_thread_indexes_for_state_kinds(
+                &analysis,
+                &ThreadAnalysisWindowView::default_visible_state_kinds(),
+            ),
+            vec![0]
         );
     }
 
