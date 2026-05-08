@@ -1651,42 +1651,46 @@ impl AppThemePalette {
     fn for_theme(theme: EffectiveTheme) -> Self {
         match theme {
             EffectiveTheme::Light => Self {
-                background: 0xffffff,
-                panel: 0xf7f8fa,
+                // 明亮主题避免大面积纯白和高反差灰边，降低长时间查看日志时的视觉疲劳；
+                // 信息密度仍由布局常量控制，这里只调整颜色，不改变任何尺寸或间距。
+                background: 0xfbfcfd,
+                panel: 0xf4f6f8,
                 surface: 0xffffff,
-                hover: 0xf6f8fa,
-                selected: 0xddf4ff,
+                hover: 0xeef3f7,
+                selected: 0xe7f2ff,
                 text: 0x24292f,
-                muted_text: 0x57606a,
-                border: 0xd0d7de,
-                accent: 0x0969da,
-                accent_hover: 0x0757b8,
+                muted_text: 0x667085,
+                border: 0xd7dde4,
+                accent: 0x2f75d6,
+                accent_hover: 0x245fb2,
                 on_accent: 0xffffff,
-                input: 0xffffff,
+                input: 0xfbfcfe,
                 menu: 0xffffff,
-                search_highlight: 0xfff8c5,
+                search_highlight: 0xfff1a8,
                 error: 0xcf222e,
-                scrollbar: 0xc9d1d9,
-                scrollbar_hover: 0x8c959f,
+                scrollbar: 0xd4dbe3,
+                scrollbar_hover: 0x98a2ad,
             },
             EffectiveTheme::Dark => Self {
-                background: 0x0d1117,
-                panel: 0x161b22,
-                surface: 0x0d1117,
-                hover: 0x21262d,
-                selected: 0x0c2d48,
-                text: 0xe6edf3,
-                muted_text: 0x8b949e,
-                border: 0x30363d,
-                accent: 0x58a6ff,
-                accent_hover: 0x79c0ff,
-                on_accent: 0x0d1117,
-                input: 0x010409,
-                menu: 0x161b22,
-                search_highlight: 0x3b2f00,
+                // 暗色主题使用略抬高的背景和更柔和的边框，避免纯黑界面造成眩光感；
+                // 文本对比仍保持足够清晰，兼容日志正文、菜单、搜索结果和线程分析窗口。
+                background: 0x101418,
+                panel: 0x171d23,
+                surface: 0x14191f,
+                hover: 0x242b33,
+                selected: 0x17324a,
+                text: 0xdce3ea,
+                muted_text: 0xa0a9b3,
+                border: 0x343c46,
+                accent: 0x68b0ff,
+                accent_hover: 0x8bc4ff,
+                on_accent: 0x101418,
+                input: 0x0f1318,
+                menu: 0x171d23,
+                search_highlight: 0x4a3a05,
                 error: 0xff7b72,
-                scrollbar: 0x30363d,
-                scrollbar_hover: 0x6e7681,
+                scrollbar: 0x3a434d,
+                scrollbar_hover: 0x747f8b,
             },
         }
     }
@@ -5601,10 +5605,11 @@ impl MainView {
     /// - 选中行和普通行分别使用更明确的悬浮色，保证“当前选中”和“鼠标所在”两个状态都能被辨认。
     fn log_tree_row_hover_background(selected: bool, theme: EffectiveTheme) -> u32 {
         match (theme, selected) {
-            (EffectiveTheme::Light, false) => 0xeaeef2,
-            (EffectiveTheme::Light, true) => 0xcce8ff,
-            (EffectiveTheme::Dark, false) => 0x30363d,
-            (EffectiveTheme::Dark, true) => 0x16456a,
+            // 左侧树 hover 需要比面板背景更明确，但不能过亮或过饱和，否则长时间扫目录会刺眼。
+            (EffectiveTheme::Light, false) => 0xe8edf3,
+            (EffectiveTheme::Light, true) => 0xd8ebff,
+            (EffectiveTheme::Dark, false) => 0x262d35,
+            (EffectiveTheme::Dark, true) => 0x1e4562,
         }
     }
 
@@ -12827,6 +12832,27 @@ mod tests {
             EffectiveTheme::resolve(ThemePreference::System, WindowAppearance::VibrantDark),
             EffectiveTheme::Dark
         );
+    }
+
+    /// 验证基础调色板避免纯白纯黑的大面积背景。
+    ///
+    /// 业务意图：
+    /// - 程序用于长时间查看日志，大面积纯白或接近纯黑会增加视觉疲劳；调色板应使用更柔和的底色。
+    /// - 该测试只锁定“舒适性配置”的边界，不约束布局、字号或信息密度。
+    #[test]
+    fn 基础调色板避免极端背景并保留状态区分() {
+        let light = AppThemePalette::for_theme(EffectiveTheme::Light);
+        assert_ne!(light.background, 0xffffff);
+        assert_ne!(light.panel, light.background);
+        assert_ne!(light.hover, light.panel);
+        assert_ne!(light.selected, light.hover);
+
+        let dark = AppThemePalette::for_theme(EffectiveTheme::Dark);
+        assert_ne!(dark.background, 0x000000);
+        assert_ne!(dark.input, 0x000000);
+        assert_ne!(dark.panel, dark.background);
+        assert_ne!(dark.hover, dark.panel);
+        assert_ne!(dark.selected, dark.hover);
     }
 
     /// 构造测试用目录树行。
