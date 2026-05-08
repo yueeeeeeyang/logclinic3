@@ -12,7 +12,7 @@
 
 use std::{
     borrow::Cow,
-    collections::HashSet,
+    collections::{BTreeSet, HashMap, HashSet},
     env, fs, io,
     ops::Range,
     path::{Path, PathBuf},
@@ -97,6 +97,73 @@ const MAIN_WINDOW_SIZE_FILE_NAME: &str = "window-size.txt";
 /// - 主题属于用户明确设置，必须和窗口大小一样跨启动保留。
 /// - 文件内容保持为简单英文枚举值，避免仅为单个配置新增 JSON/TOML 依赖。
 const THEME_PREFERENCE_FILE_NAME: &str = "theme-preference.txt";
+
+/// 左侧目录树右键菜单宽度。
+///
+/// 业务意图：
+/// - 菜单承载“另存为”和“线程日志分析”两个文件操作，宽度需要足够展示中文命令且不挤压左侧树。
+const LOG_TREE_CONTEXT_MENU_WIDTH: f32 = 176.0;
+
+/// 左侧目录树右键菜单单项高度。
+///
+/// 业务意图：
+/// - 与 tab 右键菜单保持相同操作密度，保证 macOS 和 Windows 鼠标命中体验一致。
+const LOG_TREE_CONTEXT_MENU_ITEM_HEIGHT: f32 = 34.0;
+
+/// 线程日志分析窗口默认宽度。
+///
+/// 业务意图：
+/// - 时间线需要同时展示线程名和多个快照列，因此使用比设置窗口更宽的独立窗口。
+const THREAD_ANALYSIS_WINDOW_WIDTH: f32 = 1040.0;
+
+/// 线程日志分析窗口默认高度。
+///
+/// 业务意图：
+/// - Java thread dump 往往包含大量线程，较高窗口可以减少初次打开后的滚动成本。
+const THREAD_ANALYSIS_WINDOW_HEIGHT: f32 = 720.0;
+
+/// 线程分析图中线程名列宽度。
+///
+/// 业务意图：
+/// - Java 线程名经常包含业务前缀、线程池编号和连接信息，保留固定宽度便于和右侧时间线对齐。
+const THREAD_ANALYSIS_NAME_COLUMN_WIDTH: f32 = 260.0;
+
+/// 线程分析图中单个时间快照列宽度。
+///
+/// 业务意图：
+/// - 横轴不再展示时间文本后，列宽只需要容纳正方形状态色块和少量间距，避免大量快照时横向滚动过长。
+const THREAD_ANALYSIS_SNAPSHOT_COLUMN_WIDTH: f32 = 24.0;
+
+/// 线程分析图中状态色块边长。
+///
+/// 业务意图：
+/// - 用户要求色块高度保持不变且宽度与高度一致，因此使用固定 18px 正方形。
+const THREAD_ANALYSIS_STATE_BLOCK_SIZE: f32 = 18.0;
+
+/// 线程分析色块悬浮气泡宽度。
+///
+/// 业务意图：
+/// - 气泡需要容纳完整线程名和最多 5 行日志预览；固定宽度便于根据窗口边界计算弹出方向。
+const THREAD_ANALYSIS_POPUP_WIDTH: f32 = 520.0;
+
+/// 线程分析色块悬浮气泡预估高度。
+///
+/// 业务意图：
+/// - GPUI 在点击事件阶段尚未布局气泡，不能读取真实高度；这里按三行信息和五行预览估算，
+///   用于选择向上或向下弹出，避免靠近窗口底部时被遮挡。
+const THREAD_ANALYSIS_POPUP_ESTIMATED_HEIGHT: f32 = 190.0;
+
+/// 线程分析色块悬浮气泡与鼠标点击点的间距。
+///
+/// 业务意图：
+/// - 保留少量间距，避免气泡刚出现就盖住被点击的状态色块。
+const THREAD_ANALYSIS_POPUP_OFFSET: f32 = 12.0;
+
+/// 线程分析色块悬浮气泡与窗口边缘的最小间距。
+///
+/// 业务意图：
+/// - 气泡贴边会影响阴影和边框识别，保留边距也能减少被系统标题栏或窗口边框裁切的风险。
+const THREAD_ANALYSIS_POPUP_MARGIN: f32 = 8.0;
 
 /// 可持久化的主窗口宽高。
 ///
@@ -1842,6 +1909,187 @@ enum SearchResultsContextMenuAction {
     CollapseAll,
 }
 
+/// 线程日志分析结果。
+///
+/// 业务意图：
+/// - 独立窗口只负责渲染已经解析好的时间线数据，不在绘制阶段重新扫描日志正文。
+/// - 多个文件的 Java thread dump 会合并成同一条时间轴，便于比较线程在不同快照中的状态变化。
+#[derive(Clone)]
+struct ThreadAnalysisData {
+    /// 分析标题。
+    title: String,
+    /// 面向用户的摘要。
+    summary: String,
+    /// 横轴快照标签。
+    snapshots: Vec<ThreadSnapshot>,
+    /// 纵轴线程名，按首次出现顺序去重。
+    thread_names: Vec<String>,
+    /// 线程名到每个快照详情的矩阵。
+    ///
+    /// 业务意图：
+    /// - 单个色块既要展示状态，也要支持单击查看线程片段、双击回到主窗口定位原始日志行。
+    /// - 因此矩阵保存可定位的单元详情，而不是只保存颜色所需的状态枚举。
+    matrix: Vec<Vec<Option<Arc<ThreadTimelineCell>>>>,
+}
+
+/// 单个 thread dump 快照。
+///
+/// 业务意图：
+/// - Java thread dump 通常由时间戳和 `Full thread dump` 标记组成；如果没有时间戳则使用快照序号兜底。
+#[derive(Clone)]
+struct ThreadSnapshot {
+    /// 横轴展示标签。
+    label: String,
+    /// 当前快照所属的日志文件序号。
+    ///
+    /// 业务意图：
+    /// - 用户要求只默认展示出现在多个线程日志中的线程；该字段用于区分“多个快照”与“多个文件”。
+    source_index: usize,
+    /// 当前快照所属日志来源。
+    ///
+    /// 业务意图：
+    /// - 双击分析色块需要在主窗口打开对应本地文件或压缩包成员，因此必须保留真实来源，不能只保留展示名。
+    source: LogFileSource,
+    /// 当前快照内识别出的线程状态。
+    threads: Vec<ThreadStateSample>,
+}
+
+/// 单个线程在某个快照中的状态。
+#[derive(Clone)]
+struct ThreadStateSample {
+    /// Java 线程名。
+    name: String,
+    /// Java thread dump 线程头中的线程 ID。
+    ///
+    /// 业务意图：
+    /// - HotSpot 线程头通常同时包含 `#123` 和 `tid=0x...`；这里优先记录更适合人工核对的 `#123`，
+    ///   兼容缺失 `#` 的日志时再记录 `tid`。
+    thread_id: Option<String>,
+    /// Java 线程状态。
+    state: ThreadStateKind,
+    /// 线程头在解码后日志中的零基行号。
+    ///
+    /// 业务意图：
+    /// - 双击色块回主窗口时需要跳转到线程头，而不是只打开文件或跳到状态行。
+    line_index: usize,
+    /// 线程头开始的前 5 行日志预览。
+    ///
+    /// 边界条件：
+    /// - 文件末尾不足 5 行时只保留实际存在的行；预览只用于悬浮气泡，不参与状态分析。
+    preview_lines: Vec<String>,
+}
+
+/// 线程分析时间线中的可交互色块数据。
+///
+/// 业务意图：
+/// - 渲染阶段需要快速拿到颜色、气泡内容和跳转目标；把这些信息在构建矩阵时固化，可避免点击时扫描大文件。
+#[derive(Clone)]
+struct ThreadTimelineCell {
+    /// Java 线程状态。
+    state: ThreadStateKind,
+    /// 当前快照展示时间。
+    time_label: String,
+    /// 完整 Java 线程名。
+    thread_name: String,
+    /// Java thread dump 线程 ID。
+    thread_id: Option<String>,
+    /// 原始日志来源。
+    source: LogFileSource,
+    /// 线程头零基行号。
+    line_index: usize,
+    /// 线程头开始的前 5 行日志预览。
+    preview_lines: Vec<String>,
+}
+
+/// 线程头已识别但状态行尚未出现时的临时解析状态。
+///
+/// 业务意图：
+/// - Java thread dump 的线程名、ID 位于线程头，状态位于后续行；只有两者都存在时才生成有效样本。
+/// - 临时结构避免在解析循环中用多个并行 `Option` 字段，降低状态错配风险。
+struct ThreadStateSamplePending {
+    /// Java 线程名。
+    name: String,
+    /// Java thread dump 线程 ID。
+    thread_id: Option<String>,
+    /// 线程头零基行号。
+    line_index: usize,
+    /// 线程头开始的前 5 行日志预览。
+    preview_lines: Vec<String>,
+}
+
+/// Java thread dump 中常见线程状态。
+///
+/// 业务意图：
+/// - 状态枚举驱动时间线色块，未知状态仍保留为 `Other`，避免新 JVM 文案导致整份分析失败。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThreadStateKind {
+    /// RUNNABLE。
+    Runnable,
+    /// BLOCKED。
+    Blocked,
+    /// WAITING。
+    Waiting,
+    /// TIMED_WAITING。
+    TimedWaiting,
+    /// NEW。
+    New,
+    /// TERMINATED。
+    Terminated,
+    /// 未识别或其它 JVM 状态。
+    Other,
+}
+
+impl ThreadStateKind {
+    /// 从 thread dump 状态文本解析状态枚举。
+    fn parse(text: &str) -> Self {
+        if text.contains("TIMED_WAITING") {
+            Self::TimedWaiting
+        } else if text.contains("RUNNABLE") {
+            Self::Runnable
+        } else if text.contains("BLOCKED") {
+            Self::Blocked
+        } else if text.contains("WAITING") {
+            Self::Waiting
+        } else if text.contains("NEW") {
+            Self::New
+        } else if text.contains("TERMINATED") {
+            Self::Terminated
+        } else {
+            Self::Other
+        }
+    }
+
+    /// 返回 UI 展示文案。
+    fn label(self) -> &'static str {
+        match self {
+            Self::Runnable => "RUNNABLE",
+            Self::Blocked => "BLOCKED",
+            Self::Waiting => "WAITING",
+            Self::TimedWaiting => "TIMED_WAITING",
+            Self::New => "NEW",
+            Self::Terminated => "TERMINATED",
+            Self::Other => "OTHER",
+        }
+    }
+
+    /// 返回当前主题下的状态色。
+    ///
+    /// 业务意图：
+    /// - 时间线色块需要在明暗主题下都有足够对比度，同时让阻塞、等待和运行态能快速区分。
+    fn color(self, theme: EffectiveTheme) -> u32 {
+        match (theme, self) {
+            (_, Self::Runnable) => 0x22c55e,
+            (_, Self::Blocked) => 0xef4444,
+            (_, Self::Waiting) => 0xf59e0b,
+            (_, Self::TimedWaiting) => 0x38bdf8,
+            (_, Self::New) => 0xa78bfa,
+            (_, Self::Terminated) => 0x94a3b8,
+            (EffectiveTheme::Light, Self::Other) => 0x64748b,
+            (EffectiveTheme::Dark, Self::Other) => 0x94a3b8,
+        }
+    }
+}
+
 /// 搜索结果面板高度拖动状态。
 ///
 /// 业务意图：
@@ -1875,6 +2123,674 @@ enum SearchTarget {
         /// 当前目录下所有可打开文件来源。
         sources: Vec<LogFileSource>,
     },
+}
+
+/// 线程日志分析独立窗口根视图。
+///
+/// 业务意图：
+/// - 线程日志分析以独立窗口展示，避免覆盖主日志查看上下文。
+/// - 窗口观察主视图主题变化，确保明暗主题切换后时间线背景和文字同步刷新。
+struct ThreadAnalysisWindowView {
+    /// 主窗口视图实体。
+    main_view: Entity<MainView>,
+    /// 当前分析结果。
+    analysis: ThreadAnalysisData,
+    /// 线程时间线虚拟列表滚动句柄。
+    ///
+    /// 业务意图：
+    /// - Java thread dump 可能包含数千个线程，不能一次性把所有线程行都创建成 GPUI 元素。
+    /// - 使用 `uniform_list` 只渲染可见行，并通过该句柄保存纵向和横向滚动位置。
+    scroll_handle: UniformListScrollHandle,
+    /// 当前线程分析滚动条拖动状态。
+    ///
+    /// 业务意图：
+    /// - 分析页面需要显式横向和纵向滚动条；拖动时保存方向和鼠标在滑块内的偏移，避免滑块跳动。
+    scrollbar_drag: Option<ThreadAnalysisScrollbarDrag>,
+    /// 当前单击色块后展示的悬浮气泡。
+    ///
+    /// 业务意图：
+    /// - 气泡跟随用户最近一次单击的色块展示线程详情；窗口重绘或滚动时不重新解析日志。
+    /// - `None` 表示尚未选择色块或分析数据已被替换。
+    cell_popup: Option<ThreadAnalysisCellPopup>,
+    /// 主窗口状态变更订阅。
+    _main_view_subscription: gpui::Subscription,
+}
+
+/// 线程分析滚动条拖动状态。
+///
+/// 业务意图：
+/// - 线程分析窗口没有 tab 维度，只需要记录当前拖动轴向和鼠标按下时的滑块内偏移。
+#[derive(Clone, Copy)]
+struct ThreadAnalysisScrollbarDrag {
+    /// 当前拖动的滚动轴。
+    axis: LogScrollbarAxis,
+    /// 鼠标按下点相对滑块起点的偏移。
+    cursor_offset: Pixels,
+}
+
+/// 线程分析色块悬浮气泡状态。
+///
+/// 业务意图：
+/// - GPUI 渲染是声明式的，单击事件只记录展示所需的数据和窗口坐标，真正的气泡由下一次 render 输出。
+#[derive(Clone)]
+struct ThreadAnalysisCellPopup {
+    /// 被单击的时间线单元。
+    cell: Arc<ThreadTimelineCell>,
+    /// 气泡左上角相对窗口的横向位置。
+    x: Pixels,
+    /// 气泡左上角相对窗口的纵向位置。
+    y: Pixels,
+}
+
+impl ThreadAnalysisWindowView {
+    /// 创建线程日志分析窗口根视图。
+    fn new(
+        main_view: Entity<MainView>,
+        analysis: ThreadAnalysisData,
+        context: &mut Context<Self>,
+    ) -> Self {
+        let observed_main_view = main_view.clone();
+        let main_view_subscription = context.observe(&observed_main_view, |_, _, context| {
+            context.notify();
+        });
+        Self {
+            main_view,
+            analysis,
+            scroll_handle: UniformListScrollHandle::new(),
+            scrollbar_drag: None,
+            cell_popup: None,
+            _main_view_subscription: main_view_subscription,
+        }
+    }
+
+    /// 更新分析结果。
+    ///
+    /// 业务意图：
+    /// - 用户重复对不同文件执行线程日志分析时复用已有窗口，直接替换数据并激活窗口。
+    fn set_analysis(&mut self, analysis: ThreadAnalysisData, context: &mut Context<Self>) {
+        self.analysis = analysis;
+        self.scroll_handle = UniformListScrollHandle::new();
+        self.scrollbar_drag = None;
+        self.cell_popup = None;
+        context.notify();
+    }
+
+    /// 渲染线程状态图例。
+    fn render_legend(&self, palette: AppThemePalette, theme: EffectiveTheme) -> gpui::Div {
+        div().flex().items_center().gap_3().children(
+            [
+                ThreadStateKind::Runnable,
+                ThreadStateKind::Blocked,
+                ThreadStateKind::Waiting,
+                ThreadStateKind::TimedWaiting,
+                ThreadStateKind::Other,
+            ]
+            .into_iter()
+            .map(|state| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_xs()
+                    .text_color(rgb(palette.muted_text))
+                    .child(
+                        div()
+                            .w(px(10.0))
+                            .h(px(10.0))
+                            .rounded(px(2.0))
+                            .bg(rgb(state.color(theme))),
+                    )
+                    .child(state.label())
+            }),
+        )
+    }
+
+    /// 渲染单个线程的时间线行。
+    fn render_timeline_row(
+        &self,
+        thread_name: String,
+        cells: &[Option<Arc<ThreadTimelineCell>>],
+        palette: AppThemePalette,
+        theme: EffectiveTheme,
+        context: &mut Context<Self>,
+    ) -> gpui::Div {
+        div()
+            .flex()
+            .items_center()
+            .min_w_0()
+            .h(px(30.0))
+            .border_t_1()
+            .border_color(rgb(palette.border))
+            .child(
+                div()
+                    .w(px(THREAD_ANALYSIS_NAME_COLUMN_WIDTH))
+                    .flex_none()
+                    .pr_2()
+                    .truncate()
+                    .text_xs()
+                    .text_color(rgb(palette.text))
+                    .child(thread_name.clone()),
+            )
+            .children(cells.iter().enumerate().map(|(cell_index, cell)| {
+                let color = cell
+                    .as_ref()
+                    .map(|cell| cell.state.color(theme))
+                    .unwrap_or(palette.surface);
+                let block = if let Some(cell) = cell.as_ref() {
+                    let cell_for_click = Arc::clone(cell);
+                    div()
+                        .id(SharedString::from(format!(
+                            "thread-analysis-cell-{}-{}",
+                            thread_name, cell_index
+                        )))
+                        .w(px(THREAD_ANALYSIS_STATE_BLOCK_SIZE))
+                        .h(px(THREAD_ANALYSIS_STATE_BLOCK_SIZE))
+                        .rounded(px(3.0))
+                        .bg(rgb(color))
+                        .cursor_pointer()
+                        .hover(move |block| block.opacity(0.86))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            context.listener(
+                                move |view, event: &MouseDownEvent, window, context| {
+                                    view.handle_timeline_cell_mouse_down(
+                                        cell_for_click.clone(),
+                                        event,
+                                        window,
+                                        context,
+                                    );
+                                },
+                            ),
+                        )
+                } else {
+                    div()
+                        .id(SharedString::from(format!(
+                            "thread-analysis-empty-cell-{}-{}",
+                            thread_name, cell_index
+                        )))
+                        .w(px(THREAD_ANALYSIS_STATE_BLOCK_SIZE))
+                        .h(px(THREAD_ANALYSIS_STATE_BLOCK_SIZE))
+                        .rounded(px(3.0))
+                        .bg(rgb(color))
+                };
+                div()
+                    .w(px(THREAD_ANALYSIS_SNAPSHOT_COLUMN_WIDTH))
+                    .flex_none()
+                    .px_1()
+                    .child(block)
+            }))
+    }
+
+    /// 处理线程分析色块点击。
+    ///
+    /// 业务意图：
+    /// - 单击用于在分析窗口内快速查看线程详情；双击用于回到主日志窗口并定位线程头。
+    /// - 鼠标三击及以上仍按双击处理，避免快速点击时出现无响应。
+    fn handle_timeline_cell_mouse_down(
+        &mut self,
+        cell: Arc<ThreadTimelineCell>,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let (popup_x, popup_y) = Self::thread_analysis_popup_origin(
+            f32::from(event.position.x),
+            f32::from(event.position.y),
+            f32::from(window.bounds().size.width),
+            f32::from(window.bounds().size.height),
+        );
+        self.cell_popup = Some(ThreadAnalysisCellPopup {
+            cell: cell.clone(),
+            x: popup_x,
+            y: popup_y,
+        });
+        if event.click_count >= 2 {
+            let source = cell.source.clone();
+            let line_index = cell.line_index;
+            let main_window = self.main_view.update(context, |view, context| {
+                view.open_log_source_at_line(source, line_index, context);
+                view.main_window
+            });
+            if let Some(main_window) = main_window {
+                let _ = main_window.update(context, |_view, window, _context| {
+                    window.activate_window();
+                });
+            }
+        }
+        context.stop_propagation();
+        context.notify();
+    }
+
+    /// 根据点击点和窗口尺寸计算悬浮气泡左上角。
+    ///
+    /// 业务意图：
+    /// - 色块可能位于窗口右下角，如果始终向右下弹出会被窗口裁切；这里按剩余空间自动改为向左或向上弹出。
+    /// - 计算只依赖逻辑像素，和 GPUI 布局使用的坐标体系一致，适配 macOS/Windows 缩放差异。
+    ///
+    /// 边界条件：
+    /// - 窗口小于气泡宽高时退化为贴近边距展示，尽量保留气泡主体内容。
+    fn thread_analysis_popup_origin(
+        pointer_x: f32,
+        pointer_y: f32,
+        window_width: f32,
+        window_height: f32,
+    ) -> (Pixels, Pixels) {
+        let right_x = pointer_x + THREAD_ANALYSIS_POPUP_OFFSET;
+        let left_x = pointer_x - THREAD_ANALYSIS_POPUP_WIDTH - THREAD_ANALYSIS_POPUP_OFFSET;
+        let below_y = pointer_y + THREAD_ANALYSIS_POPUP_OFFSET;
+        let above_y =
+            pointer_y - THREAD_ANALYSIS_POPUP_ESTIMATED_HEIGHT - THREAD_ANALYSIS_POPUP_OFFSET;
+        let max_x = (window_width - THREAD_ANALYSIS_POPUP_WIDTH - THREAD_ANALYSIS_POPUP_MARGIN)
+            .max(THREAD_ANALYSIS_POPUP_MARGIN);
+        let max_y =
+            (window_height - THREAD_ANALYSIS_POPUP_ESTIMATED_HEIGHT - THREAD_ANALYSIS_POPUP_MARGIN)
+                .max(THREAD_ANALYSIS_POPUP_MARGIN);
+        let x = if right_x + THREAD_ANALYSIS_POPUP_WIDTH + THREAD_ANALYSIS_POPUP_MARGIN
+            <= window_width
+        {
+            right_x
+        } else {
+            left_x
+        }
+        .clamp(THREAD_ANALYSIS_POPUP_MARGIN, max_x);
+        let y = if below_y + THREAD_ANALYSIS_POPUP_ESTIMATED_HEIGHT + THREAD_ANALYSIS_POPUP_MARGIN
+            <= window_height
+        {
+            below_y
+        } else {
+            above_y
+        }
+        .clamp(THREAD_ANALYSIS_POPUP_MARGIN, max_y);
+        (px(x), px(y))
+    }
+
+    /// 关闭当前线程分析悬浮气泡。
+    ///
+    /// 业务意图：
+    /// - 用户查看完某个色块后，点击分析窗口的其它位置应恢复干净时间线视图。
+    fn dismiss_cell_popup(&mut self, context: &mut Context<Self>) {
+        if self.cell_popup.take().is_some() {
+            context.notify();
+        }
+    }
+
+    /// 渲染线程色块悬浮气泡。
+    ///
+    /// 业务意图：
+    /// - 气泡展示用户点击色块对应的时间、完整线程名、线程 ID 和前 5 行原始日志，辅助快速确认线程上下文。
+    /// - 预览文本可能很长，因此使用固定宽度和截断，避免覆盖整个分析窗口。
+    fn render_cell_popup(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> Option<gpui::Div> {
+        let popup = self.cell_popup.as_ref()?;
+        let thread_id = popup
+            .cell
+            .thread_id
+            .as_deref()
+            .unwrap_or("未识别")
+            .to_string();
+        Some(
+            div()
+                .absolute()
+                .left(popup.x)
+                .top(popup.y)
+                .w(px(THREAD_ANALYSIS_POPUP_WIDTH))
+                .p_3()
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(rgb(palette.border))
+                .bg(rgb(palette.menu))
+                .shadow_md()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .text_xs()
+                .text_color(rgb(palette.text))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                        context.stop_propagation();
+                    }),
+                )
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .truncate()
+                        .child(format!("时间：{}", popup.cell.time_label)),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .child(format!("线程：{}", popup.cell.thread_name)),
+                )
+                .child(div().truncate().child(format!("线程 ID：{}", thread_id)))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .pt_1()
+                        .border_t_1()
+                        .border_color(rgb(palette.border))
+                        .children(popup.cell.preview_lines.iter().map(|line| {
+                            div()
+                                .truncate()
+                                .font_family(LOG_VIEWER_FONT_FAMILY)
+                                .text_color(rgb(palette.muted_text))
+                                .child(line.clone())
+                        })),
+                ),
+        )
+    }
+
+    /// 返回线程分析虚拟列表总行数。
+    ///
+    /// 业务意图：
+    /// - 横轴时间不再显示，因此虚拟列表只包含线程行，不额外渲染表头行。
+    fn timeline_row_count(&self) -> usize {
+        self.analysis.thread_names.len()
+    }
+
+    /// 渲染线程分析纵向滚动条。
+    ///
+    /// 业务意图：
+    /// - 虚拟列表虽然支持滚轮滚动，但线程很多时需要可见位置提示和拖动入口。
+    fn render_vertical_scrollbar(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let Some(metrics) = MainView::log_vertical_scrollbar_metrics(&self.scroll_handle) else {
+            return div()
+                .id("thread-analysis-vertical-scrollbar-empty")
+                .hidden();
+        };
+
+        div()
+            .id("thread-analysis-vertical-scrollbar")
+            .absolute()
+            .top(metrics.thumb_start)
+            .right(px(LOG_VIEWER_SCROLLBAR_PADDING))
+            .w(px(LOG_VIEWER_SCROLLBAR_WIDTH))
+            .h(metrics.thumb_length)
+            .rounded(px(LOG_VIEWER_SCROLLBAR_WIDTH / 2.0))
+            .bg(rgb(palette.scrollbar))
+            .cursor_pointer()
+            .hover(move |thumb| thumb.bg(rgb(palette.scrollbar_hover)))
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|view, event: &MouseDownEvent, _window, context| {
+                    view.start_scrollbar_drag(LogScrollbarAxis::Vertical, event, context);
+                }),
+            )
+    }
+
+    /// 渲染线程分析横向滚动条。
+    ///
+    /// 业务意图：
+    /// - 快照数量很多时需要横向拖动入口；轨道从线程名列右侧开始，对齐实际时间线区域。
+    fn render_horizontal_scrollbar(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let Some(metrics) = MainView::log_horizontal_scrollbar_metrics(
+            &self.scroll_handle,
+            THREAD_ANALYSIS_NAME_COLUMN_WIDTH,
+        ) else {
+            return div()
+                .id("thread-analysis-horizontal-scrollbar-empty")
+                .hidden();
+        };
+
+        div()
+            .id("thread-analysis-horizontal-scrollbar")
+            .absolute()
+            .left(metrics.thumb_start)
+            .bottom(px(LOG_VIEWER_SCROLLBAR_PADDING))
+            .w(metrics.thumb_length)
+            .h(px(LOG_VIEWER_SCROLLBAR_WIDTH))
+            .rounded(px(LOG_VIEWER_SCROLLBAR_WIDTH / 2.0))
+            .bg(rgb(palette.scrollbar))
+            .cursor_pointer()
+            .hover(move |thumb| thumb.bg(rgb(palette.scrollbar_hover)))
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|view, event: &MouseDownEvent, _window, context| {
+                    view.start_scrollbar_drag(LogScrollbarAxis::Horizontal, event, context);
+                }),
+            )
+    }
+
+    /// 开始拖动线程分析滚动条。
+    ///
+    /// 边界条件：
+    /// - 如果滚动条尚未完成测量或内容不足以滚动，则忽略本次拖动。
+    fn start_scrollbar_drag(
+        &mut self,
+        axis: LogScrollbarAxis,
+        event: &MouseDownEvent,
+        context: &mut Context<Self>,
+    ) {
+        let Some(metrics) = self.scrollbar_metrics(axis) else {
+            return;
+        };
+        if metrics.max_scroll <= px(0.0) {
+            return;
+        }
+        let Some(viewport_origin) =
+            MainView::uniform_list_viewport_axis_origin(&self.scroll_handle, axis)
+        else {
+            return;
+        };
+        let pointer_position = match axis {
+            LogScrollbarAxis::Vertical => event.position.y,
+            LogScrollbarAxis::Horizontal => event.position.x,
+        };
+        self.scrollbar_drag = Some(ThreadAnalysisScrollbarDrag {
+            axis,
+            cursor_offset: pointer_position - viewport_origin - metrics.thumb_start,
+        });
+        context.notify();
+    }
+
+    /// 根据鼠标移动更新线程分析滚动条拖动。
+    fn update_scrollbar_drag(&mut self, event: &MouseMoveEvent, context: &mut Context<Self>) {
+        let Some(drag) = self.scrollbar_drag else {
+            return;
+        };
+        if !event.dragging() {
+            self.scrollbar_drag = None;
+            context.notify();
+            return;
+        }
+        let Some(metrics) = self.scrollbar_metrics(drag.axis) else {
+            self.scrollbar_drag = None;
+            context.notify();
+            return;
+        };
+        let Some(viewport_origin) =
+            MainView::uniform_list_viewport_axis_origin(&self.scroll_handle, drag.axis)
+        else {
+            self.scrollbar_drag = None;
+            context.notify();
+            return;
+        };
+        let pointer_position = match drag.axis {
+            LogScrollbarAxis::Vertical => event.position.y,
+            LogScrollbarAxis::Horizontal => event.position.x,
+        };
+        let movable_length = (metrics.track_length - metrics.thumb_length).max(px(0.0));
+        if metrics.max_scroll <= px(0.0) || movable_length <= px(0.0) {
+            return;
+        }
+
+        let requested_thumb_start = pointer_position - viewport_origin - drag.cursor_offset;
+        let thumb_start =
+            requested_thumb_start.clamp(metrics.track_start, metrics.track_start + movable_length);
+        let scroll_offset =
+            metrics.max_scroll * ((thumb_start - metrics.track_start) / movable_length);
+        let base_scroll_handle = { self.scroll_handle.0.borrow().base_handle.clone() };
+        let current_offset = base_scroll_handle.offset();
+        match drag.axis {
+            LogScrollbarAxis::Vertical => {
+                base_scroll_handle.set_offset(point(current_offset.x, -scroll_offset));
+            }
+            LogScrollbarAxis::Horizontal => {
+                base_scroll_handle.set_offset(point(-scroll_offset, current_offset.y));
+            }
+        }
+        context.notify();
+    }
+
+    /// 结束线程分析滚动条拖动。
+    fn stop_scrollbar_drag(&mut self, context: &mut Context<Self>) {
+        if self.scrollbar_drag.take().is_some() {
+            context.notify();
+        }
+    }
+
+    /// 返回指定方向的线程分析滚动条测量结果。
+    fn scrollbar_metrics(&self, axis: LogScrollbarAxis) -> Option<LogScrollbarMetrics> {
+        match axis {
+            LogScrollbarAxis::Vertical => {
+                MainView::log_vertical_scrollbar_metrics(&self.scroll_handle)
+            }
+            LogScrollbarAxis::Horizontal => MainView::log_horizontal_scrollbar_metrics(
+                &self.scroll_handle,
+                THREAD_ANALYSIS_NAME_COLUMN_WIDTH,
+            ),
+        }
+    }
+}
+
+impl Render for ThreadAnalysisWindowView {
+    /// 渲染线程日志分析窗口。
+    fn render(&mut self, _window: &mut Window, context: &mut Context<Self>) -> impl IntoElement {
+        let (palette, theme) = {
+            let main_view = self.main_view.read(context);
+            (main_view.palette(), main_view.effective_theme())
+        };
+        let _snapshot_count = self.analysis.snapshots.len();
+        let row_count = self.timeline_row_count();
+        let scroll_handle = self.scroll_handle.clone();
+
+        div()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|view, _event: &MouseDownEvent, _window, context| {
+                    view.dismiss_cell_popup(context);
+                }),
+            )
+            .on_mouse_move(
+                context.listener(|view, event: &MouseMoveEvent, _window, context| {
+                    view.update_scrollbar_drag(event, context);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                context.listener(|view, _event: &MouseUpEvent, _window, context| {
+                    view.stop_scrollbar_drag(context);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                context.listener(|view, _event: &MouseUpEvent, _window, context| {
+                    view.stop_scrollbar_drag(context);
+                }),
+            )
+            .flex()
+            .flex_col()
+            .relative()
+            .size_full()
+            .bg(rgb(palette.background))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .h(px(54.0))
+                    .px_4()
+                    .border_b_1()
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.panel))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(palette.text))
+                                    .truncate()
+                                    .child(self.analysis.title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(palette.muted_text))
+                                    .truncate()
+                                    .child(self.analysis.summary.clone()),
+                            ),
+                    )
+                    .child(self.render_legend(palette, theme)),
+            )
+            .child(
+                div()
+                    .id("thread-analysis-scroll")
+                    .relative()
+                    .flex_1()
+                    .p_4()
+                    .child(
+                        uniform_list(
+                            "thread-analysis-virtual-list",
+                            row_count,
+                            context.processor(
+                                move |view, range: std::ops::Range<usize>, _window, _context| {
+                                    range
+                                        .map(|row_index| {
+                                            let thread_name = view
+                                                .analysis
+                                                .thread_names
+                                                .get(row_index)
+                                                .cloned()
+                                                .unwrap_or_default();
+                                            let cells = view
+                                                .analysis
+                                                .matrix
+                                                .get(row_index)
+                                                .map(Vec::as_slice)
+                                                .unwrap_or(&[]);
+                                            view.render_timeline_row(
+                                                thread_name,
+                                                cells,
+                                                palette,
+                                                theme,
+                                                _context,
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                },
+                            ),
+                        )
+                        .with_horizontal_sizing_behavior(
+                            ListHorizontalSizingBehavior::Unconstrained,
+                        )
+                        .size_full()
+                        .track_scroll(scroll_handle),
+                    )
+                    .child(self.render_vertical_scrollbar(palette, context))
+                    .child(self.render_horizontal_scrollbar(palette, context)),
+            )
+            .when(self.cell_popup.is_some(), |root| {
+                root.child(self.render_cell_popup(palette, context).unwrap_or_else(div))
+            })
+    }
 }
 
 /// 设置窗口独立窗口根视图。
@@ -3280,10 +4196,63 @@ struct LogTreeRowRenderData {
     can_toggle: bool,
     /// 当前行是否绑定日志正文来源；存在时点击打开右侧 tab。
     source: Option<LogFileSource>,
+    /// 当前行在可见目录树中的下标。
+    ///
+    /// 业务意图：
+    /// - Shift 多选需要按当前可见顺序选择连续行，折叠隐藏的节点不应被纳入本次范围。
+    visible_index: usize,
+    /// 当前行是否处于左侧树选择集合中。
+    ///
+    /// 业务意图：
+    /// - 单击、多选和右键菜单都依赖可见选中态，渲染层需要用该字段决定背景和文字强调。
+    selected: bool,
     /// 当前行展示文本。
     label: String,
     /// 当前行右侧短元信息。
     meta: Option<String>,
+}
+
+/// 左侧目录树右键菜单状态。
+///
+/// 业务意图：
+/// - 右键菜单作用于左侧当前选择文件集合；如果用户右键未选中文件，先把右键行作为唯一选择。
+/// - 菜单位置保存为左侧面板局部坐标，避免主窗口顶部工具栏或右侧区域偏移影响定位。
+struct LogTreeContextMenu {
+    /// 右键落点对应的节点 ID。
+    node_id: usize,
+    /// 右键落点对应的可读取文件来源。
+    ///
+    /// 业务意图：
+    /// - 如果当前多选集合里没有可读取文件，右键菜单命令仍应能作用于右键点中的文件。
+    /// - 单文件压缩包会在渲染阶段被映射成内部唯一文件来源，因此这里保存的是最终可打开/可分析来源。
+    source: Option<LogFileSource>,
+    /// 菜单左上角相对左侧目录树面板的横坐标。
+    x: f32,
+    /// 菜单左上角相对左侧目录树面板的纵坐标。
+    y: f32,
+}
+
+/// 左侧目录树右键菜单命令。
+///
+/// 业务意图：
+/// - 文件另存为和线程日志分析都基于当前多选文件集合，集中枚举可以让渲染和执行逻辑保持一致。
+#[derive(Clone, Copy)]
+enum LogTreeContextMenuAction {
+    /// 把当前多选日志文件保存到用户指定目录。
+    SaveAs,
+    /// 对当前多选日志文件执行 Java thread dump 时间线分析。
+    AnalyzeThreads,
+}
+
+/// 批量另存为的后台结果。
+///
+/// 业务意图：
+/// - 文件复制发生在后台线程，结果回到 UI 后只需要知道成功和失败数量，用于开发期诊断或后续状态栏展示。
+struct SaveSelectedLogsResult {
+    /// 成功写入的文件数量。
+    saved_count: usize,
+    /// 失败的文件数量。
+    failed_count: usize,
 }
 
 /// 用户通过“加载日志”按钮选择的路径来源类型。
@@ -3340,6 +4309,16 @@ impl LoadPromptKind {
 /// - 当前视图只在用户点击“加载日志”并完成系统选择器确认后读取路径。
 /// - 当前视图不保存持久状态，因此不会产生跨平台配置写入差异。
 struct MainView {
+    /// 主窗口句柄。
+    ///
+    /// 业务意图：
+    /// - 线程分析、搜索等独立窗口可能触发主窗口定位行为；保存主窗口句柄后，这些辅助窗口可以在操作完成后
+    ///   把主窗口重新激活到前台，让用户立刻看到跳转结果。
+    ///
+    /// 边界条件：
+    /// - `MainView::new` 执行时主窗口句柄尚未由 GPUI 返回，因此初始化为 `None`，窗口创建完成后立即回填。
+    main_window: Option<WindowHandle<MainView>>,
+
     /// 左侧内容区域当前宽度。
     ///
     /// 业务意图：
@@ -3377,6 +4356,31 @@ struct MainView {
     /// 边界条件：
     /// - 该句柄只服务左侧目录树，不用于右侧日志正文或其它未来列表。
     log_tree_scroll_handle: UniformListScrollHandle,
+
+    /// 左侧目录树当前选中的节点 ID 集合。
+    ///
+    /// 业务意图：
+    /// - 用户要求左侧树支持单选、Ctrl 多选和 Shift 连续多选；选择状态必须独立于右侧已打开 tab。
+    /// - 集合只保存节点 ID，不保存行号，避免折叠、展开或虚拟列表滚动后行号变化导致选中错误。
+    ///
+    /// 边界条件：
+    /// - 重新加载日志会清空该集合，因为节点 ID 只在一次加载结果内部有效。
+    /// - 目录、压缩包和错误节点也可以被选中用于视觉反馈，但文件操作会只筛选可读取文件来源。
+    log_tree_selected_node_ids: HashSet<usize>,
+
+    /// Shift 多选的锚点节点 ID。
+    ///
+    /// 业务意图：
+    /// - 常见文件树中 Shift 点击会从最近一次普通点击或 Ctrl 点击位置扩展到当前行。
+    /// - 锚点使用节点 ID，再通过当前可见行列表定位，确保折叠后的范围只覆盖用户当前看得到的行。
+    log_tree_selection_anchor: Option<usize>,
+
+    /// 当前打开的左侧目录树右键菜单。
+    ///
+    /// 业务意图：
+    /// - 菜单承载“另存为”和“线程日志分析”，需要记录右键位置并跟随当前主题自绘。
+    /// - 该状态只属于当前会话，不持久化，也不会影响右侧 tab 状态。
+    log_tree_context_menu: Option<LogTreeContextMenu>,
 
     /// 右侧 tab 栏横向滚动句柄。
     ///
@@ -3464,6 +4468,13 @@ struct MainView {
     /// 边界条件：
     /// - 用户通过系统关闭按钮关闭设置窗口时，关闭回调必须清空该字段，避免后续点击设置按钮尝试激活失效窗口。
     settings_window: Option<WindowHandle<SettingsWindowView>>,
+
+    /// 线程日志分析独立窗口句柄。
+    ///
+    /// 业务意图：
+    /// - 线程分析结果是独立工作视图，重复触发分析时更新或激活已有窗口，避免堆叠多个过期分析窗口。
+    /// - 句柄只服务当前会话；关闭窗口后由回调清空。
+    thread_analysis_window: Option<WindowHandle<ThreadAnalysisWindowView>>,
 
     /// 设置窗口打开请求是否已经排队到下一帧。
     ///
@@ -3619,9 +4630,13 @@ impl MainView {
     fn new(context: &mut Context<Self>) -> Self {
         Self {
             left_panel_width: LEFT_PANEL_DEFAULT_WIDTH,
+            main_window: None,
             is_resizing_splitter: false,
             load_state: LogTreeLoadState::Empty,
             log_tree_scroll_handle: UniformListScrollHandle::new(),
+            log_tree_selected_node_ids: HashSet::new(),
+            log_tree_selection_anchor: None,
+            log_tree_context_menu: None,
             tab_bar_scroll_handle: ScrollHandle::new(),
             open_tabs: Vec::new(),
             active_tab_id: None,
@@ -3633,6 +4648,7 @@ impl MainView {
             search_dialog: None,
             search_dialog_window: None,
             settings_window: None,
+            thread_analysis_window: None,
             settings_window_open_pending: false,
             settings_active_tab: SettingsTab::General,
             theme_preference: load_theme_preference(),
@@ -3975,6 +4991,9 @@ impl MainView {
                     view.active_tab_id = None;
                     view.tab_context_menu = None;
                     view.encoding_dropdown_menu = None;
+                    view.log_tree_context_menu = None;
+                    view.log_tree_selected_node_ids.clear();
+                    view.log_tree_selection_anchor = None;
                     view.log_scrollbar_drag = None;
                     view.log_tree_scrollbar_drag = None;
                     view.tab_bar_scroll_handle = ScrollHandle::new();
@@ -3995,6 +5014,9 @@ impl MainView {
                         Ok(tree) => {
                             view.log_tree_scroll_handle = UniformListScrollHandle::new();
                             view.log_tree_scrollbar_drag = None;
+                            view.log_tree_context_menu = None;
+                            view.log_tree_selected_node_ids.clear();
+                            view.log_tree_selection_anchor = None;
                             LogTreeLoadState::Loaded(LoadedLogTreeState::new(tree))
                         }
                         Err(error) => LogTreeLoadState::Failed {
@@ -4050,12 +5072,14 @@ impl MainView {
         let palette = self.palette();
 
         div()
+            .relative()
             .flex()
             .flex_col()
             .size_full()
             .bg(rgb(palette.panel))
             .child(self.render_log_tree_header())
             .child(self.render_log_tree_body(context))
+            .child(self.render_log_tree_context_menu(context))
     }
 
     /// 渲染左侧日志目录树标题。
@@ -4137,6 +5161,7 @@ impl MainView {
                     context.processor(|view, range: std::ops::Range<usize>, _window, context| {
                         // 先复制当前可见区间的数据，再渲染元素，避免同时持有 `load_state` 的不可变借用和
                         // 需要注册点击监听的可变 `Context`，这是 Rust 借用规则下最清晰的分界。
+                        let range_start = range.start;
                         let rows: Vec<LoadedLogTreeRow> = match &view.load_state {
                             LogTreeLoadState::Loaded(tree_state) => range
                                 .filter_map(|index| tree_state.visible_rows.get(index).cloned())
@@ -4147,7 +5172,10 @@ impl MainView {
                         };
 
                         rows.iter()
-                            .map(|row| view.render_loaded_log_tree_row(row, context))
+                            .enumerate()
+                            .map(|(offset, row)| {
+                                view.render_loaded_log_tree_row(range_start + offset, row, context)
+                            })
                             .collect::<Vec<_>>()
                     }),
                 )
@@ -4267,6 +5295,7 @@ impl MainView {
     /// - 错误详情暂不展开显示，只保存在加载结果中，后续可接入悬浮提示或状态面板。
     fn render_loaded_log_tree_row(
         &self,
+        visible_index: usize,
         row: &LoadedLogTreeRow,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -4301,10 +5330,13 @@ impl MainView {
                 icon_color,
                 can_toggle,
                 source: row_source,
+                visible_index,
+                selected: self.log_tree_selected_node_ids.contains(&row.id),
                 label: row.label.clone(),
                 meta: row.meta.clone(),
             },
             palette,
+            self.effective_theme(),
             context,
         )
     }
@@ -4321,6 +5353,7 @@ impl MainView {
     fn render_log_tree_row(
         row_data: LogTreeRowRenderData,
         palette: AppThemePalette,
+        theme: EffectiveTheme,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let LogTreeRowRenderData {
@@ -4331,12 +5364,22 @@ impl MainView {
             icon_color,
             can_toggle,
             source,
+            visible_index,
+            selected,
             label,
             meta,
         } = row_data;
         let left_padding = LOG_TREE_ROW_HORIZONTAL_PADDING + depth as f32 * LOG_TREE_ROW_INDENT;
+        let source_for_left_click = source.clone();
+        let source_for_right_click = source.clone();
+        let background = if selected {
+            palette.selected
+        } else {
+            palette.panel
+        };
+        let hover_background = Self::log_tree_row_hover_background(selected, theme);
 
-        let row = div()
+        div()
             .id(SharedString::from(format!("log-tree-row-{}", node_id)))
             .flex()
             .items_center()
@@ -4347,8 +5390,14 @@ impl MainView {
             .pl(px(left_padding))
             .pr(px(LOG_TREE_ROW_HORIZONTAL_PADDING))
             .text_sm()
-            .text_color(rgb(palette.text))
-            .hover(move |tree_row| tree_row.bg(rgb(palette.hover)))
+            .text_color(rgb(if selected {
+                palette.accent
+            } else {
+                palette.text
+            }))
+            .bg(rgb(background))
+            .cursor_pointer()
+            .hover(move |tree_row| tree_row.bg(rgb(hover_background)))
             .child(Self::render_lucide_icon(
                 expand_icon,
                 LOG_TREE_CHEVRON_WIDTH,
@@ -4370,22 +5419,933 @@ impl MainView {
                     .min_w_0()
                     .child(div().min_w_0().truncate().child(label))
                     .child(Self::render_log_tree_meta(meta.as_deref(), palette)),
-            );
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(move |view, event: &MouseDownEvent, _window, context| {
+                    view.handle_log_tree_left_mouse_down(
+                        node_id,
+                        visible_index,
+                        source_for_left_click.clone(),
+                        can_toggle,
+                        event,
+                        context,
+                    );
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(move |view, event: &MouseDownEvent, _window, context| {
+                    view.open_log_tree_context_menu(
+                        node_id,
+                        visible_index,
+                        source_for_right_click.clone(),
+                        f32::from(event.position.x),
+                        f32::from(event.position.y),
+                        event,
+                        context,
+                    );
+                }),
+            )
+    }
 
-        if let Some(source) = source {
-            row.cursor_pointer().on_click(context.listener(
-                move |view, _event: &ClickEvent, _window, context| {
-                    view.open_log_file(source.clone(), context);
-                },
-            ))
-        } else if can_toggle {
-            row.cursor_pointer().on_click(context.listener(
-                move |view, _event: &ClickEvent, _window, context| {
-                    view.toggle_log_tree_node(node_id, context);
-                },
-            ))
+    /// 返回左侧目录树行的悬浮背景色。
+    ///
+    /// 业务意图：
+    /// - 左侧树面板本身使用浅灰/深灰背景，通用 hover 色在明亮主题下和面板背景过于接近，会导致用户看不清鼠标悬浮行。
+    /// - 选中行和普通行分别使用更明确的悬浮色，保证“当前选中”和“鼠标所在”两个状态都能被辨认。
+    fn log_tree_row_hover_background(selected: bool, theme: EffectiveTheme) -> u32 {
+        match (theme, selected) {
+            (EffectiveTheme::Light, false) => 0xeaeef2,
+            (EffectiveTheme::Light, true) => 0xcce8ff,
+            (EffectiveTheme::Dark, false) => 0x30363d,
+            (EffectiveTheme::Dark, true) => 0x16456a,
+        }
+    }
+
+    /// 处理左侧目录树左键按下。
+    ///
+    /// 业务意图：
+    /// - 单击只改变目录树选择，不再直接打开日志；双击文件打开日志，双击目录或压缩包节点展开/收起。
+    /// - Shift 和 Ctrl/Command 多选都基于当前可见行顺序，符合常见文件树操作习惯。
+    ///
+    /// 边界条件：
+    /// - 错误节点或不可打开节点也允许选中，方便用户保持视觉上下文；后续文件操作会只筛选可读取来源。
+    /// - 鼠标三击及以上按双击处理，避免快速点击文件时既清空选择又不执行任何动作。
+    fn handle_log_tree_left_mouse_down(
+        &mut self,
+        node_id: usize,
+        visible_index: usize,
+        source: Option<LogFileSource>,
+        can_toggle: bool,
+        event: &MouseDownEvent,
+        context: &mut Context<Self>,
+    ) {
+        self.update_log_tree_selection_for_click(
+            node_id,
+            visible_index,
+            event.modifiers.shift,
+            event.modifiers.control || event.modifiers.platform,
+        );
+        self.log_tree_context_menu = None;
+        self.tab_context_menu = None;
+        self.encoding_dropdown_menu = None;
+        self.search_results_context_menu = None;
+
+        if event.click_count >= 2 {
+            if let Some(source) = source {
+                self.open_log_file(source, context);
+            } else if can_toggle {
+                self.toggle_log_tree_node(node_id, context);
+            }
+        }
+        context.notify();
+    }
+
+    /// 根据鼠标点击和修饰键更新目录树选择集合。
+    ///
+    /// 业务意图：
+    /// - 将多选规则拆成纯状态逻辑，避免渲染事件中混入范围计算细节。
+    /// - Ctrl/Command 点击用于增删单个节点，Shift 点击用于从锚点到当前行的连续选择。
+    fn update_log_tree_selection_for_click(
+        &mut self,
+        node_id: usize,
+        visible_index: usize,
+        shift: bool,
+        additive: bool,
+    ) {
+        let visible_node_ids = self.visible_log_tree_node_ids();
+        Self::apply_log_tree_selection_click(
+            &mut self.log_tree_selected_node_ids,
+            &mut self.log_tree_selection_anchor,
+            &visible_node_ids,
+            node_id,
+            visible_index,
+            shift,
+            additive,
+        );
+    }
+
+    /// 应用左侧树选择规则。
+    ///
+    /// 边界条件：
+    /// - Shift 点击但锚点已经不可见时，退化为普通单击，避免选择隐藏折叠节点。
+    /// - Ctrl/Command 与 Shift 同时按下时保留既有选择并追加范围，符合多数桌面文件管理器行为。
+    fn apply_log_tree_selection_click(
+        selected_node_ids: &mut HashSet<usize>,
+        selection_anchor: &mut Option<usize>,
+        visible_node_ids: &[usize],
+        node_id: usize,
+        visible_index: usize,
+        shift: bool,
+        additive: bool,
+    ) {
+        if shift {
+            let anchor_index = selection_anchor
+                .and_then(|anchor_id| visible_node_ids.iter().position(|id| *id == anchor_id))
+                .unwrap_or(visible_index);
+            if !additive {
+                selected_node_ids.clear();
+            }
+            let start = anchor_index.min(visible_index);
+            let end = anchor_index.max(visible_index);
+            for id in visible_node_ids.iter().skip(start).take(end - start + 1) {
+                selected_node_ids.insert(*id);
+            }
+            return;
+        }
+
+        *selection_anchor = Some(node_id);
+        if additive {
+            if !selected_node_ids.remove(&node_id) {
+                selected_node_ids.insert(node_id);
+            }
         } else {
-            row
+            selected_node_ids.clear();
+            selected_node_ids.insert(node_id);
+        }
+    }
+
+    /// 返回当前可见目录树行的节点 ID。
+    ///
+    /// 业务意图：
+    /// - Shift 多选只能覆盖当前用户可见的连续行，折叠隐藏的子节点不参与范围计算。
+    fn visible_log_tree_node_ids(&self) -> Vec<usize> {
+        match &self.load_state {
+            LogTreeLoadState::Loaded(tree_state) => {
+                tree_state.visible_rows.iter().map(|row| row.id).collect()
+            }
+            LogTreeLoadState::Empty
+            | LogTreeLoadState::Loading { .. }
+            | LogTreeLoadState::Failed { .. } => Vec::new(),
+        }
+    }
+
+    /// 打开左侧目录树右键菜单。
+    ///
+    /// 业务意图：
+    /// - 右键已选中文件时保留当前多选集合；右键未选中行时先把该行切换为唯一选择。
+    /// - 菜单命令随后统一作用于当前选择中的可读取文件，目录和错误节点会被自动忽略。
+    fn open_log_tree_context_menu(
+        &mut self,
+        node_id: usize,
+        visible_index: usize,
+        source: Option<LogFileSource>,
+        window_x: f32,
+        window_y: f32,
+        event: &MouseDownEvent,
+        context: &mut Context<Self>,
+    ) {
+        if !self.log_tree_selected_node_ids.contains(&node_id) {
+            self.update_log_tree_selection_for_click(
+                node_id,
+                visible_index,
+                event.modifiers.shift,
+                event.modifiers.control || event.modifiers.platform,
+            );
+        }
+        self.log_tree_context_menu = Some(LogTreeContextMenu {
+            node_id,
+            source,
+            x: window_x.clamp(0.0, self.left_panel_width - LOG_TREE_CONTEXT_MENU_WIDTH),
+            y: (window_y - TOOLBAR_HEIGHT).max(0.0),
+        });
+        self.tab_context_menu = None;
+        self.encoding_dropdown_menu = None;
+        self.search_results_context_menu = None;
+        context.notify();
+    }
+
+    /// 渲染左侧目录树右键菜单。
+    ///
+    /// 业务意图：
+    /// - 菜单提供面向文件集合的操作；视觉上跟随当前主题，行为上不依赖平台系统菜单。
+    /// - 即使右键落在目录节点上，菜单仍展示，但命令执行时只处理当前选择中的文件来源。
+    fn render_log_tree_context_menu(
+        &self,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let Some(menu) = &self.log_tree_context_menu else {
+            return div().id("log-tree-context-menu-empty").hidden();
+        };
+        let palette = self.palette();
+        let node_id = menu.node_id;
+        let fallback_source = menu.source.clone();
+
+        div()
+            .id("log-tree-context-menu")
+            .absolute()
+            .left(px(menu.x))
+            .top(px(menu.y))
+            .w(px(LOG_TREE_CONTEXT_MENU_WIDTH))
+            .py_1()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.menu))
+            .shadow_lg()
+            .child(self.render_log_tree_context_menu_item(
+                node_id,
+                fallback_source.clone(),
+                LogTreeContextMenuAction::SaveAs,
+                "另存为...",
+                Icon::Save,
+                palette,
+                context,
+            ))
+            .child(self.render_log_tree_context_menu_item(
+                node_id,
+                fallback_source,
+                LogTreeContextMenuAction::AnalyzeThreads,
+                "线程日志分析",
+                Icon::ChartNoAxesCombined,
+                palette,
+                context,
+            ))
+    }
+
+    /// 渲染左侧目录树右键菜单单项。
+    ///
+    /// 业务意图：
+    /// - 菜单项点击后进入统一命令分发，避免另存为和分析各自重复收起菜单、筛选选中来源。
+    fn render_log_tree_context_menu_item(
+        &self,
+        node_id: usize,
+        fallback_source: Option<LogFileSource>,
+        action: LogTreeContextMenuAction,
+        label: &'static str,
+        icon: Icon,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(SharedString::from(format!(
+                "log-tree-menu-{}-{}",
+                node_id, label
+            )))
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(LOG_TREE_CONTEXT_MENU_ITEM_HEIGHT))
+            .px_3()
+            .text_sm()
+            .text_color(rgb(palette.text))
+            .cursor_pointer()
+            .hover(move |item| item.bg(rgb(palette.hover)))
+            .child(Self::render_lucide_icon(
+                Some(icon),
+                16.0,
+                15.0,
+                palette.muted_text,
+            ))
+            .child(label)
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(move |view, _event: &MouseDownEvent, window, context| {
+                    view.handle_log_tree_context_menu_action(
+                        action,
+                        fallback_source.clone(),
+                        window,
+                        context,
+                    );
+                }),
+            )
+    }
+
+    /// 执行左侧目录树右键菜单命令。
+    ///
+    /// 业务意图：
+    /// - 所有命令都基于当前多选集合中的可读取文件；目录、压缩包目录和错误节点不参与文件操作。
+    fn handle_log_tree_context_menu_action(
+        &mut self,
+        action: LogTreeContextMenuAction,
+        fallback_source: Option<LogFileSource>,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let mut sources = self.selected_log_tree_file_sources();
+        if sources.is_empty()
+            && let Some(fallback_source) = fallback_source
+        {
+            sources.push(fallback_source);
+        }
+        self.log_tree_context_menu = None;
+        self.tab_context_menu = None;
+        self.encoding_dropdown_menu = None;
+        self.search_results_context_menu = None;
+
+        match action {
+            LogTreeContextMenuAction::SaveAs => {
+                self.save_selected_log_tree_sources_as(sources, context);
+            }
+            LogTreeContextMenuAction::AnalyzeThreads => {
+                self.open_thread_analysis_for_sources(sources, window, context);
+            }
+        }
+        context.notify();
+    }
+
+    /// 返回当前目录树选择中的可读取日志来源。
+    ///
+    /// 业务意图：
+    /// - 多选允许包含目录和错误节点，但“另存为”和“线程日志分析”只能处理真实文件。
+    /// - 按加载树原始顺序返回，保证批量保存和分析结果稳定。
+    fn selected_log_tree_file_sources(&self) -> Vec<LogFileSource> {
+        let LogTreeLoadState::Loaded(tree_state) = &self.load_state else {
+            return Vec::new();
+        };
+        tree_state
+            .tree
+            .rows
+            .iter()
+            .filter(|row| self.log_tree_selected_node_ids.contains(&row.id))
+            .filter_map(|row| {
+                row.source.clone().or_else(|| {
+                    (row.kind == LogTreeEntryKind::Archive)
+                        .then(|| tree_state.single_file_source_for_archive(row.id))
+                        .flatten()
+                })
+            })
+            .collect()
+    }
+
+    /// 将当前选择的日志来源另存为到用户选择的目录。
+    ///
+    /// 业务意图：
+    /// - 用户要求保存当前多选的所有文件；本地文件按原文件名写入目标目录，压缩包内部文件保留成员路径层级。
+    /// - 选择目录通过 GPUI 系统路径选择器完成，保证 macOS 和 Windows 使用平台原生交互。
+    ///
+    /// 边界条件：
+    /// - 没有选中文件时直接忽略，避免打开一个无法产生结果的目录选择器。
+    /// - 写入失败不影响其它文件；后台结果只统计数量，后续如需详细失败列表可接入状态面板。
+    fn save_selected_log_tree_sources_as(
+        &mut self,
+        sources: Vec<LogFileSource>,
+        context: &mut Context<Self>,
+    ) {
+        if sources.is_empty() {
+            return;
+        }
+
+        context
+            .spawn(async move |view, app| {
+                let options = PathPromptOptions {
+                    files: false,
+                    directories: true,
+                    multiple: false,
+                    prompt: Some("选择另存为目录".into()),
+                };
+                let receiver = match app.update(|app| app.prompt_for_paths(options)) {
+                    Ok(receiver) => receiver,
+                    Err(_) => return,
+                };
+                let target_directory = match receiver.await {
+                    Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                    Ok(Ok(None)) | Ok(Err(_)) | Err(_) => None,
+                };
+                let Some(target_directory) = target_directory else {
+                    return;
+                };
+
+                let result = app
+                    .background_executor()
+                    .spawn(async move {
+                        Self::save_log_sources_to_directory(&sources, &target_directory)
+                    })
+                    .await;
+
+                view.update(app, |view, context| {
+                    // 当前没有全局状态栏；这里只保留静默完成策略，避免批量保存失败影响日志查看流程。
+                    // 统计结果通过局部变量消费，确保后台错误不会被误认为需要中断 UI。
+                    let _ = (result.saved_count, result.failed_count);
+                    view.log_tree_context_menu = None;
+                    context.notify();
+                })
+                .ok();
+            })
+            .detach();
+    }
+
+    /// 把多个日志来源写入目标目录。
+    ///
+    /// 业务意图：
+    /// - 本地文件保存为目标目录下的原文件名；压缩包成员按成员路径创建子目录，保留压缩包内部层级。
+    /// - 使用 `read_log_source_bytes` 统一读取普通文件和压缩包成员，避免另存为路径重复理解压缩格式细节。
+    ///
+    /// 边界条件：
+    /// - 目标路径的父目录会按需创建；权限不足、同名目录冲突或源文件消失都会记为单文件失败。
+    /// - 如果多个来源映射到同一目标文件，后写入者会覆盖先写入者；这是“按原文件名保存”的直接结果。
+    fn save_log_sources_to_directory(
+        sources: &[LogFileSource],
+        target_directory: &Path,
+    ) -> SaveSelectedLogsResult {
+        let mut saved_count = 0usize;
+        let mut failed_count = 0usize;
+        for source in sources {
+            let relative_path = Self::save_relative_path_for_source(source);
+            let target_path = target_directory.join(relative_path);
+            let write_result = read_log_source_bytes(source).and_then(|bytes| {
+                if let Some(parent) = target_path.parent() {
+                    fs::create_dir_all(parent).map_err(|error| {
+                        LogContentError::new(format!(
+                            "无法创建目录 {}：{}",
+                            parent.display(),
+                            error
+                        ))
+                    })?;
+                }
+                fs::write(&target_path, bytes.as_slice()).map_err(|error| {
+                    LogContentError::new(format!(
+                        "无法写入文件 {}：{}",
+                        target_path.display(),
+                        error
+                    ))
+                })
+            });
+            if write_result.is_ok() {
+                saved_count += 1;
+            } else {
+                failed_count += 1;
+            }
+        }
+
+        SaveSelectedLogsResult {
+            saved_count,
+            failed_count,
+        }
+    }
+
+    /// 返回日志来源另存为时使用的相对路径。
+    ///
+    /// 业务意图：
+    /// - 本地文件只保留原文件名；压缩包成员保留内部路径层级，满足用户对归档内目录结构的要求。
+    ///
+    /// 边界条件：
+    /// - 压缩包成员路径已经由加载层安全归一化，这里仍按 `/` 拆分成 `PathBuf`，避免把分隔符当作文件名写入。
+    fn save_relative_path_for_source(source: &LogFileSource) -> PathBuf {
+        match source {
+            LogFileSource::LocalFile { path } => path
+                .file_name()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("log.txt")),
+            LogFileSource::ArchiveMember { member_path, .. } => member_path
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .fold(PathBuf::new(), |mut path, part| {
+                    path.push(part);
+                    path
+                }),
+        }
+    }
+
+    /// 对当前选择的日志来源执行 Java thread dump 分析。
+    ///
+    /// 业务意图：
+    /// - 读取和解码可能涉及大文件或压缩包，必须在后台执行；分析完成后再打开独立窗口展示时间线。
+    /// - 多选文件会合并分析，便于一次比较多个 thread dump 文件。
+    fn open_thread_analysis_for_sources(
+        &mut self,
+        sources: Vec<LogFileSource>,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if sources.is_empty() {
+            return;
+        }
+        let source_count = sources.len();
+        let main_view = context.entity();
+        let main_view_for_loading = main_view.clone();
+        let loading_analysis = ThreadAnalysisData {
+            title: "线程日志分析".to_string(),
+            summary: format!("正在分析 {} 个文件...", source_count),
+            snapshots: Vec::new(),
+            thread_names: Vec::new(),
+            matrix: Vec::new(),
+        };
+        // 先在当前事件循环结束后打开窗口，给用户即时反馈；后台读取和解析完成后再替换为真实结果。
+        window.defer(context, move |_window, app| {
+            Self::open_thread_analysis_window_after_main_update(
+                main_view_for_loading,
+                loading_analysis,
+                app,
+            );
+        });
+        context
+            .spawn(async move |view, app| {
+                let analysis = app
+                    .background_executor()
+                    .spawn(async move { Self::analyze_thread_dump_sources(&sources) })
+                    .await;
+
+                let _ = view;
+                app.update(move |app| {
+                    Self::open_thread_analysis_window_after_main_update(main_view, analysis, app);
+                })
+                .ok();
+            })
+            .detach();
+    }
+
+    /// 读取并分析多个日志来源中的 Java thread dump。
+    ///
+    /// 业务意图：
+    /// - 分析入口接受 `LogFileSource`，复用现有读取和自动编码识别逻辑，避免另建一套文件/压缩包读取路径。
+    ///
+    /// 边界条件：
+    /// - 某个文件读取或解码失败时跳过该文件，继续分析其它文件，避免单个坏文件阻断整批分析。
+    /// - 如果没有识别到任何快照，返回空分析数据，窗口会展示“未识别到快照”的摘要。
+    fn analyze_thread_dump_sources(sources: &[LogFileSource]) -> ThreadAnalysisData {
+        let mut snapshots = Vec::new();
+        let mut skipped_files = 0usize;
+        for (source_index, source) in sources.iter().enumerate() {
+            let source_name = source.display_name();
+            let result = read_log_source_bytes(source)
+                .and_then(|bytes| decode_log_bytes(&bytes, EncodingChoice::Auto, &source_name));
+            match result {
+                Ok(document) => {
+                    snapshots.extend(Self::parse_thread_dump_snapshots(
+                        &document.lines,
+                        &source_name,
+                        source_index,
+                        source,
+                    ));
+                }
+                Err(_) => {
+                    skipped_files += 1;
+                }
+            }
+        }
+
+        Self::build_thread_analysis_data(sources.len(), skipped_files, snapshots)
+    }
+
+    /// 从解码后的日志行中解析 Java thread dump 快照。
+    ///
+    /// 业务意图：
+    /// - Java thread dump 以 `Full thread dump` 作为快照边界，线程头通常以双引号线程名开头，
+    ///   状态行包含 `java.lang.Thread.State:`；解析这两个稳定特征即可形成线程状态时间线。
+    ///
+    /// 边界条件：
+    /// - 线程日志常见格式会先输出打印时间，再输出 `Full thread dump`；这里优先把打印时间作为横轴标签。
+    /// - 如果缺失状态行，当前线程不会加入快照，避免用未知状态污染时间线。
+    fn parse_thread_dump_snapshots(
+        lines: &[String],
+        source_name: &str,
+        source_index: usize,
+        source: &LogFileSource,
+    ) -> Vec<ThreadSnapshot> {
+        let mut snapshots = Vec::new();
+        let mut current_snapshot: Option<ThreadSnapshot> = None;
+        let mut pending_thread: Option<ThreadStateSamplePending> = None;
+        let mut last_timestamp: Option<String> = None;
+
+        for (line_index, line) in lines.iter().enumerate() {
+            if line.contains("Full thread dump") {
+                if let Some(snapshot) = current_snapshot.take()
+                    && !snapshot.threads.is_empty()
+                {
+                    snapshots.push(snapshot);
+                }
+                let label = last_timestamp
+                    .clone()
+                    .unwrap_or_else(|| format!("{} #{}", source_name, snapshots.len() + 1));
+                current_snapshot = Some(ThreadSnapshot {
+                    label,
+                    source_index,
+                    source: source.clone(),
+                    threads: Vec::new(),
+                });
+                pending_thread = None;
+                continue;
+            }
+            if let Some(timestamp) = Self::extract_thread_dump_timestamp(line) {
+                last_timestamp = Some(timestamp);
+            }
+
+            let Some(snapshot) = current_snapshot.as_mut() else {
+                continue;
+            };
+            if let Some((thread_name, thread_id)) = Self::parse_thread_header_details(line) {
+                pending_thread = Some(ThreadStateSamplePending {
+                    name: thread_name,
+                    thread_id,
+                    line_index,
+                    preview_lines: Self::thread_dump_preview_lines(lines, line_index),
+                });
+                continue;
+            }
+            if let Some(state_text) = line.split("java.lang.Thread.State:").nth(1)
+                && let Some(pending) = pending_thread.take()
+            {
+                snapshot.threads.push(ThreadStateSample {
+                    name: pending.name,
+                    thread_id: pending.thread_id,
+                    state: ThreadStateKind::parse(state_text),
+                    line_index: pending.line_index,
+                    preview_lines: pending.preview_lines,
+                });
+            }
+        }
+
+        if let Some(snapshot) = current_snapshot
+            && !snapshot.threads.is_empty()
+        {
+            snapshots.push(snapshot);
+        }
+
+        snapshots
+    }
+
+    /// 提取单个线程头开始的最多 5 行预览。
+    ///
+    /// 业务意图：
+    /// - 悬浮气泡用于查看当前色块对应线程的原始上下文，不能把下一个线程头或下一个 dump 快照混入预览。
+    /// - 预览限制为 5 行，避免超长堆栈在气泡中占满窗口。
+    fn thread_dump_preview_lines(lines: &[String], start_index: usize) -> Vec<String> {
+        let mut preview_lines = Vec::new();
+        for (line_index, line) in lines.iter().enumerate().skip(start_index) {
+            if line_index > start_index
+                && (line.contains("Full thread dump")
+                    || Self::parse_thread_header_details(line).is_some())
+            {
+                break;
+            }
+            preview_lines.push(line.clone());
+            if preview_lines.len() >= 5 {
+                break;
+            }
+        }
+        preview_lines
+    }
+
+    /// 提取 thread dump 附近的时间戳文案。
+    ///
+    /// 业务意图：
+    /// - 用户要求横轴为时间线；常见日志会在 dump 前输出 `YYYY-MM-DD HH:MM:SS` 或 JVM 日期行。
+    /// - 不引入时间解析依赖，只提取稳定前缀作为显示标签，避免因时区或本地化月份解析失败丢失标签。
+    fn extract_thread_dump_timestamp(line: &str) -> Option<String> {
+        let trimmed = line.trim();
+        if let Some(timestamp) =
+            Self::extract_thread_dump_timestamp_after_marker(trimmed, "打印时间")
+        {
+            return Some(timestamp);
+        }
+        if let Some(timestamp) =
+            Self::extract_thread_dump_timestamp_after_marker(trimmed, "print time")
+        {
+            return Some(timestamp);
+        }
+        if let Some(timestamp) =
+            Self::extract_thread_dump_timestamp_after_marker(trimmed, "dump time")
+        {
+            return Some(timestamp);
+        }
+        if let Some(timestamp) = Self::extract_leading_datetime_label(trimmed) {
+            return Some(timestamp);
+        }
+        if trimmed.len() >= 24
+            && trimmed
+                .chars()
+                .take(3)
+                .all(|character| character.is_ascii_alphabetic())
+            && trimmed.as_bytes().get(3) == Some(&b' ')
+            && trimmed.as_bytes().get(7) == Some(&b' ')
+            && trimmed.contains(':')
+        {
+            return Some(trimmed.chars().take(24).collect());
+        }
+        None
+    }
+
+    /// 从包含“打印时间”标记的日志行中提取时间部分。
+    ///
+    /// 业务意图：
+    /// - 线程日志可能用 `线程日志打印时间：2026-...` 这类前缀描述 dump 生成时间，
+    ///   横轴应展示真正的打印时间，而不是整行说明文字。
+    fn extract_thread_dump_timestamp_after_marker(line: &str, marker: &str) -> Option<String> {
+        let lower_line = line.to_ascii_lowercase();
+        let marker_index = lower_line.find(&marker.to_ascii_lowercase())?;
+        let after_marker = &line[marker_index + marker.len()..];
+        let trimmed = after_marker
+            .trim_start_matches(|character: char| {
+                character.is_whitespace()
+                    || matches!(character, ':' | '：' | '=' | '-' | '>' | '】' | ']')
+            })
+            .trim();
+        Self::extract_leading_datetime_label(trimmed)
+    }
+
+    /// 提取行首常见时间标签。
+    ///
+    /// 边界条件：
+    /// - 当前不做严格日期合法性校验，只识别日志中稳定的 `YYYY-MM-DD HH:MM:SS` 展示形态。
+    fn extract_leading_datetime_label(text: &str) -> Option<String> {
+        if text.len() >= 19
+            && text.as_bytes().get(4) == Some(&b'-')
+            && text.as_bytes().get(7) == Some(&b'-')
+            && text.as_bytes().get(10) == Some(&b' ')
+            && text.as_bytes().get(13) == Some(&b':')
+            && text.as_bytes().get(16) == Some(&b':')
+        {
+            Some(text[..19].to_string())
+        } else {
+            None
+        }
+    }
+
+    /// 从 Java thread dump 线程头中解析线程名和线程 ID。
+    ///
+    /// 边界条件：
+    /// - 标准 HotSpot 线程头以 `"线程名"` 开头；不符合该形态的行直接忽略。
+    /// - 线程 ID 优先使用 `#123` 形式，缺失时回退到 `tid=0x...`，保证不同 JVM 输出都能提供可核对标识。
+    fn parse_thread_header_details(line: &str) -> Option<(String, Option<String>)> {
+        let trimmed = line.trim_start();
+        let rest = trimmed.strip_prefix('"')?;
+        let end = rest.find('"')?;
+        let thread_name = rest[..end].to_string();
+        let metadata = rest[end + 1..].trim();
+        let thread_id = metadata
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix('#').map(|id| format!("#{id}")))
+            .or_else(|| {
+                metadata
+                    .split_whitespace()
+                    .find_map(|part| part.strip_prefix("tid=").map(|id| format!("tid={id}")))
+            });
+        Some((thread_name, thread_id))
+    }
+
+    /// 构建线程分析窗口可直接渲染的数据矩阵。
+    ///
+    /// 业务意图：
+    /// - 解析阶段按快照保存线程列表；渲染阶段需要按线程名聚合成二维矩阵，横轴为快照，纵轴为线程。
+    /// - 用户要求只在单个线程日志中出现的线程默认不显示，因此多文件分析时只保留跨文件出现的线程。
+    fn build_thread_analysis_data(
+        source_count: usize,
+        skipped_files: usize,
+        snapshots: Vec<ThreadSnapshot>,
+    ) -> ThreadAnalysisData {
+        let _has_snapshot_labels = snapshots.iter().any(|snapshot| !snapshot.label.is_empty());
+        let visible_thread_name_set = Self::default_visible_thread_names(&snapshots, source_count);
+        let mut thread_names = Vec::new();
+        let mut seen_thread_names = BTreeSet::new();
+        for snapshot in &snapshots {
+            for sample in &snapshot.threads {
+                if visible_thread_name_set.contains(&sample.name)
+                    && seen_thread_names.insert(sample.name.clone())
+                {
+                    thread_names.push(sample.name.clone());
+                }
+            }
+        }
+
+        let thread_index_by_name = thread_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.clone(), index))
+            .collect::<HashMap<_, _>>();
+        let mut matrix = vec![vec![None; snapshots.len()]; thread_names.len()];
+        for (snapshot_index, snapshot) in snapshots.iter().enumerate() {
+            for sample in &snapshot.threads {
+                if let Some(thread_index) = thread_index_by_name.get(&sample.name) {
+                    matrix[*thread_index][snapshot_index] = Some(Arc::new(ThreadTimelineCell {
+                        state: sample.state,
+                        time_label: snapshot.label.clone(),
+                        thread_name: sample.name.clone(),
+                        thread_id: sample.thread_id.clone(),
+                        source: snapshot.source.clone(),
+                        line_index: sample.line_index,
+                        preview_lines: sample.preview_lines.clone(),
+                    }));
+                }
+            }
+        }
+
+        let summary = if snapshots.is_empty() {
+            format!(
+                "未识别到 Java thread dump 快照，已跳过 {} 个无法读取或解码的文件",
+                skipped_files
+            )
+        } else {
+            format!(
+                "{} 个文件，{} 个快照，{} 个线程，跳过 {} 个文件",
+                source_count,
+                snapshots.len(),
+                thread_names.len(),
+                skipped_files
+            )
+        };
+        ThreadAnalysisData {
+            title: "线程日志分析".to_string(),
+            summary,
+            snapshots,
+            thread_names,
+            matrix,
+        }
+    }
+
+    /// 返回线程分析默认可见线程名集合。
+    ///
+    /// 业务意图：
+    /// - 多个线程日志一起分析时，默认隐藏只出现在单个日志文件中的线程，突出跨时间/跨文件持续存在的线程。
+    /// - 单文件分析时没有“跨文件”可比较对象，因此保留该文件内所有线程，避免窗口空白。
+    fn default_visible_thread_names(
+        snapshots: &[ThreadSnapshot],
+        source_count: usize,
+    ) -> HashSet<String> {
+        let mut sources_by_thread = HashMap::<String, HashSet<usize>>::new();
+        for snapshot in snapshots {
+            for sample in &snapshot.threads {
+                sources_by_thread
+                    .entry(sample.name.clone())
+                    .or_default()
+                    .insert(snapshot.source_index);
+            }
+        }
+
+        sources_by_thread
+            .into_iter()
+            .filter_map(|(thread_name, source_indexes)| {
+                (source_count <= 1 || source_indexes.len() > 1).then_some(thread_name)
+            })
+            .collect()
+    }
+
+    /// 在主视图更新租借结束后打开或更新线程分析独立窗口。
+    ///
+    /// 业务意图：
+    /// - 分析窗口可重复使用；如果用户重新分析另一组文件，直接替换窗口内容并激活。
+    /// - 窗口创建需要在 `App` 上下文中执行，避免在菜单点击的 `MainView` 更新栈里重入读取同一个视图。
+    fn open_thread_analysis_window_after_main_update(
+        main_view: Entity<MainView>,
+        analysis: ThreadAnalysisData,
+        app: &mut App,
+    ) {
+        let existing_window = main_view.update(app, |view, context| {
+            view.log_tree_context_menu = None;
+            context.notify();
+            view.thread_analysis_window
+        });
+        if let Some(window_handle) = existing_window {
+            if window_handle
+                .update(app, |window_view, window, context| {
+                    window_view.set_analysis(analysis.clone(), context);
+                    window.activate_window();
+                })
+                .is_ok()
+            {
+                return;
+            }
+            main_view.update(app, |view, _| {
+                view.thread_analysis_window = None;
+            });
+        }
+
+        let main_view_for_window = main_view.clone();
+        let main_view_for_close = main_view.clone();
+        let analysis_for_window = analysis.clone();
+        let window_options = WindowOptions {
+            titlebar: Some(TitlebarOptions {
+                title: Some("线程日志分析".into()),
+                ..Default::default()
+            }),
+            window_bounds: Some(WindowBounds::centered(
+                size(
+                    px(THREAD_ANALYSIS_WINDOW_WIDTH),
+                    px(THREAD_ANALYSIS_WINDOW_HEIGHT),
+                ),
+                app,
+            )),
+            is_resizable: true,
+            is_minimizable: true,
+            window_min_size: Some(size(px(720.0), px(420.0))),
+            ..Default::default()
+        };
+
+        match app.open_window(window_options, move |window, app| {
+            window.on_window_should_close(app, move |_, app| {
+                main_view_for_close.update(app, |view, context| {
+                    view.thread_analysis_window = None;
+                    context.notify();
+                });
+                true
+            });
+            app.new(|context| {
+                ThreadAnalysisWindowView::new(main_view_for_window, analysis_for_window, context)
+            })
+        }) {
+            Ok(window_handle) => {
+                main_view.update(app, |view, context| {
+                    view.thread_analysis_window = Some(window_handle);
+                    context.notify();
+                });
+            }
+            Err(_) => {
+                main_view.update(app, |view, context| {
+                    view.thread_analysis_window = None;
+                    context.notify();
+                });
+            }
         }
     }
 
@@ -4529,6 +6489,49 @@ impl MainView {
             tab.scroll_handle
                 .scroll_to_item_strict(line_index, ScrollStrategy::Center);
         }
+    }
+
+    /// 打开日志来源并定位到指定行。
+    ///
+    /// 业务意图：
+    /// - 线程分析窗口和搜索结果都需要“打开文件并跳到某行”的行为；集中实现可以保证新建 tab、
+    ///   已打开 tab、加载中 tab 的滚动和高亮状态一致。
+    ///
+    /// 边界条件：
+    /// - 如果目标 tab 仍在后台读取，先记录 `pending_scroll_to_line`，等加载完成后再滚动。
+    /// - 行号来自当前解析结果；如果文件在分析后被外部修改，定位可能落到相邻内容，这是无文件监听条件下的既有风险。
+    fn open_log_source_at_line(
+        &mut self,
+        source: LogFileSource,
+        line_index: usize,
+        context: &mut Context<Self>,
+    ) {
+        let source_key = source.stable_key();
+        if !self
+            .open_tabs
+            .iter()
+            .any(|tab| tab.source_key == source_key)
+        {
+            self.open_log_file(source, context);
+        }
+
+        let Some(tab_index) = self
+            .open_tabs
+            .iter()
+            .position(|tab| tab.source_key == source_key)
+        else {
+            return;
+        };
+        let tab_id = self.open_tabs[tab_index].id;
+        let ready = matches!(self.open_tabs[tab_index].state, LogTabState::Ready { .. });
+        self.open_tabs[tab_index].pending_scroll_to_line = Some(line_index);
+        self.open_tabs[tab_index].highlighted_search_line = Some(line_index);
+        self.activate_tab(tab_id);
+        if ready {
+            self.open_tabs[tab_index].pending_scroll_to_line = None;
+            self.scroll_log_tab_to_line(tab_id, line_index);
+        }
+        context.notify();
     }
 
     /// 启动日志 tab 的后台读取任务。
@@ -8214,10 +10217,7 @@ impl MainView {
             LogFileSource::LocalFile { .. } => "本地文件",
             LogFileSource::ArchiveMember { .. } => "压缩包内文件",
         };
-        let encoding_button_label = match &tab.state {
-            LogTabState::Ready { document } => document.encoding.label(),
-            LogTabState::Loading { .. } | LogTabState::Failed { .. } => tab.encoding_choice.label(),
-        };
+        let encoding_button_label = Self::log_tab_encoding_selector_label(tab);
         let status = match &tab.state {
             LogTabState::Ready { document } => {
                 // 状态栏展示编码来源和行数；实际编码本身由右侧内联编码选择器负责显示和切换。
@@ -8278,6 +10278,27 @@ impl MainView {
                     .child(Self::render_status_separator(palette))
                     .child(div().min_w_0().truncate().child(status)),
             )
+    }
+
+    /// 返回日志工具条编码选择器应展示的文案。
+    ///
+    /// 业务意图：
+    /// - 自动模式下按钮展示实际检测出的编码，方便用户理解当前文件最终按什么编码打开。
+    /// - 手动模式下按钮必须优先展示用户选择的编码，即使底层解码出的文本编码枚举与自动检测结果相同，
+    ///   也不能回退成检测结果，否则用户会误以为“编码切换选择无效”。
+    ///
+    /// 边界条件：
+    /// - 加载中或解码失败时没有稳定的文档编码，此时直接展示当前选择，保证失败后仍能看到正在尝试的编码。
+    fn log_tab_encoding_selector_label(tab: &OpenLogTab) -> &'static str {
+        match tab.encoding_choice {
+            EncodingChoice::Auto => match &tab.state {
+                LogTabState::Ready { document } => document.encoding.label(),
+                LogTabState::Loading { .. } | LogTabState::Failed { .. } => {
+                    EncodingChoice::Auto.label()
+                }
+            },
+            EncodingChoice::Manual(encoding) => encoding.label(),
+        }
     }
 
     /// 渲染编码切换控件。
@@ -10154,6 +12175,11 @@ fn main() {
                 view
             })
             .expect("创建 LogClinic 主窗口失败，应用无法继续启动");
+        let _ = main_view.update(app, |view, _window, context| {
+            // 主窗口句柄只能在 `open_window` 成功返回后获得；回填到主视图供独立工具窗口激活主窗口使用。
+            view.main_window = Some(main_view);
+            context.notify();
+        });
         let main_view_for_keys = main_view;
         let subscription = app.intercept_keystrokes(move |event, window, app| {
             // GPUI 0.2.2 在 macOS 上会从 Objective-C `keyEquivalent` 回调进入这里；该回调不能让 Rust panic
@@ -10573,6 +12599,240 @@ mod tests {
         }
     }
 
+    /// 验证左侧目录树 Shift 多选只覆盖当前可见范围。
+    ///
+    /// 业务意图：
+    /// - 多选基于用户当前看到的虚拟列表顺序；折叠隐藏的节点不应被间接选中并参与右键文件操作。
+    #[test]
+    fn 左侧树_shift_多选覆盖可见范围() {
+        let visible_node_ids = vec![10, 11, 12, 13];
+        let mut selected = HashSet::new();
+        let mut anchor = None;
+
+        MainView::apply_log_tree_selection_click(
+            &mut selected,
+            &mut anchor,
+            &visible_node_ids,
+            11,
+            1,
+            false,
+            false,
+        );
+        MainView::apply_log_tree_selection_click(
+            &mut selected,
+            &mut anchor,
+            &visible_node_ids,
+            13,
+            3,
+            true,
+            false,
+        );
+
+        assert_eq!(selected, HashSet::from([11, 12, 13]));
+        assert_eq!(anchor, Some(11));
+    }
+
+    /// 验证 Ctrl/Command 点击会切换单个节点选中态。
+    ///
+    /// 业务意图：
+    /// - 用户需要从多选集合中增删个别日志文件，不能每次点击都清空已有选择。
+    #[test]
+    fn 左侧树_ctrl_多选切换单个节点() {
+        let visible_node_ids = vec![1, 2, 3];
+        let mut selected = HashSet::from([1, 2]);
+        let mut anchor = Some(1);
+
+        MainView::apply_log_tree_selection_click(
+            &mut selected,
+            &mut anchor,
+            &visible_node_ids,
+            2,
+            1,
+            false,
+            true,
+        );
+        MainView::apply_log_tree_selection_click(
+            &mut selected,
+            &mut anchor,
+            &visible_node_ids,
+            3,
+            2,
+            false,
+            true,
+        );
+
+        assert_eq!(selected, HashSet::from([1, 3]));
+        assert_eq!(anchor, Some(3));
+    }
+
+    /// 验证另存为路径保留本地文件名和压缩包内部层级。
+    ///
+    /// 业务意图：
+    /// - 批量保存时本地文件不应带出原始绝对目录；压缩包成员则必须保留内部路径，避免同名文件互相覆盖。
+    #[test]
+    fn 另存为路径保留文件名和压缩包层级() {
+        let local = LogFileSource::LocalFile {
+            path: PathBuf::from("/tmp/a/server.log"),
+        };
+        let archive = test_archive_member("thread/2026/thread.log");
+
+        assert_eq!(
+            MainView::save_relative_path_for_source(&local),
+            PathBuf::from("server.log")
+        );
+        assert_eq!(
+            MainView::save_relative_path_for_source(&archive),
+            PathBuf::from("thread").join("2026").join("thread.log")
+        );
+    }
+
+    /// 验证 Java thread dump 会解析出快照和线程状态。
+    ///
+    /// 业务意图：
+    /// - 线程分析窗口依赖解析出的快照矩阵；线程名和状态识别失败会直接导致时间线为空。
+    #[test]
+    fn java_thread_dump_解析快照和线程状态() {
+        let lines = vec![
+            "线程日志打印时间：2026-05-07 11:01:10".to_string(),
+            "Full thread dump Java HotSpot(TM) 64-Bit Server VM:".to_string(),
+            "\"pool-1-thread-1\" #1 prio=5".to_string(),
+            "   java.lang.Thread.State: RUNNABLE".to_string(),
+            "\"worker\" #2 prio=5".to_string(),
+            "   java.lang.Thread.State: WAITING (parking)".to_string(),
+        ];
+
+        let source = LogFileSource::LocalFile {
+            path: PathBuf::from("thread.log"),
+        };
+        let snapshots = MainView::parse_thread_dump_snapshots(&lines, "thread.log", 0, &source);
+        let analysis = MainView::build_thread_analysis_data(1, 0, snapshots);
+
+        assert_eq!(analysis.snapshots.len(), 1);
+        assert_eq!(analysis.snapshots[0].label, "2026-05-07 11:01:10");
+        assert_eq!(analysis.thread_names, vec!["pool-1-thread-1", "worker"]);
+        let first_cell = analysis.matrix[0][0]
+            .as_ref()
+            .expect("第一个线程应形成可点击时间线色块");
+        assert_eq!(first_cell.state, ThreadStateKind::Runnable);
+        assert_eq!(first_cell.thread_id.as_deref(), Some("#1"));
+        assert_eq!(first_cell.line_index, 2);
+        assert_eq!(first_cell.preview_lines.len(), 2);
+        assert_eq!(
+            analysis.matrix[1][0].as_ref().map(|cell| cell.state),
+            Some(ThreadStateKind::Waiting)
+        );
+    }
+
+    /// 验证多文件线程分析默认隐藏只在单个日志中出现的线程。
+    ///
+    /// 业务意图：
+    /// - 用户希望默认关注跨线程日志持续出现的线程，单文件独有线程会增加纵轴噪声，应默认过滤掉。
+    #[test]
+    fn 多文件线程分析默认隐藏单日志独有线程() {
+        let snapshots = vec![
+            ThreadSnapshot {
+                label: "2026-05-07 11:00:00".to_string(),
+                source_index: 0,
+                source: LogFileSource::LocalFile {
+                    path: PathBuf::from("a.log"),
+                },
+                threads: vec![
+                    ThreadStateSample {
+                        name: "shared-thread".to_string(),
+                        thread_id: Some("#1".to_string()),
+                        state: ThreadStateKind::Runnable,
+                        line_index: 0,
+                        preview_lines: vec!["\"shared-thread\" #1".to_string()],
+                    },
+                    ThreadStateSample {
+                        name: "only-a".to_string(),
+                        thread_id: Some("#2".to_string()),
+                        state: ThreadStateKind::Waiting,
+                        line_index: 1,
+                        preview_lines: vec!["\"only-a\" #2".to_string()],
+                    },
+                ],
+            },
+            ThreadSnapshot {
+                label: "2026-05-07 11:01:00".to_string(),
+                source_index: 1,
+                source: LogFileSource::LocalFile {
+                    path: PathBuf::from("b.log"),
+                },
+                threads: vec![
+                    ThreadStateSample {
+                        name: "shared-thread".to_string(),
+                        thread_id: Some("#1".to_string()),
+                        state: ThreadStateKind::Blocked,
+                        line_index: 0,
+                        preview_lines: vec!["\"shared-thread\" #1".to_string()],
+                    },
+                    ThreadStateSample {
+                        name: "only-b".to_string(),
+                        thread_id: Some("#3".to_string()),
+                        state: ThreadStateKind::Runnable,
+                        line_index: 1,
+                        preview_lines: vec!["\"only-b\" #3".to_string()],
+                    },
+                ],
+            },
+        ];
+
+        let analysis = MainView::build_thread_analysis_data(2, 0, snapshots);
+
+        assert_eq!(analysis.thread_names, vec!["shared-thread"]);
+        assert_eq!(
+            analysis.matrix[0][0].as_ref().map(|cell| cell.state),
+            Some(ThreadStateKind::Runnable)
+        );
+        assert_eq!(
+            analysis.matrix[0][1].as_ref().map(|cell| cell.state),
+            Some(ThreadStateKind::Blocked)
+        );
+    }
+
+    /// 验证线程分析气泡在窗口右下角会自动改为向左上方弹出。
+    ///
+    /// 业务意图：
+    /// - 用户点击靠近窗口边缘的状态色块时，气泡不能被窗口裁切，否则关键线程 ID 和预览日志不可见。
+    #[test]
+    fn 线程分析气泡靠近边缘时反向弹出() {
+        let (x, y) = ThreadAnalysisWindowView::thread_analysis_popup_origin(
+            1000.0,
+            680.0,
+            THREAD_ANALYSIS_WINDOW_WIDTH,
+            THREAD_ANALYSIS_WINDOW_HEIGHT,
+        );
+
+        assert!(f32::from(x) < 1000.0);
+        assert!(f32::from(y) < 680.0);
+        assert!(
+            f32::from(x) + THREAD_ANALYSIS_POPUP_WIDTH + THREAD_ANALYSIS_POPUP_MARGIN
+                <= THREAD_ANALYSIS_WINDOW_WIDTH
+        );
+        assert!(
+            f32::from(y) + THREAD_ANALYSIS_POPUP_ESTIMATED_HEIGHT + THREAD_ANALYSIS_POPUP_MARGIN
+                <= THREAD_ANALYSIS_WINDOW_HEIGHT
+        );
+    }
+
+    /// 验证线程分析气泡在普通位置默认向右下方弹出。
+    ///
+    /// 业务意图：
+    /// - 非边缘区域保留靠近点击点的默认方向，让用户能直接把气泡和刚点击的色块关联起来。
+    #[test]
+    fn 线程分析气泡普通位置向右下弹出() {
+        let (x, y) = ThreadAnalysisWindowView::thread_analysis_popup_origin(
+            120.0,
+            120.0,
+            THREAD_ANALYSIS_WINDOW_WIDTH,
+            THREAD_ANALYSIS_WINDOW_HEIGHT,
+        );
+
+        assert_eq!(f32::from(x), 120.0 + THREAD_ANALYSIS_POPUP_OFFSET);
+        assert_eq!(f32::from(y), 120.0 + THREAD_ANALYSIS_POPUP_OFFSET);
+    }
+
     /// 验证日志选区的字节范围不会截断中文字符。
     ///
     /// 业务意图：
@@ -10789,6 +13049,35 @@ mod tests {
 
         assert_eq!(preview, "启动成功");
         assert_eq!(&preview[range], "启动");
+    }
+
+    /// 验证手动编码选择后选择器展示用户选择而不是自动检测结果。
+    ///
+    /// 业务意图：
+    /// - 用户切换编码后需要立刻从工具条确认当前选择；即使测试文档本身可被 UTF-8 自动识别，
+    ///   手动选择 GBK 时按钮也应显示 GBK，避免交互反馈看起来像选择无效。
+    #[test]
+    fn 手动编码选择器优先展示用户选择() {
+        let document = decode_log_bytes(b"hello", EncodingChoice::Auto, "access.log")
+            .expect("UTF-8 测试内容应能自动解码");
+        let tab = OpenLogTab {
+            id: 1,
+            source: LogFileSource::LocalFile {
+                path: PathBuf::from("access.log"),
+            },
+            source_key: "local:access.log".to_string(),
+            title: "access.log".to_string(),
+            encoding_choice: EncodingChoice::Manual(LogTextEncoding::Gbk),
+            raw_bytes: Some(Arc::new(b"hello".to_vec())),
+            state: LogTabState::Ready { document },
+            scroll_handle: UniformListScrollHandle::new(),
+            pending_scroll_to_line: None,
+            highlighted_search_line: None,
+            text_selection: None,
+            selection_drag_anchor: None,
+        };
+
+        assert_eq!(MainView::log_tab_encoding_selector_label(&tab), "GBK");
     }
 
     /// 验证单文件压缩包会返回内部成员来源，供 UI 点击压缩包根节点时直接打开。
