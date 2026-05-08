@@ -876,6 +876,13 @@ const SEARCH_DIALOG_WIDTH: f32 = 430.0;
 /// - 该窗口不可调整大小；如果后续增加搜索历史、正则等更多控件，应同步重新定义窗口高度策略。
 const SEARCH_DIALOG_WINDOW_HEIGHT: f32 = 286.0;
 
+/// 搜索关键字历史记录上限。
+///
+/// 业务意图：
+/// - 搜索窗口再次打开时需要能恢复最近一次关键字，减少重复输入。
+/// - 只保留最近 10 条，避免当前会话内频繁搜索导致状态无限增长；当前不持久化到磁盘，避免隐私规则未定义前保存用户日志关键字。
+const SEARCH_QUERY_HISTORY_LIMIT: usize = 10;
+
 /// 设置窗口默认宽度。
 ///
 /// 业务意图：
@@ -960,6 +967,12 @@ const SEARCH_RESULTS_SCROLLBAR_PADDING: f32 = 3.0;
 /// 业务意图：
 /// - 日志正文复制和搜索快捷键使用同一套全局键盘入口；复制也需要兼容 Control 字母键被平台编码成控制字符的情况。
 const CONTROL_C_CODE: &str = "\u{3}";
+
+/// `Ctrl+V` 在部分 macOS 输入路径下对应的 ASCII 控制字符。
+///
+/// 业务意图：
+/// - 搜索关键字和目录输入框需要支持粘贴；日志查看器只读，因此在查看器中粘贴会打开搜索窗口并填入剪贴板文本。
+const CONTROL_V_CODE: &str = "\u{16}";
 
 /// `Ctrl+A` 在部分平台输入路径下对应的 ASCII 控制字符。
 ///
@@ -3668,16 +3681,12 @@ impl SearchDialogWindowView {
     /// 渲染当前目录搜索目标输入区域。
     fn render_directory_target(
         &self,
-        dialog: &SearchDialogState,
+        _dialog: &SearchDialogState,
         focus_handle: gpui::FocusHandle,
         _window: &Window,
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        if dialog.scope != SearchScope::CurrentDirectory {
-            return div().id("search-dialog-window-directory-hidden").hidden();
-        }
-
         div()
             .id("search-dialog-window-directory")
             .flex()
@@ -3949,7 +3958,6 @@ impl Render for SearchDialogWindowView {
                         palette,
                         context,
                     ))
-                    .child(self.render_scope_controls(dialog.scope, palette, context))
                     .child(self.render_directory_target(
                         &dialog,
                         directory_focus,
@@ -3957,6 +3965,7 @@ impl Render for SearchDialogWindowView {
                         palette,
                         context,
                     ))
+                    .child(self.render_scope_controls(dialog.scope, palette, context))
                     .child(self.render_options_row(dialog.case_sensitive, palette, context))
                     .child(
                         div()
@@ -3975,7 +3984,10 @@ impl Render for SearchDialogWindowView {
                     .flex_col()
                     .flex_1()
                     .justify_end()
-                    .p_3()
+                    // 操作按钮位于搜索窗口右下角，额外增加右侧和底部留白，避免按钮贴近窗口边缘。
+                    // 只调整外层安全边距，不改变按钮尺寸、排列或信息密度。
+                    .px_4()
+                    .pb_4()
                     .pt_0()
                     .child(self.render_action_buttons(can_search, can_count, palette, context)),
             )
@@ -4654,6 +4666,16 @@ struct MainView {
     /// - 搜索条件只保留在内存中，不写入磁盘，避免在隐私规则未定义前保存用户查询词。
     search_dialog: Option<SearchDialogState>,
 
+    /// 当前会话内的搜索关键字历史。
+    ///
+    /// 业务意图：
+    /// - 用户反复打开搜索窗口且日志正文没有选区时，应优先恢复最近一次搜索关键字。
+    /// - 历史只保存在内存中，最多 10 条并按最近使用排序，避免把日志敏感关键字写入配置文件。
+    ///
+    /// 边界条件：
+    /// - 空白关键字不记录；重复关键字会移动到首位，保证最近使用优先。
+    search_query_history: Vec<String>,
+
     /// 搜索对话框独立窗口句柄。
     ///
     /// 业务意图：
@@ -4852,6 +4874,7 @@ impl MainView {
             log_scrollbar_drag: None,
             log_tree_scrollbar_drag: None,
             search_dialog: None,
+            search_query_history: Vec::new(),
             search_dialog_window: None,
             settings_window: None,
             thread_analysis_window: None,
@@ -7204,7 +7227,19 @@ impl MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) -> bool {
+        if self.search_text_input_focused(window)
+            && (Self::is_copy_keystroke(&keystroke) || Self::is_paste_keystroke(&keystroke))
+        {
+            return false;
+        }
+
         if Self::is_copy_keystroke(&keystroke) && self.copy_selected_log_text(context) {
+            return true;
+        }
+
+        if Self::is_paste_keystroke(&keystroke)
+            && self.paste_clipboard_text_into_search_dialog(window, context)
+        {
             return true;
         }
 
@@ -7219,6 +7254,36 @@ impl MainView {
         }
 
         false
+    }
+
+    /// 处理主窗口根节点收到的键盘事件。
+    ///
+    /// 业务意图：
+    /// - macOS 的 `Cmd+C` 可能走应用级 key equivalent，Windows 或部分焦点状态下的 `Ctrl+C` 则更可能走普通
+    ///   `on_key_down`；日志正文是自绘只读列表，不能依赖系统文本控件自动复制。
+    /// - 根节点复用全局快捷键处理逻辑，作为 `intercept_keystrokes` 的兜底入口，保证日志正文选区复制在不同平台路径下都有效。
+    fn handle_root_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if self.handle_global_keystroke(event.keystroke.clone(), window, context) {
+            context.stop_propagation();
+            context.notify();
+        }
+    }
+
+    /// 判断当前焦点是否位于搜索窗口的任一文本输入框。
+    ///
+    /// 业务意图：
+    /// - GPUI 的全局快捷键拦截可能早于输入框 `on_key_down` 触发；当关键字或目录输入框聚焦时，
+    ///   `Ctrl+C` / `Ctrl+V` 必须优先交给输入框自身处理，不能被日志查看器的复制/粘贴搜索逻辑抢走。
+    ///
+    /// 边界条件：
+    /// - 搜索窗口未打开时两个焦点句柄都不会命中，此时全局复制仍可服务日志正文选区。
+    fn search_text_input_focused(&self, window: &Window) -> bool {
+        self.search_input_focus.is_focused(window) || self.search_directory_focus.is_focused(window)
     }
 
     /// 延迟打开搜索对话框。
@@ -7255,6 +7320,18 @@ impl MainView {
             && (keystroke.modifiers.control
                 || keystroke.modifiers.platform
                 || Self::keystroke_matches_control_code(keystroke, CONTROL_C_CODE))
+    }
+
+    /// 判断是否为粘贴快捷键。
+    ///
+    /// 业务意图：
+    /// - 搜索输入框和日志查看器都需要识别 `Ctrl+V` / `Cmd+V`。
+    /// - 日志查看器是只读区域，粘贴行为会把剪贴板文本填入搜索框，避免用户按键后没有任何可见结果。
+    fn is_paste_keystroke(keystroke: &Keystroke) -> bool {
+        Self::keystroke_matches_letter_or_control_code(keystroke, "v", CONTROL_V_CODE)
+            && (keystroke.modifiers.control
+                || keystroke.modifiers.platform
+                || Self::keystroke_matches_control_code(keystroke, CONTROL_V_CODE))
     }
 
     /// 判断按键是否匹配指定字母或该字母的 ASCII 控制字符。
@@ -7383,6 +7460,39 @@ impl MainView {
                     .map(ToOwned::to_owned)
             })
             .filter(|query| !query.is_empty())
+    }
+
+    /// 把剪贴板文本粘贴到搜索关键字输入框。
+    ///
+    /// 业务意图：
+    /// - 日志正文是只读查看器，`Ctrl+V` 不能修改日志内容；用户通常是想把剪贴板里的关键字拿来搜索。
+    /// - 如果搜索窗口尚未打开，则先创建搜索状态并排队打开窗口；如果已经打开，则替换当前关键字选区。
+    ///
+    /// 边界条件：
+    /// - 非文本剪贴板、空文本或只有换行的文本不处理，避免清空用户当前搜索条件。
+    /// - 粘贴文本按搜索框单行规则清理换行，和平台输入法提交路径保持一致。
+    fn paste_clipboard_text_into_search_dialog(
+        &mut self,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) -> bool {
+        let Some(text) = context
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .map(|text| Self::sanitize_search_input_text(&text))
+            .filter(|text| !text.trim().is_empty())
+        else {
+            return false;
+        };
+
+        self.prepare_search_dialog_state();
+        if let Some(dialog) = self.search_dialog.as_mut() {
+            Self::replace_search_query_with_clipboard_text(dialog, text);
+        }
+        self.schedule_open_search_dialog(window, context);
+        self.touch_search_text_cursor_activity();
+        context.notify();
+        true
     }
 
     /// 按统一文档模型读取指定行文本。
@@ -7517,6 +7627,40 @@ impl MainView {
             .contains(&target.to_lowercase())
     }
 
+    /// 记录一次搜索关键字。
+    ///
+    /// 业务意图：
+    /// - 执行搜索后把关键字写入当前会话历史，让下一次没有正文选区时可以自动恢复最近关键字。
+    /// - 历史不持久化到配置目录，避免日志关键字涉及业务数据或敏感信息时被长期保存。
+    fn remember_search_query(&mut self, query: &str) {
+        Self::remember_search_query_in_history(&mut self.search_query_history, query);
+    }
+
+    /// 更新搜索关键字历史集合。
+    ///
+    /// 边界条件：
+    /// - 空白关键字不记录。
+    /// - 重复关键字先移除旧位置再插入首位，保证列表按最近使用排序。
+    /// - 超过上限时删除最旧记录，避免会话状态无界增长。
+    fn remember_search_query_in_history(history: &mut Vec<String>, query: &str) {
+        let query = query.trim();
+        if query.is_empty() {
+            return;
+        }
+
+        history.retain(|existing| existing != query);
+        history.insert(0, query.to_string());
+        history.truncate(SEARCH_QUERY_HISTORY_LIMIT);
+    }
+
+    /// 返回最近一次搜索关键字。
+    ///
+    /// 业务意图：
+    /// - 打开搜索窗口时如果没有日志选区，就使用最近关键字预填，满足用户“显示上一次搜索关键字”的要求。
+    fn last_search_query(&self) -> Option<String> {
+        self.search_query_history.first().cloned()
+    }
+
     /// 从已加载目录树中收集匹配用户目录目标文本的来源。
     ///
     /// 业务意图：
@@ -7646,7 +7790,7 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 如果日志正文当前存在选区，打开或再次唤起搜索框时用选中文本预填关键字，减少复制再搜索的重复操作。
-    /// - 如果对话框已经打开但没有日志选区，再次按快捷键只重新聚焦输入框，不重置查询词和搜索范围。
+    /// - 如果没有日志选区，首次打开使用最近一次搜索关键字；已有对话框只在查询词为空时恢复最近关键字，避免覆盖用户正在编辑的输入。
     ///
     /// 实现原因：
     /// - 这里只修改 `MainView` 自身状态，不创建窗口；独立搜索窗口会在 `MainView::update` 返回后再创建。
@@ -7655,15 +7799,20 @@ impl MainView {
         let selected_query = self.selected_log_text_for_search_query();
         if self.search_dialog.is_none() {
             let directory_target = self.active_search_directory_label().unwrap_or_default();
-            let query = selected_query.clone().unwrap_or_default();
+            let last_query = self.last_search_query();
+            let query = selected_query
+                .clone()
+                .or_else(|| last_query.clone())
+                .unwrap_or_default();
             let query_cursor = query.len();
+            let directory_cursor = directory_target.len();
             self.search_dialog = Some(SearchDialogState {
                 query,
                 selection_range: query_cursor..query_cursor,
                 marked_range: None,
                 scope: SearchScope::CurrentFile,
                 directory_target,
-                directory_selection_range: 0..0,
+                directory_selection_range: directory_cursor..directory_cursor,
                 directory_marked_range: None,
                 case_sensitive: false,
                 current_file_match_count: None,
@@ -7671,6 +7820,8 @@ impl MainView {
                 progress: SearchProgress::default(),
                 message: if selected_query.is_some() {
                     "已填入选中文本，按 Enter 或点击搜索".to_string()
+                } else if last_query.is_some() {
+                    "已填入上次搜索关键字，按 Enter 或点击搜索".to_string()
                 } else {
                     "输入关键字后按 Enter 或点击搜索".to_string()
                 },
@@ -7685,6 +7836,16 @@ impl MainView {
             dialog.marked_range = None;
             dialog.current_file_match_count = None;
             dialog.message = "已填入选中文本，按 Enter 或点击搜索".to_string();
+        } else if let Some(last_query) = self.last_search_query()
+            && let Some(dialog) = self.search_dialog.as_mut()
+            && dialog.query.trim().is_empty()
+        {
+            let cursor = last_query.len();
+            dialog.query = last_query;
+            dialog.selection_range = cursor..cursor;
+            dialog.marked_range = None;
+            dialog.current_file_match_count = None;
+            dialog.message = "已填入上次搜索关键字，按 Enter 或点击搜索".to_string();
         }
         self.tab_context_menu = None;
         self.encoding_dropdown_menu = None;
@@ -7827,17 +7988,27 @@ impl MainView {
     /// - 从搜索对话框读取当前查询词、范围和大小写规则，统一分发到当前文件或当前目录搜索。
     /// - 新搜索会保留历史记录，但如果上一轮搜索仍在运行，必须先标记为已取消，避免旧任务回调被丢弃后面板长期显示“搜索中”。
     fn start_search(&mut self, context: &mut Context<Self>) {
-        let Some(dialog) = self.search_dialog.as_ref() else {
+        let Some((options, scope, case_sensitive, directory_target, previous_running_job_id)) = ({
+            self.search_dialog.as_ref().map(|dialog| {
+                (
+                    SearchOptions {
+                        query: dialog.query.trim().to_string(),
+                        case_sensitive: dialog.case_sensitive,
+                    },
+                    dialog.scope,
+                    dialog.case_sensitive,
+                    dialog.directory_target.trim().to_string(),
+                    dialog.is_searching.then_some(dialog.job_id),
+                )
+            })
+        }) else {
             return;
-        };
-        let options = SearchOptions {
-            query: dialog.query.trim().to_string(),
-            case_sensitive: dialog.case_sensitive,
         };
         if options.is_empty_query() {
             self.update_search_dialog_message("请输入要搜索的关键字", context);
             return;
         }
+        self.remember_search_query(&options.query);
 
         let Some(active_tab_id) = self.active_tab_id else {
             self.update_search_dialog_message("请先从左侧打开一个日志文件", context);
@@ -7850,9 +8021,6 @@ impl MainView {
 
         let job_id = self.next_search_job_id;
         self.next_search_job_id += 1;
-        let scope = dialog.scope;
-        let case_sensitive = dialog.case_sensitive;
-        let directory_target = dialog.directory_target.trim().to_string();
 
         let search_target = match scope {
             SearchScope::CurrentFile => match &active_tab.state {
@@ -7894,7 +8062,6 @@ impl MainView {
             SearchTarget::CurrentFile { .. } => 1,
             SearchTarget::CurrentDirectory { sources } => sources.len(),
         };
-        let previous_running_job_id = dialog.is_searching.then_some(dialog.job_id);
         let panel_height = self
             .search_results_panel
             .as_ref()
@@ -8981,10 +9148,52 @@ impl MainView {
         event: &KeyDownEvent,
         context: &mut Context<Self>,
     ) {
+        if Self::is_paste_keystroke(&event.keystroke) {
+            let clipboard_text = context
+                .read_from_clipboard()
+                .and_then(|item| item.text())
+                .map(|text| Self::sanitize_search_input_text(&text));
+            if let Some(text) = clipboard_text {
+                let text_is_not_empty = !text.is_empty();
+                if text_is_not_empty {
+                    if let Some(dialog) = self.search_dialog.as_mut() {
+                        let (input_text, selection_range, marked_range) =
+                            Self::search_text_state_mut(dialog, input_kind);
+                        Self::replace_search_text_selection(
+                            input_text,
+                            selection_range,
+                            marked_range,
+                            &text,
+                        );
+                        if input_kind == SearchTextInputKind::Query {
+                            dialog.current_file_match_count = None;
+                        }
+                    }
+                    self.touch_search_text_cursor_activity();
+                    context.stop_propagation();
+                    context.notify();
+                    return;
+                }
+            }
+            context.stop_propagation();
+            return;
+        }
+
         let Some(dialog) = self.search_dialog.as_mut() else {
             return;
         };
         let (text, selection_range, marked_range) = Self::search_text_state_mut(dialog, input_kind);
+
+        if Self::is_copy_keystroke(&event.keystroke) {
+            if selection_range.start != selection_range.end {
+                let range = Self::clamp_search_text_range(text, selection_range.clone());
+                if range.start < range.end {
+                    context.write_to_clipboard(ClipboardItem::new_string(text[range].to_string()));
+                }
+            }
+            context.stop_propagation();
+            return;
+        }
 
         if Self::is_select_all_keystroke(&event.keystroke) {
             *marked_range = None;
@@ -9129,6 +9338,40 @@ impl MainView {
                 dialog.directory_marked_range.clone(),
             ),
         }
+    }
+
+    /// 用给定文本替换搜索输入框当前选区。
+    ///
+    /// 业务意图：
+    /// - 平台 IME 提交、快捷键粘贴和日志查看器粘贴到搜索框都需要同一套替换规则。
+    /// - 统一处理组合文本、选区和光标位置，可以避免关键字输入框与目录输入框行为不一致。
+    fn replace_search_text_selection(
+        text: &mut String,
+        selection_range: &mut Range<usize>,
+        marked_range: &mut Option<Range<usize>>,
+        replacement: &str,
+    ) {
+        let range = marked_range
+            .take()
+            .unwrap_or_else(|| Self::clamp_search_text_range(text, selection_range.clone()));
+        text.replace_range(range.clone(), replacement);
+        let cursor = range.start + replacement.len();
+        *selection_range = cursor..cursor;
+    }
+
+    /// 用剪贴板文本覆盖搜索关键字。
+    ///
+    /// 业务意图：
+    /// - 日志查看器是只读区域，`Ctrl+V` 的产品语义是把剪贴板内容作为新的搜索关键字，而不是继续编辑
+    ///   `prepare_search_dialog_state` 可能根据日志选区预填出来的旧文本。
+    /// - 封装为纯状态辅助函数，便于测试“覆盖而非追加”的关键边界。
+    fn replace_search_query_with_clipboard_text(dialog: &mut SearchDialogState, text: String) {
+        let cursor = text.len();
+        dialog.query = text;
+        dialog.selection_range = cursor..cursor;
+        dialog.marked_range = None;
+        dialog.current_file_match_count = None;
+        dialog.message = "已粘贴剪贴板文本，按 Enter 或点击搜索".to_string();
     }
 
     /// 判断是否为搜索输入框全选快捷键。
@@ -11809,6 +12052,7 @@ impl MainView {
     /// 业务意图：
     /// - 当前日志查看器是虚拟列表自绘，鼠标按下时需要主动记录选择锚点，后续拖动才能跨行扩展选区。
     /// - 点击日志正文同时关闭浮层菜单，避免选区操作和 tab 菜单、编码菜单叠加造成误操作。
+    /// - 点击正文后主动聚焦主窗口根节点，让 `Ctrl/Cmd+C` 走根节点键盘兜底入口，从而复制自绘选区。
     ///
     /// 边界条件：
     /// - 只响应当前仍存在且已解码的 tab；加载中或失败状态没有可选择的正文。
@@ -11839,6 +12083,7 @@ impl MainView {
             return;
         }
 
+        window.focus(&self.root_focus_handle);
         let text_selection = match event.click_count {
             0 | 1 => LogTextSelection {
                 anchor: position,
@@ -13011,6 +13256,8 @@ impl Render for MainView {
             .size_full()
             .bg(rgb(palette.background))
             .track_focus(&self.root_focus_handle)
+            .key_context("main-view-root")
+            .on_key_down(context.listener(Self::handle_root_key_down))
             .on_action(
                 context.listener(|view, _: &OpenSearchDialog, window, context| {
                     view.schedule_open_search_dialog(window, context);
@@ -13509,6 +13756,113 @@ mod tests {
         assert!(MainView::search_text_cursor_visible_for_elapsed(
             Duration::from_millis(1000)
         ));
+    }
+
+    /// 验证搜索关键字历史按最近使用排序并限制数量。
+    ///
+    /// 业务意图：
+    /// - 搜索窗口没有日志选区时会用最近关键字预填；历史顺序和上限错误会直接影响重复搜索体验。
+    /// - 该测试只覆盖纯状态逻辑，不依赖 GPUI 窗口或文本输入系统。
+    #[test]
+    fn 搜索关键字历史按最近使用排序并限制数量() {
+        let mut history = Vec::new();
+        for index in 0..12 {
+            MainView::remember_search_query_in_history(&mut history, &format!("key-{index}"));
+        }
+
+        assert_eq!(history.len(), SEARCH_QUERY_HISTORY_LIMIT);
+        assert_eq!(history.first().map(String::as_str), Some("key-11"));
+        assert_eq!(history.last().map(String::as_str), Some("key-2"));
+
+        MainView::remember_search_query_in_history(&mut history, "key-5");
+        assert_eq!(history.len(), SEARCH_QUERY_HISTORY_LIMIT);
+        assert_eq!(history.first().map(String::as_str), Some("key-5"));
+        assert_eq!(history.iter().filter(|query| *query == "key-5").count(), 1);
+
+        MainView::remember_search_query_in_history(&mut history, "   ");
+        assert_eq!(history.len(), SEARCH_QUERY_HISTORY_LIMIT);
+    }
+
+    /// 验证搜索输入框粘贴会替换当前选区并把光标放到插入文本之后。
+    ///
+    /// 业务意图：
+    /// - 关键字输入框和目录输入框复用同一套粘贴替换逻辑；如果选区替换或光标位置错误，`Ctrl+V` 会破坏用户正在编辑的搜索条件。
+    /// - 该测试覆盖纯字符串状态，不依赖系统剪贴板或 GPUI 窗口，避免平台差异造成测试不稳定。
+    #[test]
+    fn 搜索输入框粘贴替换选区并更新光标() {
+        let mut text = "error warning info".to_string();
+        let mut selection_range = 6..13;
+        let mut marked_range = None;
+
+        MainView::replace_search_text_selection(
+            &mut text,
+            &mut selection_range,
+            &mut marked_range,
+            "fatal",
+        );
+
+        assert_eq!(text, "error fatal info");
+        assert_eq!(selection_range, 11..11);
+        assert!(marked_range.is_none());
+    }
+
+    /// 验证搜索输入框粘贴优先替换平台组合文本范围。
+    ///
+    /// 业务意图：
+    /// - 中文输入法组合态下用户触发粘贴时，应替换正在组合的临时文本，而不是错误插入到旧光标位置。
+    /// - 该边界会同时影响关键字和目录输入框，因此用共享辅助函数做回归保护。
+    #[test]
+    fn 搜索输入框粘贴优先替换组合文本范围() {
+        let mut text = "目录abc路径".to_string();
+        let mut selection_range = text.len()..text.len();
+        let mut marked_range = Some(6..9);
+
+        MainView::replace_search_text_selection(
+            &mut text,
+            &mut selection_range,
+            &mut marked_range,
+            "日志",
+        );
+
+        assert_eq!(text, "目录日志路径");
+        assert_eq!(selection_range, 12..12);
+        assert!(marked_range.is_none());
+    }
+
+    /// 验证日志查看器粘贴会覆盖搜索框内已有预填关键字。
+    ///
+    /// 业务意图：
+    /// - 日志正文有选区时，打开搜索窗口会先预填选中文本；如果随后处理日志查看器 `Ctrl+V`，
+    ///   必须用剪贴板内容覆盖预填文本，而不是追加到预填文本末尾。
+    /// - 该测试不访问系统剪贴板，只锁定状态变更规则，避免平台剪贴板权限影响回归验证。
+    #[test]
+    fn 日志查看器粘贴会覆盖已有搜索预填文本() {
+        let mut dialog = SearchDialogState {
+            query: "日志选中文本".to_string(),
+            selection_range: "日志选中文本".len().."日志选中文本".len(),
+            marked_range: None,
+            scope: SearchScope::CurrentFile,
+            directory_target: String::new(),
+            directory_selection_range: 0..0,
+            directory_marked_range: None,
+            case_sensitive: false,
+            current_file_match_count: Some(3),
+            is_searching: false,
+            progress: SearchProgress::default(),
+            message: String::new(),
+            job_id: 0,
+        };
+
+        MainView::replace_search_query_with_clipboard_text(&mut dialog, "剪贴板文本".to_string());
+
+        assert_eq!(dialog.query, "剪贴板文本");
+        assert_eq!(
+            dialog.selection_range,
+            "剪贴板文本".len().."剪贴板文本".len()
+        );
+        assert!(dialog.marked_range.is_none());
+        assert_eq!(dialog.current_file_match_count, None);
+        assert_eq!(dialog.message, "已粘贴剪贴板文本，按 Enter 或点击搜索");
     }
 
     /// 验证主题配置文本只接受稳定的三种持久化值。
