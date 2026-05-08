@@ -2,12 +2,14 @@
 //
 // 业务意图：
 // - 该文件集中维护搜索窗口、关键字/目录输入框、计数按钮、搜索按钮和 GPUI 文本命中绘制逻辑。
-// - 当前通过 `include!` 保持在 `app` 模块作用域内，避免第一阶段重构破坏主窗口与搜索状态之间的私有访问。
+// - 当前作为 `app` 的子模块运行，通过显式 `pub(super)` 接口访问主窗口搜索状态。
 //
 // 边界条件：
 // - 本阶段只做物理拆分，不改变搜索范围、历史记录、快捷键、复制粘贴或搜索结果行为。
 
-struct SearchDialogWindowView {
+use super::*;
+
+pub(super) struct SearchDialogWindowView {
     /// 主窗口视图实体。
     ///
     /// 实现原因：
@@ -23,7 +25,7 @@ struct SearchDialogWindowView {
 
 impl SearchDialogWindowView {
     /// 创建搜索对话框窗口根视图。
-    fn new(main_view: Entity<MainView>, context: &mut Context<Self>) -> Self {
+    pub(super) fn new(main_view: Entity<MainView>, context: &mut Context<Self>) -> Self {
         let observed_main_view = main_view.clone();
         let main_view_subscription = context.observe(&observed_main_view, |_, _, context| {
             context.notify();
@@ -39,7 +41,7 @@ impl SearchDialogWindowView {
     ///
     /// 业务意图：
     /// - 关闭按钮和 `Esc` 都应复用主视图的搜索取消逻辑，保证后台任务、历史记录和窗口句柄状态一致。
-    fn close_dialog(&mut self, window: &mut Window, context: &mut Context<Self>) {
+    pub(super) fn close_dialog(&mut self, window: &mut Window, context: &mut Context<Self>) {
         self.main_view.update(context, |view, context| {
             view.close_search_dialog(window, context);
         });
@@ -51,7 +53,7 @@ impl SearchDialogWindowView {
     /// 业务意图：
     /// - 搜索对话框现在是独立窗口，拖动应交给平台窗口系统处理，而不是在主窗口里维护浮层坐标。
     /// - 这样鼠标移动不会再触发主窗口日志行 hover 或选择状态。
-    fn start_window_drag(&mut self, window: &mut Window, context: &mut Context<Self>) {
+    pub(super) fn start_window_drag(&mut self, window: &mut Window, context: &mut Context<Self>) {
         window.start_window_move();
         self.main_view.update(context, |view, context| {
             view.stop_log_text_selection(context);
@@ -64,7 +66,7 @@ impl SearchDialogWindowView {
     }
 
     /// 把搜索输入框按键转发给主视图状态。
-    fn handle_search_input_key_down(
+    pub(super) fn handle_search_input_key_down(
         &mut self,
         event: &KeyDownEvent,
         _window: &mut Window,
@@ -77,7 +79,7 @@ impl SearchDialogWindowView {
     }
 
     /// 把目录目标输入框按键转发给主视图状态。
-    fn handle_search_directory_key_down(
+    pub(super) fn handle_search_directory_key_down(
         &mut self,
         event: &KeyDownEvent,
         _window: &mut Window,
@@ -90,7 +92,7 @@ impl SearchDialogWindowView {
     }
 
     /// 切换搜索范围。
-    fn select_search_scope(
+    pub(super) fn select_search_scope(
         &mut self,
         scope: SearchScope,
         window: &mut Window,
@@ -126,7 +128,7 @@ impl SearchDialogWindowView {
     }
 
     /// 切换大小写匹配选项。
-    fn toggle_case_sensitive(&mut self, context: &mut Context<Self>) {
+    pub(super) fn toggle_case_sensitive(&mut self, context: &mut Context<Self>) {
         self.main_view.update(context, |view, context| {
             if let Some(dialog) = view.search_dialog.as_mut() {
                 dialog.case_sensitive = !dialog.case_sensitive;
@@ -138,7 +140,7 @@ impl SearchDialogWindowView {
     }
 
     /// 统计当前关键字在当前文件中的出现次数。
-    fn count_current_file_matches(&mut self, context: &mut Context<Self>) {
+    pub(super) fn count_current_file_matches(&mut self, context: &mut Context<Self>) {
         self.main_view.update(context, |view, context| {
             view.count_search_query_in_current_file(context);
         });
@@ -146,7 +148,7 @@ impl SearchDialogWindowView {
     }
 
     /// 启动搜索任务。
-    fn start_search(&mut self, context: &mut Context<Self>) {
+    pub(super) fn start_search(&mut self, context: &mut Context<Self>) {
         self.main_view.update(context, |view, context| {
             view.start_search(context);
         });
@@ -158,7 +160,7 @@ impl SearchDialogWindowView {
     /// 业务意图：
     /// - GPUI 当前版本的文本输入能力通过自定义元素注册到平台输入协议；鼠标事件仍需要回写到业务状态。
     /// - 单击定位光标，双击选中当前词，三连击选中整段输入，符合常见系统文本框习惯。
-    fn handle_query_input_mouse_down(
+    pub(super) fn handle_query_input_mouse_down(
         &mut self,
         event: &MouseDownEvent,
         window: &mut Window,
@@ -173,7 +175,7 @@ impl SearchDialogWindowView {
     }
 
     /// 处理目录目标输入框鼠标按下。
-    fn handle_directory_input_mouse_down(
+    pub(super) fn handle_directory_input_mouse_down(
         &mut self,
         event: &MouseDownEvent,
         window: &mut Window,
@@ -192,7 +194,7 @@ impl SearchDialogWindowView {
     }
 
     /// 拖动扩展当前搜索文本输入框的选择范围。
-    fn handle_search_text_mouse_move(
+    pub(super) fn handle_search_text_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
         context: &mut Context<Self>,
@@ -204,7 +206,7 @@ impl SearchDialogWindowView {
     }
 
     /// 结束搜索文本输入框的鼠标选择。
-    fn handle_search_text_mouse_up(&mut self, context: &mut Context<Self>) {
+    pub(super) fn handle_search_text_mouse_up(&mut self, context: &mut Context<Self>) {
         self.main_view.update(context, |view, context| {
             view.finish_search_text_mouse_selection(context);
         });

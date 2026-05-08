@@ -7,9 +7,10 @@
 // 边界条件：
 // - 本阶段不改变搜索结果截断、展开/收起、右键菜单、滚动条拖动或点击跳转行为。
 
-impl MainView {
+use super::*;
 
-    fn render_search_results_panel(
+impl MainView {
+    pub(super) fn render_search_results_panel(
         &self,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -96,7 +97,7 @@ impl MainView {
     /// 业务意图：
     /// - 结果面板中的命中可能远多于可见区域，滚动条既提示当前位置，也提供直接拖动入口。
     /// - 滑块和结果虚拟列表共享同一个滚动句柄，避免维护第二份滚动状态。
-    fn render_search_results_scrollbar(
+    pub(super) fn render_search_results_scrollbar(
         &self,
         scroll_handle: &UniformListScrollHandle,
         row_count: usize,
@@ -134,7 +135,7 @@ impl MainView {
     /// 业务意图：
     /// - 使用搜索结果虚拟列表的真实测量结果，保证滚轮滚动、结果展开/收起和滑块位置同源。
     /// - 内容高度不超过视口时不显示滚动条，避免空态或少量结果出现无效控件。
-    fn search_results_scrollbar_metrics(
+    pub(super) fn search_results_scrollbar_metrics(
         scroll_handle: &UniformListScrollHandle,
     ) -> Option<LogScrollbarMetrics> {
         let state = scroll_handle.0.borrow();
@@ -169,7 +170,9 @@ impl MainView {
     /// 业务意图：
     /// - 大量搜索结果刚渲染出来时，虚拟列表需要一帧后才有真实测量；临时滑块能立即提示结果区域可滚动。
     /// - 该结果只用于视觉提示，`max_scroll` 为 0，因此不会参与拖动换算；真实测量完成后会被替换。
-    fn fallback_search_results_scrollbar_metrics(row_count: usize) -> Option<LogScrollbarMetrics> {
+    pub(super) fn fallback_search_results_scrollbar_metrics(
+        row_count: usize,
+    ) -> Option<LogScrollbarMetrics> {
         if row_count <= 8 {
             return None;
         }
@@ -189,7 +192,7 @@ impl MainView {
     /// - 搜索历史记录头、命中结果和错误明细都需要在同一个可滚动区域内显示。
     /// - 仅为展开的记录生成明细行，可以让用户保留多次搜索历史而不被旧结果淹没。
     /// - 该函数只在结果数据或展开状态变化时调用，不能放到虚拟列表滚动渲染路径中反复执行。
-    fn search_results_panel_rows_from_records(
+    pub(super) fn search_results_panel_rows_from_records(
         records: &[SearchHistoryRecord],
     ) -> Vec<SearchResultsPanelRow> {
         let mut rows = Vec::new();
@@ -237,7 +240,9 @@ impl MainView {
     /// 业务意图：
     /// - 同一文件的命中需要集中展示并可独立展开/收起。
     /// - 分组顺序按首次命中的顺序保留，避免每次渲染排序造成结果跳动。
-    fn search_result_file_groups(record: &SearchHistoryRecord) -> Vec<SearchResultFileGroup> {
+    pub(super) fn search_result_file_groups(
+        record: &SearchHistoryRecord,
+    ) -> Vec<SearchResultFileGroup> {
         let mut groups: Vec<SearchResultFileGroup> = Vec::new();
 
         for (result_index, result) in record.results.iter().enumerate() {
@@ -264,7 +269,7 @@ impl MainView {
     /// 业务意图：
     /// - 文件分组行需要单行显示完整来源，帮助用户区分同名日志和压缩包内同名成员。
     /// - 这里仅用于 UI 展示；实际打开和定位仍依赖 `LogFileSource` 和稳定键。
-    fn search_result_source_full_path(source: &LogFileSource) -> String {
+    pub(super) fn search_result_source_full_path(source: &LogFileSource) -> String {
         match source {
             LogFileSource::LocalFile { path } => path.display().to_string(),
             LogFileSource::ArchiveMember {
@@ -296,7 +301,7 @@ impl MainView {
     /// 业务意图：
     /// - 右键菜单位置需要贴近用户点击处，便于在大量结果中快速执行批量展开/收起。
     /// - 菜单渲染在右侧工作区内部，因此需要把窗口坐标转换成右侧局部坐标。
-    fn open_search_results_context_menu(
+    pub(super) fn open_search_results_context_menu(
         &mut self,
         window_x: f32,
         window_y: f32,
@@ -317,7 +322,7 @@ impl MainView {
     ///
     /// 边界条件：
     /// - 后台搜索回调可能在渲染帧之间改变记录数量，因此每一行都必须重新通过下标安全读取。
-    fn render_search_results_panel_row(
+    pub(super) fn render_search_results_panel_row(
         &self,
         row: SearchResultsPanelRow,
         context: &mut Context<Self>,
@@ -387,7 +392,7 @@ impl MainView {
     /// 业务意图：
     /// - 搜索结果支持多层展开，右键菜单提供批量操作，避免用户逐条点击文件分组。
     /// - 菜单风格与 tab 右键菜单保持一致，避免在同一应用中出现两套交互语言。
-    fn render_search_results_context_menu(
+    pub(super) fn render_search_results_context_menu(
         &self,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -426,7 +431,7 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 菜单项点击后立即执行批量操作并收起菜单，保持和 tab 菜单一致的即时反馈。
-    fn render_search_results_context_menu_item(
+    pub(super) fn render_search_results_context_menu_item(
         &self,
         action: SearchResultsContextMenuAction,
         label: &'static str,
@@ -455,7 +460,7 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 展开/收起会影响历史记录和文件分组两层状态，集中处理可以保证行缓存同步重建。
-    fn handle_search_results_context_menu_action(
+    pub(super) fn handle_search_results_context_menu_action(
         &mut self,
         action: SearchResultsContextMenuAction,
         context: &mut Context<Self>,
@@ -473,7 +478,7 @@ impl MainView {
     /// 业务意图：
     /// - 用户在需要快速浏览全部命中时，可以一次性展开所有层级，不必逐个文件打开。
     /// - 展开后重建虚拟列表行缓存，保持滚动路径仍为 O(可见行数)。
-    fn expand_all_search_results(&mut self) {
+    pub(super) fn expand_all_search_results(&mut self) {
         let Some(panel) = self.search_results_panel.as_mut() else {
             return;
         };
@@ -493,7 +498,7 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 当搜索结果过多造成扫描困难时，用户可以一次回到只有历史摘要的紧凑视图。
-    fn collapse_all_search_results(&mut self) {
+    pub(super) fn collapse_all_search_results(&mut self) {
         let Some(panel) = self.search_results_panel.as_mut() else {
             return;
         };
@@ -506,7 +511,7 @@ impl MainView {
     }
 
     /// 渲染搜索结果面板顶部拖拽条。
-    fn render_search_results_resizer(
+    pub(super) fn render_search_results_resizer(
         &self,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -527,7 +532,7 @@ impl MainView {
     }
 
     /// 渲染搜索结果面板标题栏。
-    fn render_search_results_header(
+    pub(super) fn render_search_results_header(
         &self,
         panel: &SearchResultsPanelState,
         palette: AppThemePalette,
@@ -632,7 +637,7 @@ impl MainView {
     }
 
     /// 渲染搜索结果空态。
-    fn render_search_results_empty(
+    pub(super) fn render_search_results_empty(
         &self,
         panel: &SearchResultsPanelState,
         palette: AppThemePalette,
@@ -667,7 +672,7 @@ impl MainView {
     /// 业务意图：
     /// - 历史记录行展示查询词、范围、目标目录和命中统计，点击可展开或收起明细。
     /// - 最新搜索默认展开，旧搜索保留但折叠，便于对比不同关键字而不占满结果区域。
-    fn render_search_history_record_row(
+    pub(super) fn render_search_history_record_row(
         &self,
         record_index: usize,
         record: &SearchHistoryRecord,
@@ -777,7 +782,7 @@ impl MainView {
     /// 业务意图：
     /// - 文件分组行承载“这个文件有多少命中”的摘要，并提供展开/收起入口。
     /// - 命中明细行只显示行号和预览，避免每条结果重复展示同一个文件名。
-    fn render_search_file_group_row(
+    pub(super) fn render_search_file_group_row(
         &self,
         record_index: usize,
         source_key: String,
@@ -864,7 +869,7 @@ impl MainView {
     /// 业务意图：
     /// - 文件名由上层文件分组展示，结果行只展示行号和命中预览；点击后打开对应文件并滚动到命中行。
     /// - 命中片段只用文字颜色高亮，保持和日志正文高亮策略一致。
-    fn render_search_result_row(
+    pub(super) fn render_search_result_row(
         &self,
         result: SearchResultItem,
         context: &mut Context<Self>,
@@ -942,7 +947,7 @@ impl MainView {
     /// 边界条件：
     /// - `trim` 可能移除中文前后的 ASCII 或 Unicode 空白，命中范围必须按移除的 UTF-8 字节数平移。
     /// - 正常搜索命中一定在非空查询上，因此 trim 后命中不应为空；若遇到异常范围，回退到空范围，避免 `StyledText` 越界。
-    fn search_result_preview_text_and_range(
+    pub(super) fn search_result_preview_text_and_range(
         line_text: &str,
         match_range: Range<usize>,
     ) -> (String, Range<usize>) {
@@ -969,7 +974,7 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 目录搜索不能因为单个文件读取失败而中断；错误行让用户知道哪些文件没有被覆盖。
-    fn render_search_error_row(
+    pub(super) fn render_search_error_row(
         &self,
         record_index: usize,
         error: SearchFileError,
@@ -1017,7 +1022,7 @@ impl MainView {
     }
 
     /// 渲染展开搜索记录时的空态明细行。
-    fn render_search_record_empty_row(
+    pub(super) fn render_search_record_empty_row(
         &self,
         record_index: usize,
         record: &SearchHistoryRecord,
@@ -1060,7 +1065,7 @@ impl MainView {
     /// 业务意图：
     /// - 编码下拉框或 tab 右键菜单打开后，用户点击右侧工作区其它位置应关闭弹层。
     /// - 遮罩放在内容之上、菜单之下，既能接收空白区域点击，又不会挡住菜单项点击。
-    fn render_popup_dismiss_overlay(
+    pub(super) fn render_popup_dismiss_overlay(
         &self,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -1088,5 +1093,4 @@ impl MainView {
                 }),
             )
     }
-
 }

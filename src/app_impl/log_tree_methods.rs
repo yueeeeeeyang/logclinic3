@@ -7,9 +7,10 @@
 // 边界条件：
 // - 本阶段不改变单击打开、目录展开、多选规则、压缩包节点处理或另存为跳过/覆盖策略。
 
-impl MainView {
+use super::*;
 
-    fn render_log_tree_panel(&self, context: &mut Context<Self>) -> impl IntoElement {
+impl MainView {
+    pub(super) fn render_log_tree_panel(&self, context: &mut Context<Self>) -> impl IntoElement {
         let palette = self.palette();
 
         div()
@@ -31,7 +32,7 @@ impl MainView {
     ///
     /// 边界条件：
     /// - 当前标题不显示真实绝对路径，避免在路径脱敏和悬浮提示规则未定义前挤压窄面板。
-    fn render_log_tree_header(&self) -> impl IntoElement {
+    pub(super) fn render_log_tree_header(&self) -> impl IntoElement {
         let palette = self.palette();
         let summary = match &self.load_state {
             LogTreeLoadState::Loaded(tree_state) => tree_state.summary().to_string(),
@@ -80,7 +81,7 @@ impl MainView {
     /// 边界条件：
     /// - 目录树行高固定为 `LOG_TREE_ROW_HEIGHT`，符合 `uniform_list` 对等高元素的要求。
     /// - 虚拟列表数量来自当前可见行缓存，展开/收起后会重新计算并驱动列表更新。
-    fn render_log_tree_body(&self, context: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_log_tree_body(&self, context: &mut Context<Self>) -> impl IntoElement {
         let visible_row_count = match &self.load_state {
             LogTreeLoadState::Loaded(tree_state) => tree_state.visible_rows.len(),
             LogTreeLoadState::Empty
@@ -134,7 +135,7 @@ impl MainView {
     ///
     /// 边界条件：
     /// - 只有内容高度超过视口时显示；首帧尚未完成测量但节点明显较多时，会显示一个临时滑块提示可滚动。
-    fn render_log_tree_scrollbar(
+    pub(super) fn render_log_tree_scrollbar(
         &self,
         visible_row_count: usize,
         context: &mut Context<Self>,
@@ -173,7 +174,7 @@ impl MainView {
     /// 业务意图：
     /// - 使用虚拟列表上一次布局记录的视口高度、内容高度和滚动偏移计算滑块，让滚轮滚动和滑块位置同步。
     /// - 目录树行高固定，因此 `UniformListScrollHandle` 的测量结果可以稳定反映完整内容高度。
-    fn log_tree_scrollbar_metrics(
+    pub(super) fn log_tree_scrollbar_metrics(
         scroll_handle: &UniformListScrollHandle,
     ) -> Option<LogScrollbarMetrics> {
         let state = scroll_handle.0.borrow();
@@ -208,7 +209,7 @@ impl MainView {
     /// 业务意图：
     /// - 大目录刚加载完成时，虚拟列表需要一帧后才写入真实测量；临时滑块可以立即告诉用户左侧列表可滚动。
     /// - 该结果只用于视觉提示，真实布局完成后会被 `log_tree_scrollbar_metrics` 替换。
-    fn fallback_log_tree_scrollbar_metrics(
+    pub(super) fn fallback_log_tree_scrollbar_metrics(
         visible_row_count: usize,
     ) -> Option<LogScrollbarMetrics> {
         if visible_row_count <= 24 {
@@ -234,7 +235,7 @@ impl MainView {
     /// 边界条件：
     /// - 展开状态由 `LoadedLogTreeState` 保存；行号来自虚拟列表可见区间，不能作为展开键使用。
     /// - 错误详情暂不展开显示，只保存在加载结果中，后续可接入悬浮提示或状态面板。
-    fn render_loaded_log_tree_row(
+    pub(super) fn render_loaded_log_tree_row(
         &self,
         visible_index: usize,
         row: &LoadedLogTreeRow,
@@ -291,7 +292,7 @@ impl MainView {
     ///
     /// 边界条件：
     /// - 文件来源来自加载层，不从展示文案反推真实路径，避免目录同名或压缩包路径分隔符差异导致误读。
-    fn render_log_tree_row(
+    pub(super) fn render_log_tree_row(
         row_data: LogTreeRowRenderData,
         palette: AppThemePalette,
         theme: EffectiveTheme,
@@ -395,7 +396,7 @@ impl MainView {
     /// 业务意图：
     /// - 左侧树面板本身使用浅灰/深灰背景，通用 hover 色在明亮主题下和面板背景过于接近，会导致用户看不清鼠标悬浮行。
     /// - 选中行和普通行分别使用更明确的悬浮色，保证“当前选中”和“鼠标所在”两个状态都能被辨认。
-    fn log_tree_row_hover_background(selected: bool, theme: EffectiveTheme) -> u32 {
+    pub(super) fn log_tree_row_hover_background(selected: bool, theme: EffectiveTheme) -> u32 {
         match (theme, selected) {
             // 左侧树 hover 需要比面板背景更明确，但不能过亮或过饱和，否则长时间扫目录会刺眼。
             (EffectiveTheme::Light, false) => 0xe8edf3,
@@ -415,7 +416,7 @@ impl MainView {
     /// - 错误节点或不可打开节点也允许选中，方便用户保持视觉上下文；后续文件操作会只筛选可读取来源。
     /// - 带修饰键的点击只更新多选集合，不触发打开或展开，避免用户批量选择时意外切换右侧日志。
     /// - 双击事件的第二次按下不再重复执行主动作，避免目录被“展开后立刻收起”。
-    fn handle_log_tree_left_mouse_down(
+    pub(super) fn handle_log_tree_left_mouse_down(
         &mut self,
         node_id: usize,
         visible_index: usize,
@@ -467,7 +468,7 @@ impl MainView {
     /// 边界条件：
     /// - 同时存在文件来源和可展开子节点时优先打开文件，用于单文件压缩包按文件本身处理的场景。
     /// - Shift、Ctrl、Command 任一修饰键存在时不触发主动作，确保多选行为只改变选择集合。
-    fn log_tree_primary_action_for_click(
+    pub(super) fn log_tree_primary_action_for_click(
         has_source: bool,
         can_toggle: bool,
         shift: bool,
@@ -491,7 +492,7 @@ impl MainView {
     /// 业务意图：
     /// - 将多选规则拆成纯状态逻辑，避免渲染事件中混入范围计算细节。
     /// - Ctrl/Command 点击用于增删单个节点，Shift 点击用于从锚点到当前行的连续选择。
-    fn update_log_tree_selection_for_click(
+    pub(super) fn update_log_tree_selection_for_click(
         &mut self,
         node_id: usize,
         visible_index: usize,
@@ -515,7 +516,7 @@ impl MainView {
     /// 边界条件：
     /// - Shift 点击但锚点已经不可见时，退化为普通单击，避免选择隐藏折叠节点。
     /// - Ctrl/Command 与 Shift 同时按下时保留既有选择并追加范围，符合多数桌面文件管理器行为。
-    fn apply_log_tree_selection_click(
+    pub(super) fn apply_log_tree_selection_click(
         selected_node_ids: &mut HashSet<usize>,
         selection_anchor: &mut Option<usize>,
         visible_node_ids: &[usize],
@@ -554,7 +555,7 @@ impl MainView {
     ///
     /// 业务意图：
     /// - Shift 多选只能覆盖当前用户可见的连续行，折叠隐藏的子节点不参与范围计算。
-    fn visible_log_tree_node_ids(&self) -> Vec<usize> {
+    pub(super) fn visible_log_tree_node_ids(&self) -> Vec<usize> {
         match &self.load_state {
             LogTreeLoadState::Loaded(tree_state) => {
                 tree_state.visible_rows.iter().map(|row| row.id).collect()
@@ -570,7 +571,7 @@ impl MainView {
     /// 业务意图：
     /// - 右键已选中文件时保留当前多选集合；右键未选中行时先把该行切换为唯一选择。
     /// - 菜单命令随后统一作用于当前选择中的可读取文件，目录和错误节点会被自动忽略。
-    fn open_log_tree_context_menu(
+    pub(super) fn open_log_tree_context_menu(
         &mut self,
         node_id: usize,
         visible_index: usize,
@@ -605,7 +606,7 @@ impl MainView {
     /// 业务意图：
     /// - 菜单提供面向文件集合的操作；视觉上跟随当前主题，行为上不依赖平台系统菜单。
     /// - 即使右键落在目录节点上，菜单仍展示，但命令执行时只处理当前选择中的文件来源。
-    fn render_log_tree_context_menu(
+    pub(super) fn render_log_tree_context_menu(
         &self,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -652,7 +653,7 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 菜单项点击后进入统一命令分发，避免另存为和分析各自重复收起菜单、筛选选中来源。
-    fn render_log_tree_context_menu_item(
+    pub(super) fn render_log_tree_context_menu_item(
         &self,
         node_id: usize,
         fallback_source: Option<LogFileSource>,
@@ -700,7 +701,7 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 所有命令都基于当前多选集合中的可读取文件；目录、压缩包目录和错误节点不参与文件操作。
-    fn handle_log_tree_context_menu_action(
+    pub(super) fn handle_log_tree_context_menu_action(
         &mut self,
         action: LogTreeContextMenuAction,
         fallback_source: Option<LogFileSource>,
@@ -734,7 +735,7 @@ impl MainView {
     /// 业务意图：
     /// - 多选允许包含目录和错误节点，但“另存为”和“线程日志分析”只能处理真实文件。
     /// - 按加载树原始顺序返回，保证批量保存和分析结果稳定。
-    fn selected_log_tree_file_sources(&self) -> Vec<LogFileSource> {
+    pub(super) fn selected_log_tree_file_sources(&self) -> Vec<LogFileSource> {
         let LogTreeLoadState::Loaded(tree_state) = &self.load_state else {
             return Vec::new();
         };
@@ -762,7 +763,7 @@ impl MainView {
     /// 边界条件：
     /// - 没有选中文件时直接忽略，避免打开一个无法产生结果的目录选择器。
     /// - 写入失败不影响其它文件；后台结果只统计数量，后续如需详细失败列表可接入状态面板。
-    fn save_selected_log_tree_sources_as(
+    pub(super) fn save_selected_log_tree_sources_as(
         &mut self,
         sources: Vec<LogFileSource>,
         context: &mut Context<Self>,
@@ -779,7 +780,11 @@ impl MainView {
     /// 边界条件：
     /// - 没有来源时直接忽略，避免打开一个无法产生结果的目录选择器。
     /// - 保存放到后台执行；失败只统计数量，不阻塞日志查看，也不影响其它文件继续保存。
-    fn save_log_sources_as(&mut self, sources: Vec<LogFileSource>, context: &mut Context<Self>) {
+    pub(super) fn save_log_sources_as(
+        &mut self,
+        sources: Vec<LogFileSource>,
+        context: &mut Context<Self>,
+    ) {
         if sources.is_empty() {
             return;
         }
@@ -834,7 +839,7 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 选择目录、同名确认和右键菜单都可能触发真正保存；集中封装后台任务可以保证统计、菜单清理和 UI 刷新一致。
-    fn spawn_save_log_sources_to_directory(
+    pub(super) fn spawn_save_log_sources_to_directory(
         &mut self,
         sources: Vec<LogFileSource>,
         target_directory: PathBuf,
@@ -881,7 +886,7 @@ impl MainView {
     /// 边界条件：
     /// - 目标路径的父目录会按需创建；权限不足、同名目录冲突或源文件消失都会记为单文件失败。
     /// - 如果目标文件已存在，按用户在确认弹窗中选择的策略跳过或覆盖；覆盖会调用 `fs::copy` 直接替换文件内容。
-    fn save_log_sources_to_directory(
+    pub(super) fn save_log_sources_to_directory(
         sources: &[LogFileSource],
         target_directory: &Path,
         conflict_policy: SaveConflictPolicy,
@@ -944,7 +949,10 @@ impl MainView {
     ///
     /// 边界条件：
     /// - 这里按最终目标路径是否存在判断，包括同名普通文件、目录或符号链接；同名目录后续即使选择覆盖也会按写入失败统计。
-    fn save_target_conflicts(sources: &[LogFileSource], target_directory: &Path) -> Vec<PathBuf> {
+    pub(super) fn save_target_conflicts(
+        sources: &[LogFileSource],
+        target_directory: &Path,
+    ) -> Vec<PathBuf> {
         sources
             .iter()
             .map(|source| target_directory.join(Self::save_relative_path_for_source(source)))
@@ -959,7 +967,7 @@ impl MainView {
     ///
     /// 边界条件：
     /// - 弹窗可能已被其它状态变化清空；此时点击事件直接忽略，避免重复启动保存任务。
-    fn handle_save_overwrite_choice(
+    pub(super) fn handle_save_overwrite_choice(
         &mut self,
         conflict_policy: SaveConflictPolicy,
         context: &mut Context<Self>,
@@ -984,8 +992,8 @@ impl MainView {
     /// 边界条件：
     /// - 如果不同来源最终文件名相同，会映射到同一个目标文件，并继续触发同名文件“跳过/覆盖”确认。
     /// - 来源路径可能异常为空或以分隔符结尾，此时回退为 `log.txt`，避免生成空目标路径。
-    fn save_relative_path_for_source(source: &LogFileSource) -> PathBuf {
-        fn file_name_from_member_path(member_path: &str) -> PathBuf {
+    pub(super) fn save_relative_path_for_source(source: &LogFileSource) -> PathBuf {
+        pub(super) fn file_name_from_member_path(member_path: &str) -> PathBuf {
             member_path
                 .split('/')
                 .filter(|part| !part.is_empty())
@@ -1016,7 +1024,10 @@ impl MainView {
     /// 业务意图：
     /// - 普通本地日志由原文件直接复制，绝不能删除用户原文件。
     /// - 压缩包成员和单文件压缩包会先写入临时目录，复制完成或失败后都应清理，避免长期占用磁盘。
-    fn should_cleanup_saved_materialized_source(source: &LogFileSource, temp_path: &Path) -> bool {
+    pub(super) fn should_cleanup_saved_materialized_source(
+        source: &LogFileSource,
+        temp_path: &Path,
+    ) -> bool {
         match source {
             LogFileSource::LocalFile { path } => temp_path != path,
             LogFileSource::MaterializedArchiveMember {
@@ -1026,5 +1037,4 @@ impl MainView {
             LogFileSource::ArchiveMember { .. } | LogFileSource::NestedArchiveMember { .. } => true,
         }
     }
-
 }

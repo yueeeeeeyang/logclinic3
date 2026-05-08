@@ -2,32 +2,35 @@
 //
 // 业务意图：
 // - 该文件从历史 `app.rs` 中拆出，集中维护 Java thread dump 时间线窗口、状态过滤、滚动条和悬浮气泡。
-// - 当前通过 `include!` 保持在 `app` 模块作用域内，避免第一阶段重构大量调整 `MainView` 私有状态可见性。
+// - 当前作为 `app` 的子模块运行，通过显式 `pub(super)` 接口和主视图协作。
 //
 // 边界条件：
 // - 本阶段必须保持行为不变；后续若继续模块化，可再把纯解析逻辑和窗口渲染拆成真正的子模块。
+
+use super::*;
 
 /// 线程日志分析结果。
 ///
 /// 业务意图：
 /// - 独立窗口只负责渲染已经解析好的时间线数据，不在绘制阶段重新扫描日志正文。
 /// - 多个文件的 Java thread dump 会合并成同一条时间轴，便于比较线程在不同快照中的状态变化。
+
 #[derive(Clone)]
-struct ThreadAnalysisData {
+pub(super) struct ThreadAnalysisData {
     /// 分析标题。
-    title: String,
+    pub(super) title: String,
     /// 面向用户的摘要。
-    summary: String,
+    pub(super) summary: String,
     /// 横轴快照标签。
-    snapshots: Vec<ThreadSnapshot>,
+    pub(super) snapshots: Vec<ThreadSnapshot>,
     /// 纵轴线程名，按首次出现顺序去重。
-    thread_names: Vec<String>,
+    pub(super) thread_names: Vec<String>,
     /// 线程名到每个快照详情的矩阵。
     ///
     /// 业务意图：
     /// - 单个色块既要展示状态，也要支持单击查看线程片段、双击回到主窗口定位原始日志行。
     /// - 因此矩阵保存可定位的单元详情，而不是只保存颜色所需的状态枚举。
-    matrix: Vec<Vec<Option<Arc<ThreadTimelineCell>>>>,
+    pub(super) matrix: Vec<Vec<Option<Arc<ThreadTimelineCell>>>>,
 }
 
 /// 单个 thread dump 快照。
@@ -35,46 +38,46 @@ struct ThreadAnalysisData {
 /// 业务意图：
 /// - Java thread dump 通常由时间戳和 `Full thread dump` 标记组成；如果没有时间戳则使用快照序号兜底。
 #[derive(Clone)]
-struct ThreadSnapshot {
+pub(super) struct ThreadSnapshot {
     /// 横轴展示标签。
-    label: String,
+    pub(super) label: String,
     /// 当前快照所属的日志文件序号。
     ///
     /// 业务意图：
     /// - 用户要求只默认展示出现在多个线程日志中的线程；该字段用于区分“多个快照”与“多个文件”。
-    source_index: usize,
+    pub(super) source_index: usize,
     /// 当前快照所属日志来源。
     ///
     /// 业务意图：
     /// - 双击分析色块需要在主窗口打开对应本地文件或压缩包成员，因此必须保留真实来源，不能只保留展示名。
-    source: LogFileSource,
+    pub(super) source: LogFileSource,
     /// 当前快照内识别出的线程状态。
-    threads: Vec<ThreadStateSample>,
+    pub(super) threads: Vec<ThreadStateSample>,
 }
 
 /// 单个线程在某个快照中的状态。
 #[derive(Clone)]
-struct ThreadStateSample {
+pub(super) struct ThreadStateSample {
     /// Java 线程名。
-    name: String,
+    pub(super) name: String,
     /// Java thread dump 线程头中的线程 ID。
     ///
     /// 业务意图：
     /// - HotSpot 线程头通常同时包含 `#123` 和 `tid=0x...`；这里优先记录更适合人工核对的 `#123`，
     ///   兼容缺失 `#` 的日志时再记录 `tid`。
-    thread_id: Option<String>,
+    pub(super) thread_id: Option<String>,
     /// Java 线程状态。
-    state: ThreadStateKind,
+    pub(super) state: ThreadStateKind,
     /// 线程头在解码后日志中的零基行号。
     ///
     /// 业务意图：
     /// - 双击色块回主窗口时需要跳转到线程头，而不是只打开文件或跳到状态行。
-    line_index: usize,
+    pub(super) line_index: usize,
     /// 线程头开始的前 5 行日志预览。
     ///
     /// 边界条件：
     /// - 文件末尾不足 5 行时只保留实际存在的行；预览只用于悬浮气泡，不参与状态分析。
-    preview_lines: Vec<String>,
+    pub(super) preview_lines: Vec<String>,
 }
 
 /// 线程分析时间线中的可交互色块数据。
@@ -82,21 +85,21 @@ struct ThreadStateSample {
 /// 业务意图：
 /// - 渲染阶段需要快速拿到颜色、气泡内容和跳转目标；把这些信息在构建矩阵时固化，可避免点击时扫描大文件。
 #[derive(Clone)]
-struct ThreadTimelineCell {
+pub(super) struct ThreadTimelineCell {
     /// Java 线程状态。
-    state: ThreadStateKind,
+    pub(super) state: ThreadStateKind,
     /// 当前快照展示时间。
-    time_label: String,
+    pub(super) time_label: String,
     /// 完整 Java 线程名。
-    thread_name: String,
+    pub(super) thread_name: String,
     /// Java thread dump 线程 ID。
-    thread_id: Option<String>,
+    pub(super) thread_id: Option<String>,
     /// 原始日志来源。
-    source: LogFileSource,
+    pub(super) source: LogFileSource,
     /// 线程头零基行号。
-    line_index: usize,
+    pub(super) line_index: usize,
     /// 线程头开始的前 5 行日志预览。
-    preview_lines: Vec<String>,
+    pub(super) preview_lines: Vec<String>,
 }
 
 /// 线程头已识别但状态行尚未出现时的临时解析状态。
@@ -104,15 +107,15 @@ struct ThreadTimelineCell {
 /// 业务意图：
 /// - Java thread dump 的线程名、ID 位于线程头，状态位于后续行；只有两者都存在时才生成有效样本。
 /// - 临时结构避免在解析循环中用多个并行 `Option` 字段，降低状态错配风险。
-struct ThreadStateSamplePending {
+pub(super) struct ThreadStateSamplePending {
     /// Java 线程名。
-    name: String,
+    pub(super) name: String,
     /// Java thread dump 线程 ID。
-    thread_id: Option<String>,
+    pub(super) thread_id: Option<String>,
     /// 线程头零基行号。
-    line_index: usize,
+    pub(super) line_index: usize,
     /// 线程头开始的前 5 行日志预览。
-    preview_lines: Vec<String>,
+    pub(super) preview_lines: Vec<String>,
 }
 
 /// Java thread dump 中常见线程状态。
@@ -120,7 +123,7 @@ struct ThreadStateSamplePending {
 /// 业务意图：
 /// - 状态枚举驱动时间线色块，未知状态仍保留为 `Other`，避免新 JVM 文案导致整份分析失败。
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-enum ThreadStateKind {
+pub(super) enum ThreadStateKind {
     /// RUNNABLE。
     Runnable,
     /// BLOCKED。
@@ -139,7 +142,7 @@ enum ThreadStateKind {
 
 impl ThreadStateKind {
     /// 从 thread dump 状态文本解析状态枚举。
-    fn parse(text: &str) -> Self {
+    pub(super) fn parse(text: &str) -> Self {
         if text.contains("TIMED_WAITING") {
             Self::TimedWaiting
         } else if text.contains("RUNNABLE") {
@@ -158,7 +161,7 @@ impl ThreadStateKind {
     }
 
     /// 返回 UI 展示文案。
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             Self::Runnable => "RUNNABLE",
             Self::Blocked => "BLOCKED",
@@ -174,7 +177,7 @@ impl ThreadStateKind {
     ///
     /// 业务意图：
     /// - 时间线色块需要在明暗主题下都有足够对比度，同时让阻塞、等待和运行态能快速区分。
-    fn color(self, theme: EffectiveTheme) -> u32 {
+    pub(super) fn color(self, theme: EffectiveTheme) -> u32 {
         match (theme, self) {
             (_, Self::Runnable) => 0x22c55e,
             (_, Self::Blocked) => 0xef4444,
@@ -193,11 +196,11 @@ impl ThreadStateKind {
 /// 业务意图：
 /// - 用户按住面板顶部拖拽条上下拖动时，保存拖动开始点和开始高度，后续移动可稳定换算新高度。
 #[derive(Clone, Copy)]
-struct SearchResultsResizeDrag {
+pub(super) struct SearchResultsResizeDrag {
     /// 拖动开始时鼠标在窗口内容坐标中的纵坐标。
-    start_y: Pixels,
+    pub(super) start_y: Pixels,
     /// 拖动开始时结果面板高度。
-    start_height: f32,
+    pub(super) start_height: f32,
 }
 
 /// 一次搜索任务的后台输入。
@@ -205,7 +208,7 @@ struct SearchResultsResizeDrag {
 /// 业务意图：
 /// - 当前文件搜索复用已解码行；当前目录搜索复用加载树中收集到的文件来源。
 /// - 使用枚举可以在启动任务前完成所有 UI 状态校验，后台逻辑只处理明确输入。
-enum SearchTarget {
+pub(super) enum SearchTarget {
     /// 搜索当前文件。
     CurrentFile {
         /// 当前文件来源。
@@ -228,36 +231,36 @@ enum SearchTarget {
 /// 业务意图：
 /// - 线程日志分析以独立窗口展示，避免覆盖主日志查看上下文。
 /// - 窗口观察主视图主题变化，确保明暗主题切换后时间线背景和文字同步刷新。
-struct ThreadAnalysisWindowView {
+pub(super) struct ThreadAnalysisWindowView {
     /// 主窗口视图实体。
-    main_view: Entity<MainView>,
+    pub(super) main_view: Entity<MainView>,
     /// 当前分析结果。
-    analysis: ThreadAnalysisData,
+    pub(super) analysis: ThreadAnalysisData,
     /// 线程时间线虚拟列表滚动句柄。
     ///
     /// 业务意图：
     /// - Java thread dump 可能包含数千个线程，不能一次性把所有线程行都创建成 GPUI 元素。
     /// - 使用 `uniform_list` 只渲染可见行，并通过该句柄保存纵向和横向滚动位置。
-    scroll_handle: UniformListScrollHandle,
+    pub(super) scroll_handle: UniformListScrollHandle,
     /// 当前线程分析滚动条拖动状态。
     ///
     /// 业务意图：
     /// - 分析页面需要显式横向和纵向滚动条；拖动时保存方向和鼠标在滑块内的偏移，避免滑块跳动。
-    scrollbar_drag: Option<ThreadAnalysisScrollbarDrag>,
+    pub(super) scrollbar_drag: Option<ThreadAnalysisScrollbarDrag>,
     /// 当前单击色块后展示的悬浮气泡。
     ///
     /// 业务意图：
     /// - 气泡跟随用户最近一次单击的色块展示线程详情；窗口重绘或滚动时不重新解析日志。
     /// - `None` 表示尚未选择色块或分析数据已被替换。
-    cell_popup: Option<ThreadAnalysisCellPopup>,
+    pub(super) cell_popup: Option<ThreadAnalysisCellPopup>,
     /// 当前线程分析图中允许显示的线程状态集合。
     ///
     /// 业务意图：
     /// - 右上角图例同时作为状态过滤器；用户可以按状态隐藏无关线程和色块，默认只关注 RUNNABLE 线程。
     /// - 集合为空时表示用户主动隐藏全部状态，时间线列表应展示为空，而不是自动回退为全部显示。
-    visible_state_kinds: HashSet<ThreadStateKind>,
+    pub(super) visible_state_kinds: HashSet<ThreadStateKind>,
     /// 主窗口状态变更订阅。
-    _main_view_subscription: gpui::Subscription,
+    pub(super) _main_view_subscription: gpui::Subscription,
 }
 
 /// 线程分析滚动条拖动状态。
@@ -265,11 +268,11 @@ struct ThreadAnalysisWindowView {
 /// 业务意图：
 /// - 线程分析窗口没有 tab 维度，只需要记录当前拖动轴向和鼠标按下时的滑块内偏移。
 #[derive(Clone, Copy)]
-struct ThreadAnalysisScrollbarDrag {
+pub(super) struct ThreadAnalysisScrollbarDrag {
     /// 当前拖动的滚动轴。
-    axis: LogScrollbarAxis,
+    pub(super) axis: LogScrollbarAxis,
     /// 鼠标按下点相对滑块起点的偏移。
-    cursor_offset: Pixels,
+    pub(super) cursor_offset: Pixels,
 }
 
 /// 线程分析色块悬浮气泡状态。
@@ -277,18 +280,18 @@ struct ThreadAnalysisScrollbarDrag {
 /// 业务意图：
 /// - GPUI 渲染是声明式的，单击事件只记录展示所需的数据和窗口坐标，真正的气泡由下一次 render 输出。
 #[derive(Clone)]
-struct ThreadAnalysisCellPopup {
+pub(super) struct ThreadAnalysisCellPopup {
     /// 被单击的时间线单元。
-    cell: Arc<ThreadTimelineCell>,
+    pub(super) cell: Arc<ThreadTimelineCell>,
     /// 气泡左上角相对窗口的横向位置。
-    x: Pixels,
+    pub(super) x: Pixels,
     /// 气泡左上角相对窗口的纵向位置。
-    y: Pixels,
+    pub(super) y: Pixels,
 }
 
 impl ThreadAnalysisWindowView {
     /// 创建线程日志分析窗口根视图。
-    fn new(
+    pub(super) fn new(
         main_view: Entity<MainView>,
         analysis: ThreadAnalysisData,
         context: &mut Context<Self>,
@@ -312,7 +315,11 @@ impl ThreadAnalysisWindowView {
     ///
     /// 业务意图：
     /// - 用户重复对不同文件执行线程日志分析时复用已有窗口，直接替换数据并激活窗口。
-    fn set_analysis(&mut self, analysis: ThreadAnalysisData, context: &mut Context<Self>) {
+    pub(super) fn set_analysis(
+        &mut self,
+        analysis: ThreadAnalysisData,
+        context: &mut Context<Self>,
+    ) {
         self.analysis = analysis;
         self.scroll_handle = UniformListScrollHandle::new();
         self.scrollbar_drag = None;
@@ -391,7 +398,7 @@ impl ThreadAnalysisWindowView {
     ///
     /// 业务意图：
     /// - 用户要求默认只显示 RUNNABLE 状态线程，便于优先定位正在运行或占用 CPU 的线程。
-    fn default_visible_state_kinds() -> HashSet<ThreadStateKind> {
+    pub(super) fn default_visible_state_kinds() -> HashSet<ThreadStateKind> {
         HashSet::from([ThreadStateKind::Runnable])
     }
 
@@ -538,7 +545,7 @@ impl ThreadAnalysisWindowView {
     ///
     /// 边界条件：
     /// - 窗口小于气泡宽高时退化为贴近边距展示，尽量保留气泡主体内容。
-    fn thread_analysis_popup_origin(
+    pub(super) fn thread_analysis_popup_origin(
         pointer_x: f32,
         pointer_y: f32,
         window_width: f32,
@@ -666,7 +673,7 @@ impl ThreadAnalysisWindowView {
     ///
     /// 业务意图：
     /// - 拆成纯函数便于测试默认 RUNNABLE 过滤规则，避免 UI 事件和虚拟列表影响业务判断。
-    fn visible_thread_indexes_for_state_kinds(
+    pub(super) fn visible_thread_indexes_for_state_kinds(
         analysis: &ThreadAnalysisData,
         visible_state_kinds: &HashSet<ThreadStateKind>,
     ) -> Vec<usize> {

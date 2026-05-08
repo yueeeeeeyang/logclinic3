@@ -2,12 +2,14 @@
 //
 // 业务意图：
 // - 该文件集中维护“通用/模型”页签、主题选择和日志显示字号设置，避免设置 UI 继续堆在应用根文件里。
-// - 当前通过 `include!` 保持同一模块作用域，确保设置窗口仍可直接更新 `MainView` 的会话状态和持久化配置。
+// - 当前作为 `app` 的子模块，通过显式 `pub(super)` 接口更新 `MainView` 的会话状态和持久化配置。
 //
 // 边界条件：
 // - 本阶段只做物理拆分，不改变设置项、配置格式、按钮行为或窗口尺寸。
 
-struct SettingsWindowView {
+use super::*;
+
+pub(super) struct SettingsWindowView {
     /// 主窗口视图实体。
     ///
     /// 业务意图：
@@ -22,7 +24,7 @@ struct SettingsWindowView {
 
 impl SettingsWindowView {
     /// 创建设置窗口根视图。
-    fn new(main_view: Entity<MainView>, context: &mut Context<Self>) -> Self {
+    pub(super) fn new(main_view: Entity<MainView>, context: &mut Context<Self>) -> Self {
         let observed_main_view = main_view.clone();
         let main_view_subscription = context.observe(&observed_main_view, |_, _, context| {
             context.notify();
@@ -38,7 +40,7 @@ impl SettingsWindowView {
     ///
     /// 业务意图：
     /// - 页签状态保存在 `MainView`，让窗口关闭后再次打开仍停留在当前会话最后访问的页签。
-    fn select_tab(&mut self, tab: SettingsTab, context: &mut Context<Self>) {
+    pub(super) fn select_tab(&mut self, tab: SettingsTab, context: &mut Context<Self>) {
         self.main_view.update(context, |view, context| {
             view.settings_active_tab = tab;
             context.notify();
@@ -50,7 +52,7 @@ impl SettingsWindowView {
     ///
     /// 业务意图：
     /// - 用户在设置窗口中选择主题后应立即影响所有已打开窗口，并写入配置供下次启动恢复。
-    fn select_theme(&mut self, theme: ThemePreference, context: &mut Context<Self>) {
+    pub(super) fn select_theme(&mut self, theme: ThemePreference, context: &mut Context<Self>) {
         self.main_view.update(context, |view, context| {
             view.theme_preference = theme;
             save_theme_preference(theme);
@@ -66,7 +68,7 @@ impl SettingsWindowView {
     ///
     /// 边界条件：
     /// - 调整结果超出允许范围时不写入，避免设置按钮或损坏状态把日志字号推到不可读或挤破行高的值。
-    fn adjust_log_viewer_font_size(&mut self, delta: f32, context: &mut Context<Self>) {
+    pub(super) fn adjust_log_viewer_font_size(&mut self, delta: f32, context: &mut Context<Self>) {
         self.main_view.update(context, |view, context| {
             let target = view.log_viewer_font_size + delta;
             if let Some(font_size) = normalize_log_viewer_font_size(target) {

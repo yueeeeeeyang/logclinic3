@@ -5,11 +5,12 @@
 // - 本阶段不改变 tab、编码切换、分页日志、选区、复制、搜索高亮、右键菜单和滚动条行为。
 //
 // 边界条件：
-// - 该文件通过 `include!` 放在 `app` 模块内部，并自行声明 `impl MainView`，因此可以继续访问私有类型和字段。
+// - 该文件作为 `app` 的子模块自行声明 `impl MainView`，跨模块调用通过 `pub(super)` 方法显式暴露。
+
+use super::*;
 
 impl MainView {
-
-    fn render_log_tab_body(
+    pub(super) fn render_log_tab_body(
         &self,
         tab: &OpenLogTab,
         context: &mut Context<Self>,
@@ -38,7 +39,10 @@ impl MainView {
     /// 边界条件：
     /// - 动画只影响图标层，不触碰后台读取任务；即使文件很大，UI 线程仍只负责轻量重绘。
     /// - 使用稳定 ID 让同一个 tab 的加载状态重绘时复用动画进度，避免文案更新导致旋转重新从 0 开始。
-    fn render_log_tab_loading_message(&self, message: &str) -> gpui::Stateful<gpui::Div> {
+    pub(super) fn render_log_tab_loading_message(
+        &self,
+        message: &str,
+    ) -> gpui::Stateful<gpui::Div> {
         let palette = self.palette();
         div()
             .id("log-tab-loading-message")
@@ -66,7 +70,7 @@ impl MainView {
     /// 业务意图：
     /// - GPUI 0.2.2 只有 SVG 元素支持旋转变换；这里使用三个点的透明度脉冲，避免为加载态额外引入 SVG 资源。
     /// - 三个点错峰变化，用户在打开大文件时能持续看到“仍在处理”的动态反馈。
-    fn render_loading_spinner(icon_color: u32) -> impl IntoElement {
+    pub(super) fn render_loading_spinner(icon_color: u32) -> impl IntoElement {
         div()
             .id("log-tab-loading-dots")
             .flex()
@@ -81,7 +85,7 @@ impl MainView {
     /// 业务意图：
     /// - 每个点使用相同动画周期但不同相位，形成从左到右流动的加载感。
     /// - 点元素尺寸固定，动画期间只改变透明度，避免布局抖动。
-    fn render_loading_dot(index: usize, icon_color: u32) -> impl IntoElement {
+    pub(super) fn render_loading_dot(index: usize, icon_color: u32) -> impl IntoElement {
         div()
             .id(SharedString::from(format!("log-tab-loading-dot-{index}")))
             .w(px(8.0))
@@ -100,7 +104,7 @@ impl MainView {
     /// 业务意图：
     /// - 把动画数学逻辑拆成纯函数，避免渲染闭包里出现难以验证的魔法数字。
     /// - 返回值保持在可见范围内，即使窗口长时间停留在加载态也不会出现完全不可见的点。
-    fn loading_dot_opacity(delta: f32, phase_offset: f32) -> f32 {
+    pub(super) fn loading_dot_opacity(delta: f32, phase_offset: f32) -> f32 {
         let phase = (delta + phase_offset).fract();
         if phase < 0.5 {
             0.35 + phase * 1.3
@@ -113,7 +117,7 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 读取失败或自动编码失败时不能只显示空白，必须让用户知道下一步可以切换编码或重新加载。
-    fn render_log_tab_state_message(
+    pub(super) fn render_log_tab_state_message(
         &self,
         icon: Icon,
         icon_color: u32,
@@ -154,7 +158,7 @@ impl MainView {
     /// 业务意图：
     /// - 使用 GPUI `uniform_list` 只渲染可见日志行，避免大文件滚动时为全部行创建元素。
     /// - 行号和正文分栏显示，正文按日志级别做轻量高亮。
-    fn render_log_document_viewer(
+    pub(super) fn render_log_document_viewer(
         &self,
         tab: &OpenLogTab,
         document: &LogTabDocument,
@@ -387,7 +391,7 @@ impl MainView {
     /// 业务意图：
     /// - 小文件不需要占用上一版 68px 宽度；行数增长时再按数字位数适度增加。
     /// - 该宽度同时用于行号背景和每一行的行号单元格，保证未填满高度时背景也能对齐。
-    fn log_viewer_line_number_width(line_count: usize) -> f32 {
+    pub(super) fn log_viewer_line_number_width(line_count: usize) -> f32 {
         let digit_count = line_count.max(1).to_string().len() as f32;
         (digit_count * LOG_VIEWER_LINE_NUMBER_DIGIT_WIDTH + LOG_VIEWER_LINE_NUMBER_PADDING_WIDTH)
             .clamp(
@@ -401,7 +405,7 @@ impl MainView {
     /// 业务意图：
     /// - GPUI `uniform_list` 已经支持滚轮滚动，但长日志需要稳定可见的滚动位置提示和鼠标拖动入口。
     /// - 滑块与列表共享同一个 `UniformListScrollHandle`，拖动时直接写入列表底层滚动偏移，不复制日志行数据。
-    fn render_log_vertical_scrollbar(
+    pub(super) fn render_log_vertical_scrollbar(
         &self,
         tab_id: usize,
         scroll_handle: &UniformListScrollHandle,
@@ -448,7 +452,7 @@ impl MainView {
     /// 业务意图：
     /// - 日志行可能包含长 JSON、堆栈或配置片段，正文宽度超过视口时必须提供横向滚动提示。
     /// - 横向滚动条只在实际测量到内容超宽后显示，避免普通短日志底部出现无效控件。
-    fn render_log_horizontal_scrollbar(
+    pub(super) fn render_log_horizontal_scrollbar(
         &self,
         tab_id: usize,
         scroll_handle: &UniformListScrollHandle,
@@ -495,7 +499,7 @@ impl MainView {
     /// 业务意图：
     /// - 使用 `UniformListScrollHandle` 上一次布局记录的视口高度、内容高度和滚动偏移估算滑块。
     /// - 如果内容没有超过视口，则不显示滚动条，避免空文件或短日志出现无意义控件。
-    fn log_vertical_scrollbar_metrics(
+    pub(super) fn log_vertical_scrollbar_metrics(
         scroll_handle: &UniformListScrollHandle,
     ) -> Option<LogScrollbarMetrics> {
         let state = scroll_handle.0.borrow();
@@ -530,7 +534,7 @@ impl MainView {
     /// 业务意图：
     /// - 横向滚动基于 `uniform_list` 的非受限宽度测量结果，内容宽于视口时才显示自绘滚动条。
     /// - 轨道从正文区域开始，避开左侧行号列，视觉上更接近日志正文的实际可滚动内容。
-    fn log_horizontal_scrollbar_metrics(
+    pub(super) fn log_horizontal_scrollbar_metrics(
         scroll_handle: &UniformListScrollHandle,
         line_number_width: f32,
     ) -> Option<LogScrollbarMetrics> {
@@ -571,7 +575,9 @@ impl MainView {
     /// 业务意图：
     /// - `UniformListScrollHandle` 的内容高度需要等布局完成后才有值，首帧如果完全不显示滚动条会让长日志看起来不可滚动。
     /// - 这里仅对超过常见单屏行数的日志显示顶部最小滑块，下一次滚动或重绘会被真实测量值替换。
-    fn fallback_log_vertical_scrollbar_metrics(line_count: usize) -> Option<LogScrollbarMetrics> {
+    pub(super) fn fallback_log_vertical_scrollbar_metrics(
+        line_count: usize,
+    ) -> Option<LogScrollbarMetrics> {
         if line_count <= 40 {
             return None;
         }
@@ -593,7 +599,7 @@ impl MainView {
     ///
     /// 边界条件：
     /// - 如果当前 tab 已关闭、滚动条测量尚未完成或日志内容不足以滚动，则忽略本次按下。
-    fn start_log_scrollbar_drag(
+    pub(super) fn start_log_scrollbar_drag(
         &mut self,
         tab_id: usize,
         axis: LogScrollbarAxis,
@@ -636,7 +642,11 @@ impl MainView {
     /// 业务意图：
     /// - 自绘滚动条拖动必须反向写入 `uniform_list` 底层滚动偏移，才能让虚拟列表、滚轮滚动和滑块位置保持同源。
     /// - 只在鼠标左键仍处于按下状态时更新；如果系统报告左键已释放，则立即清理拖动状态。
-    fn update_log_scrollbar_drag(&mut self, event: &MouseMoveEvent, context: &mut Context<Self>) {
+    pub(super) fn update_log_scrollbar_drag(
+        &mut self,
+        event: &MouseMoveEvent,
+        context: &mut Context<Self>,
+    ) {
         let Some(drag) = self.log_scrollbar_drag else {
             return;
         };
@@ -700,7 +710,7 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 鼠标释放后清空拖动状态，避免下一次普通鼠标移动继续改变日志滚动位置。
-    fn stop_log_scrollbar_drag(&mut self, context: &mut Context<Self>) {
+    pub(super) fn stop_log_scrollbar_drag(&mut self, context: &mut Context<Self>) {
         if self.log_scrollbar_drag.is_some() {
             self.log_scrollbar_drag = None;
             context.notify();
@@ -718,7 +728,7 @@ impl MainView {
     /// - 只响应当前仍存在且已解码的 tab；加载中或失败状态没有可选择的正文。
     /// - 单击会形成空选择，视觉上不高亮，但会清理上一次选择，符合常见文本查看器行为。
     /// - 如果正在拖动日志滚动条或搜索结果面板高度，则正文不应进入选区模式，避免控件拖动被误解为文本拖选。
-    fn start_log_text_selection(
+    pub(super) fn start_log_text_selection(
         &mut self,
         tab_id: usize,
         line_index: usize,
@@ -771,7 +781,7 @@ impl MainView {
     /// 业务意图：
     /// - 三连击是日志查看器中快速复制当前行的常见操作，需要直接选中当前可见行的全部真实字符。
     /// - 这里只选择行内文本，不主动附加换行符；跨行换行仍由 `selected_log_text` 在多行选择时统一处理。
-    fn line_selection_for_line(line_index: usize, line: &str) -> LogTextSelection {
+    pub(super) fn line_selection_for_line(line_index: usize, line: &str) -> LogTextSelection {
         LogTextSelection {
             anchor: LogTextPosition {
                 line_index,
@@ -793,7 +803,7 @@ impl MainView {
     /// 边界条件：
     /// - 如果用户双击在 token 右边界附近，命中列可能落在 token 后一列，此时优先回退到前一个字符。
     /// - 如果双击在纯空白或结构分隔符上，则返回 `None`，调用方退化为单点选择。
-    fn word_selection_for_position(
+    pub(super) fn word_selection_for_position(
         line_index: usize,
         line: &str,
         position: LogTextPosition,
@@ -845,7 +855,7 @@ impl MainView {
     /// 业务意图：
     /// - 双击选词按“两个符号之间的文字”处理，所有标点、路径分隔符、类名分隔符和键值分隔符都不能进入选区。
     /// - `is_alphanumeric` 覆盖英文、数字和中文等 Unicode 字母数字，避免中文日志中的普通词被拆坏。
-    fn is_log_word_char(character: char) -> bool {
+    pub(super) fn is_log_word_char(character: char) -> bool {
         character.is_alphanumeric()
     }
 
@@ -857,7 +867,7 @@ impl MainView {
     ///
     /// 边界条件：
     /// - `=` 等键值分隔符不做回退，用户双击字段分隔符时不应误选左侧 key。
-    fn is_log_word_right_boundary_char(character: char) -> bool {
+    pub(super) fn is_log_word_right_boundary_char(character: char) -> bool {
         matches!(character, '.' | ')' | ']' | '}' | '>' | '"' | '\'')
     }
 
@@ -868,7 +878,7 @@ impl MainView {
     /// - 该函数只更新可见行上的拖动结果；虚拟列表外自动滚动选择后续需要单独定义交互规则。
     /// - 结果面板调高时，鼠标可能经过日志行，此时必须忽略底层正文选择，避免事件穿透造成误选。
     /// - 拖动日志正文滚动条时也必须忽略正文选择，避免滚动条拖动过程中出现选区和 hover 闪动。
-    fn update_log_text_selection(
+    pub(super) fn update_log_text_selection(
         &mut self,
         tab_id: usize,
         line_index: usize,
@@ -915,7 +925,7 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 鼠标释放后保留最终选区用于复制和搜索预填，但清理拖动锚点，避免下一次鼠标移动继续扩展旧选区。
-    fn stop_log_text_selection(&mut self, context: &mut Context<Self>) {
+    pub(super) fn stop_log_text_selection(&mut self, context: &mut Context<Self>) {
         let mut changed = false;
         for tab in &mut self.open_tabs {
             if tab.selection_drag_anchor.take().is_some() {
@@ -939,7 +949,7 @@ impl MainView {
     /// - 指针落在正文起点左侧时归到第 0 列，落在行尾右侧时归到最后一列，避免越界。
     /// - `LineLayout::closest_index_for_x` 返回 UTF-8 字节下标，必须再转换为字符列，保证中文和 emoji 不会被切断。
     /// - shape 结果由 GPUI 按文本内容和字体缓存；拖动选择同一行时不会每帧都完整重建字形布局。
-    fn log_text_position_from_pointer(
+    pub(super) fn log_text_position_from_pointer(
         &self,
         tab_id: usize,
         line_index: usize,
@@ -1005,7 +1015,7 @@ impl MainView {
     /// 业务意图：
     /// - 语法高亮按文字颜色表达，选区属于交互反馈，需要使用浅色背景以接近系统文本选择体验。
     /// - 字体颜色保持默认，避免复制选区时影响日志级别、时间戳等已有高亮的可读性。
-    fn log_text_selection_highlight_style() -> gpui::HighlightStyle {
+    pub(super) fn log_text_selection_highlight_style() -> gpui::HighlightStyle {
         gpui::HighlightStyle {
             background_color: Some(rgb(0xcfe8ff).into()),
             ..Default::default()
@@ -1017,7 +1027,7 @@ impl MainView {
     /// 业务意图：
     /// - 渲染、按下和拖动都复用同一套测量函数；横向滚动条需要根据当前日志行数计算行号列宽。
     /// - 只有处于已解码状态的 tab 才可能产生横向滚动条，因为加载和失败状态没有正文列表。
-    fn log_scrollbar_metrics_for_tab(
+    pub(super) fn log_scrollbar_metrics_for_tab(
         tab: &OpenLogTab,
         axis: LogScrollbarAxis,
     ) -> Option<LogScrollbarMetrics> {
@@ -1038,7 +1048,7 @@ impl MainView {
     /// 业务意图：
     /// - 鼠标事件给出的是窗口坐标，而滚动条滑块位置是列表内部局部坐标，拖动换算前必须统一坐标系。
     /// - 左侧目录树和右侧日志正文都使用 `UniformListScrollHandle`，统一函数可以避免两个滚动条坐标换算出现偏差。
-    fn uniform_list_viewport_axis_origin(
+    pub(super) fn uniform_list_viewport_axis_origin(
         scroll_handle: &UniformListScrollHandle,
         axis: LogScrollbarAxis,
     ) -> Option<Pixels> {
@@ -1058,7 +1068,7 @@ impl MainView {
     /// - 横向滚动时整行会被 GPUI 列表整体平移，因此行号单元格需要用反向偏移补偿，确保行号视觉固定。
     /// - 日志级别高亮只作用于等级关键字，不改变整行背景，避免大面积颜色干扰扫描。
     /// - 搜索结果跳转的目标行允许使用整行背景提示，这是定位反馈，不属于语法高亮规则。
-    fn render_log_line(
+    pub(super) fn render_log_line(
         input: LogLineRenderData,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -1172,7 +1182,7 @@ impl MainView {
     /// 业务意图：
     /// - 菜单位置使用右键点击位置，并转换成右侧日志面板内部坐标，保证单日志模式和左右分栏模式都能正确定位。
     /// - 打开正文菜单时关闭其它右侧弹层，避免多个自绘菜单重叠导致命令作用对象不清晰。
-    fn open_log_viewer_context_menu(
+    pub(super) fn open_log_viewer_context_menu(
         &mut self,
         tab_id: usize,
         window_x: f32,
@@ -1199,7 +1209,7 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 正文查看器是自绘只读列表，复制和另存为需要应用自己提供菜单，不能依赖平台文本控件菜单。
-    fn render_log_viewer_context_menu(
+    pub(super) fn render_log_viewer_context_menu(
         &self,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -1256,7 +1266,7 @@ impl MainView {
     ///
     /// 业务意图：
     /// - “复制”在没有选区时仍展示但禁用，符合用户要求的“有选中内容时，可以点击”。
-    fn render_log_viewer_context_menu_item(
+    pub(super) fn render_log_viewer_context_menu_item(
         &self,
         tab_id: usize,
         action: LogViewerContextMenuAction,
@@ -1300,7 +1310,7 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 复制和另存为都绑定右键时的 tab，避免菜单打开后因其它事件切换 active tab 导致作用对象变化。
-    fn handle_log_viewer_context_menu_action(
+    pub(super) fn handle_log_viewer_context_menu_action(
         &mut self,
         tab_id: usize,
         action: LogViewerContextMenuAction,
@@ -1327,7 +1337,7 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 正文右键菜单命令应始终作用于打开菜单时所在的 tab，不能依赖当前激活 tab，避免用户切换 tab 后保存错文件。
-    fn log_viewer_save_source_for_tab(&self, tab_id: usize) -> Option<LogFileSource> {
+    pub(super) fn log_viewer_save_source_for_tab(&self, tab_id: usize) -> Option<LogFileSource> {
         Self::log_viewer_save_source_for_tab_from_tabs(&self.open_tabs, tab_id)
     }
 
@@ -1335,7 +1345,7 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 拆成纯函数便于测试，避免右键菜单另存为入口因为 tab 查找错误而无声失败。
-    fn log_viewer_save_source_for_tab_from_tabs(
+    pub(super) fn log_viewer_save_source_for_tab_from_tabs(
         tabs: &[OpenLogTab],
         tab_id: usize,
     ) -> Option<LogFileSource> {
@@ -1343,5 +1353,4 @@ impl MainView {
             .find(|tab| tab.id == tab_id)
             .map(|tab| tab.source.clone())
     }
-
 }

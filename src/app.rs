@@ -2,7 +2,7 @@
 //!
 //! 业务意图：
 //! - 该模块承接从历史 `main.rs` 中迁出的主窗口装配、根状态协调和全局事件分发。
-//! - 功能域较大的 UI 代码已经逐步拆到 `app_impl` include 文件，后续可继续把它们升级为真正子模块。
+//! - 功能域较大的 UI 代码已经拆到 `app_impl` 子模块，由正常 `mod` 边界约束跨域访问。
 //! - 这里仍保留跨域协调逻辑，例如窗口句柄、后台任务回调、主视图状态汇总和全局快捷键。
 //!
 //! 跨平台约束：
@@ -60,6 +60,37 @@ use crate::stream_search::{count_query_occurrences_paged, search_paged_document}
 use crate::theme::{AppThemePalette, EffectiveTheme, ThemePreference};
 
 actions!(logclinic, [OpenSearchDialog]);
+
+/// 左侧日志目录树功能域。
+#[path = "app_impl/log_tree_methods.rs"]
+mod log_tree_methods;
+/// 日志正文查看器和 tab 正文功能域。
+#[path = "app_impl/log_viewer_methods.rs"]
+mod log_viewer_methods;
+/// 主窗口搜索结果面板功能域。
+#[path = "app_impl/search_results_methods.rs"]
+mod search_results_methods;
+/// 搜索独立窗口功能域。
+#[path = "app_impl/search_window.rs"]
+mod search_window;
+/// 设置独立窗口功能域。
+#[path = "app_impl/settings_window.rs"]
+mod settings_window;
+/// 应用层纯状态测试。
+#[cfg(test)]
+#[path = "app_impl/tests.rs"]
+mod tests;
+/// 线程日志分析独立窗口功能域。
+#[path = "app_impl/thread_analysis.rs"]
+mod thread_analysis;
+
+use search_window::SearchDialogWindowView;
+use settings_window::SettingsWindowView;
+use thread_analysis::{
+    SearchResultsResizeDrag, SearchTarget, ThreadSnapshot, ThreadStateKind, ThreadStateSample,
+    ThreadStateSamplePending, ThreadTimelineCell,
+};
+use thread_analysis::{ThreadAnalysisData, ThreadAnalysisWindowView};
 
 /// 应用主窗口的标题。
 ///
@@ -1928,12 +1959,6 @@ enum SearchResultsContextMenuAction {
     CollapseAll,
 }
 
-include!("app_impl/thread_analysis.rs");
-
-include!("app_impl/settings_window.rs");
-
-include!("app_impl/search_window.rs");
-
 enum LogTabState {
     /// 正在读取或重新解码。
     Loading {
@@ -3119,8 +3144,6 @@ impl MainView {
             .child(icon_text)
     }
 }
-
-include!("app_impl/log_tree_methods.rs");
 
 impl MainView {
     fn open_thread_analysis_for_sources(
@@ -6533,8 +6556,6 @@ impl MainView {
     }
 }
 
-include!("app_impl/search_results_methods.rs");
-
 impl MainView {
     fn render_splitter_hit_overlay(&self, context: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -7207,8 +7228,6 @@ impl MainView {
         )
     }
 }
-
-include!("app_impl/log_viewer_methods.rs");
 
 impl MainView {
     fn open_tab_context_menu(
@@ -8153,5 +8172,3 @@ pub(crate) fn run() {
             .ok();
     });
 }
-
-include!("app_impl/tests.rs");
