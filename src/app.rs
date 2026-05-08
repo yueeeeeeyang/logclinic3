@@ -61,6 +61,9 @@ use crate::theme::{AppThemePalette, EffectiveTheme, ThemePreference};
 
 actions!(logclinic, [OpenSearchDialog]);
 
+/// 关于独立窗口功能域。
+#[path = "app_impl/about_window.rs"]
+mod about_window;
 /// 左侧日志目录树功能域。
 #[path = "app_impl/log_tree_methods.rs"]
 mod log_tree_methods;
@@ -84,6 +87,7 @@ mod tests;
 #[path = "app_impl/thread_analysis.rs"]
 mod thread_analysis;
 
+use about_window::AboutWindowView;
 use search_window::SearchDialogWindowView;
 use settings_window::SettingsWindowView;
 use thread_analysis::{
@@ -1040,6 +1044,20 @@ const SETTINGS_WINDOW_WIDTH: f32 = 520.0;
 /// - 模型页签当前按需求留白，因此窗口高度不随页签切换变化，避免用户切换时窗口跳动。
 const SETTINGS_WINDOW_HEIGHT: f32 = 360.0;
 
+/// 关于窗口默认宽度。
+///
+/// 业务意图：
+/// - 关于窗口会展示软件名、版本、作者邮箱、特色功能和对应教程；宽度需要完整容纳教程短句，避免频繁换行导致高度被挤压。
+/// - 固定窗口尺寸可以让 macOS 和 Windows 的独立信息窗口保持一致，不受主窗口大小影响。
+const ABOUT_WINDOW_WIDTH: f32 = 640.0;
+
+/// 关于窗口默认高度。
+///
+/// 业务意图：
+/// - 高度按当前三块内容、作者邮箱和三条教程说明预留余量，保证无需滚动即可完整显示。
+/// - 关于窗口不承载动态列表，固定高度比自适应高度更可预测，也避免不同平台字体度量差异造成底部裁切。
+const ABOUT_WINDOW_HEIGHT: f32 = 520.0;
+
 /// 设置窗口左侧页签栏宽度。
 ///
 /// 业务意图：
@@ -1154,7 +1172,7 @@ struct ToolbarAction {
 /// - “加载日志”使用 `FileText`，表达日志文本文件入口。
 /// - “搜索”使用 `Search`，提供鼠标入口打开搜索窗口，避免快捷键异常时用户无法触达搜索能力。
 /// - “智能诊断”使用 `Stethoscope`，表达对日志问题进行诊断和定位，比脑回路图标更贴近按钮语义。
-/// - “设置”使用 `Settings`，表达配置入口。
+/// - “设置”使用 `Settings`，表达配置入口；“关于”使用 `Info`，表达产品信息入口。
 ///
 /// 边界条件：
 /// - 当前图标依赖启动时注册的 Lucide 字体；如果字体注册失败，启动阶段会直接暴露错误。
@@ -1174,6 +1192,10 @@ const TOOLBAR_ACTIONS: &[ToolbarAction] = &[
     ToolbarAction {
         icon: Icon::Settings,
         label: "设置",
+    },
+    ToolbarAction {
+        icon: Icon::Info,
+        label: "关于",
     },
 ];
 
@@ -2471,6 +2493,15 @@ struct MainView {
     /// - 用户通过系统关闭按钮关闭设置窗口时，关闭回调必须清空该字段，避免后续点击设置按钮尝试激活失效窗口。
     settings_window: Option<WindowHandle<SettingsWindowView>>,
 
+    /// 关于窗口独立窗口句柄。
+    ///
+    /// 业务意图：
+    /// - 关于按钮会打开独立窗口；主窗口保存句柄用于重复点击时激活已有关于窗口，而不是创建多个重复窗口。
+    ///
+    /// 边界条件：
+    /// - 用户通过系统关闭按钮关闭关于窗口时，关闭回调必须清空该字段，避免后续点击关于按钮尝试激活失效窗口。
+    about_window: Option<WindowHandle<AboutWindowView>>,
+
     /// 线程日志分析独立窗口句柄。
     ///
     /// 业务意图：
@@ -2484,6 +2515,13 @@ struct MainView {
     /// - 设置窗口创建同样需要延后到 `MainView` 更新结束后执行；该标记用于合并同一帧内的重复点击。
     /// - 真实窗口状态仍以 `settings_window` 为准，该字段只描述一次待执行的打开动作。
     settings_window_open_pending: bool,
+
+    /// 关于窗口打开请求是否已经排队到下一帧。
+    ///
+    /// 业务意图：
+    /// - 关于窗口会观察主视图主题状态，创建时需要避开当前按钮点击的 `MainView` 更新租借。
+    /// - 该标记用于合并同一帧内重复点击。
+    about_window_open_pending: bool,
 
     /// 设置窗口当前激活页签。
     ///
@@ -2662,8 +2700,10 @@ impl MainView {
             search_query_history: Vec::new(),
             search_dialog_window: None,
             settings_window: None,
+            about_window: None,
             thread_analysis_window: None,
             settings_window_open_pending: false,
+            about_window_open_pending: false,
             settings_active_tab: SettingsTab::General,
             theme_preference: load_theme_preference(),
             log_viewer_font_size: load_log_viewer_font_size_preference(),
@@ -2738,6 +2778,7 @@ impl MainView {
             .child(self.render_search_toolbar_button(context))
             .child(Self::render_toolbar_button(&TOOLBAR_ACTIONS[2], palette))
             .child(self.render_settings_toolbar_button(context))
+            .child(self.render_about_toolbar_button(context))
     }
 
     /// 构建“加载日志”工具栏按钮。
@@ -2885,6 +2926,39 @@ impl MainView {
             .on_click(context.listener(Self::open_settings_from_toolbar))
     }
 
+    /// 构建“关于”工具栏按钮。
+    ///
+    /// 业务意图：
+    /// - 关于入口放在设置按钮之后，用于查看软件名称、版本、作者和特色功能，不影响日志查看主流程。
+    /// - 重复点击应激活已有关于窗口，避免用户打开多个内容相同的窗口。
+    fn render_about_toolbar_button(&self, context: &mut Context<Self>) -> impl IntoElement {
+        let action = &TOOLBAR_ACTIONS[4];
+        let palette = self.palette();
+
+        div()
+            .id(SharedString::from(action.label))
+            .flex()
+            .items_center()
+            .gap_1()
+            .flex_none()
+            .px(px(TOOLBAR_BUTTON_HORIZONTAL_PADDING))
+            .py(px(TOOLBAR_BUTTON_VERTICAL_PADDING))
+            .text_sm()
+            .text_color(rgb(palette.text))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .hover(move |button| button.text_color(rgb(palette.accent)))
+            .active(|button| button.opacity(0.82))
+            .child(Self::render_lucide_icon(
+                Some(action.icon),
+                TOOLBAR_BUTTON_ICON_WIDTH,
+                TOOLBAR_BUTTON_ICON_SIZE,
+                palette.muted_text,
+            ))
+            .child(action.label)
+            .on_click(context.listener(Self::open_about_from_toolbar))
+    }
+
     /// 打开日志来源选择器。
     ///
     /// 业务意图：
@@ -2928,6 +3002,19 @@ impl MainView {
         self.schedule_open_settings_window(window, context);
     }
 
+    /// 从工具栏按钮打开关于窗口。
+    ///
+    /// 业务意图：
+    /// - 关于窗口会持有并观察 `MainView`，因此和设置窗口一样延后到当前主视图更新结束后再创建。
+    fn open_about_from_toolbar(
+        &mut self,
+        _event: &ClickEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.schedule_open_about_window(window, context);
+    }
+
     /// 在当前主视图更新结束后打开设置窗口。
     ///
     /// 业务意图：
@@ -2942,6 +3029,24 @@ impl MainView {
         let main_view = context.entity();
         window.defer(context, move |_window, app| {
             Self::open_settings_window_after_main_update(main_view, app);
+        });
+        context.notify();
+    }
+
+    /// 在当前主视图更新结束后打开关于窗口。
+    ///
+    /// 业务意图：
+    /// - 关于窗口会读取主题调色板并观察 `MainView`，直接在按钮监听中创建会和当前更新租借冲突。
+    /// - 重复点击关于按钮时只排队一次，避免同一帧创建多个关于窗口。
+    fn schedule_open_about_window(&mut self, window: &mut Window, context: &mut Context<Self>) {
+        if self.about_window_open_pending {
+            return;
+        }
+
+        self.about_window_open_pending = true;
+        let main_view = context.entity();
+        window.defer(context, move |_window, app| {
+            Self::open_about_window_after_main_update(main_view, app);
         });
         context.notify();
     }
@@ -4735,6 +4840,84 @@ impl MainView {
                 main_view.update(app, |view, context| {
                     view.settings_window = None;
                     view.settings_window_open_pending = false;
+                    context.notify();
+                });
+            }
+        }
+    }
+
+    /// 在 `MainView` 更新租借结束后打开关于窗口。
+    ///
+    /// 业务意图：
+    /// - 工具栏关于按钮通过该入口打开独立窗口，保证重复点击只激活已有窗口而不是创建多个窗口。
+    /// - 关于窗口只展示编译期和静态产品信息，不访问文件系统、不请求网络，也不影响日志加载或搜索任务。
+    ///
+    /// 边界条件：
+    /// - 如果旧窗口句柄失效，清空后重新创建。
+    /// - 创建失败时仅清理 pending 状态；当前没有用户可见错误面板，避免把关于窗口失败混入日志内容区。
+    fn open_about_window_after_main_update(main_view: Entity<MainView>, app: &mut App) {
+        let existing_about_window = main_view.update(app, |view, context| {
+            view.about_window_open_pending = false;
+            view.tab_context_menu = None;
+            view.encoding_dropdown_menu = None;
+            view.search_results_context_menu = None;
+            view.log_viewer_context_menu = None;
+            context.notify();
+            view.about_window
+        });
+
+        if let Some(about_window) = existing_about_window {
+            if about_window
+                .update(app, |_, window, _| {
+                    window.activate_window();
+                })
+                .is_ok()
+            {
+                return;
+            }
+            main_view.update(app, |view, _| {
+                view.about_window = None;
+            });
+        }
+
+        let main_view_for_window = main_view.clone();
+        let main_view_for_close = main_view.clone();
+        let about_window_options = WindowOptions {
+            titlebar: Some(TitlebarOptions {
+                title: Some("关于 LogClinic".into()),
+                ..Default::default()
+            }),
+            window_bounds: Some(WindowBounds::centered(
+                size(px(ABOUT_WINDOW_WIDTH), px(ABOUT_WINDOW_HEIGHT)),
+                app,
+            )),
+            is_resizable: false,
+            is_minimizable: true,
+            window_min_size: Some(size(px(ABOUT_WINDOW_WIDTH), px(ABOUT_WINDOW_HEIGHT))),
+            ..Default::default()
+        };
+
+        match app.open_window(about_window_options, move |window, app| {
+            window.on_window_should_close(app, move |_, app| {
+                main_view_for_close.update(app, |view, context| {
+                    view.about_window = None;
+                    view.about_window_open_pending = false;
+                    context.notify();
+                });
+                true
+            });
+            app.new(|context| AboutWindowView::new(main_view_for_window, context))
+        }) {
+            Ok(about_window) => {
+                main_view.update(app, |view, context| {
+                    view.about_window = Some(about_window);
+                    context.notify();
+                });
+            }
+            Err(_error) => {
+                main_view.update(app, |view, context| {
+                    view.about_window = None;
+                    view.about_window_open_pending = false;
                     context.notify();
                 });
             }
