@@ -139,7 +139,93 @@ pub fn materialize_source_for_paging(
             })
         }
         LogFileSource::ArchiveMember { .. } => materialize_archive_member(source),
+        LogFileSource::MaterializedArchiveMember {
+            member_path,
+            temp_path,
+            ..
+        } => {
+            // 7Z 加载阶段已经把成员写成可 seek 的本地临时文件；分页管线直接复用该文件。
+            // 如果成员本身又是单文件压缩包，则沿用普通本地文件规则先物化唯一内部日志。
+            if let Some(format) = ArchiveFormat::from_path(Path::new(member_path)) {
+                let member_path =
+                    single_file_archive_member_path_from_path(temp_path, format, member_path)?;
+                let nested_source = LogFileSource::ArchiveMember {
+                    archive_path: temp_path.clone(),
+                    archive_format: format,
+                    member_path,
+                };
+                let nested = materialize_archive_member(&nested_source)?;
+                return Ok(MaterializedLogSource {
+                    original_source: source.clone(),
+                    temp_path: nested.temp_path,
+                    byte_len: nested.byte_len,
+                });
+            }
+
+            let byte_len = fs::metadata(temp_path)
+                .map_err(|error| {
+                    LogContentError::new(format!(
+                        "无法读取 7Z 物化成员 {} 的大小：{}",
+                        temp_path.display(),
+                        error
+                    ))
+                })?
+                .len();
+            Ok(MaterializedLogSource {
+                original_source: source.clone(),
+                temp_path: temp_path.clone(),
+                byte_len,
+            })
+        }
+        LogFileSource::NestedArchiveMember { .. } => materialize_nested_archive_member(source),
     }
+}
+
+/// 物化外层压缩包中的内层压缩包成员。
+///
+/// 业务意图：
+/// - 多文件内层压缩包在左侧树中会展开为目录；点击其中的大日志时仍应复用分页管线，而不是一次性读入内存。
+/// - 先把内层压缩包物化成普通文件，再把内层目标成员物化成分页文件，两个步骤都使用固定缓冲区复制。
+fn materialize_nested_archive_member(
+    source: &LogFileSource,
+) -> Result<MaterializedLogSource, LogContentError> {
+    let LogFileSource::NestedArchiveMember {
+        outer_archive_path,
+        outer_archive_format,
+        archive_member_path,
+        nested_archive_format,
+        nested_member_path,
+    } = source
+    else {
+        return Err(LogContentError::new(
+            "内部错误：非嵌套压缩包来源不能物化嵌套成员",
+        ));
+    };
+
+    let inner_archive_source = LogFileSource::ArchiveMember {
+        archive_path: outer_archive_path.clone(),
+        archive_format: *outer_archive_format,
+        member_path: archive_member_path.clone(),
+    };
+    let inner_archive = materialize_archive_member(&inner_archive_source)?;
+    let nested_member_source = LogFileSource::ArchiveMember {
+        archive_path: inner_archive.temp_path.clone(),
+        archive_format: *nested_archive_format,
+        member_path: nested_member_path.clone(),
+    };
+    let nested = match materialize_archive_member(&nested_member_source) {
+        Ok(nested) => nested,
+        Err(error) => {
+            cleanup_materialized_file(&inner_archive.temp_path);
+            return Err(error);
+        }
+    };
+    cleanup_materialized_file(&inner_archive.temp_path);
+    Ok(MaterializedLogSource {
+        original_source: source.clone(),
+        temp_path: nested.temp_path,
+        byte_len: nested.byte_len,
+    })
 }
 
 /// 流式物化压缩包成员。
@@ -399,6 +485,7 @@ fn materialize_7z_member(
                 }
             };
             if normalized != member_path {
+                io::copy(reader, &mut io::sink()).map_err(|error| sevenz_rust::Error::io(error))?;
                 return Ok(true);
             }
             found = true;

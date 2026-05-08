@@ -12,25 +12,28 @@
 
 use std::{
     borrow::Cow,
+    cell::RefCell,
     collections::{BTreeSet, HashMap, HashSet},
     env, fs, io,
     ops::Range,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Animation, AnimationExt as _, AnyWindowHandle, App, AppContext, Application, Bounds,
+    Animation, AnimationExt as _, AnyWindowHandle, App, AppContext, Application, AsyncApp, Bounds,
     ClickEvent, ClipboardItem, Context, DisplayId, Element, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FontWeight, GlobalElementId, InteractiveElement, IntoElement, KeyBinding,
-    KeyDownEvent, Keystroke, LayoutId, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, PathPromptOptions, Pixels, Point,
-    Render, ScrollHandle, ScrollStrategy, ShapedLine, SharedString, StatefulInteractiveElement,
-    Style, Styled as _, StyledText, TextRun, TitlebarOptions, UTF16Selection, UnderlineStyle,
-    UniformListScrollHandle, Window, WindowAppearance, WindowBounds, WindowHandle, WindowKind,
-    WindowOptions, actions, div, fill, point, px, relative, rgb, size, uniform_list,
+    EntityInputHandler, ExternalPaths, FontWeight, GlobalElementId, InteractiveElement,
+    IntoElement, KeyBinding, KeyDownEvent, Keystroke, LayoutId, ListHorizontalSizingBehavior,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement,
+    PathPromptOptions, Pixels, Point, Render, ScrollHandle, ScrollStrategy, ShapedLine,
+    SharedString, StatefulInteractiveElement, Style, Styled as _, StyledText, TextRun,
+    TitlebarOptions, UTF16Selection, UnderlineStyle, UniformListScrollHandle, Window,
+    WindowAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, actions, div, fill,
+    point, px, relative, rgb, size, uniform_list,
 };
 use lucide_icons::{Icon, LUCIDE_FONT_BYTES};
 
@@ -44,7 +47,9 @@ mod paged_document;
 mod search;
 mod stream_search;
 
-use archive_materializer::{cleanup_materialized_file, cleanup_stale_large_log_cache};
+use archive_materializer::{
+    cleanup_materialized_file, cleanup_stale_large_log_cache, materialize_source_for_paging,
+};
 use highlighting::{SyntaxTheme, highlight_line};
 use large_log::{LargeLogOpenResult, LogTabDocument, open_log_source_for_tab};
 use log_content::{
@@ -116,6 +121,18 @@ const LOG_TREE_CONTEXT_MENU_WIDTH: f32 = 176.0;
 /// 业务意图：
 /// - 与 tab 右键菜单保持相同操作密度，保证 macOS 和 Windows 鼠标命中体验一致。
 const LOG_TREE_CONTEXT_MENU_ITEM_HEIGHT: f32 = 34.0;
+
+/// 日志正文右键菜单宽度。
+///
+/// 业务意图：
+/// - 菜单目前承载“复制”和“另存为”两个正文相关操作，宽度需要兼顾中文文案和鼠标命中面积。
+const LOG_VIEWER_CONTEXT_MENU_WIDTH: f32 = 152.0;
+
+/// 日志正文右键菜单单项高度。
+///
+/// 业务意图：
+/// - 与左侧树和 tab 右键菜单保持一致密度，避免同一应用内菜单命中体验不一致。
+const LOG_VIEWER_CONTEXT_MENU_ITEM_HEIGHT: f32 = 34.0;
 
 /// 线程日志分析窗口默认宽度。
 ///
@@ -1108,6 +1125,21 @@ impl LoadedLogTreeState {
     /// - 该值在构建 UI 状态时缓存，渲染每一帧不需要重新遍历大目录树。
     fn single_log_source(&self) -> Option<LogFileSource> {
         self.single_log_source.clone()
+    }
+
+    /// 清理加载树持有的临时物化路径。
+    ///
+    /// 业务意图：
+    /// - 7Z 在加载阶段会把内部成员物化成本地文件，重新加载日志后旧树不再可见，应释放对应磁盘空间。
+    /// - 清理目录失败不影响 UI 状态切换，异常退出残留由下次启动的过期清理兜底。
+    fn cleanup_temporary_paths(&self) {
+        for path in &self.tree.temporary_paths {
+            if path.is_dir() {
+                let _ = fs::remove_dir_all(path);
+            } else {
+                cleanup_materialized_file(path);
+            }
+        }
     }
 
     /// 返回标题区域展示的加载摘要。
@@ -3283,6 +3315,7 @@ impl SearchDialogWindowView {
             view.tab_context_menu = None;
             view.encoding_dropdown_menu = None;
             view.search_results_context_menu = None;
+            view.log_viewer_context_menu = None;
             context.notify();
         });
     }
@@ -4300,6 +4333,32 @@ enum TabContextMenuAction {
     AllTabs,
 }
 
+/// 日志正文右键菜单状态。
+///
+/// 业务意图：
+/// - 日志正文使用自绘虚拟列表，不能依赖系统文本控件菜单；这里保存菜单所需的 tab 和右侧面板局部坐标。
+/// - 菜单只作用于当前右键所在 tab，避免用户切换 tab 后复制或保存到错误文件。
+struct LogViewerContextMenu {
+    /// 右键打开菜单时对应的日志 tab。
+    tab_id: usize,
+    /// 菜单左上角相对右侧日志工作区的横坐标。
+    x: f32,
+    /// 菜单左上角相对右侧日志工作区的纵坐标。
+    y: f32,
+}
+
+/// 日志正文右键菜单命令。
+///
+/// 业务意图：
+/// - 复制依赖当前正文选区；另存为依赖当前 tab 的原始日志来源，集中枚举可以保持渲染文案和执行逻辑一致。
+#[derive(Clone, Copy)]
+enum LogViewerContextMenuAction {
+    /// 复制当前正文选区到剪贴板。
+    Copy,
+    /// 将当前 tab 的日志来源保存到用户选择的目录。
+    SaveAs,
+}
+
 /// 左侧目录树单行渲染所需的输入数据。
 ///
 /// 业务意图：
@@ -4561,6 +4620,13 @@ struct MainView {
     /// - 该状态只影响当前 UI 帧，不持久化，也不参与日志内容解码结果。
     encoding_dropdown_menu: Option<EncodingDropdownMenu>,
 
+    /// 当前打开的日志正文右键菜单。
+    ///
+    /// 业务意图：
+    /// - 菜单提供复制选区和当前文件另存为，状态必须跟随右侧工作区保存，避免和左侧树菜单互相污染。
+    /// - 重新加载、切换 tab、关闭 tab 或切换编码时应清空，避免菜单作用到已经失效的正文选区。
+    log_viewer_context_menu: Option<LogViewerContextMenu>,
+
     /// 日志正文自绘滚动条的拖动状态。
     ///
     /// 业务意图：
@@ -4782,6 +4848,7 @@ impl MainView {
             next_tab_id: 1,
             tab_context_menu: None,
             encoding_dropdown_menu: None,
+            log_viewer_context_menu: None,
             log_scrollbar_drag: None,
             log_tree_scrollbar_drag: None,
             search_dialog: None,
@@ -5125,14 +5192,40 @@ impl MainView {
                 };
 
                 view.update(app, |view, context| {
-                    view.clear_workspace_for_new_log_load();
-                    view.load_state = LogTreeLoadState::Loading {
-                        message: loading_message,
-                    };
-                    context.notify();
+                    view.start_log_source_load(selected_paths, loading_message, context);
                 })
                 .ok();
+            })
+            .detach();
+    }
 
+    /// 启动一轮日志来源加载。
+    ///
+    /// 业务意图：
+    /// - 系统路径选择器、窗口拖放、程序图标拖放和命令行启动都应该复用同一套加载流程。
+    /// - 入口统一后，清理旧 tab、重置搜索结果、单日志自动打开和错误展示不会在不同入口之间出现行为差异。
+    ///
+    /// 边界条件：
+    /// - 空路径通常代表用户取消或平台传入了非文件 URL，直接忽略，避免清空当前工作区。
+    /// - 后台扫描不能阻塞 GPUI 主线程；完成后再回到主视图更新 UI。
+    fn start_log_source_load(
+        &mut self,
+        selected_paths: Vec<PathBuf>,
+        loading_message: String,
+        context: &mut Context<Self>,
+    ) {
+        if selected_paths.is_empty() {
+            return;
+        }
+
+        self.clear_workspace_for_new_log_load();
+        self.load_state = LogTreeLoadState::Loading {
+            message: loading_message,
+        };
+        context.notify();
+
+        context
+            .spawn(async move |view, app| {
                 let load_result = app
                     .background_executor()
                     .spawn(async move { load_log_sources(selected_paths) })
@@ -5184,10 +5277,14 @@ impl MainView {
         for tab in &self.open_tabs {
             Self::cleanup_tab_paged_resources(tab);
         }
+        if let LogTreeLoadState::Loaded(tree_state) = &self.load_state {
+            tree_state.cleanup_temporary_paths();
+        }
         self.open_tabs.clear();
         self.active_tab_id = None;
         self.tab_context_menu = None;
         self.encoding_dropdown_menu = None;
+        self.log_viewer_context_menu = None;
         self.log_tree_context_menu = None;
         self.log_tree_selected_node_ids.clear();
         self.log_tree_selection_anchor = None;
@@ -5670,6 +5767,7 @@ impl MainView {
         self.log_tree_context_menu = None;
         self.tab_context_menu = None;
         self.encoding_dropdown_menu = None;
+        self.log_viewer_context_menu = None;
         self.search_results_context_menu = None;
 
         match Self::log_tree_primary_action_for_click(
@@ -6003,6 +6101,19 @@ impl MainView {
         sources: Vec<LogFileSource>,
         context: &mut Context<Self>,
     ) {
+        self.save_log_sources_as(sources, context);
+    }
+
+    /// 将指定日志来源另存为到用户选择的目录。
+    ///
+    /// 业务意图：
+    /// - 左侧树批量另存为和日志正文当前文件另存为使用同一管线，避免普通文件、压缩包成员和超大日志保存规则分叉。
+    /// - 选择目录通过 GPUI 系统路径选择器完成，保证 macOS 和 Windows 使用平台原生交互。
+    ///
+    /// 边界条件：
+    /// - 没有来源时直接忽略，避免打开一个无法产生结果的目录选择器。
+    /// - 保存放到后台执行；失败只统计数量，不阻塞日志查看，也不影响其它文件继续保存。
+    fn save_log_sources_as(&mut self, sources: Vec<LogFileSource>, context: &mut Context<Self>) {
         if sources.is_empty() {
             return;
         }
@@ -6039,6 +6150,7 @@ impl MainView {
                     // 统计结果通过局部变量消费，确保后台错误不会被误认为需要中断 UI。
                     let _ = (result.saved_count, result.failed_count);
                     view.log_tree_context_menu = None;
+                    view.log_viewer_context_menu = None;
                     context.notify();
                 })
                 .ok();
@@ -6050,7 +6162,7 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 本地文件保存为目标目录下的原文件名；压缩包成员按成员路径创建子目录，保留压缩包内部层级。
-    /// - 使用 `read_log_source_bytes` 统一读取普通文件和压缩包成员，避免另存为路径重复理解压缩格式细节。
+    /// - 使用分页物化管线把来源转换成可复制的本地文件，避免 10GB+ 日志另存为时把完整内容读入内存。
     ///
     /// 边界条件：
     /// - 目标路径的父目录会按需创建；权限不足、同名目录冲突或源文件消失都会记为单文件失败。
@@ -6064,7 +6176,7 @@ impl MainView {
         for source in sources {
             let relative_path = Self::save_relative_path_for_source(source);
             let target_path = target_directory.join(relative_path);
-            let write_result = read_log_source_bytes(source).and_then(|bytes| {
+            let write_result = (|| -> Result<(), LogContentError> {
                 if let Some(parent) = target_path.parent() {
                     fs::create_dir_all(parent).map_err(|error| {
                         LogContentError::new(format!(
@@ -6074,14 +6186,23 @@ impl MainView {
                         ))
                     })?;
                 }
-                fs::write(&target_path, bytes.as_slice()).map_err(|error| {
-                    LogContentError::new(format!(
-                        "无法写入文件 {}：{}",
-                        target_path.display(),
-                        error
-                    ))
-                })
-            });
+                let materialized = materialize_source_for_paging(source)?;
+                let should_cleanup_materialized =
+                    Self::should_cleanup_saved_materialized_source(source, &materialized.temp_path);
+                let copy_result =
+                    fs::copy(&materialized.temp_path, &target_path).map_err(|error| {
+                        LogContentError::new(format!(
+                            "无法写入文件 {}：{}",
+                            target_path.display(),
+                            error
+                        ))
+                    });
+                if should_cleanup_materialized {
+                    cleanup_materialized_file(&materialized.temp_path);
+                }
+                copy_result?;
+                Ok(())
+            })();
             if write_result.is_ok() {
                 saved_count += 1;
             } else {
@@ -6115,6 +6236,41 @@ impl MainView {
                     path.push(part);
                     path
                 }),
+            LogFileSource::MaterializedArchiveMember { member_path, .. } => member_path
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .fold(PathBuf::new(), |mut path, part| {
+                    path.push(part);
+                    path
+                }),
+            LogFileSource::NestedArchiveMember {
+                archive_member_path,
+                nested_member_path,
+                ..
+            } => archive_member_path
+                .split('/')
+                .chain(nested_member_path.split('/'))
+                .filter(|part| !part.is_empty())
+                .fold(PathBuf::new(), |mut path, part| {
+                    path.push(part);
+                    path
+                }),
+        }
+    }
+
+    /// 判断另存为结束后是否需要删除物化文件。
+    ///
+    /// 业务意图：
+    /// - 普通本地日志由原文件直接复制，绝不能删除用户原文件。
+    /// - 压缩包成员和单文件压缩包会先写入临时目录，复制完成或失败后都应清理，避免长期占用磁盘。
+    fn should_cleanup_saved_materialized_source(source: &LogFileSource, temp_path: &Path) -> bool {
+        match source {
+            LogFileSource::LocalFile { path } => temp_path != path,
+            LogFileSource::MaterializedArchiveMember {
+                temp_path: source_temp_path,
+                ..
+            } => temp_path != source_temp_path,
+            LogFileSource::ArchiveMember { .. } | LogFileSource::NestedArchiveMember { .. } => true,
         }
     }
 
@@ -6680,6 +6836,7 @@ impl MainView {
         self.active_tab_id = Some(tab_id);
         self.tab_context_menu = None;
         self.encoding_dropdown_menu = None;
+        self.log_viewer_context_menu = None;
         self.clear_search_current_file_match_count();
         self.scroll_tab_bar_to_tab(tab_id);
     }
@@ -6880,6 +7037,7 @@ impl MainView {
             // “下拉框显示手动编码、正文却来自自动识别”的状态不一致。
             self.tab_context_menu = None;
             self.encoding_dropdown_menu = None;
+            self.log_viewer_context_menu = None;
             context.notify();
             return;
         }
@@ -6895,6 +7053,7 @@ impl MainView {
         };
         self.tab_context_menu = None;
         self.encoding_dropdown_menu = None;
+        self.log_viewer_context_menu = None;
         let source_name = tab.title.clone();
         if self
             .log_scrollbar_drag
@@ -7135,7 +7294,18 @@ impl MainView {
     /// - 复制文本保留跨行选择中的换行符，满足从日志中截取堆栈片段或多行上下文的常见需求。
     /// - 选择范围使用字符列，截取前会转换为 UTF-8 字节边界，中文不会被截断为非法字符串。
     fn copy_selected_log_text(&self, context: &mut Context<Self>) -> bool {
-        let Some(text) = self.selected_log_text() else {
+        let Some(active_tab_id) = self.active_tab_id else {
+            return false;
+        };
+        self.copy_selected_log_text_for_tab(active_tab_id, context)
+    }
+
+    /// 复制指定 tab 的日志正文选区。
+    ///
+    /// 业务意图：
+    /// - 右键菜单打开时会绑定具体 tab，复制时不应受后续焦点或激活状态变化影响。
+    fn copy_selected_log_text_for_tab(&self, tab_id: usize, context: &mut Context<Self>) -> bool {
+        let Some(text) = self.selected_log_text_for_tab(tab_id) else {
             return false;
         };
         if text.is_empty() {
@@ -7149,7 +7319,15 @@ impl MainView {
     /// 取得当前激活日志 tab 的选中文本。
     fn selected_log_text(&self) -> Option<String> {
         let active_tab_id = self.active_tab_id?;
-        let tab = self.open_tabs.iter().find(|tab| tab.id == active_tab_id)?;
+        self.selected_log_text_for_tab(active_tab_id)
+    }
+
+    /// 取得指定日志 tab 的选中文本。
+    ///
+    /// 边界条件：
+    /// - tab 不存在、尚未加载成功或选区为空时返回 `None`，用于禁用右键菜单“复制”。
+    fn selected_log_text_for_tab(&self, tab_id: usize) -> Option<String> {
+        let tab = self.open_tabs.iter().find(|tab| tab.id == tab_id)?;
         let selection = tab.text_selection.as_ref()?;
         if selection.is_empty() {
             return None;
@@ -7401,6 +7579,7 @@ impl MainView {
             view.tab_context_menu = None;
             view.encoding_dropdown_menu = None;
             view.search_results_context_menu = None;
+            view.log_viewer_context_menu = None;
             context.notify();
             view.settings_window
         });
@@ -8089,6 +8268,7 @@ impl MainView {
         self.search_results_scrollbar_drag = None;
         self.tab_context_menu = None;
         self.encoding_dropdown_menu = None;
+        self.log_viewer_context_menu = None;
     }
 
     /// 根据鼠标拖动更新搜索结果面板高度。
@@ -8156,6 +8336,7 @@ impl MainView {
         self.search_results_context_menu = None;
         self.tab_context_menu = None;
         self.encoding_dropdown_menu = None;
+        self.log_viewer_context_menu = None;
         self.stop_log_text_selection(context);
     }
 
@@ -8296,6 +8477,7 @@ impl MainView {
         });
         self.tab_context_menu = None;
         self.encoding_dropdown_menu = None;
+        self.log_viewer_context_menu = None;
     }
 
     /// 处理内容区鼠标移动事件。
@@ -8574,6 +8756,7 @@ impl MainView {
             .child(self.render_search_results_panel(context))
             .child(self.render_popup_dismiss_overlay(context))
             .child(self.render_tab_context_menu(context))
+            .child(self.render_log_viewer_context_menu(context))
             .child(self.render_search_results_context_menu(context))
             .child(self.render_encoding_dropdown_menu(context))
     }
@@ -9442,6 +9625,22 @@ impl MainView {
                 member_path,
                 ..
             } => format!("{}/{}", archive_path.display(), member_path),
+            LogFileSource::MaterializedArchiveMember {
+                archive_path,
+                member_path,
+                ..
+            } => format!("{}/{}", archive_path.display(), member_path),
+            LogFileSource::NestedArchiveMember {
+                outer_archive_path,
+                archive_member_path,
+                nested_member_path,
+                ..
+            } => format!(
+                "{}/{}/{}",
+                outer_archive_path.display(),
+                archive_member_path,
+                nested_member_path
+            ),
         }
     }
 
@@ -9778,6 +9977,7 @@ impl MainView {
                             view.search_results_resize_drag = None;
                             view.search_results_scrollbar_drag = None;
                             view.search_results_context_menu = None;
+                            view.log_viewer_context_menu = None;
                             context.notify();
                         }),
                     ),
@@ -10220,6 +10420,7 @@ impl MainView {
         if self.tab_context_menu.is_none()
             && self.encoding_dropdown_menu.is_none()
             && self.search_results_context_menu.is_none()
+            && self.log_viewer_context_menu.is_none()
         {
             return div().id("popup-dismiss-overlay-empty").hidden();
         }
@@ -10235,6 +10436,7 @@ impl MainView {
                     view.tab_context_menu = None;
                     view.encoding_dropdown_menu = None;
                     view.search_results_context_menu = None;
+                    view.log_viewer_context_menu = None;
                     context.notify();
                 }),
             )
@@ -10405,6 +10607,7 @@ impl MainView {
             .set_offset(point(next_x, current_offset.y));
         self.tab_context_menu = None;
         self.encoding_dropdown_menu = None;
+        self.log_viewer_context_menu = None;
         context.notify();
     }
 
@@ -10556,6 +10759,8 @@ impl MainView {
         let source_kind = match &tab.source {
             LogFileSource::LocalFile { .. } => "本地文件",
             LogFileSource::ArchiveMember { .. } => "压缩包内文件",
+            LogFileSource::MaterializedArchiveMember { .. } => "压缩包内文件",
+            LogFileSource::NestedArchiveMember { .. } => "嵌套压缩包内文件",
         };
         let encoding_button_label = Self::log_tab_encoding_selector_label(tab);
         let status = match &tab.state {
@@ -10746,6 +10951,7 @@ impl MainView {
             self.encoding_dropdown_menu = None;
             self.tab_context_menu = None;
             self.search_results_context_menu = None;
+            self.log_viewer_context_menu = None;
             context.notify();
             return;
         }
@@ -10765,6 +10971,7 @@ impl MainView {
         };
         self.tab_context_menu = None;
         self.search_results_context_menu = None;
+        self.log_viewer_context_menu = None;
         context.notify();
     }
 
@@ -11112,6 +11319,18 @@ impl MainView {
                 .flex_1()
                 .overflow_hidden()
                 .bg(rgb(palette.background))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    context.listener(move |view, event: &MouseDownEvent, _window, context| {
+                        view.open_log_viewer_context_menu(
+                            tab_id,
+                            f32::from(event.position.x),
+                            f32::from(event.position.y),
+                            context,
+                        );
+                        context.stop_propagation();
+                    }),
+                )
                 .child(
                     div()
                         .absolute()
@@ -11505,6 +11724,7 @@ impl MainView {
         });
         self.tab_context_menu = None;
         self.encoding_dropdown_menu = None;
+        self.log_viewer_context_menu = None;
         self.stop_log_text_selection(context);
     }
 
@@ -11637,6 +11857,7 @@ impl MainView {
         tab.selection_drag_anchor = (event.click_count <= 1).then_some(position);
         self.tab_context_menu = None;
         self.encoding_dropdown_menu = None;
+        self.log_viewer_context_menu = None;
         context.notify();
     }
 
@@ -12010,6 +12231,18 @@ impl MainView {
                     );
                 }),
             )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(move |view, event: &MouseDownEvent, _window, context| {
+                    view.open_log_viewer_context_menu(
+                        tab_id,
+                        f32::from(event.position.x),
+                        f32::from(event.position.y),
+                        context,
+                    );
+                    context.stop_propagation();
+                }),
+            )
             .on_mouse_move(context.listener(
                 move |view, event: &MouseMoveEvent, window, context| {
                     view.update_log_text_selection(
@@ -12022,6 +12255,156 @@ impl MainView {
                     );
                 },
             ))
+    }
+
+    /// 打开日志正文右键菜单。
+    ///
+    /// 业务意图：
+    /// - 菜单位置使用右键点击位置，并转换成右侧日志面板内部坐标，保证单日志模式和左右分栏模式都能正确定位。
+    /// - 打开正文菜单时关闭其它右侧弹层，避免多个自绘菜单重叠导致命令作用对象不清晰。
+    fn open_log_viewer_context_menu(
+        &mut self,
+        tab_id: usize,
+        window_x: f32,
+        window_y: f32,
+        context: &mut Context<Self>,
+    ) {
+        if !self.open_tabs.iter().any(|tab| tab.id == tab_id) {
+            return;
+        }
+        let panel_x = (window_x - self.right_panel_left_offset()).max(0.0);
+        let panel_y = (window_y - TOOLBAR_HEIGHT).max(0.0);
+        self.log_viewer_context_menu = Some(LogViewerContextMenu {
+            tab_id,
+            x: panel_x,
+            y: panel_y,
+        });
+        self.tab_context_menu = None;
+        self.search_results_context_menu = None;
+        self.encoding_dropdown_menu = None;
+        context.notify();
+    }
+
+    /// 渲染日志正文右键菜单。
+    ///
+    /// 业务意图：
+    /// - 正文查看器是自绘只读列表，复制和另存为需要应用自己提供菜单，不能依赖平台文本控件菜单。
+    fn render_log_viewer_context_menu(
+        &self,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let Some(menu) = &self.log_viewer_context_menu else {
+            return div().id("log-viewer-context-menu-empty").hidden();
+        };
+        let tab_id = menu.tab_id;
+        let palette = self.palette();
+        let copy_enabled = self.selected_log_text_for_tab(tab_id).is_some();
+
+        div()
+            .id("log-viewer-context-menu")
+            .absolute()
+            .left(px(menu.x))
+            .top(px(menu.y))
+            .w(px(LOG_VIEWER_CONTEXT_MENU_WIDTH))
+            .py_1()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.menu))
+            .shadow_lg()
+            .child(self.render_log_viewer_context_menu_item(
+                tab_id,
+                LogViewerContextMenuAction::Copy,
+                "复制",
+                copy_enabled,
+                palette,
+                context,
+            ))
+            .child(self.render_log_viewer_context_menu_item(
+                tab_id,
+                LogViewerContextMenuAction::SaveAs,
+                "另存为...",
+                true,
+                palette,
+                context,
+            ))
+    }
+
+    /// 渲染日志正文右键菜单单项。
+    ///
+    /// 业务意图：
+    /// - “复制”在没有选区时仍展示但禁用，符合用户要求的“有选中内容时，可以点击”。
+    fn render_log_viewer_context_menu_item(
+        &self,
+        tab_id: usize,
+        action: LogViewerContextMenuAction,
+        label: &'static str,
+        enabled: bool,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(SharedString::from(format!(
+                "log-viewer-menu-{}-{}",
+                tab_id, label
+            )))
+            .flex()
+            .items_center()
+            .h(px(LOG_VIEWER_CONTEXT_MENU_ITEM_HEIGHT))
+            .px_3()
+            .text_sm()
+            .text_color(rgb(if enabled {
+                palette.text
+            } else {
+                palette.muted_text
+            }))
+            .cursor_pointer()
+            .when(enabled, move |item| {
+                item.hover(move |item| item.bg(rgb(palette.hover)))
+            })
+            .when(!enabled, |item| item.opacity(0.55))
+            .child(label)
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(move |view, _event: &MouseDownEvent, _window, context| {
+                    if enabled {
+                        view.handle_log_viewer_context_menu_action(tab_id, action, context);
+                    }
+                    context.stop_propagation();
+                }),
+            )
+    }
+
+    /// 执行日志正文右键菜单命令。
+    ///
+    /// 业务意图：
+    /// - 复制和另存为都绑定右键时的 tab，避免菜单打开后因其它事件切换 active tab 导致作用对象变化。
+    fn handle_log_viewer_context_menu_action(
+        &mut self,
+        tab_id: usize,
+        action: LogViewerContextMenuAction,
+        context: &mut Context<Self>,
+    ) {
+        self.log_viewer_context_menu = None;
+        self.tab_context_menu = None;
+        self.encoding_dropdown_menu = None;
+        self.search_results_context_menu = None;
+        match action {
+            LogViewerContextMenuAction::Copy => {
+                let _ = self.copy_selected_log_text_for_tab(tab_id, context);
+            }
+            LogViewerContextMenuAction::SaveAs => {
+                if let Some(source) = self
+                    .open_tabs
+                    .iter()
+                    .find(|tab| tab.id == tab_id)
+                    .map(|tab| tab.source.clone())
+                {
+                    self.save_log_sources_as(vec![source], context);
+                }
+            }
+        }
+        context.notify();
     }
 
     /// 打开 tab 右键菜单。
@@ -12047,6 +12430,7 @@ impl MainView {
         });
         self.search_results_context_menu = None;
         self.encoding_dropdown_menu = None;
+        self.log_viewer_context_menu = None;
         context.notify();
     }
 
@@ -12143,6 +12527,7 @@ impl MainView {
         self.tab_context_menu = None;
         self.encoding_dropdown_menu = None;
         self.search_results_context_menu = None;
+        self.log_viewer_context_menu = None;
         match action {
             TabContextMenuAction::Current => self.close_tab(tab_id),
             TabContextMenuAction::OtherTabs => self.close_other_tabs(tab_id),
@@ -12190,6 +12575,13 @@ impl MainView {
         {
             self.log_scrollbar_drag = None;
         }
+        if self
+            .log_viewer_context_menu
+            .as_ref()
+            .is_some_and(|menu| menu.tab_id == tab_id)
+        {
+            self.log_viewer_context_menu = None;
+        }
     }
 
     /// 关闭指定 tab 之外的所有 tab。
@@ -12223,6 +12615,13 @@ impl MainView {
         {
             self.log_scrollbar_drag = None;
         }
+        if self
+            .log_viewer_context_menu
+            .as_ref()
+            .is_some_and(|menu| menu.tab_id != tab_id)
+        {
+            self.log_viewer_context_menu = None;
+        }
     }
 
     /// 关闭所有日志 tab。
@@ -12238,6 +12637,7 @@ impl MainView {
         self.tab_context_menu = None;
         self.encoding_dropdown_menu = None;
         self.search_results_context_menu = None;
+        self.log_viewer_context_menu = None;
         self.log_scrollbar_drag = None;
         self.tab_bar_scroll_handle = ScrollHandle::new();
         self.clear_search_current_file_match_count();
@@ -12625,8 +13025,110 @@ impl Render for MainView {
                 MouseButton::Left,
                 context.listener(Self::handle_root_mouse_up),
             )
+            .can_drop(|dragged, _window, _app| dragged.is::<ExternalPaths>())
+            .on_drop(
+                context.listener(|view, external_paths: &ExternalPaths, _window, context| {
+                    // GPUI 会把系统文件拖放转成 `ExternalPaths`；这里只取真实文件系统路径，
+                    // 目录、普通文件和压缩包的具体解释仍交给加载模块统一处理。
+                    view.start_log_source_load(
+                        external_paths.paths().to_vec(),
+                        "正在加载拖入的日志".to_string(),
+                        context,
+                    );
+                }),
+            )
             .child(self.render_toolbar(context))
             .child(self.render_content(context))
+    }
+}
+
+/// 从进程启动参数中提取可加载路径。
+///
+/// 业务意图：
+/// - Windows 上把文件、目录或压缩包拖到程序图标时，通常会以命令行参数形式启动进程。
+/// - macOS/Linux 的命令行手动启动也可复用该入口，方便开发期验证“启动即加载”行为。
+///
+/// 边界条件：
+/// - 第一个参数是可执行文件路径，必须跳过。
+/// - 这里只保留非空参数，不强制要求路径存在；不存在时由加载模块生成可见错误节点。
+fn log_source_paths_from_launch_arguments() -> Vec<PathBuf> {
+    env::args_os()
+        .skip(1)
+        .filter(|argument| !argument.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// 从平台 open-url 回调中提取本地文件路径。
+///
+/// 业务意图：
+/// - macOS 把文件拖到 Dock 图标或双击关联文件时，GPUI 会通过 `on_open_urls` 传入 `file://` URL。
+/// - 部分平台可能直接传入普通路径，因此这里同时兼容 file URL 和裸路径。
+///
+/// 边界条件：
+/// - 非 `file://` URL 不属于本地日志来源，直接忽略。
+/// - URL 百分号编码只在 UTF-8 成功时解码；损坏编码保留原片段，让后续加载层显示路径错误。
+fn log_source_paths_from_open_urls(urls: Vec<String>) -> Vec<PathBuf> {
+    urls.into_iter()
+        .filter_map(|url| log_source_path_from_open_url(&url))
+        .collect()
+}
+
+/// 解析单个平台传入的本地文件 URL 或裸路径。
+fn log_source_path_from_open_url(url: &str) -> Option<PathBuf> {
+    if let Some(rest) = url.strip_prefix("file://") {
+        let decoded = percent_decode_utf8_lossy(rest);
+        #[cfg(windows)]
+        {
+            let path = decoded.strip_prefix('/').unwrap_or(&decoded);
+            return Some(PathBuf::from(path));
+        }
+        #[cfg(not(windows))]
+        {
+            return Some(PathBuf::from(decoded));
+        }
+    }
+
+    if url.contains("://") || url.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(url))
+    }
+}
+
+/// 解码 file URL 中常见的百分号编码。
+///
+/// 边界条件：
+/// - 只处理完整的 `%XX` 字节；不完整或非法十六进制片段按原字符保留。
+/// - 解码后的字节如果不是合法 UTF-8，则回退到原文本，避免构造平台相关的非法路径字节。
+fn percent_decode_utf8_lossy(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+        {
+            decoded.push((high << 4) | low);
+            index += 3;
+            continue;
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+
+    String::from_utf8(decoded).unwrap_or_else(|_| input.to_string())
+}
+
+/// 解析一个 ASCII 十六进制字符。
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -12641,9 +13143,45 @@ impl Render for MainView {
 /// - 这里使用 `expect` 并配套中文错误说明，是为了让开发期和测试期能直接暴露
 ///   窗口系统、图形环境或 GPUI 初始化问题；普通业务错误后续不得采用这种处理方式。
 fn main() {
-    Application::new().run(|app| {
+    let application = Application::new();
+    let open_url_target: Rc<RefCell<Option<(WindowHandle<MainView>, AsyncApp)>>> =
+        Rc::new(RefCell::new(None));
+    let pending_open_urls: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    {
+        let open_url_target = Rc::clone(&open_url_target);
+        let pending_open_urls = Rc::clone(&pending_open_urls);
+        application.on_open_urls(move |urls| {
+            let paths = log_source_paths_from_open_urls(urls.clone());
+            if paths.is_empty() {
+                return;
+            }
+
+            if let Some((main_view, async_app)) = open_url_target.borrow_mut().as_mut() {
+                // macOS/Finder 会在应用已经启动后继续通过 open-url 回调交付文件；此时直接复用主窗口加载流程。
+                // 如果主窗口已关闭，`update` 返回错误即可忽略，避免平台回调引发 panic。
+                main_view
+                    .update(async_app, |view, window, context| {
+                        view.start_log_source_load(
+                            paths,
+                            "正在加载拖入的日志".to_string(),
+                            context,
+                        );
+                        window.activate_window();
+                    })
+                    .ok();
+            } else {
+                // 某些平台可能在主窗口创建前触发 open-url；先暂存，主窗口完成初始化后再统一处理。
+                pending_open_urls.borrow_mut().extend(urls);
+            }
+        });
+    }
+
+    application.run(move |app| {
         // 清理异常退出遗留的超大日志物化目录，避免压缩包大成员长期占用系统临时磁盘。
         cleanup_stale_large_log_cache();
+        // 启动参数在 Windows 拖拽到程序图标、开发期命令行启动等场景中承载待打开路径。
+        // macOS Dock/Finder 的“用应用打开”通常走下方 `on_open_urls` 回调，因此两条入口都保留。
+        let launch_paths = log_source_paths_from_launch_arguments();
         app.bind_keys([
             KeyBinding::new("ctrl-f", OpenSearchDialog, None),
             KeyBinding::new("cmd-f", OpenSearchDialog, None),
@@ -12703,8 +13241,30 @@ fn main() {
         let _ = main_view.update(app, |view, _window, context| {
             // 主窗口句柄只能在 `open_window` 成功返回后获得；回填到主视图供独立工具窗口激活主窗口使用。
             view.main_window = Some(main_view);
+            if !launch_paths.is_empty() {
+                view.start_log_source_load(
+                    launch_paths,
+                    "正在加载启动传入的日志".to_string(),
+                    context,
+                );
+            }
             context.notify();
         });
+        let async_app_for_open_urls = app.to_async();
+        let pending_paths = log_source_paths_from_open_urls(pending_open_urls.take());
+        if !pending_paths.is_empty() {
+            main_view
+                .update(app, |view, window, context| {
+                    view.start_log_source_load(
+                        pending_paths,
+                        "正在加载拖入的日志".to_string(),
+                        context,
+                    );
+                    window.activate_window();
+                })
+                .ok();
+        }
+        *open_url_target.borrow_mut() = Some((main_view, async_app_for_open_urls));
         let main_view_for_keys = main_view;
         let subscription = app.intercept_keystrokes(move |event, window, app| {
             // GPUI 0.2.2 在 macOS 上会从 Objective-C `keyEquivalent` 回调进入这里；该回调不能让 Rust panic
@@ -12737,6 +13297,8 @@ mod tests {
     //! 业务意图：
     //! - GPUI 渲染交互主要依赖手动验收，但目录树状态这类纯数据规则可以通过单元测试锁定。
     //! - 本模块只验证不需要窗口系统的行为，避免测试环境依赖 macOS 或 Windows 图形能力。
+
+    use crate::log_loader::ArchiveFormat;
 
     use super::*;
 
@@ -13256,6 +13818,12 @@ mod tests {
             path: PathBuf::from("/tmp/a/server.log"),
         };
         let archive = test_archive_member("thread/2026/thread.log");
+        let materialized_archive = LogFileSource::MaterializedArchiveMember {
+            archive_path: PathBuf::from("/tmp/logs.7z"),
+            archive_format: ArchiveFormat::SevenZ,
+            member_path: "a/app.log".to_string(),
+            temp_path: PathBuf::from("/tmp/LogClinic/sevenz/a/app.log"),
+        };
 
         assert_eq!(
             MainView::save_relative_path_for_source(&local),
@@ -13264,6 +13832,10 @@ mod tests {
         assert_eq!(
             MainView::save_relative_path_for_source(&archive),
             PathBuf::from("thread").join("2026").join("thread.log")
+        );
+        assert_eq!(
+            MainView::save_relative_path_for_source(&materialized_archive),
+            PathBuf::from("a").join("app.log")
         );
     }
 
@@ -13681,6 +14253,7 @@ mod tests {
                 test_tree_row(1, 1, LogTreeEntryKind::File, false, Some(source.clone())),
             ],
             error_count: 0,
+            temporary_paths: Vec::new(),
         };
         let state = LoadedLogTreeState::new(tree);
 
@@ -13704,6 +14277,7 @@ mod tests {
                 Some(source.clone()),
             )],
             error_count: 0,
+            temporary_paths: Vec::new(),
         };
         let state = LoadedLogTreeState::new(tree);
 
@@ -13735,6 +14309,7 @@ mod tests {
                 ),
             ],
             error_count: 0,
+            temporary_paths: Vec::new(),
         };
         let error_tree = LoadedLogTree {
             summary: "2 个节点，1 个错误".to_string(),
@@ -13749,6 +14324,7 @@ mod tests {
                 test_tree_row(1, 0, LogTreeEntryKind::Error, false, None),
             ],
             error_count: 1,
+            temporary_paths: Vec::new(),
         };
 
         assert_eq!(
@@ -13784,9 +14360,35 @@ mod tests {
                 ),
             ],
             error_count: 0,
+            temporary_paths: Vec::new(),
         };
         let state = LoadedLogTreeState::new(tree);
 
         assert_eq!(state.single_file_source_for_archive(0), None);
+    }
+
+    /// 验证平台传入的 file URL 会解析成本地路径。
+    ///
+    /// 业务意图：
+    /// - macOS 把文件拖到应用图标时通常给 `on_open_urls` 传 `file://` URL，必须能还原空格和中文路径。
+    #[test]
+    fn open_url_文件路径会被解析为本地路径() {
+        let paths = log_source_paths_from_open_urls(vec![
+            "file:///Users/test/日志%20目录/app.log".to_string(),
+            "logclinic://ignored".to_string(),
+        ]);
+
+        assert_eq!(paths, vec![PathBuf::from("/Users/test/日志 目录/app.log")]);
+    }
+
+    /// 验证裸路径也能作为平台 open-url 输入兼容处理。
+    ///
+    /// 业务意图：
+    /// - 不同平台和打包方式可能直接传普通路径；兼容裸路径可以减少启动入口差异。
+    #[test]
+    fn open_url_裸路径会被保留() {
+        let paths = log_source_paths_from_open_urls(vec!["/tmp/app.log".to_string()]);
+
+        assert_eq!(paths, vec![PathBuf::from("/tmp/app.log")]);
     }
 }

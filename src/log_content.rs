@@ -3,7 +3,7 @@
 //! 业务意图：
 //! - 该模块负责把左侧目录树提供的 `LogFileSource` 读取成原始字节，并把字节解码成右侧查看器可渲染的行。
 //! - 原始字节会由 UI tab 保留在内存中，用户切换编码时只重新解码，不重新读取文件或压缩包。
-//! - 压缩包成员只通过对应库的 reader 流式读取到内存，不写入临时目录，避免引入权限、清理和路径穿越风险。
+//! - 压缩包成员优先通过对应库的 reader 流式读取到内存；RAR 嵌套成员受底层 API 限制需要短暂写入临时文件，并在读取后立即清理。
 //!
 //! 关键约束：
 //! - 单个 tab 的原始字节上限为 200MB，超限时立即返回友好错误，避免桌面 UI 因超大日志耗尽内存。
@@ -14,9 +14,10 @@ use std::{
     error::Error,
     fmt::{self, Display},
     fs::{self, File},
-    io::{BufReader, Cursor, Read},
-    path::Path,
+    io::{self, BufReader, Cursor, Read},
+    path::{Path, PathBuf},
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use chardetng::{EncodingDetector, Iso2022JpDetection, Utf8Detection};
@@ -242,6 +243,42 @@ pub fn read_log_source_bytes(source: &LogFileSource) -> Result<Arc<Vec<u8>>, Log
                     "压缩包内嵌套压缩包",
                 )?
             }
+            LogFileSource::MaterializedArchiveMember {
+                member_path,
+                temp_path,
+                ..
+            } => read_single_file_archive_from_path(temp_path, format).map_err(|error| {
+                LogContentError::new(format!("读取 7Z 物化成员 {} 失败：{}", member_path, error))
+            })?,
+            LogFileSource::NestedArchiveMember {
+                outer_archive_path,
+                outer_archive_format,
+                archive_member_path,
+                nested_archive_format,
+                nested_member_path,
+            } => {
+                let nested_bytes = read_nested_archive_member_bytes(
+                    outer_archive_path,
+                    *outer_archive_format,
+                    archive_member_path,
+                    *nested_archive_format,
+                    nested_member_path,
+                )?;
+                if format == ArchiveFormat::Rar {
+                    let temp_path =
+                        write_temporary_nested_archive_bytes(&nested_bytes, nested_member_path)?;
+                    let result = read_single_file_archive_from_path(&temp_path, format);
+                    let _ = fs::remove_file(&temp_path);
+                    result?
+                } else {
+                    read_single_file_archive_from_bytes(
+                        &nested_bytes,
+                        format,
+                        nested_member_path,
+                        "嵌套压缩包内再次嵌套压缩包",
+                    )?
+                }
+            }
         };
 
         return Ok(Arc::new(bytes));
@@ -254,9 +291,100 @@ pub fn read_log_source_bytes(source: &LogFileSource) -> Result<Arc<Vec<u8>>, Log
             archive_format,
             member_path,
         } => read_archive_member(archive_path, *archive_format, member_path)?,
+        LogFileSource::MaterializedArchiveMember { temp_path, .. } => read_local_file(temp_path)?,
+        LogFileSource::NestedArchiveMember {
+            outer_archive_path,
+            outer_archive_format,
+            archive_member_path,
+            nested_archive_format,
+            nested_member_path,
+        } => read_nested_archive_member_bytes(
+            outer_archive_path,
+            *outer_archive_format,
+            archive_member_path,
+            *nested_archive_format,
+            nested_member_path,
+        )?,
     };
 
     Ok(Arc::new(bytes))
+}
+
+/// 读取外层压缩包中的内层压缩包成员。
+///
+/// 业务意图：
+/// - 多文件内层压缩包在左侧树中作为目录展示，点击具体文件时需要保持“外层压缩包 -> 内层压缩包 -> 文件”的读取语义。
+/// - RAR 无法从内存 reader 读取目录或成员，因此只对内层 RAR 写临时文件并在读取后立即删除。
+fn read_nested_archive_member_bytes(
+    outer_archive_path: &Path,
+    outer_archive_format: ArchiveFormat,
+    archive_member_path: &str,
+    nested_archive_format: ArchiveFormat,
+    nested_member_path: &str,
+) -> Result<Vec<u8>, LogContentError> {
+    let archive_bytes = read_archive_member(
+        outer_archive_path,
+        outer_archive_format,
+        archive_member_path,
+    )?;
+    if nested_archive_format == ArchiveFormat::Rar {
+        let temp_path = write_temporary_nested_archive_bytes(&archive_bytes, archive_member_path)?;
+        let result = read_archive_member(&temp_path, nested_archive_format, nested_member_path);
+        let _ = fs::remove_file(&temp_path);
+        result
+    } else {
+        read_archive_member_from_bytes(
+            &archive_bytes,
+            nested_archive_format,
+            nested_member_path,
+            archive_member_path,
+        )
+    }
+}
+
+/// 把嵌套 RAR 字节写成临时文件。
+///
+/// 边界条件：
+/// - 文件名只用于诊断和扩展名保留，会做字符级净化，避免压缩包内部路径影响系统临时目录。
+/// - 读取完成后调用方负责删除临时文件；异常退出残留会落在系统临时目录下，后续可由系统清理。
+fn write_temporary_nested_archive_bytes(
+    archive_bytes: &[u8],
+    label: &str,
+) -> Result<PathBuf, LogContentError> {
+    let safe_label = label
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| LogContentError::new(format!("无法生成嵌套 RAR 临时时间戳：{}", error)))?
+        .as_nanos();
+    let dir = std::env::temp_dir()
+        .join("LogClinic")
+        .join("nested-rar-read")
+        .join(format!("session-{}", std::process::id()));
+    fs::create_dir_all(&dir).map_err(|error| {
+        LogContentError::new(format!(
+            "无法创建嵌套 RAR 临时目录 {}：{}",
+            dir.display(),
+            error
+        ))
+    })?;
+    let path = dir.join(format!("nested-{}-{}", unique, safe_label));
+    fs::write(&path, archive_bytes).map_err(|error| {
+        LogContentError::new(format!(
+            "无法写入嵌套 RAR 临时文件 {}：{}",
+            path.display(),
+            error
+        ))
+    })?;
+    Ok(path)
 }
 
 /// 判断被点击的日志来源本身是否也是一个受支持压缩包。
@@ -273,6 +401,12 @@ fn archive_format_for_source(source: &LogFileSource) -> Option<ArchiveFormat> {
         LogFileSource::ArchiveMember { member_path, .. } => {
             ArchiveFormat::from_path(Path::new(member_path))
         }
+        LogFileSource::MaterializedArchiveMember { member_path, .. } => {
+            ArchiveFormat::from_path(Path::new(member_path))
+        }
+        LogFileSource::NestedArchiveMember {
+            nested_member_path, ..
+        } => ArchiveFormat::from_path(Path::new(nested_member_path)),
     }
 }
 
@@ -329,6 +463,30 @@ fn read_archive_member(
         ArchiveFormat::Rar => read_rar_member(archive_path, member_path),
         ArchiveFormat::TarGz => read_tar_gz_member(archive_path, member_path),
         ArchiveFormat::SevenZ => read_7z_member(archive_path, member_path),
+    }
+}
+
+/// 从内存中的压缩包字节读取指定成员。
+///
+/// 业务意图：
+/// - 外层压缩包里的多文件内层压缩包在左侧树中会展开为目录，点击内层文件时需要按“内存中的内层压缩包 + 内层成员路径”读取。
+///
+/// 边界条件：
+/// - ZIP、TAR.GZ 和 7Z 可以基于内存 reader 读取；RAR 需要文件路径，当前返回清晰错误。
+fn read_archive_member_from_bytes(
+    archive_bytes: &[u8],
+    archive_format: ArchiveFormat,
+    member_path: &str,
+    label: &str,
+) -> Result<Vec<u8>, LogContentError> {
+    match archive_format {
+        ArchiveFormat::Zip => read_zip_member_from_bytes(archive_bytes, member_path, label),
+        ArchiveFormat::TarGz => read_tar_gz_member_from_bytes(archive_bytes, member_path, label),
+        ArchiveFormat::SevenZ => read_7z_member_from_bytes(archive_bytes, member_path, label),
+        ArchiveFormat::Rar => Err(LogContentError::new(format!(
+            "嵌套 RAR {} 暂不支持直接从内存读取，请先选择外层解包后的 RAR 文件",
+            label
+        ))),
     }
 }
 
@@ -843,6 +1001,7 @@ fn read_7z_member(archive_path: &Path, member_path: &str) -> Result<Vec<u8>, Log
             if entry.is_directory()
                 || normalize_archive_member_path(entry.name()).ok().as_deref() != Some(member_path)
             {
+                drain_7z_entry_reader(entry_reader)?;
                 return Ok(true);
             }
 
@@ -861,6 +1020,126 @@ fn read_7z_member(archive_path: &Path, member_path: &str) -> Result<Vec<u8>, Log
             member_path
         ))),
     }
+}
+
+/// 从内存 ZIP 字节中读取指定成员。
+fn read_zip_member_from_bytes(
+    archive_bytes: &[u8],
+    member_path: &str,
+    label: &str,
+) -> Result<Vec<u8>, LogContentError> {
+    let mut archive = ZipArchive::new(Cursor::new(archive_bytes)).map_err(|error| {
+        LogContentError::new(format!("无法读取嵌套 ZIP {} 的目录：{}", label, error))
+    })?;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|error| {
+            LogContentError::new(format!("无法读取嵌套 ZIP 条目 {}：{}", index, error))
+        })?;
+        if entry.is_dir()
+            || normalize_archive_member_path(entry.name()).ok().as_deref() != Some(member_path)
+        {
+            continue;
+        }
+
+        let size = entry.size();
+        ensure_size_within_limit(size, member_path)?;
+        return read_reader_to_vec_with_limit(&mut entry, Some(size), member_path);
+    }
+
+    Err(LogContentError::new(format!(
+        "嵌套压缩包 {} 中未找到日志文件：{}",
+        label, member_path
+    )))
+}
+
+/// 从内存 TAR.GZ 字节中读取指定成员。
+fn read_tar_gz_member_from_bytes(
+    archive_bytes: &[u8],
+    member_path: &str,
+    label: &str,
+) -> Result<Vec<u8>, LogContentError> {
+    let decoder = GzDecoder::new(Cursor::new(archive_bytes));
+    let mut archive = TarArchive::new(decoder);
+    let entries = archive.entries().map_err(|error| {
+        LogContentError::new(format!("无法读取嵌套 TAR.GZ {} 的目录：{}", label, error))
+    })?;
+
+    for entry in entries {
+        let mut entry = entry.map_err(|error| {
+            LogContentError::new(format!("无法读取嵌套 TAR.GZ 条目：{}", error))
+        })?;
+        let entry_path = entry.path().map_err(|error| {
+            LogContentError::new(format!("无法读取嵌套 TAR.GZ 条目路径：{}", error))
+        })?;
+        let raw_name = entry_path.to_string_lossy();
+        if entry.header().entry_type().is_dir()
+            || normalize_archive_member_path(&raw_name).ok().as_deref() != Some(member_path)
+        {
+            continue;
+        }
+
+        let size = entry.size();
+        ensure_size_within_limit(size, member_path)?;
+        return read_reader_to_vec_with_limit(&mut entry, Some(size), member_path);
+    }
+
+    Err(LogContentError::new(format!(
+        "嵌套压缩包 {} 中未找到日志文件：{}",
+        label, member_path
+    )))
+}
+
+/// 从内存 7Z 字节中读取指定成员。
+fn read_7z_member_from_bytes(
+    archive_bytes: &[u8],
+    member_path: &str,
+    label: &str,
+) -> Result<Vec<u8>, LogContentError> {
+    let cursor = Cursor::new(archive_bytes);
+    let mut reader = sevenz_rust::SevenZReader::new(
+        cursor,
+        archive_bytes.len() as u64,
+        sevenz_rust::Password::empty(),
+    )
+    .map_err(|error| {
+        LogContentError::new(format!("无法读取嵌套 7Z {} 的目录：{}", label, error))
+    })?;
+    let mut result: Option<Result<Vec<u8>, LogContentError>> = None;
+
+    reader
+        .for_each_entries(|entry, entry_reader| {
+            if entry.is_directory()
+                || normalize_archive_member_path(entry.name()).ok().as_deref() != Some(member_path)
+            {
+                drain_7z_entry_reader(entry_reader)?;
+                return Ok(true);
+            }
+
+            result = Some(
+                ensure_size_within_limit(entry.size, member_path).and_then(|_| {
+                    read_reader_to_vec_with_limit(entry_reader, Some(entry.size), member_path)
+                }),
+            );
+            Ok(false)
+        })
+        .map_err(|error| LogContentError::new(format!("读取嵌套 7Z 日志文件失败：{}", error)))?;
+
+    result.unwrap_or_else(|| {
+        Err(LogContentError::new(format!(
+            "嵌套压缩包 {} 中未找到日志文件：{}",
+            label, member_path
+        )))
+    })
+}
+
+/// 消费 7Z 当前条目的 reader。
+///
+/// 业务意图：
+/// - `sevenz-rust` 在处理 solid archive 时要求顺序消费目标条目前面的数据，不能直接跳过 reader。
+/// - 如果不 drain 非目标条目，后续读取目标日志可能触发 `ChecksumVerificationFailed`。
+fn drain_7z_entry_reader(reader: &mut dyn Read) -> Result<(), sevenz_rust::Error> {
+    io::copy(reader, &mut io::sink())?;
+    Ok(())
 }
 
 /// 从任意 reader 读取字节并应用 200MB 上限。
@@ -1314,6 +1593,42 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("多个文件"));
+        fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    /// 验证可以读取外层 ZIP 中多文件内层 ZIP 的指定成员。
+    ///
+    /// 业务意图：
+    /// - 加载树把多文件内层压缩包展开成目录后，用户点击具体文件必须能准确读取内层成员，而不是继续对内层压缩包做“唯一文件”判断。
+    #[test]
+    fn 读取外层_zip_中多文件_zip_的指定成员() -> Result<(), Box<dyn Error>> {
+        let temp_dir = unique_temp_dir("logclinic3-nested-specific-content-test")?;
+        let archive_path = temp_dir.join("outer.zip");
+        let inner_cursor = Cursor::new(Vec::new());
+        let mut inner_writer = zip::ZipWriter::new(inner_cursor);
+
+        inner_writer.start_file("first.log", zip::write::SimpleFileOptions::default())?;
+        inner_writer.write_all(b"INFO first")?;
+        inner_writer.start_file("second.log", zip::write::SimpleFileOptions::default())?;
+        inner_writer.write_all(b"INFO second")?;
+        let inner_zip_bytes = inner_writer.finish()?.into_inner();
+
+        let archive_file = File::create(&archive_path)?;
+        let mut zip_writer = zip::ZipWriter::new(archive_file);
+        zip_writer.start_file("thread_multi.zip", zip::write::SimpleFileOptions::default())?;
+        zip_writer.write_all(&inner_zip_bytes)?;
+        zip_writer.finish()?;
+
+        let bytes = read_log_source_bytes(&LogFileSource::NestedArchiveMember {
+            outer_archive_path: archive_path.clone(),
+            outer_archive_format: ArchiveFormat::Zip,
+            archive_member_path: "thread_multi.zip".to_string(),
+            nested_archive_format: ArchiveFormat::Zip,
+            nested_member_path: "second.log".to_string(),
+        })?;
+
+        assert_eq!(&bytes[..], b"INFO second");
         fs::remove_dir_all(temp_dir)?;
         Ok(())
     }

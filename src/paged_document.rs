@@ -267,7 +267,10 @@ impl PagedLineCache {
 fn is_temp_materialization(materialized: &MaterializedLogSource) -> bool {
     match &materialized.original_source {
         LogFileSource::LocalFile { path } => path != &materialized.temp_path,
-        LogFileSource::ArchiveMember { .. } => true,
+        LogFileSource::MaterializedArchiveMember { temp_path, .. } => {
+            temp_path != &materialized.temp_path
+        }
+        LogFileSource::ArchiveMember { .. } | LogFileSource::NestedArchiveMember { .. } => true,
     }
 }
 

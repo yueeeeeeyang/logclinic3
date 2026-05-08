@@ -2,27 +2,35 @@
 //!
 //! 业务意图：
 //! - 该模块只负责把用户选择的文件、目录或压缩包转换成左侧目录树需要的轻量结构。
-//! - 当前阶段不读取日志正文、不做编码识别、不做搜索索引，也不把压缩包内容解压到磁盘。
+//! - 当前阶段不读取日志正文、不做编码识别、不做搜索索引；但 7Z 会在加载阶段物化普通成员，避免后续点击反复顺序解压。
 //! - UI 层只消费 `LoadedLogTree`，避免 GPUI 渲染代码直接依赖文件系统和压缩包格式细节。
 //! - 加载层会为每个节点生成当前树内稳定 ID 和子节点标记，供 UI 实现展开、收起和虚拟列表渲染。
 //!
 //! 关键约束：
 //! - 目录扫描必须完整递归，但不跟随符号链接，避免跨目录边界读取用户未明确选择的位置。
-//! - 压缩包只读取目录项元数据，不能落盘解压，避免写入临时目录带来权限、清理和安全边界问题。
+//! - ZIP/RAR/TAR.GZ 只读取目录项元数据；7Z 会写入 session 临时目录，加载结果必须携带清理路径，避免临时磁盘长期累积。
 //! - 压缩包内部路径必须做安全归一化，绝对路径、盘符路径和 `..` 路径即使不落盘也不能作为正常树节点展示。
 
 use std::{
     error::Error,
     fmt::{self, Display},
     fs::{self, File},
-    io::BufReader,
+    io::{self, BufReader, BufWriter, Cursor, Read},
     path::{Component, Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use flate2::read::GzDecoder;
 use tar::Archive as TarArchive;
 use walkdir::WalkDir;
 use zip::ZipArchive;
+
+/// 扫描嵌套压缩包目录时允许读入内存的最大压缩包成员大小。
+///
+/// 业务意图：
+/// - 外层压缩包里的内层压缩包必须先拿到可 seek 的字节才能读取目录；限制大小可以避免加载树阶段因巨大内层压缩包占满内存。
+/// - 超过该上限时仍保留内层压缩包本身作为普通文件节点，用户可以按既有分页/物化路径打开单文件压缩包。
+const NESTED_ARCHIVE_SCAN_MAX_BYTES: u64 = 200 * 1024 * 1024;
 
 /// 加载完成后提供给左侧目录树渲染的稳定数据结构。
 ///
@@ -55,6 +63,16 @@ pub struct LoadedLogTree {
     /// - 权限失败、坏压缩包条目或不支持的特殊路径不应中断其它可读取节点。
     /// - UI 可以通过该字段决定是否展示额外的错误提示或诊断入口。
     pub error_count: usize,
+
+    /// 当前加载结果创建的临时文件或目录。
+    ///
+    /// 业务意图：
+    /// - 7Z 不适合按点击随机读取单个小文件，因此加载阶段会把内部普通成员物化到临时目录。
+    /// - UI 在重新加载日志或应用退出时可以清理这些路径，避免临时磁盘长期累积。
+    ///
+    /// 边界条件：
+    /// - 路径只属于当前进程 session，不跨启动复用；异常退出残留由启动期过期清理兜底。
+    pub temporary_paths: Vec<PathBuf>,
 }
 
 /// 左侧目录树的一行真实加载节点。
@@ -180,6 +198,7 @@ pub enum ArchiveFormat {
 /// 边界条件：
 /// - 本地文件来源不跟随符号链接；目录扫描阶段已经把符号链接作为不可打开节点展示。
 /// - 压缩包成员路径使用安全归一化后的 `/` 分隔路径，不直接信任压缩包原始路径文本。
+/// - 顶层 7Z 成员会在加载阶段物化到临时路径，但来源仍保留原始压缩包和内部成员路径，避免另存为、搜索范围等语义退化成本地临时文件。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LogFileSource {
     /// 普通文件系统中的日志文件。
@@ -200,6 +219,32 @@ pub enum LogFileSource {
         archive_format: ArchiveFormat,
         /// 压缩包内部安全归一化后的成员路径。
         member_path: String,
+    },
+
+    /// 已物化到本地临时目录的压缩包成员。
+    MaterializedArchiveMember {
+        /// 原始压缩包文件路径，用于 tab 去重、搜索范围展示和另存为层级语义。
+        archive_path: PathBuf,
+        /// 原始压缩包格式；当前主要用于 7Z 加载阶段物化后的成员来源。
+        archive_format: ArchiveFormat,
+        /// 压缩包内部安全归一化后的成员路径，必须保留目录层级。
+        member_path: String,
+        /// 该成员已经流式写出的本地临时文件路径，后续读取和分页浏览都直接走此路径，避免反复顺序解压 7Z。
+        temp_path: PathBuf,
+    },
+
+    /// 外层压缩包内的内层压缩包成员。
+    NestedArchiveMember {
+        /// 外层压缩包文件本身的路径。
+        outer_archive_path: PathBuf,
+        /// 外层压缩包格式，用于读取内层压缩包文件字节。
+        outer_archive_format: ArchiveFormat,
+        /// 外层压缩包中内层压缩包文件的安全归一化路径。
+        archive_member_path: String,
+        /// 内层压缩包格式，用于读取具体日志文件。
+        nested_archive_format: ArchiveFormat,
+        /// 内层压缩包中具体日志文件的安全归一化路径。
+        nested_member_path: String,
     },
 }
 
@@ -226,6 +271,31 @@ impl LogFileSource {
                 normalized_path_for_key(archive_path),
                 member_path
             ),
+            Self::MaterializedArchiveMember {
+                archive_path,
+                archive_format,
+                member_path,
+                ..
+            } => format!(
+                "materialized-archive:{}:{}:{}",
+                archive_format.label(),
+                normalized_path_for_key(archive_path),
+                member_path
+            ),
+            Self::NestedArchiveMember {
+                outer_archive_path,
+                outer_archive_format,
+                archive_member_path,
+                nested_archive_format,
+                nested_member_path,
+            } => format!(
+                "nested-archive:{}:{}:{}:{}:{}",
+                outer_archive_format.label(),
+                normalized_path_for_key(outer_archive_path),
+                archive_member_path,
+                nested_archive_format.label(),
+                nested_member_path
+            ),
         }
     }
 
@@ -242,6 +312,20 @@ impl LogFileSource {
                 .next()
                 .filter(|name| !name.is_empty())
                 .unwrap_or(member_path)
+                .to_string(),
+            Self::MaterializedArchiveMember { member_path, .. } => member_path
+                .rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .unwrap_or(member_path)
+                .to_string(),
+            Self::NestedArchiveMember {
+                nested_member_path, ..
+            } => nested_member_path
+                .rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .unwrap_or(nested_member_path)
                 .to_string(),
         }
     }
@@ -345,12 +429,14 @@ pub fn load_log_sources(paths: Vec<PathBuf>) -> Result<LoadedLogTree, LogLoadErr
             summary: "未选择".to_string(),
             rows: Vec::new(),
             error_count: 0,
+            temporary_paths: Vec::new(),
         });
     }
 
     let mut error_count = 0usize;
+    let mut temporary_paths = Vec::new();
     let mut root = if paths.len() == 1 {
-        load_single_source(&paths[0], &mut error_count)
+        load_single_source(&paths[0], &mut error_count, &mut temporary_paths)
     } else {
         let mut virtual_root = TreeNode::new(
             format!("已加载 {} 个来源", paths.len()),
@@ -358,9 +444,11 @@ pub fn load_log_sources(paths: Vec<PathBuf>) -> Result<LoadedLogTree, LogLoadErr
         );
 
         for path in &paths {
-            virtual_root
-                .children
-                .push(load_single_source(path, &mut error_count));
+            virtual_root.children.push(load_single_source(
+                path,
+                &mut error_count,
+                &mut temporary_paths,
+            ));
         }
 
         virtual_root
@@ -382,6 +470,7 @@ pub fn load_log_sources(paths: Vec<PathBuf>) -> Result<LoadedLogTree, LogLoadErr
         summary,
         rows,
         error_count,
+        temporary_paths,
     })
 }
 
@@ -394,7 +483,11 @@ pub fn load_log_sources(paths: Vec<PathBuf>) -> Result<LoadedLogTree, LogLoadErr
 /// 边界条件：
 /// - 符号链接来源会作为符号链接节点展示，不跟随目标。
 /// - `symlink_metadata` 失败通常代表路径不存在或权限不足，此时转为错误节点。
-fn load_single_source(path: &Path, error_count: &mut usize) -> TreeNode {
+fn load_single_source(
+    path: &Path,
+    error_count: &mut usize,
+    temporary_paths: &mut Vec<PathBuf>,
+) -> TreeNode {
     let label = display_name_for_path(path);
 
     let metadata = match fs::symlink_metadata(path) {
@@ -433,7 +526,8 @@ fn load_single_source(path: &Path, error_count: &mut usize) -> TreeNode {
                 children: Vec::new(),
             };
 
-            if let Err(error) = scan_archive(path, format, &mut root, error_count) {
+            if let Err(error) = scan_archive(path, format, &mut root, error_count, temporary_paths)
+            {
                 *error_count += 1;
                 root.children.push(TreeNode::error(
                     "压缩包读取失败",
@@ -549,18 +643,20 @@ fn scan_directory(root_path: &Path, root: &mut TreeNode, error_count: &mut usize
 ///
 /// 业务意图：
 /// - 格式相关 API 差异集中在本函数附近，调用方只关心压缩包根节点和错误处理。
-/// - 每一种格式都只读取条目列表，不把文件内容解压到磁盘。
+/// - ZIP/RAR/TAR.GZ 默认读取条目列表；遇到需要路径型 API 的内层压缩包时，会先物化到临时目录再扫描。
+/// - 7Z 为改善点击内部小文件的速度，会在这里顺序物化成员到临时目录。
 fn scan_archive(
     path: &Path,
     format: ArchiveFormat,
     root: &mut TreeNode,
     error_count: &mut usize,
+    temporary_paths: &mut Vec<PathBuf>,
 ) -> Result<(), LogLoadError> {
     match format {
-        ArchiveFormat::Zip => scan_zip_archive(path, root, error_count),
-        ArchiveFormat::Rar => scan_rar_archive(path, root, error_count),
-        ArchiveFormat::TarGz => scan_tar_gz_archive(path, root, error_count),
-        ArchiveFormat::SevenZ => scan_7z_archive(path, root, error_count),
+        ArchiveFormat::Zip => scan_zip_archive(path, root, error_count, temporary_paths),
+        ArchiveFormat::Rar => scan_rar_archive(path, root, error_count, temporary_paths),
+        ArchiveFormat::TarGz => scan_tar_gz_archive(path, root, error_count, temporary_paths),
+        ArchiveFormat::SevenZ => scan_7z_archive(path, root, error_count, temporary_paths),
     }
 }
 
@@ -576,6 +672,7 @@ fn scan_zip_archive(
     path: &Path,
     root: &mut TreeNode,
     error_count: &mut usize,
+    temporary_paths: &mut Vec<PathBuf>,
 ) -> Result<(), LogLoadError> {
     let file = File::open(path).map_err(|error| {
         LogLoadError::new(format!("无法打开 ZIP 压缩包 {}：{}", path.display(), error))
@@ -584,16 +681,36 @@ fn scan_zip_archive(
         .map_err(|error| LogLoadError::new(format!("无法读取 ZIP 目录：{}", error)))?;
 
     for index in 0..archive.len() {
-        let entry = archive.by_index(index).map_err(|error| {
+        let mut entry = archive.by_index(index).map_err(|error| {
             LogLoadError::new(format!("无法读取 ZIP 条目 {}：{}", index, error))
         })?;
+        let raw_name = entry.name().to_string();
+        let is_directory = entry.is_dir();
+        let size = entry.size();
+        if !is_directory
+            && let Some(nested_format) = ArchiveFormat::from_path(Path::new(&raw_name))
+            && let Some(nested_tree) = read_nested_archive_tree_from_reader(
+                &mut entry,
+                Some(size),
+                nested_format,
+                path,
+                ArchiveFormat::Zip,
+                &raw_name,
+                error_count,
+                temporary_paths,
+            )
+        {
+            add_nested_archive_tree(root, &raw_name, nested_tree, error_count);
+            continue;
+        }
+
         add_archive_entry(
             root,
             path,
             ArchiveFormat::Zip,
-            entry.name(),
-            entry.is_dir(),
-            Some(entry.size()),
+            &raw_name,
+            is_directory,
+            Some(size),
             error_count,
         );
     }
@@ -605,7 +722,7 @@ fn scan_zip_archive(
 ///
 /// 业务意图：
 /// - `unrar` crate 封装 RARLAB unrar 库的列表能力，可以在不解压文件的前提下读取条目元数据。
-/// - 当前只使用列表模式，不调用任何写入磁盘的解压接口。
+/// - 普通条目只使用列表模式；当条目本身是压缩包时，为了判断是否应作为目录展开，会把该条目物化到临时文件再扫描。
 ///
 /// 边界条件：
 /// - 加密文件没有密码规则，当前以错误节点展示，后续需要用户确认密码输入和缓存策略后再支持。
@@ -614,10 +731,12 @@ fn scan_rar_archive(
     path: &Path,
     root: &mut TreeNode,
     error_count: &mut usize,
+    temporary_paths: &mut Vec<PathBuf>,
 ) -> Result<(), LogLoadError> {
     let archive = unrar::Archive::new(path)
         .open_for_listing()
         .map_err(|error| LogLoadError::new(format!("无法打开 RAR 目录：{}", error)))?;
+    let mut materialized_root: Option<PathBuf> = None;
 
     for entry in archive {
         let entry = match entry {
@@ -634,6 +753,53 @@ fn scan_rar_archive(
             *error_count += 1;
             root.add_archive_error_entry(&raw_name, "加密条目", "加密 RAR 条目暂不支持读取");
             continue;
+        }
+
+        if let Some(nested_format) =
+            nested_archive_scan_format(&raw_name, false, entry.unpacked_size)
+        {
+            let Some(nested_member_path) =
+                normalized_rar_nested_archive_member_path(&raw_name, false, entry.unpacked_size)
+            else {
+                *error_count += 1;
+                root.add_archive_error_entry(&raw_name, "非法路径", "压缩包成员路径非法");
+                continue;
+            };
+            match materialize_rar_member_for_nested_scan(
+                path,
+                &nested_member_path,
+                &mut materialized_root,
+                temporary_paths,
+            ) {
+                Ok(temp_path) => {
+                    if let Some(nested_tree) = read_nested_archive_tree_from_path(
+                        &temp_path,
+                        nested_format,
+                        path,
+                        ArchiveFormat::Rar,
+                        &nested_member_path,
+                        error_count,
+                        temporary_paths,
+                    ) {
+                        add_nested_archive_tree(
+                            root,
+                            &nested_member_path,
+                            nested_tree,
+                            error_count,
+                        );
+                        continue;
+                    }
+                }
+                Err(error) => {
+                    *error_count += 1;
+                    root.add_archive_error_entry(
+                        &raw_name,
+                        "内层压缩包读取失败",
+                        error.to_string(),
+                    );
+                    continue;
+                }
+            }
         }
 
         add_archive_entry(
@@ -662,6 +828,7 @@ fn scan_tar_gz_archive(
     path: &Path,
     root: &mut TreeNode,
     error_count: &mut usize,
+    temporary_paths: &mut Vec<PathBuf>,
 ) -> Result<(), LogLoadError> {
     let file = File::open(path).map_err(|error| {
         LogLoadError::new(format!(
@@ -677,7 +844,7 @@ fn scan_tar_gz_archive(
         .map_err(|error| LogLoadError::new(format!("无法读取 TAR.GZ 目录：{}", error)))?;
 
     for entry in entries {
-        let entry = match entry {
+        let mut entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
                 *error_count += 1;
@@ -694,9 +861,25 @@ fn scan_tar_gz_archive(
                 continue;
             }
         };
-        let raw_name = entry_path.to_string_lossy();
+        let raw_name = entry_path.to_string_lossy().to_string();
         let is_directory = entry.header().entry_type().is_dir();
         let size = entry.size();
+        if !is_directory
+            && let Some(nested_format) = ArchiveFormat::from_path(Path::new(&raw_name))
+            && let Some(nested_tree) = read_nested_archive_tree_from_reader(
+                &mut entry,
+                Some(size),
+                nested_format,
+                path,
+                ArchiveFormat::TarGz,
+                &raw_name,
+                error_count,
+                temporary_paths,
+            )
+        {
+            add_nested_archive_tree(root, &raw_name, nested_tree, error_count);
+            continue;
+        }
 
         add_archive_entry(
             root,
@@ -715,32 +898,645 @@ fn scan_tar_gz_archive(
 /// 扫描 7z 压缩包目录项。
 ///
 /// 业务意图：
-/// - `sevenz-rust` 能读取 7z 文件头部中的文件列表，符合当前只构建目录树、不解压的需求。
-/// - 该函数只访问归档元数据，不写入临时目录。
+/// - 7Z，尤其 solid 7Z，随机打开内部小文件时必须顺序解压前置条目，会导致每次点击都等待很久。
+/// - 这里在加载目录树阶段把普通成员顺序物化到 session 临时目录，后续左侧树点击直接读取本地临时文件。
 ///
 /// 边界条件：
 /// - 加密 7z 或损坏头部会返回读取错误，当前展示为压缩包根节点下的错误节点。
+/// - 物化会占用磁盘空间；路径记录在 `temporary_paths` 中，由 UI 在重新加载或启动期过期清理时释放。
 fn scan_7z_archive(
     path: &Path,
     root: &mut TreeNode,
     error_count: &mut usize,
+    temporary_paths: &mut Vec<PathBuf>,
 ) -> Result<(), LogLoadError> {
-    let archive = sevenz_rust::Archive::open(path)
-        .map_err(|error| LogLoadError::new(format!("无法读取 7Z 目录：{}", error)))?;
+    let mut reader = sevenz_rust::SevenZReader::open(path, sevenz_rust::Password::empty())
+        .map_err(|error| LogLoadError::new(format!("无法读取 7Z 内容：{}", error)))?;
+    let materialized_root = sevenz_materialized_root(path)?;
+    fs::create_dir_all(&materialized_root).map_err(|error| {
+        LogLoadError::new(format!(
+            "无法创建 7Z 临时物化目录 {}：{}",
+            materialized_root.display(),
+            error
+        ))
+    })?;
+    temporary_paths.push(materialized_root.clone());
 
-    for entry in archive.files {
-        add_archive_entry(
+    let scan_result = reader
+        .for_each_entries(|entry, entry_reader| {
+            let raw_name = entry.name().to_string();
+            if entry.is_directory() {
+                add_archive_directory_entry(root, &raw_name, error_count);
+                return Ok(true);
+            }
+
+            let segments = match split_archive_entry_path(&raw_name) {
+                Ok(segments) => segments,
+                Err(reason) => {
+                    // 7Z 条目即使路径非法也必须消费当前 reader；尤其是 solid archive，
+                    // 不 drain 会破坏后续条目的顺序解压状态。该条目作为错误节点展示，其它合法文件继续加载。
+                    *error_count += 1;
+                    root.add_archive_error_entry(&raw_name, "非法路径", reason);
+                    io::copy(entry_reader, &mut io::sink()).map_err(sevenz_rust::Error::io)?;
+                    return Ok(true);
+                }
+            };
+            let temp_path = materialized_7z_member_path(&materialized_root, &segments);
+            if let Some(parent) = temp_path.parent() {
+                fs::create_dir_all(parent).map_err(sevenz_rust::Error::io)?;
+            }
+            let mut writer =
+                BufWriter::new(File::create(&temp_path).map_err(sevenz_rust::Error::io)?);
+            io::copy(entry_reader, &mut writer).map_err(sevenz_rust::Error::io)?;
+
+            if let Some(nested_format) = nested_archive_scan_format(&raw_name, false, entry.size)
+                && let Some(nested_tree) = read_nested_archive_tree_from_path(
+                    &temp_path,
+                    nested_format,
+                    path,
+                    ArchiveFormat::SevenZ,
+                    &raw_name,
+                    error_count,
+                    temporary_paths,
+                )
+            {
+                add_nested_archive_tree(root, &raw_name, nested_tree, error_count);
+                return Ok(true);
+            }
+
+            add_materialized_7z_file_entry(root, path, &segments, entry.size, temp_path);
+            Ok(true)
+        })
+        .map_err(|error| LogLoadError::new(format!("读取 7Z 内容失败：{}", error)));
+    if scan_result.is_err() {
+        let _ = fs::remove_dir_all(&materialized_root);
+    }
+    scan_result?;
+
+    Ok(())
+}
+
+/// 判断压缩包条目是否适合在加载树阶段尝试扫描为内层压缩包。
+///
+/// 业务意图：
+/// - ZIP、TAR.GZ 和 7Z 内层压缩包可以基于内存字节读取目录，因此小文件候选项可以直接展开成目录。
+/// - RAR 当前不能从内存安全扫描，超大内层压缩包也不能在构建目录树时读入内存，两类都保留为普通文件节点。
+fn nested_archive_scan_format(
+    raw_name: &str,
+    is_directory: bool,
+    size: u64,
+) -> Option<ArchiveFormat> {
+    if is_directory || size > NESTED_ARCHIVE_SCAN_MAX_BYTES {
+        return None;
+    }
+    ArchiveFormat::from_path(Path::new(raw_name))
+}
+
+/// 为扫描内层压缩包创建会话级临时根目录。
+///
+/// 业务意图：
+/// - RAR 的目录扫描和读取 API 都需要真实文件路径，无法直接从内存 reader 扫描。
+/// - 外层 RAR 或 ZIP/TAR.GZ 中的内层 RAR 需要先物化为临时文件，再复用 `scan_archive`。
+///
+/// 边界条件：
+/// - 临时目录加入 `temporary_paths`，由 UI 在重新加载或退出时清理。
+/// - 目录名包含时间戳和来源标签，避免同一进程多次加载同名归档互相覆盖。
+fn nested_archive_scan_materialized_root(label: &str) -> Result<PathBuf, LogLoadError> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| LogLoadError::new(format!("无法生成内层压缩包临时时间戳：{}", error)))?
+        .as_nanos();
+    let safe_label = label
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    Ok(std::env::temp_dir()
+        .join("LogClinic")
+        .join("large-log-cache")
+        .join(format!("session-{}", std::process::id()))
+        .join(format!("nested-archive-{}-{}", nanos, safe_label)))
+}
+
+/// 计算物化后的内层压缩包文件路径。
+fn materialized_nested_archive_path(root: &Path, raw_name: &str) -> Result<PathBuf, LogLoadError> {
+    let segments = split_archive_entry_path(raw_name)
+        .map_err(|reason| LogLoadError::new(format!("内层压缩包路径非法，无法物化：{}", reason)))?;
+    let mut path = root.to_path_buf();
+    for segment in segments {
+        path.push(segment);
+    }
+    Ok(path)
+}
+
+/// 返回 RAR 嵌套压缩包扫描时使用的安全成员路径。
+///
+/// 业务意图：
+/// - RAR 条目名可能来自 Windows 压缩工具并使用反斜杠；物化、读取和挂载树必须使用同一个 `/` 分隔路径。
+/// - 该函数把“识别为内层压缩包”和“路径安全归一化”放在同一处，避免不同调用点使用原始路径导致匹配失败。
+fn normalized_rar_nested_archive_member_path(
+    raw_name: &str,
+    is_directory: bool,
+    size: u64,
+) -> Option<String> {
+    nested_archive_scan_format(raw_name, is_directory, size)?;
+    normalize_archive_member_path(raw_name).ok()
+}
+
+/// 将 RAR 成员物化为本地文件，供内层压缩包目录扫描使用。
+///
+/// 业务意图：
+/// - `unrar` 的列表接口只能告诉我们条目名和大小，不能直接把条目 reader 交给 ZIP/7Z/TAR 扫描。
+/// - 只在条目扩展名已经确认是受支持压缩包时调用，避免对普通日志额外解压。
+fn materialize_rar_member_for_nested_scan(
+    archive_path: &Path,
+    member_path: &str,
+    materialized_root: &mut Option<PathBuf>,
+    temporary_paths: &mut Vec<PathBuf>,
+) -> Result<PathBuf, LogLoadError> {
+    if materialized_root.is_none() {
+        let label = archive_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "archive.rar".to_string());
+        let root = nested_archive_scan_materialized_root(&label)?;
+        fs::create_dir_all(&root).map_err(|error| {
+            LogLoadError::new(format!(
+                "无法创建内层压缩包临时目录 {}：{}",
+                root.display(),
+                error
+            ))
+        })?;
+        temporary_paths.push(root.clone());
+        *materialized_root = Some(root);
+    }
+
+    let root = materialized_root
+        .as_ref()
+        .ok_or_else(|| LogLoadError::new("内部错误：内层压缩包临时目录未初始化"))?;
+    let temp_path = materialized_nested_archive_path(root, member_path)?;
+    if let Some(parent) = temp_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            LogLoadError::new(format!(
+                "无法创建内层压缩包父目录 {}：{}",
+                parent.display(),
+                error
+            ))
+        })?;
+    }
+
+    let mut archive = unrar::Archive::new(archive_path)
+        .open_for_processing()
+        .map_err(|error| LogLoadError::new(format!("无法打开 RAR 内容：{}", error)))?;
+    while let Some(header) = archive
+        .read_header()
+        .map_err(|error| LogLoadError::new(format!("无法读取 RAR 条目：{}", error)))?
+    {
+        let raw_name = header.entry().filename.to_string_lossy();
+        let normalized = match normalize_archive_member_path(&raw_name) {
+            Ok(path) => path,
+            Err(_) => {
+                archive = header.skip().map_err(|error| {
+                    LogLoadError::new(format!("无法跳过非法 RAR 条目：{}", error))
+                })?;
+                continue;
+            }
+        };
+        if normalized != member_path {
+            archive = header
+                .skip()
+                .map_err(|error| LogLoadError::new(format!("无法跳过 RAR 条目：{}", error)))?;
+            continue;
+        }
+        if header.entry().is_encrypted() {
+            return Err(LogLoadError::new(format!(
+                "RAR 成员 {} 已加密，暂不支持展开为目录",
+                member_path
+            )));
+        }
+        if header.entry().is_directory() {
+            return Err(LogLoadError::new(format!(
+                "RAR 成员 {} 是目录，不能作为内层压缩包扫描",
+                member_path
+            )));
+        }
+        header
+            .extract_to(&temp_path)
+            .map_err(|error| LogLoadError::new(format!("无法物化 RAR 内层压缩包：{}", error)))?;
+        return Ok(temp_path);
+    }
+
+    Err(LogLoadError::new(format!(
+        "RAR 压缩包中未找到内层压缩包 {}",
+        member_path
+    )))
+}
+
+/// 为当前顶层 7Z 创建会话级物化根目录。
+///
+/// 业务意图：
+/// - 7Z 内部成员被转成本地临时文件后，左侧树后续点击无需再次顺序解压整个归档。
+/// - 目录名包含进程 ID、时间戳和压缩包文件名，降低同一会话重复加载同名压缩包时的冲突概率。
+fn sevenz_materialized_root(path: &Path) -> Result<PathBuf, LogLoadError> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| LogLoadError::new(format!("无法生成 7Z 临时目录时间戳：{}", error)))?
+        .as_nanos();
+    let label = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "archive.7z".to_string())
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    Ok(std::env::temp_dir()
+        .join("LogClinic")
+        .join("large-log-cache")
+        .join(format!("session-{}", std::process::id()))
+        .join(format!("sevenz-tree-{}-{}", nanos, label)))
+}
+
+/// 计算 7Z 成员的临时物化路径。
+///
+/// 边界条件：
+/// - 成员名必须先经过压缩包路径安全归一化，拒绝绝对路径、盘符和 `..`，避免写出临时根目录。
+fn materialized_7z_member_path(root: &Path, segments: &[String]) -> PathBuf {
+    let mut path = root.to_path_buf();
+    for segment in segments {
+        path.push(segment);
+    }
+    path
+}
+
+/// 添加已经物化到本地临时目录的 7Z 普通文件节点。
+///
+/// 业务意图：
+/// - 物化后的文件读取走普通本地临时路径，但来源语义仍保留原始 7Z 成员路径。
+/// - 另存为和搜索结果需要内部路径层级，不能把临时文件名当作用户选择的真实来源。
+fn add_materialized_7z_file_entry(
+    root: &mut TreeNode,
+    archive_path: &Path,
+    segments: &[String],
+    size: u64,
+    temp_path: PathBuf,
+) {
+    let member_path = join_archive_segments(segments);
+    root.add_leaf_path(
+        segments,
+        LogTreeEntryKind::File,
+        Some(format_byte_size(size)),
+        Some(LogFileSource::MaterializedArchiveMember {
+            archive_path: archive_path.to_path_buf(),
+            archive_format: ArchiveFormat::SevenZ,
+            member_path,
+            temp_path,
+        }),
+        None,
+    );
+}
+
+/// 添加 7Z 中显式出现的目录节点。
+///
+/// 边界条件：
+/// - 一些 7Z 文件没有显式目录条目，只在文件路径中隐含目录；这种情况由 `add_leaf_path` 自动补齐。
+fn add_archive_directory_entry(root: &mut TreeNode, raw_name: &str, error_count: &mut usize) {
+    let segments = match split_archive_entry_path(raw_name) {
+        Ok(segments) => segments,
+        Err(reason) => {
+            *error_count += 1;
+            root.add_archive_error_entry(raw_name, "非法路径", reason);
+            return;
+        }
+    };
+    root.add_leaf_path(&segments, LogTreeEntryKind::Directory, None, None, None);
+}
+
+/// 从已经物化成本地文件的内层压缩包读取目录树。
+///
+/// 业务意图：
+/// - 顶层 7Z 成员已经落到临时目录后，扫描内层压缩包不再需要再次从顶层 7Z 顺序解压。
+/// - 如果内层压缩包包含多个普通文件，继续作为目录挂载；单文件压缩包仍按既有规则作为文件本身打开。
+fn read_nested_archive_tree_from_path(
+    archive_path: &Path,
+    nested_format: ArchiveFormat,
+    outer_archive_path: &Path,
+    outer_archive_format: ArchiveFormat,
+    archive_member_path: &str,
+    error_count: &mut usize,
+    temporary_paths: &mut Vec<PathBuf>,
+) -> Option<TreeNode> {
+    let segments = split_archive_entry_path(archive_member_path).ok()?;
+    let label = segments.last()?.clone();
+    let mut nested_root = TreeNode::new(label, LogTreeEntryKind::Directory);
+    scan_archive(
+        archive_path,
+        nested_format,
+        &mut nested_root,
+        error_count,
+        temporary_paths,
+    )
+    .ok()?;
+
+    if nested_root.descendant_file_count() <= 1 {
+        return None;
+    }
+
+    if outer_archive_format != ArchiveFormat::SevenZ {
+        rewrite_nested_local_sources(
+            &mut nested_root,
+            outer_archive_path,
+            outer_archive_format,
+            archive_member_path,
+            nested_format,
+        );
+    }
+    Some(nested_root)
+}
+
+/// 将内层压缩包目录树中的普通来源改写为嵌套来源。
+///
+/// 业务意图：
+/// - ZIP/TAR.GZ 内层压缩包扫描会产生 `ArchiveMember`，需要保留“外层压缩包 + 内层压缩包路径 + 内层成员路径”的语义。
+/// - 7Z 内层压缩包会先物化为本地文件，此时保留 `LocalFile` 来源即可避免再次随机读取 7Z。
+fn rewrite_nested_local_sources(
+    node: &mut TreeNode,
+    outer_archive_path: &Path,
+    outer_archive_format: ArchiveFormat,
+    archive_member_path: &str,
+    nested_archive_format: ArchiveFormat,
+) {
+    if let Some(LogFileSource::ArchiveMember { member_path, .. }) = node.source.clone() {
+        node.source = Some(LogFileSource::NestedArchiveMember {
+            outer_archive_path: outer_archive_path.to_path_buf(),
+            outer_archive_format,
+            archive_member_path: archive_member_path.to_string(),
+            nested_archive_format,
+            nested_member_path: member_path,
+        });
+    }
+
+    for child in &mut node.children {
+        rewrite_nested_local_sources(
+            child,
+            outer_archive_path,
+            outer_archive_format,
+            archive_member_path,
+            nested_archive_format,
+        );
+    }
+}
+
+/// 尝试从外层压缩包条目中读取内层压缩包目录树。
+///
+/// 业务意图：
+/// - 外层压缩包内如果包含多文件压缩包，用户希望把该内层压缩包当作目录展开并选择具体文件。
+/// - 只有内层压缩包包含两个及以上普通文件时才替换成目录；单文件内层压缩包继续保留“当作文件本身打开”的既有行为。
+///
+/// 边界条件：
+/// - 加载树阶段不能为巨大内层压缩包无上限占用内存，超过 `NESTED_ARCHIVE_SCAN_MAX_BYTES` 时直接回退为普通文件节点。
+/// - RAR 内层压缩包需要路径型 API，因此会先写入临时文件，再复用普通压缩包扫描逻辑。
+fn read_nested_archive_tree_from_reader(
+    reader: &mut dyn Read,
+    declared_size: Option<u64>,
+    nested_format: ArchiveFormat,
+    outer_archive_path: &Path,
+    outer_archive_format: ArchiveFormat,
+    archive_member_path: &str,
+    error_count: &mut usize,
+    temporary_paths: &mut Vec<PathBuf>,
+) -> Option<TreeNode> {
+    let size = declared_size?;
+    if size > NESTED_ARCHIVE_SCAN_MAX_BYTES {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(size.min(1024 * 1024) as usize);
+    let mut limited_reader = reader.take(NESTED_ARCHIVE_SCAN_MAX_BYTES + 1);
+    if limited_reader.read_to_end(&mut bytes).is_err()
+        || bytes.len() as u64 > NESTED_ARCHIVE_SCAN_MAX_BYTES
+    {
+        return None;
+    }
+
+    if nested_format == ArchiveFormat::Rar {
+        let temp_path =
+            materialize_nested_archive_bytes_for_scan(&bytes, archive_member_path, temporary_paths)
+                .ok()?;
+        return read_nested_archive_tree_from_path(
+            &temp_path,
+            nested_format,
+            outer_archive_path,
+            outer_archive_format,
+            archive_member_path,
+            error_count,
+            temporary_paths,
+        );
+    }
+
+    let segments = split_archive_entry_path(archive_member_path).ok()?;
+    let label = segments.last()?.clone();
+    let mut nested_root = TreeNode::new(label, LogTreeEntryKind::Directory);
+    match nested_format {
+        ArchiveFormat::Zip => scan_nested_zip_archive(
+            &bytes,
+            &mut nested_root,
+            outer_archive_path,
+            outer_archive_format,
+            archive_member_path,
+            nested_format,
+            error_count,
+        ),
+        ArchiveFormat::TarGz => scan_nested_tar_gz_archive(
+            &bytes,
+            &mut nested_root,
+            outer_archive_path,
+            outer_archive_format,
+            archive_member_path,
+            nested_format,
+            error_count,
+        ),
+        ArchiveFormat::SevenZ => scan_nested_7z_archive(
+            &bytes,
+            &mut nested_root,
+            outer_archive_path,
+            outer_archive_format,
+            archive_member_path,
+            nested_format,
+            error_count,
+        ),
+        ArchiveFormat::Rar => return None,
+    }
+    .ok()?;
+
+    (nested_root.descendant_file_count() > 1).then_some(nested_root)
+}
+
+/// 将内存中的内层压缩包字节写入临时文件。
+///
+/// 业务意图：
+/// - RAR 只能从路径读取目录；当 RAR 位于 ZIP/TAR.GZ 这类 reader 型外层压缩包中时，需要先落盘。
+/// - 只写入小于扫描阈值的内层压缩包，避免目录构建阶段消耗大量磁盘和内存。
+fn materialize_nested_archive_bytes_for_scan(
+    bytes: &[u8],
+    archive_member_path: &str,
+    temporary_paths: &mut Vec<PathBuf>,
+) -> Result<PathBuf, LogLoadError> {
+    let root = nested_archive_scan_materialized_root(archive_member_path)?;
+    fs::create_dir_all(&root).map_err(|error| {
+        LogLoadError::new(format!(
+            "无法创建内存内层压缩包临时目录 {}：{}",
+            root.display(),
+            error
+        ))
+    })?;
+    temporary_paths.push(root.clone());
+    let temp_path = materialized_nested_archive_path(&root, archive_member_path)?;
+    if let Some(parent) = temp_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            LogLoadError::new(format!(
+                "无法创建内存内层压缩包父目录 {}：{}",
+                parent.display(),
+                error
+            ))
+        })?;
+    }
+    fs::write(&temp_path, bytes).map_err(|error| {
+        LogLoadError::new(format!(
+            "无法写入内存内层压缩包临时文件 {}：{}",
+            temp_path.display(),
+            error
+        ))
+    })?;
+    Ok(temp_path)
+}
+
+/// 扫描内存中的 ZIP 内层压缩包。
+fn scan_nested_zip_archive(
+    archive_bytes: &[u8],
+    root: &mut TreeNode,
+    outer_archive_path: &Path,
+    outer_archive_format: ArchiveFormat,
+    archive_member_path: &str,
+    nested_archive_format: ArchiveFormat,
+    error_count: &mut usize,
+) -> Result<(), LogLoadError> {
+    let mut archive = ZipArchive::new(Cursor::new(archive_bytes))
+        .map_err(|error| LogLoadError::new(format!("无法读取嵌套 ZIP 目录：{}", error)))?;
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).map_err(|error| {
+            LogLoadError::new(format!("无法读取嵌套 ZIP 条目 {}：{}", index, error))
+        })?;
+        add_nested_archive_entry(
             root,
-            path,
-            ArchiveFormat::SevenZ,
-            &entry.name,
+            outer_archive_path,
+            outer_archive_format,
+            archive_member_path,
+            nested_archive_format,
+            entry.name(),
+            entry.is_dir(),
+            Some(entry.size()),
+            error_count,
+        );
+    }
+    Ok(())
+}
+
+/// 扫描内存中的 TAR.GZ 内层压缩包。
+fn scan_nested_tar_gz_archive(
+    archive_bytes: &[u8],
+    root: &mut TreeNode,
+    outer_archive_path: &Path,
+    outer_archive_format: ArchiveFormat,
+    archive_member_path: &str,
+    nested_archive_format: ArchiveFormat,
+    error_count: &mut usize,
+) -> Result<(), LogLoadError> {
+    let decoder = GzDecoder::new(Cursor::new(archive_bytes));
+    let mut archive = TarArchive::new(decoder);
+    let entries = archive
+        .entries()
+        .map_err(|error| LogLoadError::new(format!("无法读取嵌套 TAR.GZ 目录：{}", error)))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| LogLoadError::new(format!("无法读取嵌套 TAR.GZ 条目：{}", error)))?;
+        let entry_path = entry.path().map_err(|error| {
+            LogLoadError::new(format!("无法读取嵌套 TAR.GZ 条目路径：{}", error))
+        })?;
+        let raw_name = entry_path.to_string_lossy();
+        add_nested_archive_entry(
+            root,
+            outer_archive_path,
+            outer_archive_format,
+            archive_member_path,
+            nested_archive_format,
+            raw_name.as_ref(),
+            entry.header().entry_type().is_dir(),
+            Some(entry.size()),
+            error_count,
+        );
+    }
+    Ok(())
+}
+
+/// 扫描内存中的 7Z 内层压缩包。
+fn scan_nested_7z_archive(
+    archive_bytes: &[u8],
+    root: &mut TreeNode,
+    outer_archive_path: &Path,
+    outer_archive_format: ArchiveFormat,
+    archive_member_path: &str,
+    nested_archive_format: ArchiveFormat,
+    error_count: &mut usize,
+) -> Result<(), LogLoadError> {
+    let reader = sevenz_rust::SevenZReader::new(
+        Cursor::new(archive_bytes),
+        archive_bytes.len() as u64,
+        sevenz_rust::Password::empty(),
+    )
+    .map_err(|error| LogLoadError::new(format!("无法读取嵌套 7Z 目录：{}", error)))?;
+    for entry in &reader.archive().files {
+        add_nested_archive_entry(
+            root,
+            outer_archive_path,
+            outer_archive_format,
+            archive_member_path,
+            nested_archive_format,
+            entry.name(),
             entry.is_directory(),
             Some(entry.size),
             error_count,
         );
     }
-
     Ok(())
+}
+
+/// 把已扫描出的内层压缩包目录树挂到外层压缩包目录树中。
+fn add_nested_archive_tree(
+    root: &mut TreeNode,
+    archive_member_path: &str,
+    nested_tree: TreeNode,
+    error_count: &mut usize,
+) {
+    let segments = match split_archive_entry_path(archive_member_path) {
+        Ok(segments) => segments,
+        Err(reason) => {
+            *error_count += 1;
+            root.add_archive_error_entry(archive_member_path, "非法路径", reason);
+            return;
+        }
+    };
+    root.add_subtree_path(&segments, nested_tree);
 }
 
 /// 把压缩包条目添加到目录树。
@@ -788,6 +1584,55 @@ fn add_archive_entry(
             archive_path: archive_path.to_path_buf(),
             archive_format,
             member_path: join_archive_segments(&segments),
+        })
+    };
+
+    root.add_leaf_path(&segments, kind, meta, source, None);
+}
+
+/// 把内层压缩包条目添加到内层目录树。
+///
+/// 业务意图：
+/// - 内层压缩包被当作目录显示，但其子文件仍需要保留“外层压缩包 + 内层压缩包成员 + 内层文件成员”的完整读取来源。
+fn add_nested_archive_entry(
+    root: &mut TreeNode,
+    outer_archive_path: &Path,
+    outer_archive_format: ArchiveFormat,
+    archive_member_path: &str,
+    nested_archive_format: ArchiveFormat,
+    raw_name: &str,
+    is_directory: bool,
+    size: Option<u64>,
+    error_count: &mut usize,
+) {
+    let segments = match split_archive_entry_path(raw_name) {
+        Ok(segments) => segments,
+        Err(reason) => {
+            *error_count += 1;
+            root.add_archive_error_entry(raw_name, "非法路径", reason);
+            return;
+        }
+    };
+
+    let kind = if is_directory {
+        LogTreeEntryKind::Directory
+    } else {
+        LogTreeEntryKind::File
+    };
+    let meta = if is_directory {
+        None
+    } else {
+        size.map(format_byte_size)
+    };
+    let source = if is_directory {
+        None
+    } else {
+        Some(LogFileSource::NestedArchiveMember {
+            outer_archive_path: outer_archive_path.to_path_buf(),
+            outer_archive_format,
+            archive_member_path: archive_member_path.to_string(),
+            nested_archive_format,
+            nested_member_path: join_archive_segments(&segments),
         })
     };
 
@@ -1065,6 +1910,31 @@ impl TreeNode {
         leaf.error_message = error_message;
     }
 
+    /// 在指定路径位置挂载一棵已经构建好的子树。
+    ///
+    /// 业务意图：
+    /// - 外层压缩包中的多文件内层压缩包需要显示为一个可展开目录，子树来自内层压缩包目录扫描结果。
+    ///
+    /// 边界条件：
+    /// - 如果外层压缩包同时存在同名目录，复用该目录节点并追加内层子节点；这种冲突来自压缩包本身，加载层不静默丢弃任一侧内容。
+    fn add_subtree_path(&mut self, segments: &[String], subtree: TreeNode) {
+        if segments.is_empty() {
+            return;
+        }
+
+        let mut current = self;
+        for segment in &segments[..segments.len() - 1] {
+            current = current.get_or_insert_child(segment, LogTreeEntryKind::Directory);
+        }
+
+        let leaf_label = &segments[segments.len() - 1];
+        let leaf = current.get_or_insert_child(leaf_label, LogTreeEntryKind::Directory);
+        leaf.meta = subtree.meta;
+        leaf.source = None;
+        leaf.error_message = subtree.error_message;
+        leaf.children.extend(subtree.children);
+    }
+
     /// 查找或插入一个同名同类型子节点。
     ///
     /// 业务意图：
@@ -1188,8 +2058,9 @@ mod tests {
     //! - UI 交互由后续桌面验收或自动化截图覆盖，本模块只验证数据结构构建规则。
 
     use super::*;
-    use std::io;
+    use std::io::{self, Cursor, Write};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use zip::write::SimpleFileOptions;
 
     /// 验证复合压缩包扩展名和大小写扩展名都能识别。
     #[test]
@@ -1234,6 +2105,23 @@ mod tests {
         assert_eq!(
             split_archive_entry_path("service\\access.log").unwrap(),
             vec!["service".to_string(), "access.log".to_string()]
+        );
+    }
+
+    /// 验证 RAR 内层压缩包候选路径会先归一化。
+    ///
+    /// 业务意图：
+    /// - Windows 创建的 RAR 可能把内部路径写成 `dir\inner.zip`。
+    /// - 后续物化、读取和挂载树都使用 `/` 分隔路径，避免和 RAR 处理阶段的归一化名称比较失败。
+    #[test]
+    fn rar_内层压缩包候选路径会归一化() {
+        assert_eq!(
+            normalized_rar_nested_archive_member_path("dir\\inner.zip", false, 1024),
+            Some("dir/inner.zip".to_string())
+        );
+        assert_eq!(
+            normalized_rar_nested_archive_member_path("../inner.zip", false, 1024),
+            None
         );
     }
 
@@ -1305,6 +2193,73 @@ mod tests {
             loaded.rows.iter().all(|row| row.label != "outside.log"),
             "符号链接目标内部文件不应被扫描进所选目录树"
         );
+
+        fs::remove_dir_all(temp_root)?;
+        Ok(())
+    }
+
+    /// 验证外层 ZIP 中的多文件 ZIP 会作为目录展开。
+    ///
+    /// 业务意图：
+    /// - 内层压缩包如果包含多个文件，不能继续走“单文件压缩包直接打开”规则，否则用户无法选择具体日志。
+    /// - 展开后的子文件必须保存嵌套来源，后续打开正文时才能先定位外层成员，再读取内层成员。
+    #[test]
+    fn 外层_zip_中的多文件_zip_会作为目录展开() -> Result<(), Box<dyn Error>> {
+        let temp_root = unique_temp_dir("logclinic3-nested-zip-tree-test")?;
+        let outer_path = temp_root.join("outer.zip");
+
+        let mut inner_bytes = Cursor::new(Vec::new());
+        {
+            let mut inner_writer = zip::ZipWriter::new(&mut inner_bytes);
+            inner_writer.start_file("a.log", SimpleFileOptions::default())?;
+            inner_writer.write_all(b"INFO a")?;
+            inner_writer.start_file("dir/b.log", SimpleFileOptions::default())?;
+            inner_writer.write_all(b"INFO b")?;
+            inner_writer.finish()?;
+        }
+
+        {
+            let outer_file = File::create(&outer_path)?;
+            let mut outer_writer = zip::ZipWriter::new(outer_file);
+            outer_writer.start_file("nested.zip", SimpleFileOptions::default())?;
+            outer_writer.write_all(inner_bytes.get_ref())?;
+            outer_writer.finish()?;
+        }
+
+        let loaded = load_log_sources(vec![outer_path.clone()])?;
+        let nested_row = loaded
+            .rows
+            .iter()
+            .find(|row| row.label == "nested.zip")
+            .expect("内层多文件 ZIP 应显示为可展开目录");
+        assert_eq!(nested_row.kind, LogTreeEntryKind::Directory);
+        assert!(nested_row.has_children);
+
+        let nested_sources = loaded
+            .rows
+            .iter()
+            .filter_map(|row| row.source.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(nested_sources.len(), 2);
+        assert!(nested_sources.iter().any(|source| matches!(
+            source,
+            LogFileSource::NestedArchiveMember {
+                outer_archive_path,
+                outer_archive_format: ArchiveFormat::Zip,
+                archive_member_path,
+                nested_archive_format: ArchiveFormat::Zip,
+                nested_member_path,
+            } if outer_archive_path == &outer_path
+                && archive_member_path == "nested.zip"
+                && nested_member_path == "a.log"
+        )));
+        assert!(nested_sources.iter().any(|source| matches!(
+            source,
+            LogFileSource::NestedArchiveMember {
+                nested_member_path,
+                ..
+            } if nested_member_path == "dir/b.log"
+        )));
 
         fs::remove_dir_all(temp_root)?;
         Ok(())

@@ -10,7 +10,7 @@
 //! - 只有大小超过内存阈值时才切入分页模式，小文件行为尽量保持不变。
 //! - 压缩包成员无法廉价获知解压后大小时，先尝试旧的内存读取；只有命中 200MB 上限错误才转入物化分页。
 
-use std::{fs, sync::Arc};
+use std::{fs, path::Path, sync::Arc};
 
 use crate::{
     archive_materializer::{cleanup_materialized_file, materialize_source_for_paging},
@@ -171,11 +171,13 @@ pub fn open_source_as_paged(
         Err(error) => {
             if matches!(
                 materialized.original_source,
-                LogFileSource::ArchiveMember { .. }
+                LogFileSource::ArchiveMember { .. } | LogFileSource::NestedArchiveMember { .. }
             ) || materialized.temp_path
                 != match &materialized.original_source {
                     LogFileSource::LocalFile { path } => path.clone(),
-                    LogFileSource::ArchiveMember { .. } => materialized.temp_path.clone(),
+                    LogFileSource::MaterializedArchiveMember { temp_path, .. } => temp_path.clone(),
+                    LogFileSource::ArchiveMember { .. }
+                    | LogFileSource::NestedArchiveMember { .. } => materialized.temp_path.clone(),
                 }
             {
                 cleanup_materialized_file(&materialized.temp_path);
@@ -214,6 +216,9 @@ fn should_retry_as_paged(source: &LogFileSource, error: &LogContentError) -> boo
 
     match source {
         LogFileSource::LocalFile { path } => ArchiveFormat::from_path(path).is_some(),
-        LogFileSource::ArchiveMember { .. } => true,
+        LogFileSource::MaterializedArchiveMember { member_path, .. } => {
+            ArchiveFormat::from_path(Path::new(member_path)).is_some()
+        }
+        LogFileSource::ArchiveMember { .. } | LogFileSource::NestedArchiveMember { .. } => true,
     }
 }

@@ -299,6 +299,49 @@ fn source_belongs_to_current_directory(
                 && path_key(archive_path) == path_key(current_archive_path)
                 && archive_member_belongs_to_directory(member_path, current_member_path)
         }
+        (
+            LogFileSource::MaterializedArchiveMember {
+                archive_path,
+                archive_format,
+                member_path,
+                ..
+            },
+            LogFileSource::MaterializedArchiveMember {
+                archive_path: current_archive_path,
+                archive_format: current_archive_format,
+                member_path: current_member_path,
+                ..
+            },
+        ) => {
+            archive_format == current_archive_format
+                && path_key(archive_path) == path_key(current_archive_path)
+                && archive_member_belongs_to_directory(member_path, current_member_path)
+        }
+        (
+            LogFileSource::NestedArchiveMember {
+                outer_archive_path,
+                outer_archive_format,
+                archive_member_path,
+                nested_archive_format,
+                nested_member_path,
+            },
+            LogFileSource::NestedArchiveMember {
+                outer_archive_path: current_outer_archive_path,
+                outer_archive_format: current_outer_archive_format,
+                archive_member_path: current_archive_member_path,
+                nested_archive_format: current_nested_archive_format,
+                nested_member_path: current_nested_member_path,
+            },
+        ) => {
+            outer_archive_format == current_outer_archive_format
+                && path_key(outer_archive_path) == path_key(current_outer_archive_path)
+                && archive_member_path == current_archive_member_path
+                && nested_archive_format == current_nested_archive_format
+                && archive_member_belongs_to_directory(
+                    nested_member_path,
+                    current_nested_member_path,
+                )
+        }
         _ => false,
     }
 }
@@ -349,6 +392,34 @@ pub fn source_location_label(source: &LogFileSource) -> String {
             archive_member_parent(member_path)
                 .map(|parent| format!("{archive_name}/{parent}"))
                 .unwrap_or(archive_name)
+        }
+        LogFileSource::MaterializedArchiveMember {
+            archive_path,
+            member_path,
+            ..
+        } => {
+            let archive_name = archive_path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| archive_path.display().to_string());
+            archive_member_parent(member_path)
+                .map(|parent| format!("{archive_name}/{parent}"))
+                .unwrap_or(archive_name)
+        }
+        LogFileSource::NestedArchiveMember {
+            outer_archive_path,
+            archive_member_path,
+            nested_member_path,
+            ..
+        } => {
+            let archive_name = outer_archive_path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| outer_archive_path.display().to_string());
+            let nested_parent = archive_member_parent(nested_member_path);
+            nested_parent
+                .map(|parent| format!("{archive_name}/{archive_member_path}/{parent}"))
+                .unwrap_or_else(|| format!("{archive_name}/{archive_member_path}"))
         }
     }
 }
@@ -408,6 +479,7 @@ mod tests {
                 })
                 .collect(),
             error_count: 0,
+            temporary_paths: Vec::new(),
         }
     }
 
