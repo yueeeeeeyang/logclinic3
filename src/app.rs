@@ -1,0 +1,8157 @@
+//! LogClinic 桌面客户端的应用装配与主视图协调模块。
+//!
+//! 业务意图：
+//! - 该模块承接从历史 `main.rs` 中迁出的主窗口装配、根状态协调和全局事件分发。
+//! - 功能域较大的 UI 代码已经逐步拆到 `app_impl` include 文件，后续可继续把它们升级为真正子模块。
+//! - 这里仍保留跨域协调逻辑，例如窗口句柄、后台任务回调、主视图状态汇总和全局快捷键。
+//!
+//! 跨平台约束：
+//! - macOS 和 Windows 都需要从同一个应用装配入口启动主窗口，平台打开文件和窗口尺寸差异由专门函数处理。
+//! - 窗口尺寸使用 GPUI 的逻辑像素表达，由 GPUI 负责映射到具体平台窗口系统。
+//! - 当前只持久化主窗口宽高、主题偏好和日志字号，不持久化窗口位置，避免跨显示器恢复造成窗口不可见。
+
+use std::{
+    borrow::Cow,
+    cell::RefCell,
+    collections::{BTreeSet, HashMap, HashSet},
+    env, fs, io,
+    ops::Range,
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use gpui::prelude::FluentBuilder;
+use gpui::{
+    Animation, AnimationExt as _, AnyWindowHandle, App, AppContext, Application, AsyncApp, Bounds,
+    ClickEvent, ClipboardItem, Context, DisplayId, Element, ElementId, ElementInputHandler, Entity,
+    EntityInputHandler, ExternalPaths, FontWeight, GlobalElementId, InteractiveElement,
+    IntoElement, KeyBinding, KeyDownEvent, Keystroke, LayoutId, ListHorizontalSizingBehavior,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement,
+    PathPromptOptions, Pixels, Point, Render, ScrollHandle, ScrollStrategy, ShapedLine,
+    SharedString, StatefulInteractiveElement, Style, Styled as _, StyledText, TextRun,
+    TitlebarOptions, UTF16Selection, UnderlineStyle, UniformListScrollHandle, Window,
+    WindowAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, actions, div, fill,
+    point, px, relative, rgb, size, uniform_list,
+};
+use lucide_icons::{Icon, LUCIDE_FONT_BYTES};
+
+use crate::archive_materializer::{
+    cleanup_materialized_file, cleanup_stale_large_log_cache, materialize_source_for_paging,
+};
+use crate::highlighting::{SyntaxTheme, highlight_line};
+use crate::large_log::{LargeLogOpenResult, LogTabDocument, open_log_source_for_tab};
+use crate::launch::{log_source_paths_from_launch_arguments, log_source_paths_from_open_urls};
+use crate::log_content::{
+    EncodingChoice, LogContentError, LogTextEncoding, decode_log_bytes, read_log_source_bytes,
+};
+use crate::log_loader::{
+    LoadedLogTree, LogFileSource, LogTreeEntryKind, LogTreeRow as LoadedLogTreeRow,
+    load_log_sources,
+};
+use crate::paged_document;
+use crate::search::{
+    SearchFileError, SearchOptions, SearchProgress, SearchResultItem, SearchScope,
+    collect_current_directory_sources, count_query_occurrences, search_lines,
+    source_location_label,
+};
+use crate::stream_search::{count_query_occurrences_paged, search_paged_document};
+use crate::theme::{AppThemePalette, EffectiveTheme, ThemePreference};
+
+actions!(logclinic, [OpenSearchDialog]);
+
+/// 应用主窗口的标题。
+///
+/// 业务意图：
+/// - 第一阶段只验证窗口创建，因此标题使用稳定的产品名 `LogClinic`。
+/// - 后续如果需要显示当前打开文件名或工作区状态，应在明确标题格式规则后再扩展。
+const MAIN_WINDOW_TITLE: &str = "LogClinic";
+
+/// 主窗口的默认宽度。
+///
+/// 业务约束：
+/// - 用户明确要求大屏默认窗口宽度固定为 1600px，以便日志 tab 和正文区域在首次打开时有更多横向空间。
+/// - 这里使用浮点字面量是为了匹配 GPUI `px` 的尺寸 API，避免在调用处反复转换。
+const MAIN_WINDOW_WIDTH: f32 = 1600.0;
+
+/// 主窗口的默认高度。
+///
+/// 边界说明：
+/// - 用户明确要求大屏默认窗口高度固定为 900px，保证日志正文首屏拥有稳定的可视行数。
+/// - 当前不设置最小尺寸和最大尺寸，因为本阶段只要求默认大小和用户手动调整后的尺寸记忆。
+const MAIN_WINDOW_HEIGHT: f32 = 900.0;
+
+/// 小屏电脑的主显示器宽度阈值。
+///
+/// 业务意图：
+/// - 用户明确要求按逻辑像素宽度 `< 1440px` 判定小屏电脑。
+/// - 这里使用 GPUI 暴露的显示器逻辑像素，由框架负责处理 macOS Retina 和 Windows 缩放比例差异。
+const SMALL_SCREEN_MAXIMIZED_WIDTH_THRESHOLD: f32 = 1440.0;
+
+/// 主窗口尺寸偏好文件名。
+///
+/// 业务意图：
+/// - 当前只保存主窗口宽高，不保存位置、最大化状态或其他设置，因此使用独立小文本文件即可。
+/// - 如果后续接入完整设置系统，应迁移到统一配置文件并保留兼容读取逻辑。
+const MAIN_WINDOW_SIZE_FILE_NAME: &str = "window-size.txt";
+
+/// 主题偏好文件名。
+///
+/// 业务意图：
+/// - 主题属于用户明确设置，必须和窗口大小一样跨启动保留。
+/// - 文件内容保持为简单英文枚举值，避免仅为单个配置新增 JSON/TOML 依赖。
+const THEME_PREFERENCE_FILE_NAME: &str = "theme-preference.txt";
+
+/// 日志显示字号偏好文件名。
+///
+/// 业务意图：
+/// - 日志字号是用户明确调整的阅读偏好，需要像主题一样跨启动恢复。
+/// - 文件只保存一个像素值，继续使用简单文本格式，避免为单项设置引入完整配置依赖。
+const LOG_VIEWER_FONT_SIZE_FILE_NAME: &str = "log-viewer-font-size.txt";
+
+/// 左侧目录树右键菜单宽度。
+///
+/// 业务意图：
+/// - 菜单承载“另存为”和“线程日志分析”两个文件操作，宽度需要足够展示中文命令且不挤压左侧树。
+const LOG_TREE_CONTEXT_MENU_WIDTH: f32 = 176.0;
+
+/// 左侧目录树右键菜单单项高度。
+///
+/// 业务意图：
+/// - 与 tab 右键菜单保持相同操作密度，保证 macOS 和 Windows 鼠标命中体验一致。
+const LOG_TREE_CONTEXT_MENU_ITEM_HEIGHT: f32 = 34.0;
+
+/// 日志正文右键菜单宽度。
+///
+/// 业务意图：
+/// - 菜单目前承载“复制”和“另存为”两个正文相关操作，宽度需要兼顾中文文案和鼠标命中面积。
+const LOG_VIEWER_CONTEXT_MENU_WIDTH: f32 = 152.0;
+
+/// 日志正文右键菜单单项高度。
+///
+/// 业务意图：
+/// - 与左侧树和 tab 右键菜单保持一致密度，避免同一应用内菜单命中体验不一致。
+const LOG_VIEWER_CONTEXT_MENU_ITEM_HEIGHT: f32 = 34.0;
+
+/// 线程日志分析窗口默认宽度。
+///
+/// 业务意图：
+/// - 时间线需要同时展示线程名和多个快照列，因此使用比设置窗口更宽的独立窗口。
+const THREAD_ANALYSIS_WINDOW_WIDTH: f32 = 1040.0;
+
+/// 线程日志分析窗口默认高度。
+///
+/// 业务意图：
+/// - Java thread dump 往往包含大量线程，较高窗口可以减少初次打开后的滚动成本。
+const THREAD_ANALYSIS_WINDOW_HEIGHT: f32 = 720.0;
+
+/// 线程分析图中线程名列宽度。
+///
+/// 业务意图：
+/// - Java 线程名经常包含业务前缀、线程池编号和连接信息，保留固定宽度便于和右侧时间线对齐。
+const THREAD_ANALYSIS_NAME_COLUMN_WIDTH: f32 = 260.0;
+
+/// 线程分析图中单个时间快照列宽度。
+///
+/// 业务意图：
+/// - 横轴不再展示时间文本后，列宽只需要容纳正方形状态色块和少量间距，避免大量快照时横向滚动过长。
+const THREAD_ANALYSIS_SNAPSHOT_COLUMN_WIDTH: f32 = 24.0;
+
+/// 线程分析图中状态色块边长。
+///
+/// 业务意图：
+/// - 用户要求色块高度保持不变且宽度与高度一致，因此使用固定 18px 正方形。
+const THREAD_ANALYSIS_STATE_BLOCK_SIZE: f32 = 18.0;
+
+/// 线程分析色块悬浮气泡宽度。
+///
+/// 业务意图：
+/// - 气泡需要容纳完整线程名和最多 5 行日志预览；固定宽度便于根据窗口边界计算弹出方向。
+const THREAD_ANALYSIS_POPUP_WIDTH: f32 = 520.0;
+
+/// 线程分析色块悬浮气泡预估高度。
+///
+/// 业务意图：
+/// - GPUI 在点击事件阶段尚未布局气泡，不能读取真实高度；这里按三行信息和五行预览估算，
+///   用于选择向上或向下弹出，避免靠近窗口底部时被遮挡。
+const THREAD_ANALYSIS_POPUP_ESTIMATED_HEIGHT: f32 = 190.0;
+
+/// 线程分析色块悬浮气泡与鼠标点击点的间距。
+///
+/// 业务意图：
+/// - 保留少量间距，避免气泡刚出现就盖住被点击的状态色块。
+const THREAD_ANALYSIS_POPUP_OFFSET: f32 = 12.0;
+
+/// 线程分析色块悬浮气泡与窗口边缘的最小间距。
+///
+/// 业务意图：
+/// - 气泡贴边会影响阴影和边框识别，保留边距也能减少被系统标题栏或窗口边框裁切的风险。
+const THREAD_ANALYSIS_POPUP_MARGIN: f32 = 8.0;
+
+/// 可持久化的主窗口宽高。
+///
+/// 业务意图：
+/// - 该结构只表达用户最后调整过的窗口内容宽高，启动时会重新居中，不恢复历史位置。
+/// - 宽高使用 GPUI 逻辑像素，避免把平台物理像素、DPI 缩放或窗口装饰尺寸写入业务配置。
+///
+/// 边界条件：
+/// - 宽高必须是有限正数；零、负数、NaN 和无穷大都视为损坏配置并丢弃。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MainWindowSizePreference {
+    /// 主窗口宽度，单位为 GPUI 逻辑像素。
+    width: f32,
+    /// 主窗口高度，单位为 GPUI 逻辑像素。
+    height: f32,
+}
+
+impl MainWindowSizePreference {
+    /// 创建合法的主窗口宽高偏好。
+    ///
+    /// 业务意图：
+    /// - 所有读入、测试和关闭保存路径都经过同一个校验入口，避免损坏配置在下次启动时造成不可见窗口。
+    /// - 当前只按“有限正数”校验；如果后续定义最小窗口尺寸，应在这里统一收紧规则。
+    fn new(width: f32, height: f32) -> Option<Self> {
+        if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 {
+            Some(Self { width, height })
+        } else {
+            None
+        }
+    }
+}
+
+/// 主窗口首次启动时的尺寸策略。
+///
+/// 业务意图：
+/// - 该枚举把“是否有历史尺寸”和“小屏默认最大化”的产品规则拆成纯数据，便于单元测试覆盖。
+/// - 真正转换为 GPUI `WindowBounds` 时再依赖 `App`，避免测试环境必须启动真实窗口系统。
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MainWindowStartupDecision {
+    /// 使用用户上次保存的宽高，窗口启动时仍重新居中。
+    Remembered(MainWindowSizePreference),
+    /// 使用固定 1600x900 居中窗口，适用于大屏或无法读取显示器信息的场景。
+    DefaultWindowed,
+    /// 使用系统最大化窗口，适用于首次在小屏电脑启动。
+    DefaultMaximized,
+}
+
+/// 根据历史宽高和主显示器宽度决定主窗口启动策略。
+///
+/// 业务意图：
+/// - 历史宽高代表用户明确调整过窗口大小，优先级高于小屏默认最大化。
+/// - 没有历史宽高时，才按主显示器逻辑像素宽度判断是否最大化。
+///
+/// 边界条件：
+/// - 显示器宽度读取失败时按大屏窗口化处理，避免在图形环境信息不完整时强行最大化。
+fn decide_main_window_startup(
+    saved_size: Option<MainWindowSizePreference>,
+    primary_display_width: Option<f32>,
+) -> MainWindowStartupDecision {
+    if let Some(saved_size) = saved_size {
+        return MainWindowStartupDecision::Remembered(saved_size);
+    }
+
+    if primary_display_width.is_some_and(|width| width < SMALL_SCREEN_MAXIMIZED_WIDTH_THRESHOLD) {
+        MainWindowStartupDecision::DefaultMaximized
+    } else {
+        MainWindowStartupDecision::DefaultWindowed
+    }
+}
+
+/// 把主窗口启动策略转换成 GPUI 窗口边界。
+///
+/// 业务意图：
+/// - 历史宽高和大屏默认都以居中窗口打开，不恢复上次位置。
+/// - 小屏默认最大化时仍把 1600x900 作为恢复尺寸交给 GPUI，用户退出最大化后能得到稳定默认宽高。
+fn main_window_bounds_for_decision(
+    decision: MainWindowStartupDecision,
+    display_id: Option<DisplayId>,
+    app: &App,
+) -> WindowBounds {
+    match decision {
+        MainWindowStartupDecision::Remembered(saved_size) => {
+            WindowBounds::Windowed(Bounds::centered(
+                display_id,
+                size(px(saved_size.width), px(saved_size.height)),
+                app,
+            ))
+        }
+        MainWindowStartupDecision::DefaultWindowed => WindowBounds::Windowed(Bounds::centered(
+            display_id,
+            size(px(MAIN_WINDOW_WIDTH), px(MAIN_WINDOW_HEIGHT)),
+            app,
+        )),
+        MainWindowStartupDecision::DefaultMaximized => WindowBounds::Maximized(Bounds::centered(
+            display_id,
+            size(px(MAIN_WINDOW_WIDTH), px(MAIN_WINDOW_HEIGHT)),
+            app,
+        )),
+    }
+}
+
+/// 读取当前主显示器的逻辑像素宽度。
+///
+/// 跨平台约束：
+/// - GPUI 负责把 macOS Retina、Windows 缩放和平台显示器坐标转换为逻辑像素。
+/// - 如果应用启动早期无法取得主显示器，则返回 `None`，由启动策略回退到固定窗口化。
+fn primary_display_width(app: &App) -> Option<f32> {
+    app.primary_display()
+        .map(|display| display.bounds().size.width / px(1.0))
+}
+
+/// 读取当前主显示器 ID。
+///
+/// 业务意图：
+/// - GPUI 创建窗口和计算居中位置都支持 display id；显式使用同一个主显示器可以避免多屏环境下
+///   “按一个屏幕计算中心、实际在另一个屏幕打开”导致窗口看起来靠左。
+fn primary_display_id(app: &App) -> Option<DisplayId> {
+    app.primary_display().map(|display| display.id())
+}
+
+/// 构造主窗口启动边界。
+///
+/// 业务意图：
+/// - 主入口只需要调用这个函数即可获得完整窗口策略，避免把配置读取、显示器判断和 GPUI 边界构造散落在 `main` 中。
+fn build_main_window_bounds(app: &App) -> WindowBounds {
+    let saved_size = load_main_window_size_preference();
+    let decision = decide_main_window_startup(saved_size, primary_display_width(app));
+    main_window_bounds_for_decision(decision, primary_display_id(app), app)
+}
+
+/// 解析主窗口宽高偏好文件内容。
+///
+/// 文件格式：
+/// - 第一列为宽度，第二列为高度，中间使用空白字符分隔。
+/// - 不使用 JSON/TOML 是为了避免仅为一个内部小配置新增依赖。
+///
+/// 边界条件：
+/// - 格式错误、缺少字段、多余字段、非法浮点数或非正尺寸都返回 `None`，让启动流程回退默认策略。
+fn parse_main_window_size_preference(raw: &str) -> Option<MainWindowSizePreference> {
+    let mut parts = raw.split_whitespace();
+    let width = parts.next()?.parse::<f32>().ok()?;
+    let height = parts.next()?.parse::<f32>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    MainWindowSizePreference::new(width, height)
+}
+
+/// 序列化主窗口宽高偏好。
+///
+/// 业务意图：
+/// - 固定使用简单空格分隔，便于人工排查配置损坏，也便于测试按文本断言。
+fn serialize_main_window_size_preference(size: MainWindowSizePreference) -> String {
+    format!("{} {}\n", size.width.round(), size.height.round())
+}
+
+/// 从指定文件读取主窗口宽高偏好。
+///
+/// 错误处理：
+/// - 配置文件缺失、无权限读取或内容损坏都不阻止应用启动。
+/// - 启动窗口大小不是核心日志查看能力，因此错误统一视为无历史尺寸。
+fn read_main_window_size_preference(path: &Path) -> Option<MainWindowSizePreference> {
+    let raw = fs::read_to_string(path).ok()?;
+    parse_main_window_size_preference(&raw)
+}
+
+/// 将主窗口宽高偏好写入指定文件。
+///
+/// 错误处理：
+/// - 调用者可以选择忽略错误，因为窗口关闭阶段不应因配置目录权限问题阻止退出。
+/// - 这里仍返回 `io::Result`，方便测试覆盖目录创建和文件写入失败的边界。
+fn write_main_window_size_preference(
+    path: &Path,
+    size: MainWindowSizePreference,
+) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serialize_main_window_size_preference(size))
+}
+
+/// 获取当前平台的主窗口宽高偏好文件路径。
+///
+/// 跨平台约束：
+/// - macOS 使用 `$HOME/Library/Application Support/LogClinic`，符合普通桌面应用配置目录习惯。
+/// - Windows 使用 `%APPDATA%\LogClinic`，避免写入程序安装目录或当前工作目录。
+/// - 其他平台当前不是目标运行平台，返回 `None` 并退回默认窗口策略。
+fn main_window_size_preference_path() -> Option<PathBuf> {
+    app_config_dir().map(|dir| dir.join(MAIN_WINDOW_SIZE_FILE_NAME))
+}
+
+/// 获取当前平台的应用配置目录。
+///
+/// 跨平台约束：
+/// - macOS 使用 `$HOME/Library/Application Support/LogClinic`，符合普通桌面应用配置目录习惯。
+/// - Windows 使用 `%APPDATA%\LogClinic`，避免写入程序安装目录或当前工作目录。
+/// - 其他平台当前不是目标运行平台，返回 `None` 并退回内存默认值。
+fn app_config_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        return env::var_os("HOME").map(PathBuf::from).map(|home| {
+            home.join("Library")
+                .join("Application Support")
+                .join("LogClinic")
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|app_data| app_data.join("LogClinic"));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        None
+    }
+}
+
+/// 读取主窗口宽高偏好。
+///
+/// 业务意图：
+/// - 该函数作为主入口的读配置边界，隔离平台路径选择和配置文件损坏处理。
+fn load_main_window_size_preference() -> Option<MainWindowSizePreference> {
+    let path = main_window_size_preference_path()?;
+    read_main_window_size_preference(&path)
+}
+
+/// 保存主窗口宽高偏好。
+///
+/// 错误处理：
+/// - 保存失败不会影响用户关闭应用；该偏好只是体验优化，不属于日志读取、解析或展示的核心数据。
+/// - 开发调试时通过 stderr 暴露失败原因，便于定位权限或路径环境变量问题。
+fn save_main_window_size_preference(size: MainWindowSizePreference) {
+    let Some(path) = main_window_size_preference_path() else {
+        return;
+    };
+    if let Err(error) = write_main_window_size_preference(&path, size) {
+        eprintln!("保存主窗口尺寸偏好失败：{}：{}", path.display(), error);
+    }
+}
+
+/// 获取主题偏好文件路径。
+fn theme_preference_path() -> Option<PathBuf> {
+    app_config_dir().map(|dir| dir.join(THEME_PREFERENCE_FILE_NAME))
+}
+
+/// 解析主题偏好配置文本。
+///
+/// 边界条件：
+/// - 配置文件可能被用户手工修改或写入中断破坏；未知值统一视为 `None`，调用方回退到“跟随系统”。
+fn parse_theme_preference(raw: &str) -> Option<ThemePreference> {
+    match raw.trim() {
+        "light" => Some(ThemePreference::Light),
+        "dark" => Some(ThemePreference::Dark),
+        "system" => Some(ThemePreference::System),
+        _ => None,
+    }
+}
+
+/// 序列化主题偏好。
+fn serialize_theme_preference(preference: ThemePreference) -> String {
+    format!("{}\n", preference.as_config_value())
+}
+
+/// 从指定文件读取主题偏好。
+///
+/// 错误处理：
+/// - 文件缺失、读取失败或内容损坏都不阻止应用启动，统一由调用方回退到“跟随系统”。
+fn read_theme_preference(path: &Path) -> Option<ThemePreference> {
+    let raw = fs::read_to_string(path).ok()?;
+    parse_theme_preference(&raw)
+}
+
+/// 将主题偏好写入指定文件。
+fn write_theme_preference(path: &Path, preference: ThemePreference) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serialize_theme_preference(preference))
+}
+
+/// 读取主题偏好。
+///
+/// 业务意图：
+/// - 主题是设置窗口中明确提供的用户偏好，应跨启动恢复；配置不可用时默认跟随系统。
+fn load_theme_preference() -> ThemePreference {
+    theme_preference_path()
+        .and_then(|path| read_theme_preference(&path))
+        .unwrap_or(ThemePreference::System)
+}
+
+/// 保存主题偏好。
+///
+/// 错误处理：
+/// - 写入失败不影响当前会话的主题切换，仅在 stderr 输出诊断信息，避免配置目录权限问题阻断 UI 操作。
+fn save_theme_preference(preference: ThemePreference) {
+    let Some(path) = theme_preference_path() else {
+        return;
+    };
+    if let Err(error) = write_theme_preference(&path, preference) {
+        eprintln!("保存主题偏好失败：{}：{}", path.display(), error);
+    }
+}
+
+/// 获取日志显示字号偏好文件路径。
+fn log_viewer_font_size_preference_path() -> Option<PathBuf> {
+    app_config_dir().map(|dir| dir.join(LOG_VIEWER_FONT_SIZE_FILE_NAME))
+}
+
+/// 规范化日志显示字号。
+///
+/// 业务意图：
+/// - 设置页、配置读取和测试都通过同一套边界规则，避免 UI 可选范围与磁盘配置可接受范围不一致。
+///
+/// 边界条件：
+/// - NaN、无穷大、过小或过大的值都视为无效配置；合法值按 1px 粒度取整，保证设置按钮显示稳定整数 px。
+fn normalize_log_viewer_font_size(value: f32) -> Option<f32> {
+    if !value.is_finite() {
+        return None;
+    }
+    let rounded = value.round();
+    if (LOG_VIEWER_MIN_FONT_SIZE..=LOG_VIEWER_MAX_FONT_SIZE).contains(&rounded) {
+        Some(rounded)
+    } else {
+        None
+    }
+}
+
+/// 解析日志显示字号配置文本。
+///
+/// 边界条件：
+/// - 配置文件可能被用户手工修改；格式错误、空文本和超出范围都返回 `None`，调用方回退默认 12px。
+fn parse_log_viewer_font_size_preference(raw: &str) -> Option<f32> {
+    normalize_log_viewer_font_size(raw.trim().parse::<f32>().ok()?)
+}
+
+/// 序列化日志显示字号配置。
+fn serialize_log_viewer_font_size_preference(font_size: f32) -> String {
+    format!("{}\n", font_size.round())
+}
+
+/// 从指定文件读取日志显示字号。
+///
+/// 错误处理：
+/// - 文件缺失、读取失败或内容损坏都不影响应用启动，统一由调用方回退默认字号。
+fn read_log_viewer_font_size_preference(path: &Path) -> Option<f32> {
+    let raw = fs::read_to_string(path).ok()?;
+    parse_log_viewer_font_size_preference(&raw)
+}
+
+/// 将日志显示字号写入指定文件。
+fn write_log_viewer_font_size_preference(path: &Path, font_size: f32) -> io::Result<()> {
+    let Some(font_size) = normalize_log_viewer_font_size(font_size) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "日志显示字号超出允许范围",
+        ));
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serialize_log_viewer_font_size_preference(font_size))
+}
+
+/// 读取日志显示字号偏好。
+///
+/// 业务意图：
+/// - 日志正文是应用最核心的长时间阅读区域，用户调整字号后应在下次启动恢复。
+fn load_log_viewer_font_size_preference() -> f32 {
+    log_viewer_font_size_preference_path()
+        .and_then(|path| read_log_viewer_font_size_preference(&path))
+        .unwrap_or(LOG_VIEWER_DEFAULT_FONT_SIZE)
+}
+
+/// 保存日志显示字号偏好。
+///
+/// 错误处理：
+/// - 写入失败不影响当前会话的字号调整，仅输出开发期诊断，避免配置目录权限问题阻断 UI 操作。
+fn save_log_viewer_font_size_preference(font_size: f32) {
+    let Some(path) = log_viewer_font_size_preference_path() else {
+        return;
+    };
+    if let Err(error) = write_log_viewer_font_size_preference(&path, font_size) {
+        eprintln!("保存日志显示字号偏好失败：{}：{}", path.display(), error);
+    }
+}
+
+/// 顶部工具栏的固定高度。
+///
+/// 业务意图：
+/// - 工具栏用于承载当前已经明确的全局入口：加载日志、智能诊断、设置。
+/// - 用户要求工具栏高度和 tab 页签高度一致，因此这里直接复用 `LOG_TAB_BAR_HEIGHT`。
+/// - 统一高度可以让顶部全局工具栏和右侧日志 tab 栏的垂直节奏一致，减少首屏跳变感。
+///
+/// 边界条件：
+/// - 当前不实现可换行工具栏；如果后续窗口宽度允许缩小，需要再定义窄宽度下的折叠策略。
+const TOOLBAR_HEIGHT: f32 = LOG_TAB_BAR_HEIGHT;
+
+/// 主界面工具栏按钮的水平内边距。
+///
+/// 实现原因：
+/// - 当前按钮是文字按钮，不再使用边框和实体背景，因此水平内边距需要更紧凑。
+/// - 统一内边距可以保证三个入口在 macOS 和 Windows 字体渲染差异下仍保持一致点击区域。
+const TOOLBAR_BUTTON_HORIZONTAL_PADDING: f32 = 8.0;
+
+/// 主界面工具栏按钮的垂直内边距。
+///
+/// 边界说明：
+/// - 工具栏高度和 tab 栏一致后，垂直内边距仍保持紧凑，避免文字和图标被裁切。
+/// - 当前按钮不承载多行文本，也不展示快捷键提示，因此不需要动态高度。
+const TOOLBAR_BUTTON_VERTICAL_PADDING: f32 = 4.0;
+
+/// Lucide 图标字体在 GPUI 中使用的字体族名称。
+///
+/// 业务意图：
+/// - `lucide-icons` 通过字体字形暴露图标，必须在渲染图标字符时指定该字体族。
+/// - 显式定义字体族名称可以避免图标字符被系统默认字体渲染成方块或错误符号。
+///
+/// 边界条件：
+/// - 字体数据来自 `lucide-icons` 依赖内置的 `LUCIDE_FONT_BYTES`，启动时注册到 GPUI 文本系统。
+/// - 如果未来改为 SVG 图标或其它图标库，应同步替换字体注册和图标渲染逻辑。
+const LUCIDE_FONT_FAMILY: &str = "lucide";
+
+/// 工具栏按钮图标的固定宽度。
+///
+/// 业务意图：
+/// - 三个 Lucide 图标字形宽度可能不同，固定图标区域可以让按钮文字起点更稳定。
+/// - 该宽度只约束图标可视区域，不改变按钮整体点击区域。
+///
+/// 边界条件：
+/// - 当前图标尺寸与工具栏高度配套，避免在 macOS 和 Windows 字体度量差异下发生裁切。
+/// - 固定宽度只约束单个图标，不处理多个图标、徽标或加载状态。
+const TOOLBAR_BUTTON_ICON_WIDTH: f32 = 16.0;
+
+/// 工具栏按钮图标字号。
+///
+/// 业务意图：
+/// - Lucide 字体图标需要使用接近 16px 的字号才能保持清晰线条和按钮视觉平衡。
+/// - 单独定义字号便于后续统一调整工具栏密度。
+///
+/// 边界条件：
+/// - 字号不能超过工具栏高度，否则部分平台的字体上升/下降空间可能导致图标裁切。
+const TOOLBAR_BUTTON_ICON_SIZE: f32 = 16.0;
+
+/// 左侧内容区域的默认宽度。
+///
+/// 业务意图：
+/// - 用户明确要求左右两栏布局默认左侧区域宽度为 300px。
+/// - 当前不持久化用户拖动后的宽度，避免在配置存储位置和权限未定义前写入用户环境。
+const LEFT_PANEL_DEFAULT_WIDTH: f32 = 300.0;
+
+/// 左侧内容区域可拖动到的最小宽度。
+///
+/// 业务意图：
+/// - 左侧区域后续预计承载日志来源、文件列表或过滤条件，过窄会导致基础交互不可用。
+/// - 用户未定义最小宽度，因此采用保守的桌面客户端默认值，避免拖动后面板完全消失。
+///
+/// 边界条件：
+/// - 该值只约束当前进程内拖动行为，不代表后续设置持久化或布局配置规则。
+const LEFT_PANEL_MIN_WIDTH: f32 = 180.0;
+
+/// 右侧内容区域可保留的最小宽度。
+///
+/// 业务意图：
+/// - 右侧区域后续预计承载日志内容主视图，需要保留足够宽度避免拖动左栏挤占主体区域。
+/// - 用户未定义右侧最小宽度，因此当前用 320px 作为临时保护边界。
+///
+/// 边界条件：
+/// - 如果后续右侧加入表格、详情面板或诊断视图，应重新定义最小宽度和窄屏折叠规则。
+const RIGHT_PANEL_MIN_WIDTH: f32 = 320.0;
+
+/// 左右内容区域之间的可拖动命中区域宽度。
+///
+/// 业务意图：
+/// - 用户要求分隔条视觉上改成细线，但仍然需要支持拖动改变宽度。
+/// - 因此这里保留 6px 透明命中区域，让鼠标更容易命中；命中区通过覆盖在右侧内容上的透明层实现，
+///   不再占用额外布局宽度，避免分割线右侧出现白色视觉缝隙。
+///
+/// 边界条件：
+/// - 当前仅支持鼠标拖动，不支持键盘调整、双击重置或触控手势。
+/// - 命中区域不参与 flex 布局，拖动边界计算只需要扣除真实可见线条宽度。
+const SPLITTER_HIT_WIDTH: f32 = 6.0;
+
+/// 左右内容区域之间分割线的可见宽度。
+///
+/// 业务意图：
+/// - 用户反馈上一版分隔条太粗，因此可见线条收敛为 1px。
+/// - 视觉宽度与拖拽命中宽度分离，保证界面轻量的同时不牺牲可用性。
+///
+/// 边界条件：
+/// - 当前线条颜色固定；如果后续加入主题系统，应把颜色纳入主题令牌而不是继续硬编码。
+const SPLITTER_VISIBLE_WIDTH: f32 = 1.0;
+
+/// 覆盖在右侧内容上的透明拖动命中宽度。
+///
+/// 业务意图：
+/// - 可见分割线只占 1px，剩余命中区域放到右侧内容之上，让右侧内容视觉上紧贴分割线。
+const SPLITTER_OVERLAY_HIT_WIDTH: f32 = SPLITTER_HIT_WIDTH - SPLITTER_VISIBLE_WIDTH;
+
+/// 左侧目录树标题区域高度。
+///
+/// 业务意图：
+/// - 左侧区域用于展示真实加载后的日志目录树，标题区域帮助用户识别当前面板语义。
+/// - 当前标题不展示真实绝对路径，避免路径脱敏和窄面板排版规则未定义前暴露过多信息。
+const LOG_TREE_HEADER_HEIGHT: f32 = 34.0;
+
+/// 左侧目录树每行固定高度。
+///
+/// 业务意图：
+/// - 固定行高可以让树结构在 macOS 和 Windows 字体渲染差异下保持稳定密度。
+/// - 后续接入虚拟列表或大目录时，也可以基于固定行高计算滚动区域。
+///
+/// 边界条件：
+/// - 当前未实现超长目录名的多行展示；长文本统一截断，避免挤压布局。
+const LOG_TREE_ROW_HEIGHT: f32 = 28.0;
+
+/// 左侧目录树首次加载后的默认展开深度。
+///
+/// 业务意图：
+/// - 用户要求默认展开 2 级目录，因此深度 0 和深度 1 的可展开节点默认处于展开状态。
+/// - 深度 2 的节点默认可见但不继续展开，避免大目录首次渲染时一次性暴露过多文件行。
+///
+/// 边界条件：
+/// - 这里使用加载层提供的 `depth`，只影响初始 UI 展开状态，不裁剪真实扫描结果。
+/// - 用户手动展开或收起后只在当前进程内生效，重新加载日志会重新套用默认展开规则。
+const LOG_TREE_DEFAULT_EXPANDED_DEPTH: usize = 2;
+
+/// 左侧目录树每一级层级缩进。
+///
+/// 业务意图：
+/// - 树形结构依赖稳定缩进表达父子关系，16px 可以容纳展开箭头和文件夹图标。
+/// - 缩进值固定，避免不同节点因为文本长度不同导致层级难以扫描。
+const LOG_TREE_ROW_INDENT: f32 = 16.0;
+
+/// 左侧目录树行内容的基础水平内边距。
+///
+/// 业务意图：
+/// - 给树节点与面板边缘之间保留基础留白，避免图标贴边影响可读性。
+/// - 缩进会叠加在该基础内边距之上，因此根节点和子节点都保持一致起点规则。
+const LOG_TREE_ROW_HORIZONTAL_PADDING: f32 = 10.0;
+
+/// 左侧目录树展开箭头占位宽度。
+///
+/// 业务意图：
+/// - 文件节点没有展开箭头，但仍需要占用同等宽度，保证文件夹和文件名称左边缘对齐。
+/// - 该值只影响视觉布局，不代表当前节点支持真实展开或收起。
+const LOG_TREE_CHEVRON_WIDTH: f32 = 14.0;
+
+/// 左侧目录树展开箭头字号。
+///
+/// 边界条件：
+/// - 箭头图标必须小于行高，避免在低 DPI 或 Windows 字体度量差异下被裁切。
+const LOG_TREE_CHEVRON_SIZE: f32 = 13.0;
+
+/// 左侧目录树文件夹和文件图标占位宽度。
+///
+/// 业务意图：
+/// - 固定图标宽度可以让节点文字起点稳定，提升目录树快速扫描体验。
+const LOG_TREE_ITEM_ICON_WIDTH: f32 = 16.0;
+
+/// 左侧目录树文件夹和文件图标字号。
+///
+/// 边界条件：
+/// - 图标字号与行高配套，避免树节点在不同平台字体度量下出现垂直裁切。
+const LOG_TREE_ITEM_ICON_SIZE: f32 = 15.0;
+
+/// 左侧目录树滚动条可见宽度。
+///
+/// 业务意图：
+/// - 左侧目录树也使用虚拟列表，文件较多时需要稳定显示滚动位置，避免用户误以为列表只展示当前屏内容。
+/// - 宽度和右侧日志正文滚动条保持一致，降低左右区域的视觉差异。
+const LOG_TREE_SCROLLBAR_WIDTH: f32 = 6.0;
+
+/// 左侧目录树滚动条最小滑块高度。
+///
+/// 边界条件：
+/// - 大目录中按比例计算出的滑块可能过小，最小高度保证鼠标仍能命中并拖动。
+const LOG_TREE_SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 36.0;
+
+/// 左侧目录树滚动条距离面板边缘的内缩。
+///
+/// 业务意图：
+/// - 滚动条贴近右侧但不压住分割线，避免目录树和右侧内容边界混在一起。
+const LOG_TREE_SCROLLBAR_PADDING: f32 = 3.0;
+
+/// 右侧日志 tab 栏高度。
+///
+/// 业务意图：
+/// - tab 栏需要容纳多个已打开日志文件的切换入口，同时不抢占日志正文可视高度。
+/// - 固定高度便于右侧主体区域继续使用等高虚拟列表渲染日志行。
+const LOG_TAB_BAR_HEIGHT: f32 = 34.0;
+
+/// tab 栏两侧滚动箭头按钮宽度。
+///
+/// 业务意图：
+/// - 用户要求打开日志较多时 tab 可以横向滚动，并在两边显示滚动箭头。
+/// - 按钮固定宽度可以让 tab 可视区域在滚动前后保持稳定。
+const LOG_TAB_SCROLL_BUTTON_WIDTH: f32 = 28.0;
+
+/// tab 栏每次点击滚动箭头时移动的距离。
+///
+/// 业务意图：
+/// - 该值约等于两个中等长度 tab 的宽度，点击次数和定位速度比较平衡。
+const LOG_TAB_SCROLL_STEP: f32 = 180.0;
+
+/// tab 内关闭图标按钮宽度。
+///
+/// 业务意图：
+/// - 关闭按钮需要稳定命中区，避免用户只能点到很小的 `X` 字形。
+const LOG_TAB_CLOSE_BUTTON_WIDTH: f32 = 18.0;
+
+/// 右侧日志文档工具条高度。
+///
+/// 业务意图：
+/// - 当前工具条只承载编码切换和当前文件状态，后续如果加入搜索或跳转行号也应从这里扩展。
+const LOG_DOCUMENT_TOOLBAR_HEIGHT: f32 = 36.0;
+
+/// 右侧日志正文每行固定高度。
+///
+/// 业务意图：
+/// - 日志正文使用 `uniform_list` 进行虚拟渲染，必须保持每行高度一致，才能在大文件滚动时稳定计算可见区间。
+const LOG_VIEWER_ROW_HEIGHT: f32 = 22.0;
+
+/// 日志查看器行号列固定宽度。
+///
+/// 业务意图：
+/// - 行号和正文分开渲染，便于用户定位日志上下文，同时避免行号挤压正文起点。
+const LOG_VIEWER_LINE_NUMBER_MIN_WIDTH: f32 = 46.0;
+
+/// 日志查看器行号列最大宽度。
+///
+/// 业务意图：
+/// - 大文件行数较多时行号列可以略微变宽，但不能回到上一版过宽导致正文起点过远的问题。
+const LOG_VIEWER_LINE_NUMBER_MAX_WIDTH: f32 = 64.0;
+
+/// 日志查看器行号单个数字的估算宽度。
+///
+/// 业务意图：
+/// - GPUI 当前没有在渲染前测量等宽行号文本的必要性，使用稳定估算即可让常见行数下列宽更紧凑。
+const LOG_VIEWER_LINE_NUMBER_DIGIT_WIDTH: f32 = 7.0;
+
+/// 日志查看器行号列右侧留白和边框的估算宽度。
+///
+/// 业务意图：
+/// - 行号需要和边框保持一点距离，避免数字贴线影响扫描。
+const LOG_VIEWER_LINE_NUMBER_PADDING_WIDTH: f32 = 18.0;
+
+/// 日志正文相对行号列右侧的水平内边距。
+///
+/// 业务意图：
+/// - 行号列固定在左侧，正文需要留出少量间距，避免文本贴着行号分割线显示。
+/// - 文本选择命中测试也必须使用同一个偏移，保证鼠标选中的列和实际渲染起点一致。
+const LOG_VIEWER_TEXT_LEFT_PADDING: f32 = 8.0;
+
+/// 日志正文使用的等宽字体族。
+///
+/// 业务意图：
+/// - 日志通常包含时间戳、线程名和列对齐字段，等宽字体能提升扫描和对比效率。
+/// - 用户指定使用 JetBrains Mono，并要求内置到程序中，因此启动时会注册随项目打包的字体字节。
+const LOG_VIEWER_FONT_FAMILY: &str = "JetBrains Mono";
+
+/// 日志查看器中制表符按固定 4 列展开。
+///
+/// 业务意图：
+/// - 一些日志用 `\t` 分隔字段，VS Code 等编辑器会按 tab stop 展开，所以列之间看起来有稳定间隔。
+/// - GPUI 当前直接渲染 `\t` 时宽度不符合日志阅读预期，字段会贴在一起；这里在显示层展开为空格。
+///
+/// 边界条件：
+/// - 这里只改变视觉显示，不改原始日志文本；复制、搜索、另存为仍保留文件里的真实 `\t`。
+/// - tab stop 按用户要求固定为 4 列，暂不做设置项，避免影响现有信息密度。
+const LOG_VIEWER_TAB_WIDTH: usize = 4;
+
+/// 内置 JetBrains Mono Regular 字体数据。
+///
+/// 业务意图：
+/// - 日志正文必须使用 JetBrains Mono，不能依赖用户系统是否安装该字体。
+/// - `include_bytes!` 会把字体文件编译进可执行产物，macOS 和 Windows 启动时通过同一套 GPUI 字体注册流程加载。
+///
+/// 边界条件：
+/// - 当前只内置 Regular 字重；日志正文高亮仍通过字体系统模拟粗体，后续若要求更高字重质量可追加 Bold 字体文件。
+const JETBRAINS_MONO_REGULAR_FONT_BYTES: &[u8] =
+    include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
+
+/// 日志正文默认字号。
+///
+/// 边界条件：
+/// - 用户要求默认字号为 12px；当前继续沿用 22px 行高，保证单屏可见行数和滚动计算稳定。
+/// - 设置页只调整文字字号，不改变固定行高和信息密度。
+const LOG_VIEWER_DEFAULT_FONT_SIZE: f32 = 12.0;
+
+/// 日志正文可设置的最小字号。
+///
+/// 边界条件：
+/// - 过小字体会导致中文、英文和符号在长时间阅读时难以辨认，因此设置页不允许继续减小。
+const LOG_VIEWER_MIN_FONT_SIZE: f32 = 10.0;
+
+/// 日志正文可设置的最大字号。
+///
+/// 边界条件：
+/// - 当前日志行高仍保持固定密度；过大字体可能与行高冲突并影响虚拟列表测量，因此先限制到 20px。
+const LOG_VIEWER_MAX_FONT_SIZE: f32 = 20.0;
+
+/// 日志字号设置的单次调整步长。
+///
+/// 业务意图：
+/// - 1px 步进足够细，用户可以在不改变布局密度的前提下微调阅读舒适度。
+const LOG_VIEWER_FONT_SIZE_STEP: f32 = 1.0;
+
+/// 日志正文滚动条可见宽度。
+///
+/// 业务意图：
+/// - GPUI `uniform_list` 默认只处理滚动交互，不预留可见滚动条；这里自绘轻量滚动条提示当前位置。
+const LOG_VIEWER_SCROLLBAR_WIDTH: f32 = 6.0;
+
+/// 日志正文滚动条最小滑块长度。
+///
+/// 边界条件：
+/// - 超长或超宽日志中按比例计算出的滑块可能过小，最小长度保证用户仍能看到并拖动滚动位置。
+const LOG_VIEWER_SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 36.0;
+
+/// 日志正文滚动条距离内容边缘的内缩。
+///
+/// 业务意图：
+/// - 让滚动条不贴到窗口边缘和 tab 内容边界，视觉上更轻量。
+const LOG_VIEWER_SCROLLBAR_PADDING: f32 = 3.0;
+
+/// 编码下拉框按钮宽度。
+///
+/// 业务意图：
+/// - 编码选择器现在嵌入右侧状态信息中，宽度需要比旧版左侧独立控件更紧凑。
+/// - 该宽度仍需容纳最长的 “UTF-8 BOM” 文案和下拉箭头。
+const ENCODING_DROPDOWN_BUTTON_WIDTH: f32 = 94.0;
+
+/// 编码下拉框弹层宽度。
+///
+/// 业务意图：
+/// - 所有编码选项文案长度固定，使用稳定宽度避免菜单在不同平台字体下抖动。
+const ENCODING_DROPDOWN_WIDTH: f32 = 116.0;
+
+/// 编码下拉按钮高度。
+///
+/// 业务意图：
+/// - 菜单弹层位置需要和按钮底边对齐，因此按钮高度集中成常量，避免渲染处和定位处写两份数字。
+const ENCODING_DROPDOWN_BUTTON_HEIGHT: f32 = 24.0;
+
+/// 编码下拉菜单距离按钮底边的垂直间隔。
+///
+/// 边界条件：
+/// - 保留 2px 间隔可以让菜单边框和按钮边框不粘连。
+const ENCODING_DROPDOWN_MENU_GAP: f32 = 2.0;
+
+/// 编码下拉框单项高度。
+///
+/// 边界条件：
+/// - 当前每项只包含单行中文或 ASCII 编码名，不需要多行布局。
+const ENCODING_DROPDOWN_ITEM_HEIGHT: f32 = 28.0;
+
+/// tab 右键菜单宽度。
+///
+/// 业务意图：
+/// - 三个菜单项文案长度固定，使用稳定宽度可以避免菜单因为字体差异跳动。
+const TAB_CONTEXT_MENU_WIDTH: f32 = 132.0;
+
+/// tab 右键菜单单项高度。
+///
+/// 边界条件：
+/// - 菜单项只显示单行中文命令，不承载图标或快捷键。
+const TAB_CONTEXT_MENU_ITEM_HEIGHT: f32 = 30.0;
+
+/// 搜索结果右键菜单宽度。
+///
+/// 业务意图：
+/// - 搜索结果菜单只承载展开/收起两类批量操作，固定宽度可以和 tab 菜单保持一致的视觉节奏。
+const SEARCH_RESULTS_CONTEXT_MENU_WIDTH: f32 = 132.0;
+
+/// 搜索结果右键菜单单项高度。
+///
+/// 边界条件：
+/// - 菜单项只显示单行中文命令，不承载二级菜单。
+const SEARCH_RESULTS_CONTEXT_MENU_ITEM_HEIGHT: f32 = 30.0;
+
+/// 搜索对话框默认宽度。
+///
+/// 业务意图：
+/// - 对话框需要同时容纳查询输入、范围切换和大小写开关，宽度固定可以让独立窗口尺寸稳定。
+/// - 搜索对话框已经从主窗口浮层迁移为独立浮动窗口，因此不再参与右侧日志正文布局。
+const SEARCH_DIALOG_WIDTH: f32 = 430.0;
+
+/// 搜索对话框独立窗口默认高度。
+///
+/// 业务意图：
+/// - 独立窗口需要一次性容纳“当前文件”和“当前目录”两种搜索模式下的控件，避免切换范围时窗口高度跳变。
+/// - 当前目录模式会额外显示目标目录输入框，因此高度按较高形态预留。
+///
+/// 边界条件：
+/// - 该窗口不可调整大小；如果后续增加搜索历史、正则等更多控件，应同步重新定义窗口高度策略。
+const SEARCH_DIALOG_WINDOW_HEIGHT: f32 = 286.0;
+
+/// 搜索关键字历史记录上限。
+///
+/// 业务意图：
+/// - 搜索窗口再次打开时需要能恢复最近一次关键字，减少重复输入。
+/// - 只保留最近 10 条，避免当前会话内频繁搜索导致状态无限增长；当前不持久化到磁盘，避免隐私规则未定义前保存用户日志关键字。
+const SEARCH_QUERY_HISTORY_LIMIT: usize = 10;
+
+/// 设置窗口默认宽度。
+///
+/// 业务意图：
+/// - 设置窗口需要容纳左侧页签和右侧设置项，固定宽度可以让独立窗口在 macOS 和 Windows 上保持稳定布局。
+/// - 当前只包含通用和模型两个页签，不需要随内容动态调整窗口宽度。
+const SETTINGS_WINDOW_WIDTH: f32 = 520.0;
+
+/// 设置窗口默认高度。
+///
+/// 业务意图：
+/// - 高度需要容纳通用页签中的主题选择，同时给后续模型设置预留基础空间。
+/// - 模型页签当前按需求留白，因此窗口高度不随页签切换变化，避免用户切换时窗口跳动。
+const SETTINGS_WINDOW_HEIGHT: f32 = 360.0;
+
+/// 设置窗口左侧页签栏宽度。
+///
+/// 业务意图：
+/// - 页签名称为中文短文本，固定宽度可以让右侧内容区宽度稳定，后续增加更多设置项时仍易于扫描。
+const SETTINGS_TAB_SIDEBAR_WIDTH: f32 = 132.0;
+
+/// 搜索输入框高度。
+///
+/// 业务意图：
+/// - 搜索框只承载单行查询词，不支持多行输入，因此固定高度可以简化键盘和点击焦点处理。
+const SEARCH_INPUT_HEIGHT: f32 = 30.0;
+
+/// 搜索结果面板默认高度。
+///
+/// 业务意图：
+/// - 面板从右侧内容区底部弹出，默认高度需要能展示多条结果，同时保留上方日志上下文。
+const SEARCH_RESULTS_PANEL_DEFAULT_HEIGHT: f32 = 260.0;
+
+/// 搜索结果面板最小高度。
+///
+/// 边界条件：
+/// - 继续允许用户拖小结果面板，但不能小到关闭按钮、摘要和至少一条结果不可见。
+const SEARCH_RESULTS_PANEL_MIN_HEIGHT: f32 = 140.0;
+
+/// 搜索结果面板相对右侧内容区的最大高度比例。
+///
+/// 业务意图：
+/// - 用户要求结果面板可以上下拖动高度，但不能完全覆盖日志正文。
+const SEARCH_RESULTS_PANEL_MAX_RATIO: f32 = 0.6;
+
+/// 搜索结果面板拖拽条高度。
+const SEARCH_RESULTS_PANEL_RESIZER_HEIGHT: f32 = 8.0;
+
+/// 搜索结果标题栏顶部视觉留白。
+///
+/// 业务意图：
+/// - 拖拽命中区需要保持足够高度，方便用户调整面板；但标题内容不应因此显得上边距过大。
+/// - 将视觉留白和拖拽命中区拆开，标题栏能保持紧凑，同时顶部仍保留可拖动热区。
+const SEARCH_RESULTS_PANEL_HEADER_TOP_PADDING: f32 = 3.0;
+
+/// 搜索结果行固定高度。
+///
+/// 业务意图：
+/// - 结果列表使用虚拟列表，固定行高可以避免大量命中时创建全部行元素。
+const SEARCH_RESULT_ROW_HEIGHT: f32 = 34.0;
+
+/// 搜索结果面板滚动条可见宽度。
+///
+/// 业务意图：
+/// - 搜索结果可能包含大量历史记录、文件分组和命中明细，面板也需要像日志正文一样提供稳定可见的滚动位置提示。
+/// - 宽度沿用日志正文滚动条的视觉尺度，避免底部面板看起来像另一套控件体系。
+const SEARCH_RESULTS_SCROLLBAR_WIDTH: f32 = 6.0;
+
+/// 搜索结果面板滚动条最小滑块长度。
+///
+/// 边界条件：
+/// - 大量结果会让按比例计算的滑块非常短，最小长度保证用户仍能稳定点击和拖动。
+const SEARCH_RESULTS_SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 36.0;
+
+/// 搜索结果面板滚动条距离列表边缘的内缩。
+///
+/// 业务意图：
+/// - 右侧保留轻微内缩，让滚动条不贴边，并和日志正文、左侧目录树滚动条的视觉位置保持一致。
+const SEARCH_RESULTS_SCROLLBAR_PADDING: f32 = 3.0;
+
+/// `Ctrl+C` 在部分 macOS 输入路径下对应的 ASCII 控制字符。
+///
+/// 业务意图：
+/// - 日志正文复制和搜索快捷键使用同一套全局键盘入口；复制也需要兼容 Control 字母键被平台编码成控制字符的情况。
+const CONTROL_C_CODE: &str = "\u{3}";
+
+/// `Ctrl+V` 在部分 macOS 输入路径下对应的 ASCII 控制字符。
+///
+/// 业务意图：
+/// - 搜索关键字和目录输入框需要支持粘贴；日志查看器只读，因此在查看器中粘贴会打开搜索窗口并填入剪贴板文本。
+const CONTROL_V_CODE: &str = "\u{16}";
+
+/// `Ctrl+A` 在部分平台输入路径下对应的 ASCII 控制字符。
+///
+/// 业务意图：
+/// - 搜索关键字和目录输入框需要支持全选；不同系统可能把 `Ctrl+A` 表示为字母 `a` 或控制字符。
+/// - 与复制快捷键保持同一套兼容策略，避免 Windows/macOS 键盘路径出现只在某个平台生效的问题。
+const CONTROL_A_CODE: &str = "\u{1}";
+
+/// 顶部工具栏按钮的声明式配置。
+///
+/// 业务意图：
+/// - 将按钮标签和图标绑定在一起，避免渲染代码里出现三组分散的硬编码。
+/// - 后续如果按钮需要权限、禁用态或快捷键，可以在这个结构上扩展字段。
+///
+/// 边界条件：
+/// - 当前只包含静态字符串，所有按钮在进程生命周期内固定不变。
+/// - “加载日志”已绑定真实系统选择器和路径扫描流程；“智能诊断”和“设置”仍等待业务规则明确后接入。
+struct ToolbarAction {
+    /// 按钮前置图标。
+    ///
+    /// 业务意图：
+    /// - 使用 Lucide 图标库提供的类型安全枚举，替换上一版难看的纯文本符号。
+    /// - 图标语义需要和按钮动作一致，帮助用户快速识别入口类别。
+    icon: Icon,
+
+    /// 按钮显示文案。
+    ///
+    /// 业务意图：
+    /// - 文案直接来自用户当前需求，后续如需国际化或快捷键提示再统一抽象。
+    label: &'static str,
+}
+
+/// 顶部工具栏按钮列表。
+///
+/// 业务意图：
+/// - “加载日志”使用 `FileText`，表达日志文本文件入口。
+/// - “搜索”使用 `Search`，提供鼠标入口打开搜索窗口，避免快捷键异常时用户无法触达搜索能力。
+/// - “智能诊断”使用 `Stethoscope`，表达对日志问题进行诊断和定位，比脑回路图标更贴近按钮语义。
+/// - “设置”使用 `Settings`，表达配置入口。
+///
+/// 边界条件：
+/// - 当前图标依赖启动时注册的 Lucide 字体；如果字体注册失败，启动阶段会直接暴露错误。
+const TOOLBAR_ACTIONS: &[ToolbarAction] = &[
+    ToolbarAction {
+        icon: Icon::FileText,
+        label: "加载日志",
+    },
+    ToolbarAction {
+        icon: Icon::Search,
+        label: "搜索",
+    },
+    ToolbarAction {
+        icon: Icon::Stethoscope,
+        label: "智能诊断",
+    },
+    ToolbarAction {
+        icon: Icon::Settings,
+        label: "设置",
+    },
+];
+
+/// 已加载日志目录树在 UI 层的交互状态。
+///
+/// 业务意图：
+/// - `LoadedLogTree` 是加载模块输出的完整树数据，不能直接混入展开/收起这种界面会话状态。
+/// - 这里集中保存展开节点集合和可见行缓存，让目录树可以支持折叠，同时为虚拟列表提供稳定数据源。
+///
+/// 边界条件：
+/// - 展开集合只保存当前加载结果内部的节点 ID，重新加载后必须重新初始化，不能跨加载复用。
+/// - 可见行缓存只包含当前应该渲染的行，不影响完整树数据；节点点击读取正文时仍应回到完整树来源模型。
+struct LoadedLogTreeState {
+    /// 加载层生成的完整目录树。
+    ///
+    /// 业务意图：
+    /// - 完整树用于在用户切换展开状态时重新计算可见行。
+    /// - 后续接入节点点击时，也应从完整树继续补充来源定位信息，而不是只依赖可见行。
+    tree: LoadedLogTree,
+
+    /// 当前处于展开状态的节点 ID 集合。
+    ///
+    /// 业务意图：
+    /// - 使用集合可以让展开/收起切换保持 O(1) 查询，避免滚动渲染时反复线性查找。
+    /// - 只记录展开节点；未出现的可展开节点视为收起。
+    expanded_node_ids: HashSet<usize>,
+
+    /// 当前需要展示给目录树虚拟列表的可见行。
+    ///
+    /// 业务意图：
+    /// - 文件很多时不能把完整树每一行都渲染成 GPUI 元素，否则滚动会卡顿。
+    /// - 先按展开状态算出可见行，再交给 `uniform_list` 按可视区间懒渲染。
+    visible_rows: Vec<LoadedLogTreeRow>,
+
+    /// 当前加载结果是否只包含一个可打开日志来源。
+    ///
+    /// 业务意图：
+    /// - 用户加载单个日志时应直接进入右侧浏览，不再显示只有一个文件的左侧树。
+    /// - 目录或压缩包内部如果最终只有一个可读日志，也按同一规则处理；多文件仍保留树用于选择。
+    ///
+    /// 边界条件：
+    /// - 加载过程中出现错误时不隐藏树，避免错误节点被自动打开流程吞掉，用户仍能看到失败原因。
+    /// - 只统计 `File` 节点且必须带有 `LogFileSource`，目录、压缩包容器、符号链接和错误节点不算可打开日志。
+    single_log_source: Option<LogFileSource>,
+}
+
+impl LoadedLogTreeState {
+    /// 根据完整加载结果创建 UI 交互状态。
+    ///
+    /// 业务意图：
+    /// - 首次加载时按用户要求默认展开 2 级目录，避免大目录一次性完全展开导致首屏过载。
+    /// - 初始化后立即构建可见行缓存，保证标题摘要、虚拟列表数量和点击状态同步。
+    fn new(tree: LoadedLogTree) -> Self {
+        let expanded_node_ids = tree
+            .rows
+            .iter()
+            .filter(|row| row.has_children && row.depth < LOG_TREE_DEFAULT_EXPANDED_DEPTH)
+            .map(|row| row.id)
+            .collect();
+        let single_log_source = Self::single_log_source_for_tree(&tree);
+
+        let mut state = Self {
+            tree,
+            expanded_node_ids,
+            visible_rows: Vec::new(),
+            single_log_source,
+        };
+        state.rebuild_visible_rows();
+        state
+    }
+
+    /// 返回整棵加载树中唯一可打开日志来源。
+    ///
+    /// 业务意图：
+    /// - 加载单个普通文件、只含一个日志的目录、只含一个日志成员的压缩包时，主界面可以跳过左侧树并自动打开日志。
+    ///
+    /// 边界条件：
+    /// - 如果存在扫描错误，保持 `None`，让左侧树继续展示错误行，避免用户误以为目录已完整加载。
+    /// - 如果发现两个及以上可打开文件，立即返回 `None`，避免自动打开其中任意一个造成选择歧义。
+    fn single_log_source_for_tree(tree: &LoadedLogTree) -> Option<LogFileSource> {
+        if tree.error_count > 0 {
+            return None;
+        }
+
+        let mut single_source: Option<LogFileSource> = None;
+        for row in &tree.rows {
+            if row.kind != LogTreeEntryKind::File {
+                continue;
+            }
+
+            let Some(source) = row.source.clone() else {
+                continue;
+            };
+            if single_source.replace(source).is_some() {
+                return None;
+            }
+        }
+
+        single_source
+    }
+
+    /// 返回当前加载结果中唯一可打开日志来源。
+    ///
+    /// 业务意图：
+    /// - 该值在构建 UI 状态时缓存，渲染每一帧不需要重新遍历大目录树。
+    fn single_log_source(&self) -> Option<LogFileSource> {
+        self.single_log_source.clone()
+    }
+
+    /// 清理加载树持有的临时物化路径。
+    ///
+    /// 业务意图：
+    /// - 7Z 在加载阶段会把内部成员物化成本地文件，重新加载日志后旧树不再可见，应释放对应磁盘空间。
+    /// - 清理目录失败不影响 UI 状态切换，异常退出残留由下次启动的过期清理兜底。
+    fn cleanup_temporary_paths(&self) {
+        for path in &self.tree.temporary_paths {
+            if path.is_dir() {
+                let _ = fs::remove_dir_all(path);
+            } else {
+                cleanup_materialized_file(path);
+            }
+        }
+    }
+
+    /// 返回标题区域展示的加载摘要。
+    ///
+    /// 边界条件：
+    /// - 摘要来自加载层统计，表达完整树节点数量，而不是当前可见行数量。
+    fn summary(&self) -> &str {
+        &self.tree.summary
+    }
+
+    /// 判断指定节点是否处于展开状态。
+    ///
+    /// 业务意图：
+    /// - 渲染可见行时需要根据该状态选择向右或向下的展开箭头。
+    fn is_expanded(&self, node_id: usize) -> bool {
+        self.expanded_node_ids.contains(&node_id)
+    }
+
+    /// 如果指定压缩包节点内部只有一个可打开文件，则返回该文件来源。
+    ///
+    /// 业务意图：
+    /// - 用户从左侧树点击压缩包文件时，如果压缩包内部只有一个日志文件，直接打开正文比先展开再点文件更符合预期。
+    /// - 该规则只在 UI 交互层生效，不改变加载层的目录树结构，后续仍可以展示完整压缩包内容。
+    ///
+    /// 边界条件：
+    /// - 只有 `Archive` 节点会触发该规则；普通目录即使只有一个文件也保持展开/收起行为。
+    /// - “只有一个文件”按可打开的文件节点统计，目录节点不计数；如果发现两个及以上文件则返回 `None`。
+    /// - 错误节点和符号链接不作为可打开日志来源，避免把不可读条目误当作候选文件。
+    fn single_file_source_for_archive(&self, node_id: usize) -> Option<LogFileSource> {
+        let archive_index = self
+            .tree
+            .rows
+            .iter()
+            .position(|row| row.id == node_id && row.kind == LogTreeEntryKind::Archive)?;
+        let archive_depth = self.tree.rows[archive_index].depth;
+        let mut single_source: Option<LogFileSource> = None;
+
+        for row in self.tree.rows.iter().skip(archive_index + 1) {
+            if row.depth <= archive_depth {
+                break;
+            }
+
+            if row.kind != LogTreeEntryKind::File {
+                continue;
+            }
+
+            let source = row.source.clone()?;
+            if single_source.replace(source).is_some() {
+                return None;
+            }
+        }
+
+        single_source
+    }
+
+    /// 切换某个可展开节点的展开状态。
+    ///
+    /// 业务意图：
+    /// - 文件夹点击后需要立即展开或收起子树，并刷新虚拟列表的可见行数量。
+    ///
+    /// 边界条件：
+    /// - 非文件夹或没有子节点的节点不能进入展开集合，避免 UI 状态出现无效 ID。
+    /// - 如果传入的 ID 不属于当前树，函数保持静默，避免异步加载切换后旧事件导致崩溃。
+    fn toggle_node(&mut self, node_id: usize) {
+        let Some(row) = self.tree.rows.iter().find(|row| row.id == node_id) else {
+            return;
+        };
+
+        if !row.has_children {
+            return;
+        }
+
+        if !self.expanded_node_ids.remove(&node_id) {
+            self.expanded_node_ids.insert(node_id);
+        }
+
+        self.rebuild_visible_rows();
+    }
+
+    /// 重新按展开状态计算虚拟列表可见行。
+    ///
+    /// 业务意图：
+    /// - 完整目录树是前序扁平结构，收起某个节点时，其后连续的更深层级行都应该隐藏。
+    /// - 使用一次线性扫描构建缓存，避免每次虚拟列表渲染可见范围时都重复计算父节点展开链。
+    ///
+    /// 边界条件：
+    /// - 收起父节点后，即使子节点 ID 仍在展开集合中也不会显示；再次展开父节点时会恢复子节点原状态。
+    /// - 错误节点、文件节点和符号链接没有子节点，不参与展开控制。
+    fn rebuild_visible_rows(&mut self) {
+        self.visible_rows.clear();
+
+        let mut collapsed_depth: Option<usize> = None;
+        for row in &self.tree.rows {
+            if let Some(depth) = collapsed_depth {
+                if row.depth > depth {
+                    continue;
+                }
+
+                collapsed_depth = None;
+            }
+
+            self.visible_rows.push(row.clone());
+
+            if row.has_children && !self.expanded_node_ids.contains(&row.id) {
+                collapsed_depth = Some(row.depth);
+            }
+        }
+    }
+}
+
+/// 左侧日志目录树当前展示的数据状态。
+///
+/// 业务意图：
+/// - 初始状态不展示左侧目录树，让主内容区完整显示“需要先加载日志”的提示。
+/// - 加载中、加载成功和加载失败都由同一个枚举表达，避免 UI 层使用多个布尔字段组合出非法状态。
+///
+/// 边界条件：
+/// - 当前不保留历史加载结果；用户再次选择来源时，新结果会替换旧目录树。
+/// - 当前不支持取消正在进行的扫描任务，后续大目录扫描若需要取消必须补充任务句柄和状态规则。
+enum LogTreeLoadState {
+    /// 尚未加载真实来源。
+    Empty,
+    /// 已经打开系统选择器并开始扫描用户选择的来源。
+    Loading {
+        /// 展示给用户的加载说明。
+        ///
+        /// 业务意图：
+        /// - 说明当前是在扫描真实来源，而不是应用卡死或仍处于未加载状态。
+        message: String,
+    },
+    /// 真实日志来源已经扫描完成，并已经构建 UI 交互状态。
+    Loaded(LoadedLogTreeState),
+    /// 加载流程发生致命错误，无法形成可展示结果。
+    Failed {
+        /// 中文错误说明。
+        ///
+        /// 边界条件：
+        /// - 局部权限错误会作为树节点展示，只有系统对话框失败或加载流程整体失败才进入该状态。
+        message: String,
+    },
+}
+
+/// 右侧已经打开的日志 tab。
+///
+/// 业务意图：
+/// - 每个日志文件对应一个 tab，tab 内保留来源、原始字节、编码选择和渲染状态。
+/// - 同一来源重复点击时通过 `source_key` 定位已有 tab，避免重复打开同一份日志。
+///
+/// 边界条件：
+/// - tab 状态只存在于当前进程内，不持久化到配置文件。
+/// - 后台读取任务完成时如果 tab 已被关闭，会按 `id` 查找失败并静默忽略。
+struct OpenLogTab {
+    /// 当前进程内唯一 tab ID。
+    id: usize,
+    /// 日志文件来源。
+    source: LogFileSource,
+    /// 用于去重的稳定来源键。
+    source_key: String,
+    /// tab 上展示的短标题。
+    title: String,
+    /// 用户当前选择的编码策略。
+    encoding_choice: EncodingChoice,
+    /// 已读取的原始字节。
+    ///
+    /// 业务意图：
+    /// - 自动检测失败时仍保留原始字节，用户手动切换编码可以直接重新解码。
+    /// - 读取失败时保持 `None`，因为没有可复用的正文数据。
+    raw_bytes: Option<Arc<Vec<u8>>>,
+    /// tab 当前正文状态。
+    state: LogTabState,
+    /// 当前 tab 的日志正文虚拟列表滚动句柄。
+    ///
+    /// 业务意图：
+    /// - 每个 tab 独立保存滚动上下文，切换 tab 时不会把其它文件的滚动位置混进来。
+    scroll_handle: UniformListScrollHandle,
+    /// 打开后需要滚动定位的目标行。
+    ///
+    /// 业务意图：
+    /// - 搜索结果点击可能打开一个尚未读取完成的新 tab，目标行必须暂存到 tab 上，等后台解码成功后再滚动。
+    /// - 使用 0 基行号与 `DecodedLogDocument.lines` 下标保持一致，避免 UI 展示行号和数据下标混用。
+    pending_scroll_to_line: Option<usize>,
+    /// 最近一次通过搜索结果跳转的命中行。
+    ///
+    /// 业务意图：
+    /// - 点击搜索结果后不仅要滚动到目标位置，还要用背景色标记命中行，避免用户在密集日志中丢失上下文。
+    /// - 该状态只属于当前 tab 的临时视觉反馈，不持久化，也不影响日志语法高亮。
+    highlighted_search_line: Option<usize>,
+    /// 当前 tab 内日志正文的只读文本选择范围。
+    ///
+    /// 业务意图：
+    /// - 日志正文采用虚拟列表自绘，不是系统文本控件，GPUI 不会自动保存跨行选择状态。
+    /// - 将选择范围绑定到 tab，可以让用户切换 tab 后仍保留当前文件的选择上下文，并支持复制和填入搜索框。
+    ///
+    /// 边界条件：
+    /// - 选择范围使用行号和字符列，不使用 UTF-8 字节下标；复制时再转换为安全字节边界，避免中文被截断。
+    /// - 重新解码、重新加载或打开失败时必须清理该字段，因为旧行列可能不再对应新文档。
+    text_selection: Option<LogTextSelection>,
+    /// 当前正在拖拽选择时的固定起点。
+    ///
+    /// 业务意图：
+    /// - 鼠标按下确定锚点，后续移动只更新焦点，才能正确支持从下往上或从右往左反向选择。
+    /// - 鼠标释放后清空该临时字段，但保留 `text_selection` 供复制和搜索预填使用。
+    selection_drag_anchor: Option<LogTextPosition>,
+}
+
+/// 日志正文中的文本位置。
+///
+/// 业务意图：
+/// - 自绘日志行没有系统 selection，因此需要一个轻量位置类型表达“第几行第几个字符”。
+/// - `column` 使用 Unicode 字符序号而不是字节序号，保证中文、全角符号和 emoji 不会被拆成非法 UTF-8。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct LogTextPosition {
+    /// 0 基日志行号，对应 `DecodedLogDocument.lines` 下标。
+    line_index: usize,
+    /// 0 基字符列，对应该行 `chars()` 序号。
+    column: usize,
+}
+
+/// 日志正文只读选择范围。
+///
+/// 业务意图：
+/// - `anchor` 表示鼠标按下位置，`focus` 表示当前拖拽位置；二者顺序不固定。
+/// - 复制、渲染选区和填充搜索框前都通过 `normalized` 统一为从前到后的范围。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LogTextSelection {
+    /// 选择起始锚点。
+    anchor: LogTextPosition,
+    /// 选择当前焦点。
+    focus: LogTextPosition,
+}
+
+impl LogTextSelection {
+    /// 返回按文档顺序排列后的选择范围端点。
+    ///
+    /// 边界条件：
+    /// - 用户可能从后往前拖选，因此不能假设 `anchor <= focus`。
+    fn normalized(&self) -> (LogTextPosition, LogTextPosition) {
+        if self.anchor <= self.focus {
+            (self.anchor, self.focus)
+        } else {
+            (self.focus, self.anchor)
+        }
+    }
+
+    /// 判断当前选择是否为空。
+    fn is_empty(&self) -> bool {
+        self.anchor == self.focus
+    }
+}
+
+/// 单行日志渲染所需的输入数据。
+///
+/// 业务意图：
+/// - 日志行渲染需要同时知道 tab、行号、正文、高亮、行号列和搜索定位状态；集中成结构体可以避免函数参数膨胀。
+/// - 该结构只在当前 UI 帧内短暂使用，不保存到 tab 状态，避免复制日志正文或高亮状态的生命周期变复杂。
+struct LogLineRenderData {
+    /// 所属 tab ID，用于鼠标选择事件回写到正确 tab。
+    tab_id: usize,
+    /// 0 基日志行号。
+    line_index: usize,
+    /// 当前行原始正文。
+    ///
+    /// 业务意图：
+    /// - 鼠标选择、复制和搜索都必须继续使用日志文件里的真实文本，不能因为显示层展开 `\t` 而改写内容。
+    line: String,
+    /// 当前行用于视觉渲染的正文。
+    ///
+    /// 业务意图：
+    /// - `\t` 会在显示层按固定 tab stop 展开为空格，让日志列间距与常见编辑器一致。
+    /// - 该字段只用于 `StyledText`，不参与复制或保存。
+    display_line: String,
+    /// 当前行语法高亮与选区高亮范围，范围基于 `display_line` 的 UTF-8 字节边界。
+    highlights: Vec<(Range<usize>, gpui::HighlightStyle)>,
+    /// 行号列宽度。
+    line_number_width: f32,
+    /// 当前日志显示字号。
+    ///
+    /// 业务意图：
+    /// - 日志正文渲染由静态辅助函数完成，必须显式传入当前设置字号，避免继续读取旧的固定常量。
+    font_size: f32,
+    /// 横向滚动时行号列的反向补偿偏移。
+    horizontal_line_number_offset: Pixels,
+    /// 当前行是否是搜索结果跳转后的目标行。
+    search_highlighted: bool,
+    /// 是否临时禁用行 hover 样式。
+    ///
+    /// 业务意图：
+    /// - 调整搜索结果面板高度或拖动日志正文滚动条时，鼠标可能经过底层日志行；即使不应触发选区，GPUI hover 仍可能命中行。
+    /// - 在渲染数据中显式携带禁用标记，可以让日志行完全不注册 hover 样式，避免拖动控件时底层正文闪动。
+    suppress_hover: bool,
+    /// 当前主题调色板。
+    palette: AppThemePalette,
+}
+
+/// 日志行显示层展开结果。
+///
+/// 业务意图：
+/// - 日志原文里的 `\t` 需要按固定 4 列 tab stop 展示为空格，但选区、搜索高亮和鼠标命中仍要回到原始文本。
+/// - 该结构同时保存原始字节下标和显示字节下标的双向映射，避免中文、多字节字符和 tab 混合时出现高亮错位。
+///
+/// 边界条件：
+/// - 映射数组长度分别为原始文本和显示文本的 `len + 1`，保证行尾位置也能安全换算。
+/// - 对于 UTF-8 多字节字符的内部字节，映射会回退到字符起点；正常业务范围都应落在字符边界。
+#[derive(Debug, PartialEq, Eq)]
+struct ExpandedLogLine {
+    /// 展开 tab 后用于渲染的文本。
+    text: String,
+    /// 原始文本字节下标到显示文本字节下标的映射。
+    original_to_display_bytes: Vec<usize>,
+    /// 显示文本字节下标到原始文本字节下标的映射。
+    display_to_original_bytes: Vec<usize>,
+}
+
+/// 日志正文自绘滚动条的方向。
+///
+/// 业务意图：
+/// - 右侧日志查看器需要同时支持纵向和横向滚动条拖动，两者共享拖动生命周期，但坐标轴和偏移字段不同。
+/// - 使用枚举明确区分方向，避免在拖动计算中通过布尔值表达业务含义。
+#[derive(Clone, Copy)]
+enum LogScrollbarAxis {
+    /// 控制日志正文上下滚动。
+    Vertical,
+    /// 控制日志正文左右滚动。
+    Horizontal,
+}
+
+/// 日志正文滚动条正在被拖动时的临时状态。
+///
+/// 业务意图：
+/// - 鼠标按下滑块后，后续移动事件需要知道拖动的是哪个 tab、哪个方向，以及鼠标按下点在滑块内的偏移。
+/// - 保存滑块内偏移可以避免拖动开始瞬间滑块跳动，符合原生滚动条的交互预期。
+///
+/// 边界条件：
+/// - 该状态只存在于鼠标左键拖动期间；关闭 tab、释放鼠标或来源重新加载时都会被清理。
+#[derive(Clone, Copy)]
+struct LogScrollbarDrag {
+    /// 正在拖动滚动条的 tab ID。
+    tab_id: usize,
+    /// 当前拖动的滚动条方向。
+    axis: LogScrollbarAxis,
+    /// 鼠标按下点相对滑块起点的偏移。
+    cursor_offset: Pixels,
+}
+
+/// 日志正文自绘滚动条的布局测量结果。
+///
+/// 业务意图：
+/// - 滑块渲染、按下命中和拖动换算都必须使用同一套轨道与滑块尺寸，避免视觉位置和实际滚动位置不一致。
+/// - 坐标均为相对日志列表视口左上角的局部坐标，调用方再根据方向映射到窗口坐标。
+#[derive(Clone, Copy)]
+struct LogScrollbarMetrics {
+    /// 滑块起点在当前轴向上的局部坐标。
+    thumb_start: Pixels,
+    /// 滑块在当前轴向上的长度。
+    thumb_length: Pixels,
+    /// 轨道起点在当前轴向上的局部坐标。
+    track_start: Pixels,
+    /// 轨道在当前轴向上的总长度。
+    track_length: Pixels,
+    /// 当前轴向可滚动的最大距离。
+    max_scroll: Pixels,
+}
+
+/// 左侧目录树滚动条正在被拖动时的临时状态。
+///
+/// 业务意图：
+/// - 左侧树和右侧日志正文都使用虚拟列表，但左侧树没有 tab 维度，因此用独立状态记录滑块内鼠标偏移。
+/// - 保存偏移可以避免拖动开始时滑块跳到鼠标中心，交互行为更接近系统滚动条。
+///
+/// 边界条件：
+/// - 该状态只在鼠标左键拖动期间有效；重新加载日志、鼠标释放或列表测量失效时都会清空。
+#[derive(Clone, Copy)]
+struct LogTreeScrollbarDrag {
+    /// 鼠标按下点相对滑块顶部的偏移。
+    cursor_offset: Pixels,
+}
+
+/// 搜索结果面板滚动条正在被拖动时的临时状态。
+///
+/// 业务意图：
+/// - 搜索结果面板使用虚拟列表承载历史记录和命中明细，滚动条拖动需要保存鼠标按下点在滑块内的偏移。
+/// - 只保存偏移而不保存列表内容，避免拖动过程和搜索结果数据生命周期耦合。
+///
+/// 边界条件：
+/// - 该状态只在鼠标左键拖动期间有效；关闭结果面板、释放鼠标或列表测量失效时都会清空。
+#[derive(Clone, Copy)]
+struct SearchResultsScrollbarDrag {
+    /// 鼠标按下点相对滑块顶部的偏移。
+    cursor_offset: Pixels,
+}
+
+/// 搜索对话框中的文本输入槽位。
+///
+/// 业务意图：
+/// - 搜索对话框现在包含“关键字”和“目录目标”两个可编辑文本框，二者都需要走 GPUI 平台输入协议以支持中文 IME。
+/// - 用枚举标识当前编辑槽位，可以复用同一套 UTF-16/UTF-8 范围转换和组合文本替换逻辑。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchTextInputKind {
+    /// 搜索关键字输入框。
+    Query,
+    /// 当前目录搜索的目标目录输入框。
+    DirectoryTarget,
+}
+
+/// 设置窗口当前激活的页签。
+///
+/// 业务意图：
+/// - 设置窗口按用户要求拆成“通用”和“模型”两个页签；状态放在主视图中，避免关闭窗口后当前会话选择丢失。
+/// - 当前页签状态只存在于进程内，不写入配置文件；后续若需要记忆页签，应先定义设置持久化策略。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsTab {
+    /// 通用设置页签，当前承载主题和日志显示字号设置。
+    General,
+    /// 模型设置页签，当前按需求留白。
+    Model,
+}
+
+impl SettingsTab {
+    /// 返回设置页签固定展示顺序。
+    ///
+    /// 业务意图：
+    /// - 页签顺序是用户明确给出的“通用、模型”，集中定义避免渲染和测试出现顺序分歧。
+    fn all() -> &'static [Self] {
+        &[Self::General, Self::Model]
+    }
+
+    /// 返回页签中文标签。
+    fn label(self) -> &'static str {
+        match self {
+            Self::General => "通用",
+            Self::Model => "模型",
+        }
+    }
+
+    /// 返回页签图标。
+    ///
+    /// 业务意图：
+    /// - 独立设置窗口的页签入口使用图标加文本，帮助用户快速区分通用配置和模型配置。
+    fn icon(self) -> Icon {
+        match self {
+            Self::General => Icon::Settings,
+            Self::Model => Icon::MonitorCog,
+        }
+    }
+}
+
+/// 搜索对话框的交互状态。
+///
+/// 业务意图：
+/// - `Ctrl+F` 打开后，对话框需要保存查询词、搜索范围、大小写策略和实时进度。
+/// - 该状态只存在于当前会话，不写入配置文件，避免在搜索历史和隐私规则未定义前持久化用户输入。
+///
+/// 边界条件：
+/// - 关闭对话框会取消当前搜索任务，但不会主动清空结果面板，方便用户继续查看上一次结果。
+#[derive(Clone)]
+struct SearchDialogState {
+    /// 查询词。
+    ///
+    /// 业务意图：
+    /// - 当前只支持单行普通文本搜索，输入中的换行会被忽略。
+    query: String,
+    /// 搜索输入框的当前选择范围，使用 UTF-8 字节下标。
+    ///
+    /// 业务意图：
+    /// - GPUI 输入协议对外使用 UTF-16 下标，但内部查询词和 `String` 操作必须使用 UTF-8 字节边界。
+    /// - 第一版搜索框不支持鼠标选择文本，选择范围通常是光标位置；仍保留范围字段以兼容 IME 替换组合文本。
+    selection_range: Range<usize>,
+    /// 中文、日文等输入法正在组合的文本范围，使用 UTF-8 字节下标。
+    ///
+    /// 边界条件：
+    /// - 组合完成后必须清空该范围，否则后续普通输入会错误替换旧组合文本。
+    marked_range: Option<Range<usize>>,
+    /// 搜索范围。
+    scope: SearchScope,
+    /// 当前目录搜索的目标目录文本。
+    ///
+    /// 业务意图：
+    /// - 选择“当前目录”时，需要把实际搜索目标展示给用户，允许用户缩小到子目录或修改为加载树中的其它目录片段。
+    /// - 该字段只用于过滤已经加载树中收集到的可搜索来源，不会扩大文件系统访问范围。
+    directory_target: String,
+    /// 目录目标输入框的选择范围，使用 UTF-8 字节下标。
+    directory_selection_range: Range<usize>,
+    /// 目录目标输入框的 IME 组合文本范围，使用 UTF-8 字节下标。
+    directory_marked_range: Option<Range<usize>>,
+    /// 是否区分大小写。
+    case_sensitive: bool,
+    /// 当前关键字在当前激活文件中的出现次数。
+    ///
+    /// 业务意图：
+    /// - 搜索窗口需要即时反馈关键字在当前文件中的命中次数，帮助用户决定是否继续执行完整搜索。
+    /// - 该字段是缓存值，避免光标闪烁导致窗口频繁重绘时反复扫描大日志。
+    ///
+    /// 边界条件：
+    /// - `None` 表示没有关键字、没有当前文件、当前文件仍在加载或打开失败；UI 应展示占位而不是误报 0。
+    current_file_match_count: Option<usize>,
+    /// 当前是否有后台搜索任务仍在运行。
+    is_searching: bool,
+    /// 当前搜索任务的进度快照。
+    progress: SearchProgress,
+    /// 搜索状态提示。
+    message: String,
+    /// 对话框绑定的任务 ID。
+    ///
+    /// 业务意图：
+    /// - 用户快速连续搜索时，旧后台任务可能晚于新任务返回；任务 ID 用于丢弃过期更新。
+    job_id: usize,
+}
+
+/// 单次搜索历史记录。
+///
+/// 业务意图：
+/// - 用户可能连续尝试多个关键字或范围，底部面板需要保留每一次搜索作为可展开记录，避免新搜索覆盖旧上下文。
+/// - 每条记录独立保存进度、命中和错误，后台任务回调只更新对应 `job_id` 的记录。
+#[derive(Clone)]
+struct SearchHistoryRecord {
+    /// 后台任务 ID。
+    job_id: usize,
+    /// 本次搜索使用的查询词。
+    query: String,
+    /// 本次搜索范围。
+    scope: SearchScope,
+    /// 当前目录搜索的目标目录；当前文件搜索为 `None`。
+    directory_target: Option<String>,
+    /// 本次搜索是否区分大小写。
+    case_sensitive: bool,
+    /// 搜索进度终态或当前进度。
+    progress: SearchProgress,
+    /// 搜索命中结果。
+    results: Vec<SearchResultItem>,
+    /// 单文件读取或解码失败列表。
+    errors: Vec<SearchFileError>,
+    /// 当前记录是否来自被用户取消的搜索任务。
+    canceled: bool,
+    /// 记录是否展开显示明细。
+    expanded: bool,
+    /// 当前记录中已经展开的文件分组来源键。
+    ///
+    /// 业务意图：
+    /// - 历史记录只负责“这次搜索是否展开”，文件分组负责“某个文件内结果是否展开”。
+    /// - 使用来源稳定键而不是文件名，避免同名文件或压缩包内同名成员互相影响展开状态。
+    expanded_file_keys: HashSet<String>,
+}
+
+impl SearchHistoryRecord {
+    /// 返回当前记录的状态文案。
+    ///
+    /// 边界条件：
+    /// - 取消状态优先于进度判断，否则关闭对话框后旧任务回调被丢弃，记录会长期误显示为“搜索中”。
+    fn state_label(&self) -> &'static str {
+        if self.canceled {
+            "已取消"
+        } else if self.progress.searched_files < self.progress.total_files {
+            "搜索中"
+        } else {
+            "完成"
+        }
+    }
+}
+
+/// 搜索结果面板虚拟列表行。
+///
+/// 业务意图：
+/// - 面板需要同时展示搜索历史记录头、命中明细、错误明细和空态说明。
+/// - 统一展平成固定高度行后仍可继续使用 `uniform_list`，避免大量结果时重新引入滚动卡顿。
+#[derive(Clone)]
+enum SearchResultsPanelRow {
+    /// 一条搜索历史记录的摘要行。
+    RecordHeader { record_index: usize },
+    /// 一条文件分组摘要行。
+    FileHeader {
+        /// 所属历史记录下标。
+        record_index: usize,
+        /// 文件来源稳定键。
+        source_key: String,
+        /// 文件完整展示路径。
+        ///
+        /// 业务意图：
+        /// - 文件分组行渲染时直接使用缓存的展示文本，避免滚动可见行时重新扫描该搜索记录的全部命中。
+        full_path: String,
+        /// 当前文件内命中数量。
+        ///
+        /// 业务意图：
+        /// - 该数量在展平行时已经可以确定，缓存到行模型中可以让虚拟列表渲染保持 O(可见行数)。
+        result_count: usize,
+    },
+    /// 一条搜索命中明细行。
+    Result {
+        /// 所属历史记录下标。
+        record_index: usize,
+        /// 命中结果下标。
+        result_index: usize,
+    },
+    /// 一条文件级错误明细行。
+    Error {
+        /// 所属历史记录下标。
+        record_index: usize,
+        /// 错误下标。
+        error_index: usize,
+    },
+    /// 展开记录但暂无命中或错误时显示的说明行。
+    Empty { record_index: usize },
+}
+
+/// 搜索历史记录内的文件分组。
+///
+/// 业务意图：
+/// - 同一个文件可能有大量命中，结果面板需要先按文件归类，再让用户按需展开某个文件。
+/// - 分组只保存命中结果在 `record.results` 中的下标，避免复制整条命中记录导致内存上涨。
+#[derive(Clone)]
+struct SearchResultFileGroup {
+    /// 文件来源稳定键。
+    source_key: String,
+    /// 文件完整展示路径。
+    ///
+    /// 业务意图：
+    /// - 结果面板按文件分组时，用户需要直接看到完整路径判断命中来源，避免文件名相同但目录不同造成误判。
+    full_path: String,
+    /// 当前文件内的命中结果下标。
+    result_indices: Vec<usize>,
+}
+
+/// 搜索结果面板状态。
+///
+/// 业务意图：
+/// - 面板从右侧内容区底部弹出，保存搜索历史记录和高度。
+/// - 结果列表使用虚拟列表滚动句柄，避免大量命中时滚动卡顿。
+#[derive(Clone)]
+struct SearchResultsPanelState {
+    /// 搜索历史记录，按发起时间从旧到新排列。
+    records: Vec<SearchHistoryRecord>,
+    /// 已展平的虚拟列表行缓存。
+    ///
+    /// 业务意图：
+    /// - 搜索结果可能包含成千上万条命中，滚动时不能每一帧都重新展平全部历史记录和文件分组。
+    /// - 该缓存只在记录增删、命中追加或展开状态改变时重建，渲染时按可见 range 直接取片段。
+    rows: Vec<SearchResultsPanelRow>,
+    /// 面板当前高度。
+    height: f32,
+    /// 结果虚拟列表滚动句柄。
+    scroll_handle: UniformListScrollHandle,
+}
+
+/// 搜索结果面板右键菜单状态。
+///
+/// 业务意图：
+/// - 结果面板可能包含多次搜索和大量文件分组，用户需要批量展开或收起以快速调整信息密度。
+/// - GPUI 0.2.2 没有适合该场景的现成上下文菜单，因此保存右键位置并自绘菜单。
+struct SearchResultsContextMenu {
+    /// 菜单左上角相对右侧日志工作区的横坐标。
+    x: f32,
+    /// 菜单左上角相对右侧日志工作区的纵坐标。
+    y: f32,
+}
+
+/// 搜索结果面板右键菜单命令。
+#[derive(Clone, Copy)]
+enum SearchResultsContextMenuAction {
+    /// 展开所有搜索历史记录和文件分组。
+    ExpandAll,
+    /// 收起所有搜索历史记录和文件分组。
+    CollapseAll,
+}
+
+include!("app_impl/thread_analysis.rs");
+
+include!("app_impl/settings_window.rs");
+
+include!("app_impl/search_window.rs");
+
+enum LogTabState {
+    /// 正在读取或重新解码。
+    Loading {
+        /// 展示给用户的中文状态。
+        message: String,
+    },
+    /// 已成功解码。
+    Ready {
+        /// 可供右侧虚拟列表渲染的日志文档。
+        ///
+        /// 业务意图：
+        /// - 小文件保存完整解码文档，超大文件保存分页文档；UI 渲染层通过统一枚举读取行数和可见文本。
+        document: LogTabDocument,
+    },
+    /// 读取或解码失败。
+    Failed {
+        /// 中文错误说明。
+        message: String,
+    },
+}
+
+/// 日志 tab 读取完成后回到 UI 线程的数据。
+///
+/// 业务意图：
+/// - 后台任务不能直接修改 GPUI 状态，必须把结果封装后在 `view.update` 中合并。
+enum LogTabLoadResult {
+    /// 读取和自动解码都成功。
+    Ready {
+        /// 原始字节，用于后续手动切换编码。
+        raw_bytes: Option<Arc<Vec<u8>>>,
+        /// 自动解码后的文档。
+        document: LogTabDocument,
+    },
+    /// 原始字节读取成功，但自动检测或解码失败。
+    DecodeFailed {
+        /// 原始字节仍需保留，用户可以手动选择编码重新解析。
+        raw_bytes: Arc<Vec<u8>>,
+        /// 中文错误说明。
+        message: String,
+    },
+    /// 原始字节读取失败。
+    ReadFailed {
+        /// 中文错误说明。
+        message: String,
+    },
+}
+
+/// 日志 tab 重新解码完成后的结果。
+///
+/// 业务意图：
+/// - 手动切换编码只需要更新文档状态，不需要替换原始字节。
+enum LogTabDecodeResult {
+    /// 解码成功。
+    Ready {
+        /// 触发该后台任务时用户选择的编码策略。
+        ///
+        /// 业务意图：
+        /// - 用户快速连续切换编码时，较早的后台任务可能晚返回；合并阶段需要用该字段识别并丢弃过期结果。
+        encoding_choice: EncodingChoice,
+        /// 新编码下的日志文档。
+        document: LogTabDocument,
+    },
+    /// 解码失败。
+    Failed {
+        /// 触发该后台任务时用户选择的编码策略。
+        ///
+        /// 边界条件：
+        /// - 如果该值已经不是 tab 当前选择，说明用户又切换了编码，旧错误不能覆盖新的加载状态。
+        encoding_choice: EncodingChoice,
+        /// 中文错误说明。
+        message: String,
+    },
+}
+
+/// tab 右键菜单状态。
+///
+/// 业务意图：
+/// - GPUI 0.2.2 的 `show_window_menu` 是系统窗口菜单，不适合作为 tab 操作菜单。
+/// - 因此这里保存右键位置并用 GPUI 元素自绘一个轻量菜单。
+struct TabContextMenu {
+    /// 菜单针对的 tab ID。
+    tab_id: usize,
+    /// 菜单左上角的窗口内容区横坐标。
+    x: f32,
+    /// 菜单左上角的窗口内容区纵坐标。
+    y: f32,
+}
+
+/// 编码选择下拉框状态。
+///
+/// 业务意图：
+/// - 用户要求编码选择不要平铺在顶部，因此这里把当前打开的编码菜单作为独立弹层状态保存。
+/// - 菜单只绑定一个 tab，切换 tab、关闭 tab 或重新加载日志时都会收起，避免对旧 tab 继续操作。
+struct EncodingDropdownMenu {
+    /// 下拉框所属的 tab ID。
+    tab_id: usize,
+    /// 菜单左上角相对右侧日志工作区的横坐标。
+    ///
+    /// 业务意图：
+    /// - 编码选择器已经移动到右侧状态栏，按钮位置会随状态文本宽度变化，不能继续使用固定左边距。
+    x: f32,
+    /// 菜单左上角相对右侧日志工作区的纵坐标。
+    y: f32,
+}
+
+/// tab 右键菜单命令。
+///
+/// 业务意图：
+/// - 菜单项直接对应用户要求的三个关闭操作，避免 UI 文案和处理逻辑分散。
+#[derive(Clone, Copy)]
+enum TabContextMenuAction {
+    /// 关闭被右键点击的 tab。
+    Current,
+    /// 关闭除被右键点击 tab 之外的所有 tab。
+    OtherTabs,
+    /// 关闭所有 tab。
+    AllTabs,
+}
+
+/// 日志正文右键菜单状态。
+///
+/// 业务意图：
+/// - 日志正文使用自绘虚拟列表，不能依赖系统文本控件菜单；这里保存菜单所需的 tab 和右侧面板局部坐标。
+/// - 菜单只作用于当前右键所在 tab，避免用户切换 tab 后复制或保存到错误文件。
+struct LogViewerContextMenu {
+    /// 右键打开菜单时对应的日志 tab。
+    tab_id: usize,
+    /// 菜单左上角相对右侧日志工作区的横坐标。
+    x: f32,
+    /// 菜单左上角相对右侧日志工作区的纵坐标。
+    y: f32,
+}
+
+/// 日志正文右键菜单命令。
+///
+/// 业务意图：
+/// - 复制依赖当前正文选区；另存为依赖当前 tab 的原始日志来源，集中枚举可以保持渲染文案和执行逻辑一致。
+#[derive(Clone, Copy)]
+enum LogViewerContextMenuAction {
+    /// 复制当前正文选区到剪贴板。
+    Copy,
+    /// 将当前 tab 的日志来源保存到用户选择的目录。
+    SaveAs,
+}
+
+/// 左侧目录树单行渲染所需的输入数据。
+///
+/// 业务意图：
+/// - 目录树行需要同时表达层级、图标、元信息和点击行为，字段较多；集中成结构体可以保持渲染函数签名稳定。
+/// - 该结构只服务 UI 渲染，不回写加载层，也不作为文件来源持久化模型。
+struct LogTreeRowRenderData {
+    /// 当前加载结果内部的节点 ID，用于展开状态和元素稳定标识。
+    node_id: usize,
+    /// 当前节点在树中的深度，用于计算左侧缩进。
+    depth: usize,
+    /// 展开箭头图标；没有子节点时为 `None`，仍会保留占位宽度。
+    expand_icon: Option<Icon>,
+    /// 节点类型图标。
+    item_icon: Icon,
+    /// 节点类型图标颜色。
+    icon_color: u32,
+    /// 当前行是否可以展开或收起。
+    can_toggle: bool,
+    /// 当前行是否绑定日志正文来源；存在时点击打开右侧 tab。
+    source: Option<LogFileSource>,
+    /// 当前行在可见目录树中的下标。
+    ///
+    /// 业务意图：
+    /// - Shift 多选需要按当前可见顺序选择连续行，折叠隐藏的节点不应被纳入本次范围。
+    visible_index: usize,
+    /// 当前行是否处于左侧树选择集合中。
+    ///
+    /// 业务意图：
+    /// - 单击、多选和右键菜单都依赖可见选中态，渲染层需要用该字段决定背景和文字强调。
+    selected: bool,
+    /// 当前行展示文本。
+    label: String,
+    /// 当前行右侧短元信息。
+    meta: Option<String>,
+}
+
+/// 左侧目录树普通点击触发的主动作。
+///
+/// 业务意图：
+/// - 目录树需要同时支持“单击打开/展开”和 Shift、Ctrl/Command 多选；集中描述主动作可以避免点击处理里散落判断。
+/// - 该动作不携带真实文件来源，文件来源仍由调用点从加载层传入，避免测试辅助类型复制路径模型。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogTreePrimaryClickAction {
+    /// 不执行打开或展开，只保留选择变化。
+    None,
+    /// 打开当前日志文件到右侧 tab。
+    OpenSource,
+    /// 展开或收起当前目录/压缩包节点。
+    ToggleNode,
+}
+
+/// 左侧目录树右键菜单状态。
+///
+/// 业务意图：
+/// - 右键菜单作用于左侧当前选择文件集合；如果用户右键未选中文件，先把右键行作为唯一选择。
+/// - 菜单位置保存为左侧面板局部坐标，避免主窗口顶部工具栏或右侧区域偏移影响定位。
+struct LogTreeContextMenu {
+    /// 右键落点对应的节点 ID。
+    node_id: usize,
+    /// 右键落点对应的可读取文件来源。
+    ///
+    /// 业务意图：
+    /// - 如果当前多选集合里没有可读取文件，右键菜单命令仍应能作用于右键点中的文件。
+    /// - 单文件压缩包会在渲染阶段被映射成内部唯一文件来源，因此这里保存的是最终可打开/可分析来源。
+    source: Option<LogFileSource>,
+    /// 菜单左上角相对左侧目录树面板的横坐标。
+    x: f32,
+    /// 菜单左上角相对左侧目录树面板的纵坐标。
+    y: f32,
+}
+
+/// 左侧目录树右键菜单命令。
+///
+/// 业务意图：
+/// - 文件另存为和线程日志分析都基于当前多选文件集合，集中枚举可以让渲染和执行逻辑保持一致。
+#[derive(Clone, Copy)]
+enum LogTreeContextMenuAction {
+    /// 把当前多选日志文件保存到用户指定目录。
+    SaveAs,
+    /// 对当前多选日志文件执行 Java thread dump 时间线分析。
+    AnalyzeThreads,
+}
+
+/// 批量另存为的后台结果。
+///
+/// 业务意图：
+/// - 文件复制发生在后台线程，结果回到 UI 后只需要知道成功和失败数量，用于开发期诊断或后续状态栏展示。
+struct SaveSelectedLogsResult {
+    /// 成功写入的文件数量。
+    saved_count: usize,
+    /// 因用户选择“跳过”而未覆盖的同名文件数量。
+    skipped_count: usize,
+    /// 失败的文件数量。
+    failed_count: usize,
+}
+
+/// 另存为遇到同名目标文件时的处理策略。
+///
+/// 业务意图：
+/// - 用户要求目标目录已有同名文件时必须弹窗确认，并提供“跳过”和“覆盖”两种明确选择。
+/// - 策略作为纯数据传入后台保存函数，避免 UI 弹窗逻辑和文件复制逻辑耦合。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SaveConflictPolicy {
+    /// 跳过已存在的目标文件。
+    SkipExisting,
+    /// 覆盖已存在的目标文件。
+    OverwriteExisting,
+}
+
+/// 另存为同名文件确认弹窗状态。
+///
+/// 业务意图：
+/// - 批量另存为可能一次命中多个同名文件；主窗口只弹一次确认，用户选择后对本次保存任务统一应用。
+///
+/// 边界条件：
+/// - 这里只保存必要展示信息和待保存来源，不保存文件句柄；确认后仍按原管线重新物化和复制来源。
+struct SaveOverwriteConfirmDialog {
+    /// 待保存的日志来源。
+    sources: Vec<LogFileSource>,
+    /// 用户选择的目标目录。
+    target_directory: PathBuf,
+    /// 已存在目标路径数量。
+    conflict_count: usize,
+    /// 首个冲突目标路径，用于弹窗展示具体示例，避免用户无法判断风险。
+    first_conflict_path: PathBuf,
+}
+
+/// 用户通过“加载日志”按钮选择的路径来源类型。
+///
+/// 业务意图：
+/// - “加载日志”按钮现在直接打开系统选择器，减少点击后无反馈的歧义。
+/// - 枚举保留路径选择配置入口，后续如需区分平台或补充 Windows 专用目录选择策略时不影响调用方。
+#[derive(Clone, Copy)]
+enum LoadPromptKind {
+    /// 选择普通文件、目录或压缩包来源。
+    LogSources,
+}
+
+impl LoadPromptKind {
+    /// 为 GPUI 系统路径选择器生成配置。
+    ///
+    /// 业务意图：
+    /// - `files` 和 `directories` 同时开启，让 macOS 能像常见桌面工具一样在一次对话框里选择文件或目录。
+    /// - `multiple` 保持为 `true`，允许用户一次加载多个文件、目录或压缩包来源。
+    ///
+    /// 边界条件：
+    /// - GPUI 0.2.2 的 `PathPromptOptions` 不提供扩展名过滤字段，因此压缩包类型由加载层识别。
+    /// - GPUI 0.2.2 的 Windows 后端对混选支持有限，后续 Windows 真机验收时如不满足需要补专用文件/目录入口。
+    fn to_prompt_options(self) -> PathPromptOptions {
+        match self {
+            Self::LogSources => PathPromptOptions {
+                files: true,
+                directories: true,
+                multiple: true,
+                prompt: Some("选择日志来源".into()),
+            },
+        }
+    }
+
+    /// 返回进入加载状态时展示的中文说明。
+    ///
+    /// 边界条件：
+    /// - 当前文案只用于左侧目录树区域，不作为错误判断依据。
+    fn loading_message(self) -> &'static str {
+        match self {
+            Self::LogSources => "正在扫描已选择的日志来源...",
+        }
+    }
+}
+
+/// 主窗口根视图。
+///
+/// 业务意图：
+/// - 作为 GPUI 窗口的根实体，当前承载顶部工具栏、左右分栏和左侧日志目录树。
+/// - 后续日志列表、状态栏、设置面板等 UI 应从这个根视图向下扩展，而不是直接写在
+///   `main` 函数里，从而保持启动流程和渲染逻辑分离。
+///
+/// 边界条件：
+/// - 当前视图只在用户点击“加载日志”并完成系统选择器确认后读取路径。
+/// - 当前视图不保存持久状态，因此不会产生跨平台配置写入差异。
+struct MainView {
+    /// 主窗口句柄。
+    ///
+    /// 业务意图：
+    /// - 线程分析、搜索等独立窗口可能触发主窗口定位行为；保存主窗口句柄后，这些辅助窗口可以在操作完成后
+    ///   把主窗口重新激活到前台，让用户立刻看到跳转结果。
+    ///
+    /// 边界条件：
+    /// - `MainView::new` 执行时主窗口句柄尚未由 GPUI 返回，因此初始化为 `None`，窗口创建完成后立即回填。
+    main_window: Option<WindowHandle<MainView>>,
+
+    /// 左侧内容区域当前宽度。
+    ///
+    /// 业务意图：
+    /// - 保存用户在当前进程内拖动分割线后的结果，让左右栏布局能即时响应。
+    /// - 初始值来自 `LEFT_PANEL_DEFAULT_WIDTH`，严格满足默认左侧 300px 的需求。
+    ///
+    /// 边界条件：
+    /// - 当前宽度不写入磁盘；关闭应用后会恢复默认值。
+    /// - 更新宽度时必须经过最小宽度约束，避免左右任一区域被拖到不可用。
+    left_panel_width: f32,
+
+    /// 当前是否处于拖动分割线状态。
+    ///
+    /// 业务意图：
+    /// - 区分普通鼠标移动和调整分栏宽度，避免鼠标经过内容区域时误改布局。
+    ///
+    /// 边界条件：
+    /// - 鼠标左键在分割线按下时变为 `true`，在内容区域收到左键释放时恢复为 `false`。
+    /// - 当前不处理窗口失焦或鼠标释放发生在窗口外的情况，后续如需更强交互再补充捕获策略。
+    is_resizing_splitter: bool,
+
+    /// 左侧日志目录树当前的数据状态。
+    ///
+    /// 业务意图：
+    /// - 保存未加载、加载中、加载成功和加载失败状态，驱动内容区渲染。
+    /// - 真实加载结果只保存在内存中，不写入配置或缓存目录。
+    load_state: LogTreeLoadState,
+
+    /// 左侧目录树虚拟列表的滚动句柄。
+    ///
+    /// 业务意图：
+    /// - `uniform_list` 需要稳定句柄保存滚动位置和测量结果，否则每次重绘都可能重置滚动上下文。
+    /// - 每次重新加载日志后会替换为新句柄，让新目录树从顶部开始展示，避免继承上一棵树的滚动偏移。
+    ///
+    /// 边界条件：
+    /// - 该句柄只服务左侧目录树，不用于右侧日志正文或其它未来列表。
+    log_tree_scroll_handle: UniformListScrollHandle,
+
+    /// 左侧目录树当前选中的节点 ID 集合。
+    ///
+    /// 业务意图：
+    /// - 用户要求左侧树支持单选、Ctrl 多选和 Shift 连续多选；选择状态必须独立于右侧已打开 tab。
+    /// - 集合只保存节点 ID，不保存行号，避免折叠、展开或虚拟列表滚动后行号变化导致选中错误。
+    ///
+    /// 边界条件：
+    /// - 重新加载日志会清空该集合，因为节点 ID 只在一次加载结果内部有效。
+    /// - 目录、压缩包和错误节点也可以被选中用于视觉反馈，但文件操作会只筛选可读取文件来源。
+    log_tree_selected_node_ids: HashSet<usize>,
+
+    /// Shift 多选的锚点节点 ID。
+    ///
+    /// 业务意图：
+    /// - 常见文件树中 Shift 点击会从最近一次普通点击或 Ctrl 点击位置扩展到当前行。
+    /// - 锚点使用节点 ID，再通过当前可见行列表定位，确保折叠后的范围只覆盖用户当前看得到的行。
+    log_tree_selection_anchor: Option<usize>,
+
+    /// 当前打开的左侧目录树右键菜单。
+    ///
+    /// 业务意图：
+    /// - 菜单承载“另存为”和“线程日志分析”，需要记录右键位置并跟随当前主题自绘。
+    /// - 该状态只属于当前会话，不持久化，也不会影响右侧 tab 状态。
+    log_tree_context_menu: Option<LogTreeContextMenu>,
+
+    /// 右侧 tab 栏横向滚动句柄。
+    ///
+    /// 业务意图：
+    /// - tab 标题需要完整展示，不再省略；打开日志较多时通过横向滚动查看所有 tab。
+    /// - 使用 GPUI `ScrollHandle` 保存横向偏移，滚动箭头和鼠标滚动可以共享同一份滚动状态。
+    tab_bar_scroll_handle: ScrollHandle,
+
+    /// 右侧已经打开的日志 tab 列表。
+    ///
+    /// 业务意图：
+    /// - 每个日志文件一个 tab，保存读取状态、编码选择和滚动句柄。
+    /// - Vec 顺序就是 tab 栏展示顺序，第一版不支持拖拽重排。
+    open_tabs: Vec<OpenLogTab>,
+
+    /// 当前激活的日志 tab ID。
+    ///
+    /// 边界条件：
+    /// - 没有打开任何 tab 时为 `None`，右侧展示“点击左侧日志文件查看内容”的提示。
+    /// - 关闭当前 tab 后会自动切换到剩余 tab 中靠近当前位置的一个。
+    active_tab_id: Option<usize>,
+
+    /// 下一个待分配的 tab ID。
+    ///
+    /// 业务意图：
+    /// - 使用单调递增 ID 避免 Vec 下标在关闭 tab 后失效，后台任务也能安全定位目标 tab。
+    next_tab_id: usize,
+
+    /// 当前打开的 tab 右键菜单。
+    ///
+    /// 边界条件：
+    /// - 菜单只在当前窗口内显示，不跨 tab 或跨加载持久化。
+    tab_context_menu: Option<TabContextMenu>,
+
+    /// 当前打开的编码下拉框。
+    ///
+    /// 业务意图：
+    /// - 编码切换控件从平铺按钮改为下拉框后，需要记录哪个 tab 的菜单处于展开状态。
+    /// - 该状态只影响当前 UI 帧，不持久化，也不参与日志内容解码结果。
+    encoding_dropdown_menu: Option<EncodingDropdownMenu>,
+
+    /// 当前打开的日志正文右键菜单。
+    ///
+    /// 业务意图：
+    /// - 菜单提供复制选区和当前文件另存为，状态必须跟随右侧工作区保存，避免和左侧树菜单互相污染。
+    /// - 重新加载、切换 tab、关闭 tab 或切换编码时应清空，避免菜单作用到已经失效的正文选区。
+    log_viewer_context_menu: Option<LogViewerContextMenu>,
+
+    /// 另存为同名文件覆盖确认弹窗。
+    ///
+    /// 业务意图：
+    /// - 用户选择目标目录后，如果检测到同名文件，必须暂停保存并让用户明确选择“跳过”或“覆盖”。
+    ///
+    /// 边界条件：
+    /// - 弹窗只作用于当前这一次另存为任务；用户取消或完成后必须清空，避免后续保存误用旧来源。
+    save_overwrite_confirm_dialog: Option<SaveOverwriteConfirmDialog>,
+
+    /// 日志正文自绘滚动条的拖动状态。
+    ///
+    /// 业务意图：
+    /// - GPUI `uniform_list` 本身负责滚轮滚动和虚拟渲染，但当前 UI 需要可见滚动条支持鼠标拖动。
+    /// - 该状态把鼠标拖动生命周期和具体 tab 绑定，避免切换 tab 后继续写入旧日志视图的滚动偏移。
+    ///
+    /// 边界条件：
+    /// - 只支持鼠标左键拖动滑块；点击轨道跳转、键盘滚动和触控条行为后续再按验收标准扩展。
+    log_scrollbar_drag: Option<LogScrollbarDrag>,
+
+    /// 左侧目录树自绘滚动条的拖动状态。
+    ///
+    /// 业务意图：
+    /// - 大目录树使用虚拟列表时需要可见滚动条，并支持鼠标拖动定位。
+    /// - 该状态只保存拖动过程中的临时偏移，不影响目录树展开状态或加载结果。
+    ///
+    /// 边界条件：
+    /// - 重新加载日志会替换目录树滚动句柄，同时清理该拖动状态，避免旧测量数据继续参与滚动计算。
+    log_tree_scrollbar_drag: Option<LogTreeScrollbarDrag>,
+
+    /// 当前搜索对话框状态。
+    ///
+    /// 业务意图：
+    /// - `Ctrl+F` 或 `Cmd+F` 打开对话框；关闭后该字段为 `None`。
+    /// - 搜索条件只保留在内存中，不写入磁盘，避免在隐私规则未定义前保存用户查询词。
+    search_dialog: Option<SearchDialogState>,
+
+    /// 当前会话内的搜索关键字历史。
+    ///
+    /// 业务意图：
+    /// - 用户反复打开搜索窗口且日志正文没有选区时，应优先恢复最近一次搜索关键字。
+    /// - 历史只保存在内存中，最多 10 条并按最近使用排序，避免把日志敏感关键字写入配置文件。
+    ///
+    /// 边界条件：
+    /// - 空白关键字不记录；重复关键字会移动到首位，保证最近使用优先。
+    search_query_history: Vec<String>,
+
+    /// 搜索对话框独立窗口句柄。
+    ///
+    /// 业务意图：
+    /// - 搜索对话框已经迁移为独立窗口，主窗口需要保存句柄用于快捷键重复唤起、搜索完成自动关闭和取消搜索。
+    /// - 句柄只代表当前会话内的临时工具窗口，不参与持久化。
+    ///
+    /// 边界条件：
+    /// - 如果用户通过系统方式关闭窗口，关闭回调必须把该字段清空，避免后续 `Ctrl+F` 尝试激活已关闭窗口。
+    search_dialog_window: Option<WindowHandle<SearchDialogWindowView>>,
+
+    /// 设置窗口独立窗口句柄。
+    ///
+    /// 业务意图：
+    /// - 设置按钮会打开独立窗口；主窗口保存句柄用于重复点击时激活已有设置窗口，而不是创建多个重复窗口。
+    /// - 该句柄只服务当前会话，不参与持久化。
+    ///
+    /// 边界条件：
+    /// - 用户通过系统关闭按钮关闭设置窗口时，关闭回调必须清空该字段，避免后续点击设置按钮尝试激活失效窗口。
+    settings_window: Option<WindowHandle<SettingsWindowView>>,
+
+    /// 线程日志分析独立窗口句柄。
+    ///
+    /// 业务意图：
+    /// - 线程分析结果是独立工作视图，重复触发分析时更新或激活已有窗口，避免堆叠多个过期分析窗口。
+    /// - 句柄只服务当前会话；关闭窗口后由回调清空。
+    thread_analysis_window: Option<WindowHandle<ThreadAnalysisWindowView>>,
+
+    /// 设置窗口打开请求是否已经排队到下一帧。
+    ///
+    /// 业务意图：
+    /// - 设置窗口创建同样需要延后到 `MainView` 更新结束后执行；该标记用于合并同一帧内的重复点击。
+    /// - 真实窗口状态仍以 `settings_window` 为准，该字段只描述一次待执行的打开动作。
+    settings_window_open_pending: bool,
+
+    /// 设置窗口当前激活页签。
+    ///
+    /// 业务意图：
+    /// - 当前设置窗口包含“通用”和“模型”两个页签，该字段保存当前会话内最后访问的页签。
+    /// - 默认打开“通用”，符合用户要求第一个页签先提供通用显示设置。
+    settings_active_tab: SettingsTab,
+
+    /// 当前主题偏好。
+    ///
+    /// 业务意图：
+    /// - 通用页签提供主题选择，字段驱动全应用基础调色板并在用户修改后写入配置文件。
+    /// - 配置缺失或损坏时默认“跟随系统”，避免在用户未主动选择前改变现有视觉表现。
+    theme_preference: ThemePreference,
+
+    /// 日志正文显示字号，单位为 GPUI 逻辑像素。
+    ///
+    /// 业务意图：
+    /// - 通用页签允许用户微调日志正文阅读字号；字段驱动日志正文、搜索结果预览和鼠标命中测量。
+    ///
+    /// 边界条件：
+    /// - 只保存合法范围内的整数 px；行高暂不随字号变化，保证大日志虚拟列表信息密度不被设置改变。
+    log_viewer_font_size: f32,
+
+    /// 当前窗口系统外观。
+    ///
+    /// 业务意图：
+    /// - 当主题偏好为“跟随系统”时，需要用 GPUI 提供的窗口外观计算实际调色板。
+    /// - 该字段会随系统外观变化更新，驱动主窗口和独立窗口重绘。
+    system_window_appearance: WindowAppearance,
+
+    /// 主窗口外观变化订阅。
+    ///
+    /// 业务意图：
+    /// - GPUI 的窗口外观监听返回订阅句柄，必须保存在主视图中，否则监听会立即失效。
+    window_appearance_subscription: Option<gpui::Subscription>,
+
+    /// 搜索对话框打开请求是否已经排队到下一帧。
+    ///
+    /// 业务意图：
+    /// - macOS 的 `Cmd+F` / `Ctrl+F` 会先进入原生 key equivalent 回调，不能在该回调栈中直接创建独立窗口。
+    /// - 快捷键可能因为按键重复或平台重放在短时间内触发多次，因此用该标记合并同一帧内的重复打开请求。
+    ///
+    /// 边界条件：
+    /// - 该字段只描述“打开搜索窗口”这一瞬时任务，不代表窗口是否已经打开；真实窗口状态仍以 `search_dialog_window` 为准。
+    search_dialog_open_pending: bool,
+
+    /// 搜索结果底部面板状态。
+    ///
+    /// 业务意图：
+    /// - 搜索开始后立即打开结果面板展示进行中状态，完成后保留结果供用户点击定位。
+    /// - 关闭面板只隐藏当前结果，不影响搜索对话框中的查询词。
+    search_results_panel: Option<SearchResultsPanelState>,
+
+    /// 搜索结果面板高度拖动状态。
+    ///
+    /// 边界条件：
+    /// - 如果用户关闭结果面板或鼠标释放，拖动状态必须清空，避免下一次鼠标移动继续改变高度。
+    search_results_resize_drag: Option<SearchResultsResizeDrag>,
+
+    /// 搜索结果面板滚动条拖动状态。
+    ///
+    /// 业务意图：
+    /// - 结果面板内容较多时，用户可以直接拖动滚动条快速定位，而不是只能依赖滚轮。
+    /// - 该状态独立于面板高度拖动，避免滚动和 resize 两类交互互相覆盖。
+    search_results_scrollbar_drag: Option<SearchResultsScrollbarDrag>,
+
+    /// 当前打开的搜索结果右键菜单。
+    ///
+    /// 业务意图：
+    /// - 搜索结果面板支持右键批量展开/收起，菜单状态独立于 tab 菜单和编码下拉框。
+    /// - 关闭面板、点击空白或执行菜单命令时必须清理该状态。
+    search_results_context_menu: Option<SearchResultsContextMenu>,
+
+    /// 下一个搜索任务 ID。
+    ///
+    /// 业务意图：
+    /// - 后台搜索任务可能乱序返回，使用单调递增 ID 可以丢弃旧任务更新。
+    next_search_job_id: usize,
+
+    /// 搜索输入框焦点句柄。
+    ///
+    /// 业务意图：
+    /// - `Ctrl+F` 打开对话框后应立即把键盘输入导向查询框。
+    /// - 焦点句柄只服务搜索输入，不和日志正文或目录树共用，避免快捷键和普通输入互相干扰。
+    search_input_focus: gpui::FocusHandle,
+
+    /// 当前目录搜索目标输入框焦点句柄。
+    ///
+    /// 业务意图：
+    /// - 目录目标输入框同样需要支持中文路径和 IME 组合输入，必须拥有独立焦点以区分平台输入应该写入哪个字段。
+    /// - 不与关键字输入框共用焦点，避免用户编辑目录时误把文本写入查询词。
+    search_directory_focus: gpui::FocusHandle,
+
+    /// 搜索关键字输入框最近一次由 GPUI 文本系统排版得到的单行布局。
+    ///
+    /// 业务意图：
+    /// - 关键字输入框需要单击定位、拖拽选择、双击选词和三连击全选。
+    /// - GPUI 当前版本没有公开导出的现成 `TextInput` 控件，官方示例也通过保存 `ShapedLine` 来完成精确命中，
+    ///   因此这里缓存布局结果，避免使用固定字符宽度导致中文、英文和路径字符命中不准。
+    search_query_last_layout: Option<ShapedLine>,
+
+    /// 搜索关键字输入框最近一次绘制时的窗口坐标边界。
+    ///
+    /// 边界条件：
+    /// - 窗口缩放、主题切换或内容变化都会在下一次绘制时刷新该值；绘制前为空时鼠标命中退化到文本末尾。
+    search_query_last_bounds: Option<Bounds<Pixels>>,
+
+    /// 目录目标输入框最近一次由 GPUI 文本系统排版得到的单行布局。
+    ///
+    /// 业务意图：
+    /// - 目录路径可能包含中文、空格和平台分隔符，必须用真实字形布局计算点击位置。
+    search_directory_last_layout: Option<ShapedLine>,
+
+    /// 目录目标输入框最近一次绘制时的窗口坐标边界。
+    search_directory_last_bounds: Option<Bounds<Pixels>>,
+
+    /// 当前正在拖拽选择的搜索文本输入槽位。
+    ///
+    /// 边界条件：
+    /// - 只在鼠标左键按下并移动期间有效；鼠标释放、关闭搜索窗口或切换输入框时都应清空。
+    search_text_selection_drag: Option<(SearchTextInputKind, usize)>,
+
+    /// 搜索输入框最近一次光标活动时间。
+    ///
+    /// 业务意图：
+    /// - 用户移动光标、点击定位或输入文本的当前帧应立即显示光标，避免操作反馈落在闪烁隐藏帧。
+    /// - 活动停止后直接进入闪烁状态，不再保留额外延迟。
+    ///
+    /// 边界条件：
+    /// - 该字段只服务当前会话内的搜索窗口，不写入配置；系统休眠恢复后 `Instant` 仍适合做相对时间判断。
+    search_text_cursor_last_activity: Instant,
+
+    /// 全局键盘监听订阅。
+    ///
+    /// 业务意图：
+    /// - GPUI 的全局快捷键拦截器返回订阅句柄，必须跟随主视图保存，否则订阅被释放后 `Ctrl+F` 将不再生效。
+    /// - 使用拦截器而不是事后观察器，是为了在 macOS key equivalent 和输入控件提前消费事件前捕获搜索快捷键。
+    global_keystroke_subscription: Option<gpui::Subscription>,
+
+    /// 主界面根节点焦点句柄。
+    ///
+    /// 业务意图：
+    /// - 主窗口需要存在稳定焦点路径，搜索对话框关闭后可以把焦点恢复到根节点，后续全局快捷键和普通鼠标操作才能继续落到主界面。
+    /// - 搜索对话框关闭后可把焦点还给根节点，避免焦点停在已经关闭的搜索窗口上导致后续快捷键无响应。
+    root_focus_handle: gpui::FocusHandle,
+}
+
+impl MainView {
+    /// 创建主窗口根视图。
+    ///
+    /// 业务意图：
+    /// - 集中初始化所有首屏 UI 状态，避免在 `main` 的窗口创建回调中散落默认值。
+    /// - 左侧栏默认 300px 是用户明确要求，必须从这里作为唯一入口初始化。
+    fn new(context: &mut Context<Self>) -> Self {
+        Self {
+            left_panel_width: LEFT_PANEL_DEFAULT_WIDTH,
+            main_window: None,
+            is_resizing_splitter: false,
+            load_state: LogTreeLoadState::Empty,
+            log_tree_scroll_handle: UniformListScrollHandle::new(),
+            log_tree_selected_node_ids: HashSet::new(),
+            log_tree_selection_anchor: None,
+            log_tree_context_menu: None,
+            tab_bar_scroll_handle: ScrollHandle::new(),
+            open_tabs: Vec::new(),
+            active_tab_id: None,
+            next_tab_id: 1,
+            tab_context_menu: None,
+            encoding_dropdown_menu: None,
+            log_viewer_context_menu: None,
+            save_overwrite_confirm_dialog: None,
+            log_scrollbar_drag: None,
+            log_tree_scrollbar_drag: None,
+            search_dialog: None,
+            search_query_history: Vec::new(),
+            search_dialog_window: None,
+            settings_window: None,
+            thread_analysis_window: None,
+            settings_window_open_pending: false,
+            settings_active_tab: SettingsTab::General,
+            theme_preference: load_theme_preference(),
+            log_viewer_font_size: load_log_viewer_font_size_preference(),
+            system_window_appearance: WindowAppearance::Light,
+            window_appearance_subscription: None,
+            search_dialog_open_pending: false,
+            search_results_panel: None,
+            search_results_resize_drag: None,
+            search_results_scrollbar_drag: None,
+            search_results_context_menu: None,
+            next_search_job_id: 1,
+            search_input_focus: context.focus_handle(),
+            search_directory_focus: context.focus_handle(),
+            search_query_last_layout: None,
+            search_query_last_bounds: None,
+            search_directory_last_layout: None,
+            search_directory_last_bounds: None,
+            search_text_selection_drag: None,
+            search_text_cursor_last_activity: Instant::now(),
+            global_keystroke_subscription: None,
+            root_focus_handle: context.focus_handle(),
+        }
+    }
+
+    /// 返回当前主视图实际生效的主题。
+    fn effective_theme(&self) -> EffectiveTheme {
+        EffectiveTheme::resolve(self.theme_preference, self.system_window_appearance)
+    }
+
+    /// 返回当前主视图调色板。
+    fn palette(&self) -> AppThemePalette {
+        AppThemePalette::for_theme(self.effective_theme())
+    }
+
+    /// 更新系统窗口外观。
+    ///
+    /// 业务意图：
+    /// - 当用户选择“跟随系统”时，系统外观变化应立即驱动当前窗口重绘。
+    /// - 即使用户强制选择明亮或暗色，也保存最新系统外观，方便之后切回“跟随系统”时立即正确。
+    fn set_system_window_appearance(
+        &mut self,
+        appearance: WindowAppearance,
+        context: &mut Context<Self>,
+    ) {
+        self.system_window_appearance = appearance;
+        context.notify();
+    }
+
+    /// 构建顶部工具栏。
+    ///
+    /// 业务意图：
+    /// - 将全局操作入口集中在窗口顶部，符合日志查看客户端的主要工作流。
+    /// - “加载日志”已经接入真实路径选择和目录树扫描；设置会打开独立设置窗口；诊断仍只保留入口。
+    ///
+    /// 边界条件：
+    /// - 工具栏内容固定为单行，超窄窗口下的折叠、隐藏或溢出行为尚未定义。
+    /// - 诊断按钮当前只保留入口，后续实现具体业务时必须补充对应业务规则和错误处理。
+    fn render_toolbar(&self, context: &mut Context<Self>) -> impl IntoElement {
+        let palette = self.palette();
+
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(TOOLBAR_HEIGHT))
+            .pl(px(LOG_TREE_ROW_HORIZONTAL_PADDING))
+            .pr_4()
+            .bg(rgb(palette.panel))
+            .border_b_1()
+            .border_color(rgb(palette.border))
+            .child(self.render_load_toolbar_button(context))
+            .child(self.render_search_toolbar_button(context))
+            .child(Self::render_toolbar_button(&TOOLBAR_ACTIONS[2], palette))
+            .child(self.render_settings_toolbar_button(context))
+    }
+
+    /// 构建“加载日志”工具栏按钮。
+    ///
+    /// 业务意图：
+    /// - 该按钮是当前首个真实业务入口，点击后直接打开系统选择器，避免用户误判为没有响应。
+    /// - 与其它工具栏按钮保持相同文字按钮样式，避免功能入口因为有状态而产生视觉突兀。
+    ///
+    /// 边界条件：
+    /// - 按钮左内边距为 0，使图标左缘和加载后目录树标题左缘使用同一条基准线。
+    /// - 当前通过 GPUI 的路径选择器同时请求文件和目录；Windows 混选能力需在后续真机验收中确认。
+    fn render_load_toolbar_button(&self, context: &mut Context<Self>) -> impl IntoElement {
+        let action = &TOOLBAR_ACTIONS[0];
+        let palette = self.palette();
+
+        div()
+            .id(SharedString::from(action.label))
+            .flex()
+            .items_center()
+            .gap_1()
+            .flex_none()
+            .pl(px(0.0))
+            .pr(px(TOOLBAR_BUTTON_HORIZONTAL_PADDING))
+            .py(px(TOOLBAR_BUTTON_VERTICAL_PADDING))
+            .text_sm()
+            .text_color(rgb(palette.text))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .hover(move |button| button.text_color(rgb(palette.accent)))
+            .active(|button| button.opacity(0.82))
+            .child(Self::render_lucide_icon(
+                Some(action.icon),
+                TOOLBAR_BUTTON_ICON_WIDTH,
+                TOOLBAR_BUTTON_ICON_SIZE,
+                palette.muted_text,
+            ))
+            .child(action.label)
+            .on_click(context.listener(Self::open_log_sources_prompt))
+    }
+
+    /// 构建“搜索”工具栏按钮。
+    ///
+    /// 业务意图：
+    /// - 搜索除了快捷键外必须有可见入口，用户在 macOS/Windows 快捷键被系统或输入法拦截时仍能打开搜索窗口。
+    /// - 搜索按钮放在“加载日志”和“智能诊断”之间，符合先加载、再搜索、再诊断的排障流程顺序。
+    ///
+    /// 边界条件：
+    /// - 点击按钮来自鼠标事件，不处于 macOS key equivalent 回调栈中，因此可以直接打开或激活独立搜索窗口。
+    /// - 如果日志正文已有选区，沿用快捷键入口的预填逻辑，把选中文本写入搜索关键字。
+    fn render_search_toolbar_button(&self, context: &mut Context<Self>) -> impl IntoElement {
+        let action = &TOOLBAR_ACTIONS[1];
+        let palette = self.palette();
+
+        div()
+            .id(SharedString::from(action.label))
+            .flex()
+            .items_center()
+            .gap_1()
+            .flex_none()
+            .px(px(TOOLBAR_BUTTON_HORIZONTAL_PADDING))
+            .py(px(TOOLBAR_BUTTON_VERTICAL_PADDING))
+            .text_sm()
+            .text_color(rgb(palette.text))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .hover(move |button| button.text_color(rgb(palette.accent)))
+            .active(|button| button.opacity(0.82))
+            .child(Self::render_lucide_icon(
+                Some(action.icon),
+                TOOLBAR_BUTTON_ICON_WIDTH,
+                TOOLBAR_BUTTON_ICON_SIZE,
+                palette.muted_text,
+            ))
+            .child(action.label)
+            .on_click(context.listener(Self::open_search_from_toolbar))
+    }
+
+    /// 构建一个顶部工具栏按钮。
+    ///
+    /// 业务意图：
+    /// - 统一工具栏入口的视觉样式，避免后续每个功能入口自行定义按钮外观。
+    /// - 按钮使用“图标 + 中文文字”的文字按钮形态，满足轻量工具栏要求。
+    ///
+    /// 边界条件：
+    /// - 当前仅用于“智能诊断”占位入口；点击后不改变状态、不访问文件、不请求网络。
+    /// - `id` 使用按钮标签生成，当前三个标签唯一；后续如果允许重复入口，需要改为稳定枚举 ID。
+    fn render_toolbar_button(action: &ToolbarAction, palette: AppThemePalette) -> impl IntoElement {
+        div()
+            .id(SharedString::from(action.label))
+            .flex()
+            .items_center()
+            .gap_1()
+            .flex_none()
+            .px(px(TOOLBAR_BUTTON_HORIZONTAL_PADDING))
+            .py(px(TOOLBAR_BUTTON_VERTICAL_PADDING))
+            .text_sm()
+            .text_color(rgb(palette.text))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .hover(move |button| button.text_color(rgb(palette.accent)))
+            .active(|button| button.opacity(0.82))
+            .child(Self::render_lucide_icon(
+                Some(action.icon),
+                TOOLBAR_BUTTON_ICON_WIDTH,
+                TOOLBAR_BUTTON_ICON_SIZE,
+                palette.muted_text,
+            ))
+            .child(action.label)
+            .on_click(|_event, _window, _context| {
+                // 智能诊断当前只要求保留入口，具体业务动作尚未定义。
+                // 后续实现时应按 AGENTS.md 先确认权限、数据边界和验收标准，再绑定真实处理逻辑。
+            })
+    }
+
+    /// 构建“设置”工具栏按钮。
+    ///
+    /// 业务意图：
+    /// - 设置入口现在有真实独立窗口，重复点击应激活已有窗口，避免用户打开多个配置窗口后状态不一致。
+    /// - 视觉样式保持和其它工具栏按钮一致，避免设置入口因为已接入功能而破坏顶部工具栏节奏。
+    fn render_settings_toolbar_button(&self, context: &mut Context<Self>) -> impl IntoElement {
+        let action = &TOOLBAR_ACTIONS[3];
+        let palette = self.palette();
+
+        div()
+            .id(SharedString::from(action.label))
+            .flex()
+            .items_center()
+            .gap_1()
+            .flex_none()
+            .px(px(TOOLBAR_BUTTON_HORIZONTAL_PADDING))
+            .py(px(TOOLBAR_BUTTON_VERTICAL_PADDING))
+            .text_sm()
+            .text_color(rgb(palette.text))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .hover(move |button| button.text_color(rgb(palette.accent)))
+            .active(|button| button.opacity(0.82))
+            .child(Self::render_lucide_icon(
+                Some(action.icon),
+                TOOLBAR_BUTTON_ICON_WIDTH,
+                TOOLBAR_BUTTON_ICON_SIZE,
+                palette.muted_text,
+            ))
+            .child(action.label)
+            .on_click(context.listener(Self::open_settings_from_toolbar))
+    }
+
+    /// 打开日志来源选择器。
+    ///
+    /// 业务意图：
+    /// - 用户点击“加载日志”后必须立即看到系统选择器反馈，避免工具栏按钮看起来没有响应。
+    /// - 选择器允许选择文件、目录和压缩包；具体来源类型由加载模块根据路径和元数据判断。
+    fn open_log_sources_prompt(
+        &mut self,
+        _event: &ClickEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.begin_path_prompt(LoadPromptKind::LogSources, context);
+    }
+
+    /// 从工具栏按钮打开搜索窗口。
+    ///
+    /// 业务意图：
+    /// - 该入口和 `Ctrl+F` / `Cmd+F` 使用同一套 `open_search_dialog` 状态初始化逻辑，保证查询词预填、目录目标和已有窗口激活行为一致。
+    /// - GPUI 的点击监听执行时 `MainView` 仍处于更新租借中；搜索窗口创建会观察并读取 `MainView`，
+    ///   因此这里也必须排到下一帧执行，避免“cannot read MainView while it is already being updated”。
+    fn open_search_from_toolbar(
+        &mut self,
+        _event: &ClickEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.schedule_open_search_dialog(window, context);
+    }
+
+    /// 从工具栏按钮打开设置窗口。
+    ///
+    /// 业务意图：
+    /// - 设置窗口会持有并观察 `MainView`，因此和搜索窗口一样延后到当前主视图更新结束后再创建。
+    /// - 这样可以避免在按钮点击的状态更新栈中同时读取同一个 `MainView`。
+    fn open_settings_from_toolbar(
+        &mut self,
+        _event: &ClickEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.schedule_open_settings_window(window, context);
+    }
+
+    /// 在当前主视图更新结束后打开设置窗口。
+    ///
+    /// 业务意图：
+    /// - 设置窗口会读取并观察 `MainView`，直接在按钮监听中创建会和当前更新租借冲突。
+    /// - 重复点击设置按钮时只排队一次，避免同一帧创建多个设置窗口。
+    fn schedule_open_settings_window(&mut self, window: &mut Window, context: &mut Context<Self>) {
+        if self.settings_window_open_pending {
+            return;
+        }
+
+        self.settings_window_open_pending = true;
+        let main_view = context.entity();
+        window.defer(context, move |_window, app| {
+            Self::open_settings_window_after_main_update(main_view, app);
+        });
+        context.notify();
+    }
+
+    /// 启动系统路径选择器，并在用户确认后异步扫描路径。
+    ///
+    /// 业务意图：
+    /// - 系统选择器必须在前台应用上下文中打开；文件系统扫描可能较慢，因此放到后台执行器。
+    /// - 新一轮扫描完成前会清空旧 tab，避免右侧继续展示不属于当前来源树的日志内容。
+    ///
+    /// 边界条件：
+    /// - 用户取消选择时保持现有目录树不变。
+    /// - 当前不支持取消后台扫描；如果用户连续触发多次加载，后完成的任务会覆盖先完成的任务。
+    fn begin_path_prompt(&mut self, prompt_kind: LoadPromptKind, context: &mut Context<Self>) {
+        let options = prompt_kind.to_prompt_options();
+        let loading_message = prompt_kind.loading_message().to_string();
+
+        context
+            .spawn(async move |view, app| {
+                let receiver = match app.update(|app| app.prompt_for_paths(options)) {
+                    Ok(receiver) => receiver,
+                    Err(error) => {
+                        view.update(app, |view, context| {
+                            view.load_state = LogTreeLoadState::Failed {
+                                message: format!("无法打开系统路径选择器：{}", error),
+                            };
+                            context.notify();
+                        })
+                        .ok();
+                        return;
+                    }
+                };
+
+                let selected_paths: Vec<PathBuf> = match receiver.await {
+                    Ok(Ok(Some(paths))) if !paths.is_empty() => paths,
+                    Ok(Ok(_)) => return,
+                    Ok(Err(error)) => {
+                        view.update(app, |view, context| {
+                            view.load_state = LogTreeLoadState::Failed {
+                                message: format!("路径选择器返回错误：{}", error),
+                            };
+                            context.notify();
+                        })
+                        .ok();
+                        return;
+                    }
+                    Err(error) => {
+                        view.update(app, |view, context| {
+                            view.load_state = LogTreeLoadState::Failed {
+                                message: format!("路径选择器被中断：{}", error),
+                            };
+                            context.notify();
+                        })
+                        .ok();
+                        return;
+                    }
+                };
+
+                view.update(app, |view, context| {
+                    view.start_log_source_load(selected_paths, loading_message, context);
+                })
+                .ok();
+            })
+            .detach();
+    }
+
+    /// 启动一轮日志来源加载。
+    ///
+    /// 业务意图：
+    /// - 系统路径选择器、窗口拖放、程序图标拖放和命令行启动都应该复用同一套加载流程。
+    /// - 入口统一后，清理旧 tab、重置搜索结果、单日志自动打开和错误展示不会在不同入口之间出现行为差异。
+    ///
+    /// 边界条件：
+    /// - 空路径通常代表用户取消或平台传入了非文件 URL，直接忽略，避免清空当前工作区。
+    /// - 后台扫描不能阻塞 GPUI 主线程；完成后再回到主视图更新 UI。
+    fn start_log_source_load(
+        &mut self,
+        selected_paths: Vec<PathBuf>,
+        loading_message: String,
+        context: &mut Context<Self>,
+    ) {
+        if selected_paths.is_empty() {
+            return;
+        }
+
+        self.clear_workspace_for_new_log_load();
+        self.load_state = LogTreeLoadState::Loading {
+            message: loading_message,
+        };
+        context.notify();
+
+        context
+            .spawn(async move |view, app| {
+                let load_result = app
+                    .background_executor()
+                    .spawn(async move { load_log_sources(selected_paths) })
+                    .await;
+
+                view.update(app, |view, context| {
+                    view.load_state = match load_result {
+                        Ok(tree) => {
+                            view.log_tree_scroll_handle = UniformListScrollHandle::new();
+                            view.log_tree_scrollbar_drag = None;
+                            view.log_tree_context_menu = None;
+                            view.log_tree_selected_node_ids.clear();
+                            view.log_tree_selection_anchor = None;
+                            let tree_state = LoadedLogTreeState::new(tree);
+                            let single_log_source = tree_state.single_log_source();
+                            let load_state = LogTreeLoadState::Loaded(tree_state);
+
+                            // 加载结果只有一个日志时直接打开正文，左侧树由渲染层隐藏。
+                            // 这里仍然保留 `Loaded` 状态，搜索当前目录等功能可以继续复用完整来源树。
+                            if let Some(source) = single_log_source {
+                                view.load_state = load_state;
+                                view.open_log_file(source, context);
+                                return;
+                            }
+
+                            load_state
+                        }
+                        Err(error) => LogTreeLoadState::Failed {
+                            message: error.to_string(),
+                        },
+                    };
+                    context.notify();
+                })
+                .ok();
+            })
+            .detach();
+    }
+
+    /// 清理重新加载日志前依赖旧来源树的工作区状态。
+    ///
+    /// 业务意图：
+    /// - 用户重新加载日志后，右侧 tab 和搜索结果都不应继续展示旧目录树中的文件，否则会误以为这些结果来自新加载内容。
+    /// - 清理集中在一个函数里，避免后续新增右侧工作区状态时只清 tab、漏掉搜索结果或弹层。
+    ///
+    /// 边界条件：
+    /// - 搜索窗口本身不强制关闭，保留用户输入的关键字；但正在运行的搜索会被置为无效，旧后台回调无法继续写回结果面板。
+    /// - 只清理会引用旧日志来源的数据，不重置主题、窗口、左侧宽度等会话级偏好。
+    fn clear_workspace_for_new_log_load(&mut self) {
+        for tab in &self.open_tabs {
+            Self::cleanup_tab_paged_resources(tab);
+        }
+        if let LogTreeLoadState::Loaded(tree_state) = &self.load_state {
+            tree_state.cleanup_temporary_paths();
+        }
+        self.open_tabs.clear();
+        self.active_tab_id = None;
+        self.tab_context_menu = None;
+        self.encoding_dropdown_menu = None;
+        self.log_viewer_context_menu = None;
+        self.log_tree_context_menu = None;
+        self.save_overwrite_confirm_dialog = None;
+        self.log_tree_selected_node_ids.clear();
+        self.log_tree_selection_anchor = None;
+        self.log_scrollbar_drag = None;
+        self.log_tree_scrollbar_drag = None;
+        self.tab_bar_scroll_handle = ScrollHandle::new();
+
+        self.search_results_panel = None;
+        self.search_results_resize_drag = None;
+        self.search_results_scrollbar_drag = None;
+        self.search_results_context_menu = None;
+        self.next_search_job_id += 1;
+        if let Some(dialog) = self.search_dialog.as_mut() {
+            dialog.current_file_match_count = None;
+            dialog.is_searching = false;
+            dialog.progress = SearchProgress::default();
+            dialog.message = "日志已重新加载，请重新打开文件后搜索".to_string();
+        }
+    }
+
+    /// 渲染一个 Lucide 字体图标。
+    ///
+    /// 业务意图：
+    /// - 工具栏和目录树都依赖同一套第三方图标库，集中渲染可以避免字体族、字号和占位宽度分散。
+    /// - `icon` 允许为空，用于目录树文件节点的展开箭头占位，保证不同类型节点文本对齐。
+    ///
+    /// 边界条件：
+    /// - 该函数只负责渲染图标字形，不处理点击、悬浮说明或无障碍标签。
+    /// - 字体必须已在应用启动时注册，否则图标字符可能被系统字体渲染成错误符号。
+    fn render_lucide_icon(
+        icon: Option<Icon>,
+        width: f32,
+        icon_size: f32,
+        icon_color: u32,
+    ) -> impl IntoElement {
+        // Lucide 枚举通过 `char` 映射到字体字形；空图标使用空字符串占位，避免目录树行错位。
+        let icon_text = icon
+            .map(|icon| char::from(icon).to_string())
+            .unwrap_or_default();
+
+        div()
+            .w(px(width))
+            .flex_none()
+            .font_family(LUCIDE_FONT_FAMILY)
+            .text_size(px(icon_size))
+            .text_color(rgb(icon_color))
+            .child(icon_text)
+    }
+}
+
+include!("app_impl/log_tree_methods.rs");
+
+impl MainView {
+    fn open_thread_analysis_for_sources(
+        &mut self,
+        sources: Vec<LogFileSource>,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if sources.is_empty() {
+            return;
+        }
+        let source_count = sources.len();
+        let main_view = context.entity();
+        let main_view_for_loading = main_view.clone();
+        let loading_analysis = ThreadAnalysisData {
+            title: "线程日志分析".to_string(),
+            summary: format!("正在分析 {} 个文件...", source_count),
+            snapshots: Vec::new(),
+            thread_names: Vec::new(),
+            matrix: Vec::new(),
+        };
+        // 先在当前事件循环结束后打开窗口，给用户即时反馈；后台读取和解析完成后再替换为真实结果。
+        window.defer(context, move |_window, app| {
+            Self::open_thread_analysis_window_after_main_update(
+                main_view_for_loading,
+                loading_analysis,
+                app,
+            );
+        });
+        context
+            .spawn(async move |view, app| {
+                let analysis = app
+                    .background_executor()
+                    .spawn(async move { Self::analyze_thread_dump_sources(&sources) })
+                    .await;
+
+                let _ = view;
+                app.update(move |app| {
+                    Self::open_thread_analysis_window_after_main_update(main_view, analysis, app);
+                })
+                .ok();
+            })
+            .detach();
+    }
+
+    /// 读取并分析多个日志来源中的 Java thread dump。
+    ///
+    /// 业务意图：
+    /// - 分析入口接受 `LogFileSource`，复用现有读取和自动编码识别逻辑，避免另建一套文件/压缩包读取路径。
+    ///
+    /// 边界条件：
+    /// - 某个文件读取或解码失败时跳过该文件，继续分析其它文件，避免单个坏文件阻断整批分析。
+    /// - 如果没有识别到任何快照，返回空分析数据，窗口会展示“未识别到快照”的摘要。
+    fn analyze_thread_dump_sources(sources: &[LogFileSource]) -> ThreadAnalysisData {
+        let mut snapshots = Vec::new();
+        let mut skipped_files = 0usize;
+        for (source_index, source) in sources.iter().enumerate() {
+            let source_name = source.display_name();
+            let result = read_log_source_bytes(source)
+                .and_then(|bytes| decode_log_bytes(&bytes, EncodingChoice::Auto, &source_name));
+            match result {
+                Ok(document) => {
+                    snapshots.extend(Self::parse_thread_dump_snapshots(
+                        &document.lines,
+                        &source_name,
+                        source_index,
+                        source,
+                    ));
+                }
+                Err(_) => {
+                    skipped_files += 1;
+                }
+            }
+        }
+
+        Self::build_thread_analysis_data(sources.len(), skipped_files, snapshots)
+    }
+
+    /// 从解码后的日志行中解析 Java thread dump 快照。
+    ///
+    /// 业务意图：
+    /// - Java thread dump 以 `Full thread dump` 作为快照边界，线程头通常以双引号线程名开头，
+    ///   状态行包含 `java.lang.Thread.State:`；解析这两个稳定特征即可形成线程状态时间线。
+    ///
+    /// 边界条件：
+    /// - 线程日志常见格式会先输出打印时间，再输出 `Full thread dump`；这里优先把打印时间作为横轴标签。
+    /// - 如果缺失状态行，当前线程不会加入快照，避免用未知状态污染时间线。
+    fn parse_thread_dump_snapshots(
+        lines: &[String],
+        source_name: &str,
+        source_index: usize,
+        source: &LogFileSource,
+    ) -> Vec<ThreadSnapshot> {
+        let mut snapshots = Vec::new();
+        let mut current_snapshot: Option<ThreadSnapshot> = None;
+        let mut pending_thread: Option<ThreadStateSamplePending> = None;
+        let mut last_timestamp: Option<String> = None;
+
+        for (line_index, line) in lines.iter().enumerate() {
+            if line.contains("Full thread dump") {
+                if let Some(snapshot) = current_snapshot.take()
+                    && !snapshot.threads.is_empty()
+                {
+                    snapshots.push(snapshot);
+                }
+                let label = last_timestamp
+                    .clone()
+                    .unwrap_or_else(|| format!("{} #{}", source_name, snapshots.len() + 1));
+                current_snapshot = Some(ThreadSnapshot {
+                    label,
+                    source_index,
+                    source: source.clone(),
+                    threads: Vec::new(),
+                });
+                pending_thread = None;
+                continue;
+            }
+            if let Some(timestamp) = Self::extract_thread_dump_timestamp(line) {
+                last_timestamp = Some(timestamp);
+            }
+
+            let Some(snapshot) = current_snapshot.as_mut() else {
+                continue;
+            };
+            if let Some((thread_name, thread_id)) = Self::parse_thread_header_details(line) {
+                pending_thread = Some(ThreadStateSamplePending {
+                    name: thread_name,
+                    thread_id,
+                    line_index,
+                    preview_lines: Self::thread_dump_preview_lines(lines, line_index),
+                });
+                continue;
+            }
+            if let Some(state_text) = line.split("java.lang.Thread.State:").nth(1)
+                && let Some(pending) = pending_thread.take()
+            {
+                snapshot.threads.push(ThreadStateSample {
+                    name: pending.name,
+                    thread_id: pending.thread_id,
+                    state: ThreadStateKind::parse(state_text),
+                    line_index: pending.line_index,
+                    preview_lines: pending.preview_lines,
+                });
+            }
+        }
+
+        if let Some(snapshot) = current_snapshot
+            && !snapshot.threads.is_empty()
+        {
+            snapshots.push(snapshot);
+        }
+
+        snapshots
+    }
+
+    /// 提取单个线程头开始的最多 5 行预览。
+    ///
+    /// 业务意图：
+    /// - 悬浮气泡用于查看当前色块对应线程的原始上下文，不能把下一个线程头或下一个 dump 快照混入预览。
+    /// - 预览限制为 5 行，避免超长堆栈在气泡中占满窗口。
+    fn thread_dump_preview_lines(lines: &[String], start_index: usize) -> Vec<String> {
+        let mut preview_lines = Vec::new();
+        for (line_index, line) in lines.iter().enumerate().skip(start_index) {
+            if line_index > start_index
+                && (line.contains("Full thread dump")
+                    || Self::parse_thread_header_details(line).is_some())
+            {
+                break;
+            }
+            preview_lines.push(line.clone());
+            if preview_lines.len() >= 5 {
+                break;
+            }
+        }
+        preview_lines
+    }
+
+    /// 提取 thread dump 附近的时间戳文案。
+    ///
+    /// 业务意图：
+    /// - 用户要求横轴为时间线；常见日志会在 dump 前输出 `YYYY-MM-DD HH:MM:SS` 或 JVM 日期行。
+    /// - 不引入时间解析依赖，只提取稳定前缀作为显示标签，避免因时区或本地化月份解析失败丢失标签。
+    fn extract_thread_dump_timestamp(line: &str) -> Option<String> {
+        let trimmed = line.trim();
+        if let Some(timestamp) =
+            Self::extract_thread_dump_timestamp_after_marker(trimmed, "打印时间")
+        {
+            return Some(timestamp);
+        }
+        if let Some(timestamp) =
+            Self::extract_thread_dump_timestamp_after_marker(trimmed, "print time")
+        {
+            return Some(timestamp);
+        }
+        if let Some(timestamp) =
+            Self::extract_thread_dump_timestamp_after_marker(trimmed, "dump time")
+        {
+            return Some(timestamp);
+        }
+        if let Some(timestamp) = Self::extract_leading_datetime_label(trimmed) {
+            return Some(timestamp);
+        }
+        if trimmed.len() >= 24
+            && trimmed
+                .chars()
+                .take(3)
+                .all(|character| character.is_ascii_alphabetic())
+            && trimmed.as_bytes().get(3) == Some(&b' ')
+            && trimmed.as_bytes().get(7) == Some(&b' ')
+            && trimmed.contains(':')
+        {
+            return Some(trimmed.chars().take(24).collect());
+        }
+        None
+    }
+
+    /// 从包含“打印时间”标记的日志行中提取时间部分。
+    ///
+    /// 业务意图：
+    /// - 线程日志可能用 `线程日志打印时间：2026-...` 这类前缀描述 dump 生成时间，
+    ///   横轴应展示真正的打印时间，而不是整行说明文字。
+    fn extract_thread_dump_timestamp_after_marker(line: &str, marker: &str) -> Option<String> {
+        let lower_line = line.to_ascii_lowercase();
+        let marker_index = lower_line.find(&marker.to_ascii_lowercase())?;
+        let after_marker = &line[marker_index + marker.len()..];
+        let trimmed = after_marker
+            .trim_start_matches(|character: char| {
+                character.is_whitespace()
+                    || matches!(character, ':' | '：' | '=' | '-' | '>' | '】' | ']')
+            })
+            .trim();
+        Self::extract_leading_datetime_label(trimmed)
+    }
+
+    /// 提取行首常见时间标签。
+    ///
+    /// 边界条件：
+    /// - 当前不做严格日期合法性校验，只识别日志中稳定的 `YYYY-MM-DD HH:MM:SS` 展示形态。
+    fn extract_leading_datetime_label(text: &str) -> Option<String> {
+        if text.len() >= 19
+            && text.as_bytes().get(4) == Some(&b'-')
+            && text.as_bytes().get(7) == Some(&b'-')
+            && text.as_bytes().get(10) == Some(&b' ')
+            && text.as_bytes().get(13) == Some(&b':')
+            && text.as_bytes().get(16) == Some(&b':')
+        {
+            Some(text[..19].to_string())
+        } else {
+            None
+        }
+    }
+
+    /// 从 Java thread dump 线程头中解析线程名和线程 ID。
+    ///
+    /// 边界条件：
+    /// - 标准 HotSpot 线程头以 `"线程名"` 开头；不符合该形态的行直接忽略。
+    /// - 线程 ID 优先使用 `#123` 形式，缺失时回退到 `tid=0x...`，保证不同 JVM 输出都能提供可核对标识。
+    fn parse_thread_header_details(line: &str) -> Option<(String, Option<String>)> {
+        let trimmed = line.trim_start();
+        let rest = trimmed.strip_prefix('"')?;
+        let end = rest.find('"')?;
+        let thread_name = rest[..end].to_string();
+        let metadata = rest[end + 1..].trim();
+        let thread_id = metadata
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix('#').map(|id| format!("#{id}")))
+            .or_else(|| {
+                metadata
+                    .split_whitespace()
+                    .find_map(|part| part.strip_prefix("tid=").map(|id| format!("tid={id}")))
+            });
+        Some((thread_name, thread_id))
+    }
+
+    /// 构建线程分析窗口可直接渲染的数据矩阵。
+    ///
+    /// 业务意图：
+    /// - 解析阶段按快照保存线程列表；渲染阶段需要按线程名聚合成二维矩阵，横轴为快照，纵轴为线程。
+    /// - 用户要求只在单个线程日志中出现的线程默认不显示，因此多文件分析时只保留跨文件出现的线程。
+    fn build_thread_analysis_data(
+        source_count: usize,
+        skipped_files: usize,
+        snapshots: Vec<ThreadSnapshot>,
+    ) -> ThreadAnalysisData {
+        let _has_snapshot_labels = snapshots.iter().any(|snapshot| !snapshot.label.is_empty());
+        let visible_thread_name_set = Self::default_visible_thread_names(&snapshots, source_count);
+        let mut thread_names = Vec::new();
+        let mut seen_thread_names = BTreeSet::new();
+        for snapshot in &snapshots {
+            for sample in &snapshot.threads {
+                if visible_thread_name_set.contains(&sample.name)
+                    && seen_thread_names.insert(sample.name.clone())
+                {
+                    thread_names.push(sample.name.clone());
+                }
+            }
+        }
+
+        let thread_index_by_name = thread_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.clone(), index))
+            .collect::<HashMap<_, _>>();
+        let mut matrix = vec![vec![None; snapshots.len()]; thread_names.len()];
+        for (snapshot_index, snapshot) in snapshots.iter().enumerate() {
+            for sample in &snapshot.threads {
+                if let Some(thread_index) = thread_index_by_name.get(&sample.name) {
+                    matrix[*thread_index][snapshot_index] = Some(Arc::new(ThreadTimelineCell {
+                        state: sample.state,
+                        time_label: snapshot.label.clone(),
+                        thread_name: sample.name.clone(),
+                        thread_id: sample.thread_id.clone(),
+                        source: snapshot.source.clone(),
+                        line_index: sample.line_index,
+                        preview_lines: sample.preview_lines.clone(),
+                    }));
+                }
+            }
+        }
+
+        let summary = if snapshots.is_empty() {
+            format!(
+                "未识别到 Java thread dump 快照，已跳过 {} 个无法读取或解码的文件",
+                skipped_files
+            )
+        } else {
+            format!(
+                "{} 个文件，{} 个快照，{} 个线程，跳过 {} 个文件",
+                source_count,
+                snapshots.len(),
+                thread_names.len(),
+                skipped_files
+            )
+        };
+        ThreadAnalysisData {
+            title: "线程日志分析".to_string(),
+            summary,
+            snapshots,
+            thread_names,
+            matrix,
+        }
+    }
+
+    /// 返回线程分析默认可见线程名集合。
+    ///
+    /// 业务意图：
+    /// - 多个线程日志一起分析时，默认隐藏只出现在单个日志文件中的线程，突出跨时间/跨文件持续存在的线程。
+    /// - 单文件分析时没有“跨文件”可比较对象，因此保留该文件内所有线程，避免窗口空白。
+    fn default_visible_thread_names(
+        snapshots: &[ThreadSnapshot],
+        source_count: usize,
+    ) -> HashSet<String> {
+        let mut sources_by_thread = HashMap::<String, HashSet<usize>>::new();
+        for snapshot in snapshots {
+            for sample in &snapshot.threads {
+                sources_by_thread
+                    .entry(sample.name.clone())
+                    .or_default()
+                    .insert(snapshot.source_index);
+            }
+        }
+
+        sources_by_thread
+            .into_iter()
+            .filter_map(|(thread_name, source_indexes)| {
+                (source_count <= 1 || source_indexes.len() > 1).then_some(thread_name)
+            })
+            .collect()
+    }
+
+    /// 在主视图更新租借结束后打开或更新线程分析独立窗口。
+    ///
+    /// 业务意图：
+    /// - 分析窗口可重复使用；如果用户重新分析另一组文件，直接替换窗口内容并激活。
+    /// - 窗口创建需要在 `App` 上下文中执行，避免在菜单点击的 `MainView` 更新栈里重入读取同一个视图。
+    fn open_thread_analysis_window_after_main_update(
+        main_view: Entity<MainView>,
+        analysis: ThreadAnalysisData,
+        app: &mut App,
+    ) {
+        let existing_window = main_view.update(app, |view, context| {
+            view.log_tree_context_menu = None;
+            context.notify();
+            view.thread_analysis_window
+        });
+        if let Some(window_handle) = existing_window {
+            if window_handle
+                .update(app, |window_view, window, context| {
+                    window_view.set_analysis(analysis.clone(), context);
+                    window.activate_window();
+                })
+                .is_ok()
+            {
+                return;
+            }
+            main_view.update(app, |view, _| {
+                view.thread_analysis_window = None;
+            });
+        }
+
+        let main_view_for_window = main_view.clone();
+        let main_view_for_close = main_view.clone();
+        let analysis_for_window = analysis.clone();
+        let window_options = WindowOptions {
+            titlebar: Some(TitlebarOptions {
+                title: Some("线程日志分析".into()),
+                ..Default::default()
+            }),
+            window_bounds: Some(WindowBounds::centered(
+                size(
+                    px(THREAD_ANALYSIS_WINDOW_WIDTH),
+                    px(THREAD_ANALYSIS_WINDOW_HEIGHT),
+                ),
+                app,
+            )),
+            is_resizable: true,
+            is_minimizable: true,
+            window_min_size: Some(size(px(720.0), px(420.0))),
+            ..Default::default()
+        };
+
+        match app.open_window(window_options, move |window, app| {
+            window.on_window_should_close(app, move |_, app| {
+                main_view_for_close.update(app, |view, context| {
+                    view.thread_analysis_window = None;
+                    context.notify();
+                });
+                true
+            });
+            app.new(|context| {
+                ThreadAnalysisWindowView::new(main_view_for_window, analysis_for_window, context)
+            })
+        }) {
+            Ok(window_handle) => {
+                main_view.update(app, |view, context| {
+                    view.thread_analysis_window = Some(window_handle);
+                    context.notify();
+                });
+            }
+            Err(_) => {
+                main_view.update(app, |view, context| {
+                    view.thread_analysis_window = None;
+                    context.notify();
+                });
+            }
+        }
+    }
+
+    /// 判断某个日志目录树节点当前是否展开。
+    ///
+    /// 业务意图：
+    /// - 渲染虚拟列表可见行时需要给文件夹选择正确箭头方向。
+    ///
+    /// 边界条件：
+    /// - 非已加载状态下没有目录树，统一返回 `false`，避免旧事件或重绘路径访问不存在的树状态。
+    fn is_log_tree_node_expanded(&self, node_id: usize) -> bool {
+        match &self.load_state {
+            LogTreeLoadState::Loaded(tree_state) => tree_state.is_expanded(node_id),
+            LogTreeLoadState::Empty
+            | LogTreeLoadState::Loading { .. }
+            | LogTreeLoadState::Failed { .. } => false,
+        }
+    }
+
+    /// 返回单文件压缩包根节点可以直接打开的内部文件来源。
+    ///
+    /// 业务意图：
+    /// - 该方法把“压缩包只有一个文件时直接打开”的交互规则收口在主视图，避免渲染函数理解完整树扫描细节。
+    /// - 非加载状态和非压缩包节点统一返回 `None`，调用方可以继续走普通展开/收起逻辑。
+    fn single_file_archive_source(&self, node_id: usize) -> Option<LogFileSource> {
+        match &self.load_state {
+            LogTreeLoadState::Loaded(tree_state) => {
+                tree_state.single_file_source_for_archive(node_id)
+            }
+            LogTreeLoadState::Empty
+            | LogTreeLoadState::Loading { .. }
+            | LogTreeLoadState::Failed { .. } => None,
+        }
+    }
+
+    /// 切换日志目录树节点的展开状态。
+    ///
+    /// 业务意图：
+    /// - 用户点击文件夹或压缩包行时，左侧树应立即展开或收起对应子树。
+    /// - 切换后只重建可见行缓存，完整加载结果保持不变，避免重复扫描文件系统或压缩包。
+    ///
+    /// 边界条件：
+    /// - 只有当前已加载状态会响应；加载中、失败或未加载状态下的旧点击事件会被忽略。
+    fn toggle_log_tree_node(&mut self, node_id: usize, context: &mut Context<Self>) {
+        if let LogTreeLoadState::Loaded(tree_state) = &mut self.load_state {
+            tree_state.toggle_node(node_id);
+            context.notify();
+        }
+    }
+
+    /// 打开左侧目录树中的日志文件。
+    ///
+    /// 业务意图：
+    /// - 普通文件和压缩包成员都通过 `LogFileSource` 统一进入右侧 tab 工作区。
+    /// - 同一个来源重复点击时只激活已有 tab，避免用户误打开多个相同文件。
+    ///
+    /// 边界条件：
+    /// - 读取和自动解码都放到后台执行器，避免大文件或压缩包流式读取阻塞 GPUI 主线程。
+    /// - 如果 tab 在后台任务完成前被关闭，结果合并时会因找不到 ID 而被忽略。
+    fn open_log_file(&mut self, source: LogFileSource, context: &mut Context<Self>) {
+        let source_key = source.stable_key();
+        if let Some(tab) = self
+            .open_tabs
+            .iter()
+            .find(|tab| tab.source_key == source_key)
+        {
+            self.activate_tab(tab.id);
+            context.notify();
+            return;
+        }
+
+        let tab_id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let title = source.display_name();
+        if self.open_tabs.is_empty() {
+            self.tab_bar_scroll_handle = ScrollHandle::new();
+        }
+        self.open_tabs.push(OpenLogTab {
+            id: tab_id,
+            source: source.clone(),
+            source_key,
+            title,
+            encoding_choice: EncodingChoice::Auto,
+            raw_bytes: None,
+            state: LogTabState::Loading {
+                message: "正在读取日志文件...".to_string(),
+            },
+            scroll_handle: UniformListScrollHandle::new(),
+            pending_scroll_to_line: None,
+            highlighted_search_line: None,
+            text_selection: None,
+            selection_drag_anchor: None,
+        });
+        self.activate_tab(tab_id);
+        context.notify();
+        self.spawn_log_tab_load(tab_id, source, context);
+    }
+
+    /// 激活指定日志 tab 并确保 tab 页签在横向滚动区域内可见。
+    ///
+    /// 业务意图：
+    /// - 打开、点击、右键和后台内容刷新都会改变用户关注的 tab，tab 栏需要自动滚动到能看到当前 tab 的位置。
+    /// - 将激活逻辑集中到一个方法，避免不同入口遗漏关闭弹层或遗漏页签自动定位。
+    ///
+    /// 边界条件：
+    /// - 如果 tab 已经被关闭或不存在，直接忽略，避免旧异步任务或过期点击事件激活不存在的页面。
+    fn activate_tab(&mut self, tab_id: usize) {
+        if !self.open_tabs.iter().any(|tab| tab.id == tab_id) {
+            return;
+        }
+
+        self.active_tab_id = Some(tab_id);
+        self.tab_context_menu = None;
+        self.encoding_dropdown_menu = None;
+        self.log_viewer_context_menu = None;
+        self.clear_search_current_file_match_count();
+        self.scroll_tab_bar_to_tab(tab_id);
+    }
+
+    /// 将指定 tab 页签滚动到可视范围内。
+    ///
+    /// 业务意图：
+    /// - tab 标题完整展示后，页签总宽度可能超过右侧区域；激活 tab 时自动定位能减少用户手动点箭头的次数。
+    /// - GPUI `ScrollHandle::scroll_to_item` 会在下一次布局时按 child 下标做最小滚动，适合这里的横向页签列表。
+    fn scroll_tab_bar_to_tab(&self, tab_id: usize) {
+        if let Some(index) = self.open_tabs.iter().position(|tab| tab.id == tab_id) {
+            self.tab_bar_scroll_handle.scroll_to_item(index);
+        }
+    }
+
+    /// 将指定 tab 的日志正文滚动到目标行。
+    ///
+    /// 业务意图：
+    /// - 搜索结果点击后需要把命中行带到用户视野中央，而不是只打开文件让用户手动查找。
+    /// - 使用 `UniformListScrollHandle::scroll_to_item_strict` 延迟到下一次布局执行，适合虚拟列表尚未完成测量的场景。
+    ///
+    /// 边界条件：
+    /// - 只有已打开 tab 才能滚动；如果 tab 仍在加载，调用方应先把行号写入 `pending_scroll_to_line`。
+    /// - 行号来自搜索时的解码结果，如果文件在搜索后被外部修改，滚动位置可能不再对应同一内容，这是当前未实现文件监听的已知边界。
+    fn scroll_log_tab_to_line(&self, tab_id: usize, line_index: usize) {
+        if let Some(tab) = self.open_tabs.iter().find(|tab| tab.id == tab_id) {
+            tab.scroll_handle
+                .scroll_to_item_strict(line_index, ScrollStrategy::Center);
+        }
+    }
+
+    /// 打开日志来源并定位到指定行。
+    ///
+    /// 业务意图：
+    /// - 线程分析窗口和搜索结果都需要“打开文件并跳到某行”的行为；集中实现可以保证新建 tab、
+    ///   已打开 tab、加载中 tab 的滚动和高亮状态一致。
+    ///
+    /// 边界条件：
+    /// - 如果目标 tab 仍在后台读取，先记录 `pending_scroll_to_line`，等加载完成后再滚动。
+    /// - 行号来自当前解析结果；如果文件在分析后被外部修改，定位可能落到相邻内容，这是无文件监听条件下的既有风险。
+    fn open_log_source_at_line(
+        &mut self,
+        source: LogFileSource,
+        line_index: usize,
+        context: &mut Context<Self>,
+    ) {
+        let source_key = source.stable_key();
+        if !self
+            .open_tabs
+            .iter()
+            .any(|tab| tab.source_key == source_key)
+        {
+            self.open_log_file(source, context);
+        }
+
+        let Some(tab_index) = self
+            .open_tabs
+            .iter()
+            .position(|tab| tab.source_key == source_key)
+        else {
+            return;
+        };
+        let tab_id = self.open_tabs[tab_index].id;
+        let ready = matches!(self.open_tabs[tab_index].state, LogTabState::Ready { .. });
+        self.open_tabs[tab_index].pending_scroll_to_line = Some(line_index);
+        self.open_tabs[tab_index].highlighted_search_line = Some(line_index);
+        self.activate_tab(tab_id);
+        if ready {
+            self.open_tabs[tab_index].pending_scroll_to_line = None;
+            self.scroll_log_tab_to_line(tab_id, line_index);
+        }
+        context.notify();
+    }
+
+    /// 启动日志 tab 的后台读取任务。
+    ///
+    /// 业务意图：
+    /// - 读取压缩包成员和解码大文本都可能耗时，必须离开 UI 线程执行。
+    /// - 后台任务返回时只按 tab ID 合并状态，避免持有过期引用。
+    fn spawn_log_tab_load(
+        &self,
+        tab_id: usize,
+        source: LogFileSource,
+        context: &mut Context<Self>,
+    ) {
+        let source_name = source.display_name();
+        context
+            .spawn(async move |view, app| {
+                let result = app
+                    .background_executor()
+                    .spawn(async move {
+                        match open_log_source_for_tab(source, EncodingChoice::Auto, &source_name) {
+                            Ok(LargeLogOpenResult::InMemoryReady {
+                                raw_bytes,
+                                document,
+                            }) => LogTabLoadResult::Ready {
+                                raw_bytes: Some(raw_bytes),
+                                document: LogTabDocument::InMemory(document),
+                            },
+                            Ok(LargeLogOpenResult::InMemoryDecodeFailed { raw_bytes, message }) => {
+                                LogTabLoadResult::DecodeFailed { raw_bytes, message }
+                            }
+                            Ok(LargeLogOpenResult::PagedReady { document }) => {
+                                LogTabLoadResult::Ready {
+                                    raw_bytes: None,
+                                    document: LogTabDocument::Paged(document),
+                                }
+                            }
+                            Err(error) => LogTabLoadResult::ReadFailed {
+                                message: error.to_string(),
+                            },
+                        }
+                    })
+                    .await;
+
+                view.update(app, |view, context| {
+                    view.apply_log_tab_load_result(tab_id, result);
+                    context.notify();
+                })
+                .ok();
+            })
+            .detach();
+    }
+
+    /// 合并日志 tab 的后台读取结果。
+    ///
+    /// 业务意图：
+    /// - 读取成功后保存原始字节；即使自动检测失败，也允许用户通过手动编码按钮重新解析。
+    fn apply_log_tab_load_result(&mut self, tab_id: usize, result: LogTabLoadResult) {
+        let mut pending_scroll_to_line = None;
+        {
+            let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+                return;
+            };
+
+            tab.scroll_handle = UniformListScrollHandle::new();
+            tab.text_selection = None;
+            tab.selection_drag_anchor = None;
+            match result {
+                LogTabLoadResult::Ready {
+                    raw_bytes,
+                    document,
+                } => {
+                    tab.raw_bytes = raw_bytes;
+                    tab.state = LogTabState::Ready { document };
+                    pending_scroll_to_line = tab.pending_scroll_to_line.take();
+                }
+                LogTabLoadResult::DecodeFailed { raw_bytes, message } => {
+                    tab.raw_bytes = Some(raw_bytes);
+                    tab.state = LogTabState::Failed { message };
+                    tab.pending_scroll_to_line = None;
+                }
+                LogTabLoadResult::ReadFailed { message } => {
+                    tab.raw_bytes = None;
+                    tab.state = LogTabState::Failed { message };
+                    tab.pending_scroll_to_line = None;
+                }
+            }
+        }
+
+        if self.active_tab_id == Some(tab_id) {
+            self.scroll_tab_bar_to_tab(tab_id);
+            self.clear_search_current_file_match_count();
+        }
+        if let Some(line_index) = pending_scroll_to_line {
+            self.scroll_log_tab_to_line(tab_id, line_index);
+        }
+    }
+
+    /// 为指定 tab 切换编码并重新解码。
+    ///
+    /// 业务意图：
+    /// - 编码切换必须复用 tab 内保存的原始字节，避免重新读取压缩包成员或普通文件。
+    /// - 切换后重置该 tab 的正文滚动句柄，让用户从文件开头重新检查解码结果。
+    fn select_tab_encoding(
+        &mut self,
+        tab_id: usize,
+        encoding_choice: EncodingChoice,
+        context: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+
+        let raw_bytes = tab.raw_bytes.clone();
+        let paged_document = match &tab.state {
+            LogTabState::Ready {
+                document: LogTabDocument::Paged(document),
+            } => Some(document.clone()),
+            LogTabState::Ready {
+                document: LogTabDocument::InMemory(_),
+            }
+            | LogTabState::Loading { .. }
+            | LogTabState::Failed { .. } => None,
+        };
+        if raw_bytes.is_none() && paged_document.is_none() {
+            // 原始字节或分页文档尚未读取完成时不能提前写入编码选择，否则后台自动加载完成后会出现
+            // “下拉框显示手动编码、正文却来自自动识别”的状态不一致。
+            self.tab_context_menu = None;
+            self.encoding_dropdown_menu = None;
+            self.log_viewer_context_menu = None;
+            context.notify();
+            return;
+        }
+
+        tab.encoding_choice = encoding_choice;
+        tab.scroll_handle = UniformListScrollHandle::new();
+        tab.pending_scroll_to_line = None;
+        tab.highlighted_search_line = None;
+        tab.text_selection = None;
+        tab.selection_drag_anchor = None;
+        tab.state = LogTabState::Loading {
+            message: format!("正在按 {} 重新解析...", encoding_choice.label()),
+        };
+        self.tab_context_menu = None;
+        self.encoding_dropdown_menu = None;
+        self.log_viewer_context_menu = None;
+        let source_name = tab.title.clone();
+        if self
+            .log_scrollbar_drag
+            .is_some_and(|drag| drag.tab_id == tab_id)
+        {
+            self.log_scrollbar_drag = None;
+        }
+        context.notify();
+        if let Some(raw_bytes) = raw_bytes {
+            self.spawn_log_tab_decode(tab_id, raw_bytes, encoding_choice, source_name, context);
+        } else if let Some(document) = paged_document {
+            self.spawn_paged_log_tab_decode(tab_id, document, encoding_choice, context);
+        }
+    }
+
+    /// 启动日志 tab 的后台重新解码任务。
+    ///
+    /// 业务意图：
+    /// - 200MB 以内的日志重新解码仍可能耗时，放到后台执行可以避免界面短暂停顿。
+    fn spawn_log_tab_decode(
+        &self,
+        tab_id: usize,
+        raw_bytes: Arc<Vec<u8>>,
+        encoding_choice: EncodingChoice,
+        source_name: String,
+        context: &mut Context<Self>,
+    ) {
+        context
+            .spawn(async move |view, app| {
+                let result = app
+                    .background_executor()
+                    .spawn(async move {
+                        decode_log_bytes(&raw_bytes, encoding_choice, &source_name)
+                            .map(|document| LogTabDecodeResult::Ready {
+                                encoding_choice,
+                                document: LogTabDocument::InMemory(document),
+                            })
+                            .unwrap_or_else(|error: LogContentError| LogTabDecodeResult::Failed {
+                                encoding_choice,
+                                message: error.to_string(),
+                            })
+                    })
+                    .await;
+
+                view.update(app, |view, context| {
+                    view.apply_log_tab_decode_result(tab_id, result);
+                    context.notify();
+                })
+                .ok();
+            })
+            .detach();
+    }
+
+    /// 启动分页日志 tab 的后台编码切换任务。
+    ///
+    /// 业务意图：
+    /// - 超大日志切换编码时不能重新读取压缩包或重建行索引，只更新分页文档的解码策略并清理可见行缓存。
+    /// - 该操作仍放到后台执行，避免自动检测编码样本读取影响 UI 响应。
+    fn spawn_paged_log_tab_decode(
+        &self,
+        tab_id: usize,
+        document: paged_document::PagedLogDocument,
+        encoding_choice: EncodingChoice,
+        context: &mut Context<Self>,
+    ) {
+        context
+            .spawn(async move |view, app| {
+                let result = app
+                    .background_executor()
+                    .spawn(async move {
+                        document
+                            .with_encoding(encoding_choice)
+                            .map(|document| LogTabDecodeResult::Ready {
+                                encoding_choice,
+                                document: LogTabDocument::Paged(document),
+                            })
+                            .unwrap_or_else(|error| LogTabDecodeResult::Failed {
+                                encoding_choice,
+                                message: error.to_string(),
+                            })
+                    })
+                    .await;
+
+                view.update(app, |view, context| {
+                    view.apply_log_tab_decode_result(tab_id, result);
+                    context.notify();
+                })
+                .ok();
+            })
+            .detach();
+    }
+
+    /// 合并日志 tab 的重新解码结果。
+    ///
+    /// 边界条件：
+    /// - 如果用户在解码完成前关闭了 tab，则结果会被忽略。
+    /// - 如果用户在旧任务完成前再次切换编码，则旧结果会被丢弃，避免 UI 显示内容和编码按钮不一致。
+    fn apply_log_tab_decode_result(&mut self, tab_id: usize, result: LogTabDecodeResult) {
+        {
+            let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+                return;
+            };
+
+            let result_encoding_choice = match &result {
+                LogTabDecodeResult::Ready {
+                    encoding_choice, ..
+                }
+                | LogTabDecodeResult::Failed {
+                    encoding_choice, ..
+                } => *encoding_choice,
+            };
+            if tab.encoding_choice != result_encoding_choice {
+                return;
+            }
+
+            tab.scroll_handle = UniformListScrollHandle::new();
+            tab.text_selection = None;
+            tab.selection_drag_anchor = None;
+            match result {
+                LogTabDecodeResult::Ready { document, .. } => {
+                    tab.state = LogTabState::Ready { document };
+                }
+                LogTabDecodeResult::Failed { message, .. } => {
+                    tab.state = LogTabState::Failed { message };
+                }
+            }
+        }
+
+        if self.active_tab_id == Some(tab_id) {
+            self.scroll_tab_bar_to_tab(tab_id);
+            self.clear_search_current_file_match_count();
+        }
+    }
+
+    /// 处理全局键盘快捷键。
+    ///
+    /// 业务意图：
+    /// - 搜索是日志查看器的核心工作流，需要即使焦点停在日志正文或目录树上也能通过 `Ctrl+F` 打开。
+    /// - macOS 用户通常使用 `Cmd+F`，因此在保留用户要求的 `Ctrl+F` 同时支持平台键。
+    /// - 该函数返回是否消费了快捷键，调用方据此阻止事件继续传给平台菜单或底层输入控件。
+    ///
+    /// 边界条件：
+    /// - 这里不处理普通字符输入，避免全局监听截获搜索框或未来编辑控件的文本输入。
+    /// - Enter 仅在搜索对话框打开时触发搜索，Esc 仅关闭搜索对话框。
+    fn handle_global_keystroke(
+        &mut self,
+        keystroke: Keystroke,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) -> bool {
+        if self.search_text_input_focused(window)
+            && (Self::is_copy_keystroke(&keystroke) || Self::is_paste_keystroke(&keystroke))
+        {
+            return false;
+        }
+
+        if Self::is_copy_keystroke(&keystroke) && self.copy_selected_log_text(context) {
+            return true;
+        }
+
+        if Self::is_paste_keystroke(&keystroke)
+            && self.paste_clipboard_text_into_search_dialog(window, context)
+        {
+            return true;
+        }
+
+        if self.search_dialog.is_some() && keystroke.key == "enter" {
+            self.start_search(context);
+            return true;
+        }
+
+        if self.search_dialog.is_some() && keystroke.key == "escape" {
+            self.close_search_dialog(window, context);
+            return true;
+        }
+
+        false
+    }
+
+    /// 处理主窗口根节点收到的键盘事件。
+    ///
+    /// 业务意图：
+    /// - macOS 的 `Cmd+C` 可能走应用级 key equivalent，Windows 或部分焦点状态下的 `Ctrl+C` 则更可能走普通
+    ///   `on_key_down`；日志正文是自绘只读列表，不能依赖系统文本控件自动复制。
+    /// - 根节点复用全局快捷键处理逻辑，作为 `intercept_keystrokes` 的兜底入口，保证日志正文选区复制在不同平台路径下都有效。
+    fn handle_root_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if self.handle_global_keystroke(event.keystroke.clone(), window, context) {
+            context.stop_propagation();
+            context.notify();
+        }
+    }
+
+    /// 判断当前焦点是否位于搜索窗口的任一文本输入框。
+    ///
+    /// 业务意图：
+    /// - GPUI 的全局快捷键拦截可能早于输入框 `on_key_down` 触发；当关键字或目录输入框聚焦时，
+    ///   `Ctrl+C` / `Ctrl+V` 必须优先交给输入框自身处理，不能被日志查看器的复制/粘贴搜索逻辑抢走。
+    ///
+    /// 边界条件：
+    /// - 搜索窗口未打开时两个焦点句柄都不会命中，此时全局复制仍可服务日志正文选区。
+    fn search_text_input_focused(&self, window: &Window) -> bool {
+        self.search_input_focus.is_focused(window) || self.search_directory_focus.is_focused(window)
+    }
+
+    /// 延迟打开搜索对话框。
+    ///
+    /// 业务意图：
+    /// - macOS 会把 `Cmd+F`、`Ctrl+F` 这类快捷键先作为 key equivalent 分发；如果在该原生回调栈里直接创建窗口，
+    ///   GPUI 或平台窗口系统内部一旦 panic，就会跨 `extern "C"` 边界触发不可恢复 abort。
+    /// - 这里使用 `Window::defer` 而不是 `Context::defer_in`：前者回调拿到的是 `App`，不会自动重新租借
+    ///   `MainView`；后者会在闭包外包一层 `MainView::update`，导致搜索窗口读取 `MainView` 时发生重复借用。
+    ///
+    /// 边界条件：
+    /// - 延迟执行仍读取当前日志选区，因此用户按下快捷键时已有的选中文本会正常预填到搜索框。
+    /// - 同一帧内重复触发只保留一个打开请求，避免按键重放创建多个搜索窗口。
+    fn schedule_open_search_dialog(&mut self, window: &mut Window, context: &mut Context<Self>) {
+        if self.search_dialog_open_pending {
+            return;
+        }
+
+        self.search_dialog_open_pending = true;
+        let main_view = context.entity();
+        window.defer(context, move |window, app| {
+            Self::open_search_dialog_after_main_update(main_view, window, app);
+        });
+        context.notify();
+    }
+
+    /// 判断是否为复制日志选中文本的快捷键。
+    ///
+    /// 业务意图：
+    /// - macOS 用户习惯 `Cmd+C`，Windows 用户习惯 `Ctrl+C`，两者都应复制当前日志正文选区。
+    /// - 当前只在日志正文有非空选择时消费该快捷键；没有选择时保持后续控件自己的复制行为空间。
+    fn is_copy_keystroke(keystroke: &Keystroke) -> bool {
+        Self::keystroke_matches_letter_or_control_code(keystroke, "c", CONTROL_C_CODE)
+            && (keystroke.modifiers.control
+                || keystroke.modifiers.platform
+                || Self::keystroke_matches_control_code(keystroke, CONTROL_C_CODE))
+    }
+
+    /// 判断是否为粘贴快捷键。
+    ///
+    /// 业务意图：
+    /// - 搜索输入框和日志查看器都需要识别 `Ctrl+V` / `Cmd+V`。
+    /// - 日志查看器是只读区域，粘贴行为会把剪贴板文本填入搜索框，避免用户按键后没有任何可见结果。
+    fn is_paste_keystroke(keystroke: &Keystroke) -> bool {
+        Self::keystroke_matches_letter_or_control_code(keystroke, "v", CONTROL_V_CODE)
+            && (keystroke.modifiers.control
+                || keystroke.modifiers.platform
+                || Self::keystroke_matches_control_code(keystroke, CONTROL_V_CODE))
+    }
+
+    /// 判断按键是否匹配指定字母或该字母的 ASCII 控制字符。
+    ///
+    /// 业务意图：
+    /// - GPUI 的 `Keystroke::key` 和 `key_char` 在不同平台输入路径下可能保存不同形态：
+    ///   普通 `Cmd+F` 通常表现为 `key = "f"`，而 `Ctrl+F` 可能表现为 `"\u{6}"`。
+    /// - 把匹配逻辑集中在这里，可以让搜索和复制快捷键都兼容真实键盘、AppleScript 自动化和不同键盘布局。
+    ///
+    /// 边界条件：
+    /// - 该函数只用于带控制键语义的快捷键，不参与普通文本输入，避免把不可见控制字符误写入搜索框。
+    fn keystroke_matches_letter_or_control_code(
+        keystroke: &Keystroke,
+        letter: &str,
+        control_code: &str,
+    ) -> bool {
+        keystroke.key.eq_ignore_ascii_case(letter)
+            || Self::keystroke_matches_control_code(keystroke, control_code)
+            || keystroke
+                .key_char
+                .as_deref()
+                .is_some_and(|key_char| key_char.eq_ignore_ascii_case(letter))
+    }
+
+    /// 判断按键是否是指定 ASCII 控制字符。
+    fn keystroke_matches_control_code(keystroke: &Keystroke, control_code: &str) -> bool {
+        keystroke.key == control_code || keystroke.key_char.as_deref() == Some(control_code)
+    }
+
+    /// 复制当前激活日志 tab 的选中文本。
+    ///
+    /// 业务意图：
+    /// - 日志正文是只读查看器，复制操作应从已解码的真实文本行中提取，而不是从屏幕像素或渲染元素反推。
+    /// - 只有存在非空选择时才写入剪贴板，避免用户在搜索框等其它控件内按复制键时被日志查看器误拦截。
+    ///
+    /// 边界条件：
+    /// - 复制文本保留跨行选择中的换行符，满足从日志中截取堆栈片段或多行上下文的常见需求。
+    /// - 选择范围使用字符列，截取前会转换为 UTF-8 字节边界，中文不会被截断为非法字符串。
+    fn copy_selected_log_text(&self, context: &mut Context<Self>) -> bool {
+        let Some(active_tab_id) = self.active_tab_id else {
+            return false;
+        };
+        self.copy_selected_log_text_for_tab(active_tab_id, context)
+    }
+
+    /// 复制指定 tab 的日志正文选区。
+    ///
+    /// 业务意图：
+    /// - 右键菜单打开时会绑定具体 tab，复制时不应受后续焦点或激活状态变化影响。
+    fn copy_selected_log_text_for_tab(&self, tab_id: usize, context: &mut Context<Self>) -> bool {
+        let Some(text) = self.selected_log_text_for_tab(tab_id) else {
+            return false;
+        };
+        if text.is_empty() {
+            return false;
+        }
+
+        context.write_to_clipboard(ClipboardItem::new_string(text));
+        true
+    }
+
+    /// 取得当前激活日志 tab 的选中文本。
+    fn selected_log_text(&self) -> Option<String> {
+        let active_tab_id = self.active_tab_id?;
+        self.selected_log_text_for_tab(active_tab_id)
+    }
+
+    /// 取得指定日志 tab 的选中文本。
+    ///
+    /// 边界条件：
+    /// - tab 不存在、尚未加载成功或选区为空时返回 `None`，用于禁用右键菜单“复制”。
+    fn selected_log_text_for_tab(&self, tab_id: usize) -> Option<String> {
+        let tab = self.open_tabs.iter().find(|tab| tab.id == tab_id)?;
+        let selection = tab.text_selection.as_ref()?;
+        if selection.is_empty() {
+            return None;
+        }
+        let LogTabState::Ready { document } = &tab.state else {
+            return None;
+        };
+
+        let (start, end) = selection.normalized();
+        let line_count = document.line_count();
+        if line_count == 0 || start.line_index >= line_count {
+            return None;
+        }
+        let end_line_index = end.line_index.min(line_count.saturating_sub(1));
+        if start.line_index > end_line_index {
+            return None;
+        }
+
+        let mut selected_text = String::new();
+        for line_index in start.line_index..=end_line_index {
+            let Some(line) = Self::log_document_line_text(document, line_index) else {
+                continue;
+            };
+            if line_index > start.line_index {
+                selected_text.push('\n');
+            }
+            let Some((start_column, end_column)) =
+                Self::selection_columns_for_line(selection, line_index, &line)
+            else {
+                continue;
+            };
+            let start_byte = Self::byte_index_for_char_column(&line, start_column);
+            let end_byte = Self::byte_index_for_char_column(&line, end_column);
+            if start_byte < end_byte {
+                selected_text.push_str(&line[start_byte..end_byte]);
+            }
+        }
+
+        Some(selected_text)
+    }
+
+    /// 取得可填入搜索框的日志选中文本。
+    ///
+    /// 业务意图：
+    /// - 当前搜索引擎是逐行普通文本搜索，搜索框也是单行输入；当用户选中多行日志时，直接填入换行会让搜索条件不可用。
+    /// - 因此这里取第一段非空行作为搜索关键字，复制功能仍保留完整多行内容。
+    fn selected_log_text_for_search_query(&self) -> Option<String> {
+        self.selected_log_text()
+            .and_then(|text| {
+                text.lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+            .filter(|query| !query.is_empty())
+    }
+
+    /// 把剪贴板文本粘贴到搜索关键字输入框。
+    ///
+    /// 业务意图：
+    /// - 日志正文是只读查看器，`Ctrl+V` 不能修改日志内容；用户通常是想把剪贴板里的关键字拿来搜索。
+    /// - 如果搜索窗口尚未打开，则先创建搜索状态并排队打开窗口；如果已经打开，则替换当前关键字选区。
+    ///
+    /// 边界条件：
+    /// - 非文本剪贴板、空文本或只有换行的文本不处理，避免清空用户当前搜索条件。
+    /// - 粘贴文本按搜索框单行规则清理换行，和平台输入法提交路径保持一致。
+    fn paste_clipboard_text_into_search_dialog(
+        &mut self,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) -> bool {
+        let Some(text) = context
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .map(|text| Self::sanitize_search_input_text(&text))
+            .filter(|text| !text.trim().is_empty())
+        else {
+            return false;
+        };
+
+        self.prepare_search_dialog_state();
+        if let Some(dialog) = self.search_dialog.as_mut() {
+            Self::replace_search_query_with_clipboard_text(dialog, text);
+        }
+        self.schedule_open_search_dialog(window, context);
+        self.touch_search_text_cursor_activity();
+        context.notify();
+        true
+    }
+
+    /// 按统一文档模型读取指定行文本。
+    ///
+    /// 业务意图：
+    /// - 小文件行文本来自内存 `Vec<String>`，超大文件行文本来自分页 seek 读取；复制、渲染和命中定位需要共享同一入口。
+    /// - 分页读取失败时返回 `None`，避免复制或临时渲染路径因单行 I/O 错误直接崩溃；真正的打开错误仍在后台任务阶段展示。
+    fn log_document_line_text(document: &LogTabDocument, line_index: usize) -> Option<String> {
+        match document {
+            LogTabDocument::InMemory(document) => document.lines.get(line_index).cloned(),
+            LogTabDocument::Paged(document) => document
+                .read_line(line_index)
+                .ok()
+                .flatten()
+                .map(|line| line.text),
+        }
+    }
+
+    /// 返回某一行被当前选择覆盖的字符列范围。
+    ///
+    /// 业务意图：
+    /// - 渲染选区和复制文本都需要同一套范围规则，避免屏幕高亮和复制结果不一致。
+    /// - 这里输出字符列而不是字节范围，由调用方按具体字符串转换为 UTF-8 安全字节边界。
+    fn selection_columns_for_line(
+        selection: &LogTextSelection,
+        line_index: usize,
+        line: &str,
+    ) -> Option<(usize, usize)> {
+        let (start, end) = selection.normalized();
+        if line_index < start.line_index || line_index > end.line_index {
+            return None;
+        }
+
+        let line_char_count = line.chars().count();
+        let start_column = if line_index == start.line_index {
+            start.column.min(line_char_count)
+        } else {
+            0
+        };
+        let end_column = if line_index == end.line_index {
+            end.column.min(line_char_count)
+        } else {
+            line_char_count
+        };
+
+        Some((start_column, end_column))
+    }
+
+    /// 返回某一行被选择覆盖的 UTF-8 字节范围。
+    ///
+    /// 边界条件：
+    /// - 空范围不参与渲染高亮，但复制跨行选择时仍会通过行间换行保留空行语义。
+    fn selected_byte_range_for_line(
+        selection: &LogTextSelection,
+        line_index: usize,
+        line: &str,
+    ) -> Option<Range<usize>> {
+        let (start_column, end_column) =
+            Self::selection_columns_for_line(selection, line_index, line)?;
+        let start_byte = Self::byte_index_for_char_column(line, start_column);
+        let end_byte = Self::byte_index_for_char_column(line, end_column);
+        (start_byte < end_byte).then_some(start_byte..end_byte)
+    }
+
+    /// 将字符列转换为字符串的 UTF-8 字节下标。
+    ///
+    /// 业务意图：
+    /// - 鼠标选择以字符列表达，`String::replace_range`、切片和 `StyledText` 高亮范围都要求 UTF-8 字节边界。
+    /// - 统一转换函数可以避免中文、全角字符或 emoji 出现在选区边缘时产生非法切片。
+    fn byte_index_for_char_column(text: &str, column: usize) -> usize {
+        if column == 0 {
+            return 0;
+        }
+        text.char_indices()
+            .nth(column)
+            .map(|(index, _)| index)
+            .unwrap_or(text.len())
+    }
+
+    /// 将 UTF-8 字节下标转换为字符列。
+    ///
+    /// 业务意图：
+    /// - GPUI 文本 shaping 的命中结果以字节下标表达，而日志选区状态使用字符列保存。
+    /// - 统一转换后，鼠标命中、选区高亮、复制和搜索预填可以继续共用字符列模型。
+    ///
+    /// 边界条件：
+    /// - 正常情况下 GPUI 返回的字节下标位于字符边界；这里仍做边界回退，避免未来字体 shaping 或
+    ///   组合字符场景返回中间下标时导致字符串切片 panic。
+    fn char_column_for_byte_index(text: &str, byte_index: usize) -> usize {
+        let byte_index = byte_index.min(text.len());
+        let safe_byte_index = if text.is_char_boundary(byte_index) {
+            byte_index
+        } else {
+            text.char_indices()
+                .map(|(index, _)| index)
+                .take_while(|index| *index < byte_index)
+                .last()
+                .unwrap_or(0)
+        };
+
+        text[..safe_byte_index].chars().count()
+    }
+
+    /// 将日志行中的制表符展开为显示用空格，并保留原始文本到显示文本的字节映射。
+    ///
+    /// 业务意图：
+    /// - 日志字段常用 `\t` 分隔，直接渲染会导致不同平台或 GPUI 文本系统下间隔过窄，字段看起来粘连。
+    /// - 展开时按固定 4 列 tab stop 计算空格数，而不是简单替换成 4 个空格，才能让后续列落在稳定边界。
+    ///
+    /// 边界条件：
+    /// - 这里只处理单行文本，换行已经由日志解码阶段拆分。
+    /// - UTF-8 多字节字符在 JetBrains Mono 下仍按一个字符列推进；中文全角宽度不在本次 tab 对齐规则内扩展。
+    fn expanded_log_line_for_display(line: &str) -> ExpandedLogLine {
+        let mut text = String::with_capacity(line.len());
+        let mut original_to_display_bytes = vec![0; line.len() + 1];
+        let mut display_to_original_bytes = vec![0];
+        let mut display_column = 0usize;
+
+        for (original_start, character) in line.char_indices() {
+            let original_end = original_start + character.len_utf8();
+            let display_start = text.len();
+
+            if character == '\t' {
+                let spaces = LOG_VIEWER_TAB_WIDTH - (display_column % LOG_VIEWER_TAB_WIDTH);
+                for offset in 0..spaces {
+                    text.push(' ');
+                    display_to_original_bytes.push(if offset == 0 {
+                        original_start
+                    } else {
+                        original_end
+                    });
+                }
+                display_column += spaces;
+            } else {
+                text.push(character);
+                for _ in display_start..text.len() {
+                    display_to_original_bytes.push(original_start);
+                }
+                display_column += 1;
+            }
+
+            let display_end = text.len();
+            for original_byte in original_start..original_end {
+                original_to_display_bytes[original_byte] = display_start;
+            }
+            original_to_display_bytes[original_end] = display_end;
+            display_to_original_bytes[display_end] = original_end;
+        }
+
+        original_to_display_bytes[line.len()] = text.len();
+        display_to_original_bytes[text.len()] = line.len();
+
+        ExpandedLogLine {
+            text,
+            original_to_display_bytes,
+            display_to_original_bytes,
+        }
+    }
+
+    /// 将原始日志字节下标换算为展开后的显示字节下标。
+    ///
+    /// 业务意图：
+    /// - 语法高亮、搜索高亮和选区高亮都是基于原始日志文本计算的，渲染前必须同步平移到显示文本。
+    fn display_byte_index_for_original_byte(
+        expanded: &ExpandedLogLine,
+        byte_index: usize,
+    ) -> usize {
+        expanded
+            .original_to_display_bytes
+            .get(byte_index)
+            .copied()
+            .unwrap_or_else(|| expanded.text.len())
+    }
+
+    /// 将显示文本字节下标换算回原始日志字节下标。
+    ///
+    /// 业务意图：
+    /// - 鼠标命中测试发生在展开后的显示文本上，但选区状态保存原始文本字符列；这里负责把二者接回同一坐标系。
+    fn original_byte_index_for_display_byte(
+        expanded: &ExpandedLogLine,
+        byte_index: usize,
+    ) -> usize {
+        expanded
+            .display_to_original_bytes
+            .get(byte_index)
+            .copied()
+            .unwrap_or_else(|| expanded.original_to_display_bytes.len().saturating_sub(1))
+    }
+
+    /// 将基于原始日志文本的高亮范围映射到展开后的显示文本。
+    ///
+    /// 业务意图：
+    /// - tab 展开后显示文本长度变长，如果继续使用原始字节范围，搜索命中、语法高亮和选区背景都会向左错位。
+    /// - 映射时保留原来的 `HighlightStyle`，只调整字节范围。
+    ///
+    /// 边界条件：
+    /// - 空范围或越界范围会被压缩到安全边界后丢弃，避免传给 GPUI 非法高亮区间。
+    fn map_log_highlights_to_display(
+        highlights: Vec<(Range<usize>, gpui::HighlightStyle)>,
+        expanded: &ExpandedLogLine,
+    ) -> Vec<(Range<usize>, gpui::HighlightStyle)> {
+        let original_len = expanded.original_to_display_bytes.len().saturating_sub(1);
+        highlights
+            .into_iter()
+            .filter_map(|(range, style)| {
+                let start = range.start.min(original_len);
+                let end = range.end.min(original_len);
+                let display_start = Self::display_byte_index_for_original_byte(expanded, start);
+                let display_end = Self::display_byte_index_for_original_byte(expanded, end);
+                (display_start < display_end).then_some((display_start..display_end, style))
+            })
+            .collect()
+    }
+
+    /// 返回当前激活文件所在目录的展示标签。
+    ///
+    /// 业务意图：
+    /// - 用户切换到“当前目录”搜索时，需要看到实际将被搜索的目录目标。
+    /// - 这里仅从当前活动 tab 的 `LogFileSource` 派生展示文本，不访问磁盘，也不扩大已加载目录树的权限边界。
+    fn active_search_directory_label(&self) -> Option<String> {
+        let active_tab_id = self.active_tab_id?;
+        let active_tab = self.open_tabs.iter().find(|tab| tab.id == active_tab_id)?;
+        Some(source_location_label(&active_tab.source))
+    }
+
+    /// 判断某个文件来源是否匹配用户编辑后的目录目标文本。
+    ///
+    /// 业务意图：
+    /// - 当前目录搜索的基础范围仍由 `collect_current_directory_sources` 从加载树中递归收集。
+    /// - 用户修改目录目标时，只在这批已授权来源内按展示路径做二次过滤，满足缩小范围或输入子目录片段的需求。
+    ///
+    /// 边界条件：
+    /// - 目标为空时不额外过滤，保持“当前文件所在目录递归搜索”的默认行为。
+    /// - 路径大小写在 Windows 上通常不敏感；这里统一使用小写包含匹配，优先保证跨平台用户输入的容错性。
+    fn source_matches_directory_target(source: &LogFileSource, target: &str) -> bool {
+        let target = target.trim();
+        if target.is_empty() {
+            return true;
+        }
+
+        source_location_label(source)
+            .to_lowercase()
+            .contains(&target.to_lowercase())
+    }
+
+    /// 记录一次搜索关键字。
+    ///
+    /// 业务意图：
+    /// - 执行搜索后把关键字写入当前会话历史，让下一次没有正文选区时可以自动恢复最近关键字。
+    /// - 历史不持久化到配置目录，避免日志关键字涉及业务数据或敏感信息时被长期保存。
+    fn remember_search_query(&mut self, query: &str) {
+        Self::remember_search_query_in_history(&mut self.search_query_history, query);
+    }
+
+    /// 更新搜索关键字历史集合。
+    ///
+    /// 边界条件：
+    /// - 空白关键字不记录。
+    /// - 重复关键字先移除旧位置再插入首位，保证列表按最近使用排序。
+    /// - 超过上限时删除最旧记录，避免会话状态无界增长。
+    fn remember_search_query_in_history(history: &mut Vec<String>, query: &str) {
+        let query = query.trim();
+        if query.is_empty() {
+            return;
+        }
+
+        history.retain(|existing| existing != query);
+        history.insert(0, query.to_string());
+        history.truncate(SEARCH_QUERY_HISTORY_LIMIT);
+    }
+
+    /// 返回最近一次搜索关键字。
+    ///
+    /// 业务意图：
+    /// - 打开搜索窗口时如果没有日志选区，就使用最近关键字预填，满足用户“显示上一次搜索关键字”的要求。
+    fn last_search_query(&self) -> Option<String> {
+        self.search_query_history.first().cloned()
+    }
+
+    /// 从已加载目录树中收集匹配用户目录目标文本的来源。
+    ///
+    /// 业务意图：
+    /// - “当前目录”搜索默认落在当前文件所在目录；当用户手动修改目标目录时，应允许定位到加载树中的其它目录或子目录片段。
+    /// - 搜索仍只遍历已加载树中存在的 `LogFileSource`，不会因为用户输入路径而额外扫描磁盘或解压压缩包。
+    ///
+    /// 边界条件：
+    /// - 同一来源可能因压缩包单文件快捷入口等原因重复出现在树中，必须按稳定键去重。
+    fn collect_sources_matching_directory_target(
+        tree: &LoadedLogTree,
+        target: &str,
+    ) -> Vec<LogFileSource> {
+        let mut seen_keys = HashSet::new();
+        let mut sources = Vec::new();
+
+        for source in tree.rows.iter().filter_map(|row| row.source.as_ref()) {
+            if !Self::source_matches_directory_target(source, target) {
+                continue;
+            }
+
+            let key = source.stable_key();
+            if seen_keys.insert(key) {
+                sources.push(source.clone());
+            }
+        }
+
+        sources
+    }
+
+    /// 标记指定搜索历史记录已取消。
+    ///
+    /// 业务意图：
+    /// - 关闭搜索对话框会让后台任务回调失效，结果面板必须同步从“搜索中”切换为“已取消”。
+    /// - 只修改对应任务的记录，避免影响面板中其它历史搜索。
+    fn mark_search_record_canceled(&mut self, job_id: usize) {
+        let Some(panel) = self.search_results_panel.as_mut() else {
+            return;
+        };
+        if let Some(record) = panel
+            .records
+            .iter_mut()
+            .find(|record| record.job_id == job_id)
+        {
+            record.canceled = true;
+        }
+    }
+
+    /// 在 `MainView` 更新租借结束后打开设置窗口。
+    ///
+    /// 业务意图：
+    /// - 工具栏设置按钮通过该入口打开独立窗口，保证重复点击只激活已有窗口而不是创建多个窗口。
+    /// - 设置窗口只读写 `MainView` 中的设置状态，不访问文件系统、不请求网络，也不影响日志加载或搜索任务。
+    ///
+    /// 边界条件：
+    /// - 如果旧窗口句柄失效，清空后重新创建。
+    /// - 创建失败时仅清理 pending 状态；当前没有用户可见错误面板，避免把设置窗口失败混入日志内容区。
+    fn open_settings_window_after_main_update(main_view: Entity<MainView>, app: &mut App) {
+        let existing_settings_window = main_view.update(app, |view, context| {
+            view.settings_window_open_pending = false;
+            view.tab_context_menu = None;
+            view.encoding_dropdown_menu = None;
+            view.search_results_context_menu = None;
+            view.log_viewer_context_menu = None;
+            context.notify();
+            view.settings_window
+        });
+
+        if let Some(settings_window) = existing_settings_window {
+            if settings_window
+                .update(app, |_, window, _| {
+                    window.activate_window();
+                })
+                .is_ok()
+            {
+                return;
+            }
+            main_view.update(app, |view, _| {
+                view.settings_window = None;
+            });
+        }
+
+        let main_view_for_window = main_view.clone();
+        let main_view_for_close = main_view.clone();
+        let settings_window_options = WindowOptions {
+            titlebar: Some(TitlebarOptions {
+                title: Some("设置".into()),
+                ..Default::default()
+            }),
+            window_bounds: Some(WindowBounds::centered(
+                size(px(SETTINGS_WINDOW_WIDTH), px(SETTINGS_WINDOW_HEIGHT)),
+                app,
+            )),
+            is_resizable: false,
+            is_minimizable: true,
+            window_min_size: Some(size(px(SETTINGS_WINDOW_WIDTH), px(SETTINGS_WINDOW_HEIGHT))),
+            ..Default::default()
+        };
+
+        match app.open_window(settings_window_options, move |window, app| {
+            window.on_window_should_close(app, move |_, app| {
+                main_view_for_close.update(app, |view, context| {
+                    view.settings_window = None;
+                    view.settings_window_open_pending = false;
+                    context.notify();
+                });
+                true
+            });
+            app.new(|context| SettingsWindowView::new(main_view_for_window, context))
+        }) {
+            Ok(settings_window) => {
+                main_view.update(app, |view, context| {
+                    view.settings_window = Some(settings_window);
+                    context.notify();
+                });
+            }
+            Err(_error) => {
+                main_view.update(app, |view, context| {
+                    view.settings_window = None;
+                    view.settings_window_open_pending = false;
+                    context.notify();
+                });
+            }
+        }
+    }
+
+    /// 准备搜索对话框状态。
+    ///
+    /// 业务意图：
+    /// - 如果日志正文当前存在选区，打开或再次唤起搜索框时用选中文本预填关键字，减少复制再搜索的重复操作。
+    /// - 如果没有日志选区，首次打开使用最近一次搜索关键字；已有对话框只在查询词为空时恢复最近关键字，避免覆盖用户正在编辑的输入。
+    ///
+    /// 实现原因：
+    /// - 这里只修改 `MainView` 自身状态，不创建窗口；独立搜索窗口会在 `MainView::update` 返回后再创建。
+    /// - 这样可以避免搜索窗口根视图初始化或渲染时读取 `MainView`，和当前 `MainView` 更新租借发生重叠。
+    fn prepare_search_dialog_state(&mut self) {
+        let selected_query = self.selected_log_text_for_search_query();
+        if self.search_dialog.is_none() {
+            let directory_target = self.active_search_directory_label().unwrap_or_default();
+            let last_query = self.last_search_query();
+            let query = selected_query
+                .clone()
+                .or_else(|| last_query.clone())
+                .unwrap_or_default();
+            let query_cursor = query.len();
+            let directory_cursor = directory_target.len();
+            self.search_dialog = Some(SearchDialogState {
+                query,
+                selection_range: query_cursor..query_cursor,
+                marked_range: None,
+                scope: SearchScope::CurrentFile,
+                directory_target,
+                directory_selection_range: directory_cursor..directory_cursor,
+                directory_marked_range: None,
+                case_sensitive: false,
+                current_file_match_count: None,
+                is_searching: false,
+                progress: SearchProgress::default(),
+                message: if selected_query.is_some() {
+                    "已填入选中文本，按 Enter 或点击搜索".to_string()
+                } else if last_query.is_some() {
+                    "已填入上次搜索关键字，按 Enter 或点击搜索".to_string()
+                } else {
+                    "输入关键字后按 Enter 或点击搜索".to_string()
+                },
+                job_id: 0,
+            });
+        } else if let Some(selected_query) = selected_query
+            && let Some(dialog) = self.search_dialog.as_mut()
+        {
+            let cursor = selected_query.len();
+            dialog.query = selected_query;
+            dialog.selection_range = cursor..cursor;
+            dialog.marked_range = None;
+            dialog.current_file_match_count = None;
+            dialog.message = "已填入选中文本，按 Enter 或点击搜索".to_string();
+        } else if let Some(last_query) = self.last_search_query()
+            && let Some(dialog) = self.search_dialog.as_mut()
+            && dialog.query.trim().is_empty()
+        {
+            let cursor = last_query.len();
+            dialog.query = last_query;
+            dialog.selection_range = cursor..cursor;
+            dialog.marked_range = None;
+            dialog.current_file_match_count = None;
+            dialog.message = "已填入上次搜索关键字，按 Enter 或点击搜索".to_string();
+        }
+        self.tab_context_menu = None;
+        self.encoding_dropdown_menu = None;
+    }
+
+    /// 在 `MainView` 更新租借结束后打开搜索对话框。
+    ///
+    /// 业务意图：
+    /// - 工具栏按钮、`Ctrl+F` 和 `Cmd+F` 都通过该入口打开搜索窗口，避免不同入口出现不同状态规则。
+    /// - 搜索窗口是独立 GPUI 窗口，它的根视图会读取并观察 `MainView`；因此窗口创建必须发生在 `MainView::update` 闭包外。
+    ///
+    /// 边界条件：
+    /// - 如果已有搜索窗口仍有效，则只激活并聚焦输入框。
+    /// - 如果旧句柄已经失效，则清空后重新创建；创建失败时把错误写回搜索对话框状态。
+    fn open_search_dialog_after_main_update(
+        main_view: Entity<MainView>,
+        _current_window: &mut Window,
+        app: &mut App,
+    ) {
+        let (search_input_focus, existing_search_window) =
+            main_view.update(app, |view, context| {
+                view.search_dialog_open_pending = false;
+                view.prepare_search_dialog_state();
+                context.notify();
+                (view.search_input_focus.clone(), view.search_dialog_window)
+            });
+
+        if let Some(search_window) = existing_search_window {
+            if search_window
+                .update(app, |_, window, _| {
+                    window.activate_window();
+                    window.focus(&search_input_focus);
+                })
+                .is_ok()
+            {
+                return;
+            }
+            main_view.update(app, |view, _| {
+                view.search_dialog_window = None;
+            });
+        }
+
+        let main_view_for_window = main_view.clone();
+        let main_view_for_close = main_view.clone();
+        let search_window_options = WindowOptions {
+            titlebar: None,
+            window_bounds: Some(WindowBounds::centered(
+                size(px(SEARCH_DIALOG_WIDTH), px(SEARCH_DIALOG_WINDOW_HEIGHT)),
+                app,
+            )),
+            kind: WindowKind::Floating,
+            is_resizable: false,
+            is_minimizable: false,
+            window_min_size: Some(size(
+                px(SEARCH_DIALOG_WIDTH),
+                px(SEARCH_DIALOG_WINDOW_HEIGHT),
+            )),
+            ..Default::default()
+        };
+
+        match app.open_window(search_window_options, move |window, app| {
+            window.focus(&search_input_focus);
+            window.on_window_should_close(app, move |_, app| {
+                main_view_for_close.update(app, |view, context| {
+                    view.search_dialog_window = None;
+                    view.clear_search_dialog_state(true, context);
+                });
+                true
+            });
+            app.new(|context| SearchDialogWindowView::new(main_view_for_window, context))
+        }) {
+            Ok(search_window) => {
+                main_view.update(app, |view, context| {
+                    view.search_dialog_window = Some(search_window);
+                    context.notify();
+                });
+            }
+            Err(error) => {
+                main_view.update(app, |view, context| {
+                    view.search_dialog_window = None;
+                    if let Some(dialog) = view.search_dialog.as_mut() {
+                        dialog.message = format!("打开搜索窗口失败：{error}");
+                        dialog.is_searching = false;
+                    }
+                    context.notify();
+                });
+            }
+        }
+    }
+
+    /// 关闭搜索对话框并让当前后台搜索任务失效。
+    ///
+    /// 业务意图：
+    /// - 用户关闭对话框时表示不再关注当前搜索过程；旧任务即使稍后返回，也不应继续更新进度或结果。
+    /// - 结果面板不在这里清空，方便用户保留已完成的结果上下文；如果任务仍在运行，则标记为已取消，避免面板永远停留在进行中。
+    fn close_search_dialog(&mut self, window: &mut Window, context: &mut Context<Self>) {
+        let search_window = self.search_dialog_window.take();
+        let current_window_is_search = search_window
+            .map(AnyWindowHandle::from)
+            .is_some_and(|search_window| search_window == window.window_handle());
+        self.clear_search_dialog_state(true, context);
+        if current_window_is_search {
+            window.remove_window();
+        } else if let Some(search_window) = search_window {
+            let _ = search_window.update(context, |_, window, _| {
+                window.remove_window();
+            });
+            window.focus(&self.root_focus_handle);
+        } else {
+            window.focus(&self.root_focus_handle);
+        }
+        context.notify();
+    }
+
+    /// 清理搜索对话框状态。
+    ///
+    /// 业务意图：
+    /// - 关闭搜索窗口、搜索完成自动收起和系统窗口关闭都需要同一套状态清理规则。
+    /// - 取消关闭时需要标记正在运行的记录为已取消；正常完成时只清空对话框，不改变结果记录终态。
+    fn clear_search_dialog_state(&mut self, cancel_running: bool, context: &mut Context<Self>) {
+        let running_job_id = self
+            .search_dialog
+            .as_ref()
+            .filter(|dialog| cancel_running && dialog.is_searching)
+            .map(|dialog| dialog.job_id);
+        if self.search_dialog.is_none() {
+            return;
+        }
+        self.search_dialog = None;
+        self.next_search_job_id += 1;
+        if let Some(job_id) = running_job_id {
+            self.mark_search_record_canceled(job_id);
+        }
+        context.notify();
+    }
+
+    /// 启动一次搜索。
+    ///
+    /// 业务意图：
+    /// - 从搜索对话框读取当前查询词、范围和大小写规则，统一分发到当前文件或当前目录搜索。
+    /// - 新搜索会保留历史记录，但如果上一轮搜索仍在运行，必须先标记为已取消，避免旧任务回调被丢弃后面板长期显示“搜索中”。
+    fn start_search(&mut self, context: &mut Context<Self>) {
+        let Some((options, scope, case_sensitive, directory_target, previous_running_job_id)) = ({
+            self.search_dialog.as_ref().map(|dialog| {
+                (
+                    SearchOptions {
+                        query: dialog.query.trim().to_string(),
+                        case_sensitive: dialog.case_sensitive,
+                    },
+                    dialog.scope,
+                    dialog.case_sensitive,
+                    dialog.directory_target.trim().to_string(),
+                    dialog.is_searching.then_some(dialog.job_id),
+                )
+            })
+        }) else {
+            return;
+        };
+        if options.is_empty_query() {
+            self.update_search_dialog_message("请输入要搜索的关键字", context);
+            return;
+        }
+        self.remember_search_query(&options.query);
+
+        let Some(active_tab_id) = self.active_tab_id else {
+            self.update_search_dialog_message("请先从左侧打开一个日志文件", context);
+            return;
+        };
+        let Some(active_tab) = self.open_tabs.iter().find(|tab| tab.id == active_tab_id) else {
+            self.update_search_dialog_message("当前日志 tab 不存在，请重新选择文件", context);
+            return;
+        };
+
+        let job_id = self.next_search_job_id;
+        self.next_search_job_id += 1;
+
+        let search_target = match scope {
+            SearchScope::CurrentFile => match &active_tab.state {
+                LogTabState::Ready { document } => SearchTarget::CurrentFile {
+                    source: active_tab.source.clone(),
+                    document: document.clone(),
+                },
+                LogTabState::Loading { .. } => {
+                    self.update_search_dialog_message("当前文件仍在加载，完成后再搜索", context);
+                    return;
+                }
+                LogTabState::Failed { .. } => {
+                    self.update_search_dialog_message("当前文件打开失败，无法搜索正文", context);
+                    return;
+                }
+            },
+            SearchScope::CurrentDirectory => {
+                let LogTreeLoadState::Loaded(tree_state) = &self.load_state else {
+                    self.update_search_dialog_message("请先加载日志目录后再搜索当前目录", context);
+                    return;
+                };
+                let sources = if directory_target.is_empty() {
+                    collect_current_directory_sources(&tree_state.tree, &active_tab.source)
+                } else {
+                    Self::collect_sources_matching_directory_target(
+                        &tree_state.tree,
+                        &directory_target,
+                    )
+                };
+                if sources.is_empty() {
+                    self.update_search_dialog_message("当前目录中没有可搜索的日志文件", context);
+                    return;
+                }
+                SearchTarget::CurrentDirectory { sources }
+            }
+        };
+
+        let total_files = match &search_target {
+            SearchTarget::CurrentFile { .. } => 1,
+            SearchTarget::CurrentDirectory { sources } => sources.len(),
+        };
+        let panel_height = self
+            .search_results_panel
+            .as_ref()
+            .map(|panel| panel.height)
+            .unwrap_or(SEARCH_RESULTS_PANEL_DEFAULT_HEIGHT);
+        let new_record = SearchHistoryRecord {
+            job_id,
+            query: options.query.clone(),
+            scope,
+            directory_target: (scope == SearchScope::CurrentDirectory)
+                .then(|| directory_target.clone())
+                .filter(|target| !target.is_empty()),
+            case_sensitive,
+            progress: SearchProgress {
+                searched_files: 0,
+                total_files,
+                matched_lines: 0,
+            },
+            results: Vec::new(),
+            errors: Vec::new(),
+            canceled: false,
+            expanded: true,
+            expanded_file_keys: HashSet::new(),
+        };
+        if let Some(previous_job_id) = previous_running_job_id {
+            self.mark_search_record_canceled(previous_job_id);
+        }
+        if let Some(panel) = self.search_results_panel.as_mut() {
+            for record in &mut panel.records {
+                record.expanded = false;
+            }
+            panel.records.push(new_record);
+            panel.rows = Self::search_results_panel_rows_from_records(&panel.records);
+            panel.scroll_handle = UniformListScrollHandle::new();
+        } else {
+            let records = vec![new_record];
+            let rows = Self::search_results_panel_rows_from_records(&records);
+            self.search_results_panel = Some(SearchResultsPanelState {
+                records,
+                rows,
+                height: panel_height,
+                scroll_handle: UniformListScrollHandle::new(),
+            });
+        }
+        if let Some(dialog) = self.search_dialog.as_mut() {
+            dialog.job_id = job_id;
+            dialog.is_searching = true;
+            dialog.progress = SearchProgress {
+                searched_files: 0,
+                total_files,
+                matched_lines: 0,
+            };
+            dialog.message = format!("正在搜索 0/{total_files} 个文件...");
+        }
+        context.notify();
+
+        match search_target {
+            SearchTarget::CurrentFile { source, document } => {
+                self.spawn_current_file_search(job_id, source, document, options, context);
+            }
+            SearchTarget::CurrentDirectory { sources } => {
+                self.spawn_current_directory_search(job_id, sources, options, context);
+            }
+        }
+    }
+
+    /// 更新搜索对话框提示文案。
+    fn update_search_dialog_message(
+        &mut self,
+        message: impl Into<String>,
+        context: &mut Context<Self>,
+    ) {
+        if let Some(dialog) = self.search_dialog.as_mut() {
+            dialog.message = message.into();
+            dialog.is_searching = false;
+        }
+        context.notify();
+    }
+
+    /// 启动当前文件后台搜索。
+    ///
+    /// 业务意图：
+    /// - 当前文件虽然已经解码，但逐行搜索大日志仍可能耗时，因此放到后台执行器运行。
+    /// - 这里传入 `Arc<Vec<String>>`，只共享已解码行集合，不在 UI 线程复制 200MB 级别日志。
+    fn spawn_current_file_search(
+        &self,
+        job_id: usize,
+        source: LogFileSource,
+        document: LogTabDocument,
+        options: SearchOptions,
+        context: &mut Context<Self>,
+    ) {
+        context
+            .spawn(async move |view, app| {
+                let results = app
+                    .background_executor()
+                    .spawn(async move {
+                        match document {
+                            LogTabDocument::InMemory(document) => {
+                                search_lines(&source, document.lines.as_ref(), &options)
+                            }
+                            LogTabDocument::Paged(document) => {
+                                let outcome = search_paged_document(&document, &options);
+                                let _ = outcome.truncated;
+                                outcome.results
+                            }
+                        }
+                    })
+                    .await;
+
+                view.update(app, |view, context| {
+                    view.apply_search_file_result(job_id, Ok(results), 1);
+                    view.finish_search_job(job_id, context);
+                    context.notify();
+                })
+                .ok();
+            })
+            .detach();
+    }
+
+    /// 启动当前目录递归后台搜索。
+    ///
+    /// 业务意图：
+    /// - 目录搜索可能涉及多个本地文件或压缩包成员，必须逐文件放到后台读取和解码。
+    /// - 每个文件完成后立即回传进度，让搜索对话框显示真实进展，而不是等全部完成才更新。
+    fn spawn_current_directory_search(
+        &self,
+        job_id: usize,
+        sources: Vec<LogFileSource>,
+        options: SearchOptions,
+        context: &mut Context<Self>,
+    ) {
+        let total_files = sources.len();
+        context
+            .spawn(async move |view, app| {
+                for source in sources {
+                    let search_options = options.clone();
+                    let result = app
+                        .background_executor()
+                        .spawn(async move { Self::search_one_source(source, search_options) })
+                        .await;
+
+                    let should_continue = view
+                        .update(app, |view, context| {
+                            let current =
+                                view.apply_search_file_result(job_id, result, total_files);
+                            context.notify();
+                            current
+                        })
+                        .unwrap_or(false);
+
+                    if !should_continue {
+                        return;
+                    }
+                }
+
+                view.update(app, |view, context| {
+                    view.finish_search_job(job_id, context);
+                    context.notify();
+                })
+                .ok();
+            })
+            .detach();
+    }
+
+    /// 搜索单个文件来源。
+    ///
+    /// 业务意图：
+    /// - 目录搜索中的每个文件独立读取、自动解码和搜索；失败时转换为文件级错误，调用方继续处理其它文件。
+    /// - 这里复用现有 200MB 大小上限和编码检测逻辑，避免搜索路径绕过日志打开边界。
+    fn search_one_source(
+        source: LogFileSource,
+        options: SearchOptions,
+    ) -> Result<Vec<SearchResultItem>, SearchFileError> {
+        let file_name = source.display_name();
+        let opened = open_log_source_for_tab(source.clone(), EncodingChoice::Auto, &file_name)
+            .map_err(|error| SearchFileError {
+                file_name: file_name.clone(),
+                message: error.to_string(),
+            })?;
+
+        match opened {
+            LargeLogOpenResult::InMemoryReady { document, .. } => {
+                Ok(search_lines(&source, &document.lines, &options))
+            }
+            LargeLogOpenResult::InMemoryDecodeFailed { message, .. } => {
+                Err(SearchFileError { file_name, message })
+            }
+            LargeLogOpenResult::PagedReady { document } => {
+                let outcome = search_paged_document(&document, &options);
+                let _ = outcome.truncated;
+                if let Some(temp_path) = document.materialized_temp_path.as_deref() {
+                    cleanup_materialized_file(temp_path);
+                }
+                Ok(outcome.results)
+            }
+        }
+    }
+
+    /// 合并单个文件的搜索结果并返回任务是否仍然有效。
+    ///
+    /// 业务意图：
+    /// - 后台任务回到 UI 线程时必须校验任务 ID，避免旧任务覆盖新搜索状态。
+    /// - 文件级错误只累积到结果面板，不中断当前任务。
+    fn apply_search_file_result(
+        &mut self,
+        job_id: usize,
+        result: Result<Vec<SearchResultItem>, SearchFileError>,
+        total_files: usize,
+    ) -> bool {
+        if !self.is_current_search_job(job_id) {
+            return false;
+        }
+
+        let mut matched_lines = 0usize;
+        if let Some(panel) = self.search_results_panel.as_mut() {
+            {
+                let Some(record) = panel
+                    .records
+                    .iter_mut()
+                    .find(|record| record.job_id == job_id)
+                else {
+                    return false;
+                };
+                match result {
+                    Ok(mut results) => {
+                        matched_lines = results.len();
+                        for result in &results {
+                            record.expanded_file_keys.insert(result.source_key.clone());
+                        }
+                        record.results.append(&mut results);
+                    }
+                    Err(error) => {
+                        record.errors.push(error);
+                    }
+                }
+                record.progress.searched_files += 1;
+                record.progress.total_files = total_files;
+                record.progress.matched_lines = record.results.len();
+            }
+            panel.rows = Self::search_results_panel_rows_from_records(&panel.records);
+        }
+
+        if let Some(dialog) = self.search_dialog.as_mut() {
+            dialog.progress.searched_files += 1;
+            dialog.progress.total_files = total_files;
+            dialog.progress.matched_lines += matched_lines;
+            dialog.message = format!(
+                "正在搜索 {}/{} 个文件，已命中 {} 行",
+                dialog.progress.searched_files,
+                dialog.progress.total_files,
+                dialog.progress.matched_lines
+            );
+        }
+
+        true
+    }
+
+    /// 标记搜索任务完成并关闭搜索对话框。
+    ///
+    /// 业务意图：
+    /// - 搜索对话框只负责输入条件和展示进行中进度；任务完成后应自动收起，把空间让给正文和底部结果面板。
+    /// - 结果面板保留历史记录和明细，用户可以继续查看、展开和点击定位。
+    fn finish_search_job(&mut self, job_id: usize, context: &mut Context<Self>) {
+        if !self.is_current_search_job(job_id) {
+            return;
+        }
+
+        if let Some(panel) = self.search_results_panel.as_mut()
+            && let Some(record) = panel
+                .records
+                .iter_mut()
+                .find(|record| record.job_id == job_id)
+        {
+            record.canceled = false;
+        }
+        self.search_dialog = None;
+        if let Some(search_window) = self.search_dialog_window.take() {
+            let _ = search_window.update(context, |_, window, _| {
+                window.remove_window();
+            });
+        }
+    }
+
+    /// 判断后台回调是否属于当前仍有效的搜索任务。
+    fn is_current_search_job(&self, job_id: usize) -> bool {
+        self.search_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.job_id == job_id && dialog.is_searching)
+    }
+
+    /// 点击搜索结果后打开文件并滚动到命中行。
+    ///
+    /// 业务意图：
+    /// - 搜索结果不仅用于查看，还应成为跨文件定位入口。
+    /// - 如果目标文件尚未打开，则新建 tab；如果已经打开，则直接激活并滚动。
+    fn open_search_result(&mut self, result: SearchResultItem, context: &mut Context<Self>) {
+        let source_key = result.source_key.clone();
+        let line_index = result.line_index;
+
+        if !self
+            .open_tabs
+            .iter()
+            .any(|tab| tab.source_key == source_key)
+        {
+            self.open_log_file(result.source.clone(), context);
+        }
+
+        let Some(tab_index) = self
+            .open_tabs
+            .iter()
+            .position(|tab| tab.source_key == source_key)
+        else {
+            return;
+        };
+        let tab_id = self.open_tabs[tab_index].id;
+        let ready = matches!(self.open_tabs[tab_index].state, LogTabState::Ready { .. });
+        self.open_tabs[tab_index].pending_scroll_to_line = Some(line_index);
+        self.open_tabs[tab_index].highlighted_search_line = Some(line_index);
+        self.activate_tab(tab_id);
+        if ready {
+            self.open_tabs[tab_index].pending_scroll_to_line = None;
+            self.scroll_log_tab_to_line(tab_id, line_index);
+        }
+        context.notify();
+    }
+
+    /// 处理根视图鼠标移动。
+    ///
+    /// 业务意图：
+    /// - 结果面板高度调整和结果面板滚动条拖动都可能跨过右侧正文、左侧树或工具栏区域，因此放到根视图统一处理。
+    /// - 搜索对话框已经改为独立窗口，不再需要主窗口接管拖动过程。
+    /// - 现有左右分割线和滚动条拖动仍在内容区处理，避免扩大它们的鼠标命中范围。
+    fn handle_root_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.update_search_results_resize_drag(event, window, context);
+        self.update_search_results_scrollbar_drag(event, context);
+    }
+
+    /// 处理根视图鼠标释放。
+    ///
+    /// 业务意图：
+    /// - 结果面板 resize 和结果面板滚动条拖动都依赖鼠标释放清理临时状态。
+    fn handle_root_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let had_drag = self.search_results_resize_drag.take().is_some();
+        let had_scrollbar_drag = self.search_results_scrollbar_drag.take().is_some();
+        self.stop_log_text_selection(context);
+        if had_drag || had_scrollbar_drag {
+            context.notify();
+        }
+    }
+
+    /// 开始调整搜索结果面板高度。
+    fn start_search_results_resize(&mut self, event: &MouseDownEvent) {
+        let Some(panel) = &self.search_results_panel else {
+            return;
+        };
+        self.search_results_resize_drag = Some(SearchResultsResizeDrag {
+            start_y: event.position.y,
+            start_height: panel.height,
+        });
+        self.search_results_scrollbar_drag = None;
+        self.tab_context_menu = None;
+        self.encoding_dropdown_menu = None;
+        self.log_viewer_context_menu = None;
+    }
+
+    /// 根据鼠标拖动更新搜索结果面板高度。
+    fn update_search_results_resize_drag(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.search_results_resize_drag else {
+            return;
+        };
+        if !event.dragging() {
+            self.search_results_resize_drag = None;
+            context.notify();
+            return;
+        }
+
+        let Some(panel) = self.search_results_panel.as_mut() else {
+            self.search_results_resize_drag = None;
+            context.notify();
+            return;
+        };
+        let content_height = (f32::from(window.viewport_size().height) - TOOLBAR_HEIGHT).max(1.0);
+        let max_height =
+            (content_height * SEARCH_RESULTS_PANEL_MAX_RATIO).max(SEARCH_RESULTS_PANEL_MIN_HEIGHT);
+        let next_height = drag.start_height + f32::from(drag.start_y - event.position.y);
+        panel.height = next_height.clamp(SEARCH_RESULTS_PANEL_MIN_HEIGHT, max_height);
+        context.notify();
+    }
+
+    /// 开始拖动搜索结果面板滚动条滑块。
+    ///
+    /// 业务意图：
+    /// - 搜索结果面板可能包含大量历史记录和命中行，需要支持直接拖动滚动条快速定位。
+    /// - 拖动开始时记录鼠标在滑块内的偏移，避免滑块突然跳到鼠标中心。
+    ///
+    /// 边界条件：
+    /// - 如果结果面板未打开、列表尚未完成测量或内容不足以滚动，则忽略本次按下。
+    fn start_search_results_scrollbar_drag(
+        &mut self,
+        event: &MouseDownEvent,
+        context: &mut Context<Self>,
+    ) {
+        let Some(panel) = &self.search_results_panel else {
+            return;
+        };
+        let Some(metrics) = Self::search_results_scrollbar_metrics(&panel.scroll_handle) else {
+            return;
+        };
+        if metrics.max_scroll <= px(0.0) {
+            return;
+        }
+        let Some(viewport_top) = Self::uniform_list_viewport_axis_origin(
+            &panel.scroll_handle,
+            LogScrollbarAxis::Vertical,
+        ) else {
+            return;
+        };
+
+        self.search_results_scrollbar_drag = Some(SearchResultsScrollbarDrag {
+            cursor_offset: event.position.y - viewport_top - metrics.thumb_start,
+        });
+        self.search_results_resize_drag = None;
+        self.search_results_context_menu = None;
+        self.tab_context_menu = None;
+        self.encoding_dropdown_menu = None;
+        self.log_viewer_context_menu = None;
+        self.stop_log_text_selection(context);
+    }
+
+    /// 根据鼠标移动更新搜索结果面板滚动条拖动结果。
+    ///
+    /// 业务意图：
+    /// - 自绘滚动条拖动必须写回搜索结果虚拟列表的底层滚动偏移，才能和滚轮滚动、虚拟渲染保持一致。
+    /// - 只在鼠标左键仍按下时更新；如果释放发生在其它区域，也会在下一次移动时清理拖动状态。
+    fn update_search_results_scrollbar_drag(
+        &mut self,
+        event: &MouseMoveEvent,
+        context: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.search_results_scrollbar_drag else {
+            return;
+        };
+        if !event.dragging() {
+            self.search_results_scrollbar_drag = None;
+            context.notify();
+            return;
+        }
+        let Some(panel) = self.search_results_panel.as_ref() else {
+            self.search_results_scrollbar_drag = None;
+            context.notify();
+            return;
+        };
+        let Some(metrics) = Self::search_results_scrollbar_metrics(&panel.scroll_handle) else {
+            self.search_results_scrollbar_drag = None;
+            context.notify();
+            return;
+        };
+        let Some(viewport_top) = Self::uniform_list_viewport_axis_origin(
+            &panel.scroll_handle,
+            LogScrollbarAxis::Vertical,
+        ) else {
+            self.search_results_scrollbar_drag = None;
+            context.notify();
+            return;
+        };
+
+        let movable_length = (metrics.track_length - metrics.thumb_length).max(px(0.0));
+        if metrics.max_scroll <= px(0.0) || movable_length <= px(0.0) {
+            return;
+        }
+
+        let requested_thumb_start = event.position.y - viewport_top - drag.cursor_offset;
+        let thumb_start =
+            requested_thumb_start.clamp(metrics.track_start, metrics.track_start + movable_length);
+        let scroll_offset =
+            metrics.max_scroll * ((thumb_start - metrics.track_start) / movable_length);
+        let base_scroll_handle = {
+            // `UniformListScrollHandle` 包装了真正的 `ScrollHandle`；克隆后再写入，避免持有 RefCell 借用时触发嵌套借用。
+            panel.scroll_handle.0.borrow().base_handle.clone()
+        };
+        let current_offset = base_scroll_handle.offset();
+        base_scroll_handle.set_offset(point(current_offset.x, -scroll_offset));
+        context.notify();
+    }
+
+    /// 根据真实加载节点类型返回目录树图标和颜色。
+    ///
+    /// 业务意图：
+    /// - 将类型到视觉符号的映射集中管理，后续新增节点类型时不会散落在多个渲染分支里。
+    fn loaded_log_tree_icon(kind: LogTreeEntryKind, palette: AppThemePalette) -> (Icon, u32) {
+        match kind {
+            LogTreeEntryKind::Directory => (Icon::FolderOpen, palette.accent),
+            LogTreeEntryKind::File => (Icon::FileText, palette.muted_text),
+            LogTreeEntryKind::Archive => (Icon::FileArchive, 0x8250df),
+            LogTreeEntryKind::Symlink => (Icon::FolderSymlink, palette.muted_text),
+            LogTreeEntryKind::Error => (Icon::FileX, palette.error),
+        }
+    }
+
+    /// 渲染目录树节点右侧的补充信息。
+    ///
+    /// 业务意图：
+    /// - 元信息用于展示文件大小或错误类别，让目录树信息更便于扫描。
+    /// - 没有元信息的节点仍通过统一函数返回空占位，保持行模板简单稳定。
+    ///
+    /// 边界条件：
+    /// - 当前元信息不参与排序、过滤或诊断，只是短文本展示。
+    /// - 后续若元信息可能很长，需要定义截断、悬浮提示和优先级规则。
+    fn render_log_tree_meta(meta: Option<&str>, palette: AppThemePalette) -> gpui::Div {
+        let meta_element = div()
+            .flex_none()
+            .text_xs()
+            .text_color(rgb(palette.muted_text))
+            .child(meta.unwrap_or_default().to_string());
+
+        if meta.is_some() {
+            meta_element
+        } else {
+            meta_element.hidden()
+        }
+    }
+
+    /// 开始拖动左右分栏分割线。
+    ///
+    /// 业务意图：
+    /// - 用户按下分割线后进入调整模式，后续鼠标移动将改变左侧区域宽度。
+    ///
+    /// 边界条件：
+    /// - 只响应鼠标左键，避免右键菜单或其它鼠标键误触发布局变化。
+    /// - 按下瞬间不立即改变宽度，实际宽度在移动事件中按当前位置计算。
+    fn start_resizing_splitter(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        _context: &mut Context<Self>,
+    ) {
+        self.is_resizing_splitter = true;
+    }
+
+    /// 开始拖动左侧目录树滚动条滑块。
+    ///
+    /// 业务意图：
+    /// - 目录树节点较多时，用户需要可以直接拖动滚动条快速定位，而不是只能依赖滚轮。
+    /// - 记录鼠标在滑块内的偏移，避免拖动开始时滑块位置突变。
+    ///
+    /// 边界条件：
+    /// - 如果列表尚未完成测量或内容不足以滚动，则忽略本次按下。
+    fn start_log_tree_scrollbar_drag(&mut self, event: &MouseDownEvent) {
+        let Some(metrics) = Self::log_tree_scrollbar_metrics(&self.log_tree_scroll_handle) else {
+            return;
+        };
+        if metrics.max_scroll <= px(0.0) {
+            return;
+        }
+        let Some(viewport_top) = Self::uniform_list_viewport_axis_origin(
+            &self.log_tree_scroll_handle,
+            LogScrollbarAxis::Vertical,
+        ) else {
+            return;
+        };
+
+        self.log_tree_scrollbar_drag = Some(LogTreeScrollbarDrag {
+            cursor_offset: event.position.y - viewport_top - metrics.thumb_start,
+        });
+        self.tab_context_menu = None;
+        self.encoding_dropdown_menu = None;
+        self.log_viewer_context_menu = None;
+    }
+
+    /// 处理内容区鼠标移动事件。
+    ///
+    /// 业务意图：
+    /// - 左右分割线拖动、左侧树滚动条拖动和日志滚动条拖动都依赖窗口级鼠标移动；统一入口可以保证这些交互在同一帧内得到更新。
+    /// - 该方法只分发交互，不直接渲染 UI，便于后续继续追加其它拖动类操作。
+    fn handle_content_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.resize_splitter(event, window, context);
+        self.update_log_tree_scrollbar_drag(event, context);
+        self.update_log_scrollbar_drag(event, context);
+    }
+
+    /// 处理内容区鼠标左键释放事件。
+    ///
+    /// 业务意图：
+    /// - 用户释放鼠标时需要同时结束分割线拖动、左侧树滚动条拖动和日志滚动条拖动，避免后续移动继续改变布局或滚动位置。
+    fn handle_content_mouse_up(
+        &mut self,
+        event: &MouseUpEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.stop_resizing_splitter(event, window, context);
+        self.stop_log_tree_scrollbar_drag(context);
+        self.stop_log_scrollbar_drag(context);
+        self.stop_log_text_selection(context);
+    }
+
+    /// 根据鼠标移动更新左侧目录树滚动条拖动结果。
+    ///
+    /// 业务意图：
+    /// - 自绘滚动条拖动必须写回目录树虚拟列表底层滚动偏移，才能和滚轮滚动、虚拟行渲染保持一致。
+    /// - 只在鼠标左键仍按下时更新；如果释放发生在其它元素上，也会在下一次移动时清理拖动状态。
+    fn update_log_tree_scrollbar_drag(
+        &mut self,
+        event: &MouseMoveEvent,
+        context: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.log_tree_scrollbar_drag else {
+            return;
+        };
+        if !event.dragging() {
+            self.log_tree_scrollbar_drag = None;
+            context.notify();
+            return;
+        }
+        let Some(metrics) = Self::log_tree_scrollbar_metrics(&self.log_tree_scroll_handle) else {
+            self.log_tree_scrollbar_drag = None;
+            context.notify();
+            return;
+        };
+        let Some(viewport_top) = Self::uniform_list_viewport_axis_origin(
+            &self.log_tree_scroll_handle,
+            LogScrollbarAxis::Vertical,
+        ) else {
+            self.log_tree_scrollbar_drag = None;
+            context.notify();
+            return;
+        };
+
+        let movable_length = (metrics.track_length - metrics.thumb_length).max(px(0.0));
+        if metrics.max_scroll <= px(0.0) || movable_length <= px(0.0) {
+            return;
+        }
+
+        let requested_thumb_start = event.position.y - viewport_top - drag.cursor_offset;
+        let thumb_start =
+            requested_thumb_start.clamp(metrics.track_start, metrics.track_start + movable_length);
+        let scroll_offset =
+            metrics.max_scroll * ((thumb_start - metrics.track_start) / movable_length);
+        let base_scroll_handle = {
+            // 克隆底层滚动句柄后释放 `RefCell` 借用，再写入偏移，避免测量状态借用和滚动状态更新交叉。
+            self.log_tree_scroll_handle.0.borrow().base_handle.clone()
+        };
+        let current_offset = base_scroll_handle.offset();
+        base_scroll_handle.set_offset(point(current_offset.x, -scroll_offset));
+        context.notify();
+    }
+
+    /// 结束左侧目录树滚动条拖动。
+    ///
+    /// 业务意图：
+    /// - 鼠标释放后清理拖动状态，避免普通鼠标移动继续改变目录树滚动位置。
+    fn stop_log_tree_scrollbar_drag(&mut self, context: &mut Context<Self>) {
+        if self.log_tree_scrollbar_drag.is_some() {
+            self.log_tree_scrollbar_drag = None;
+            context.notify();
+        }
+    }
+
+    /// 拖动分割线时更新左侧内容区域宽度。
+    ///
+    /// 业务意图：
+    /// - 将鼠标横坐标映射为左侧区域宽度，从而提供直接、可预期的分栏拖动体验。
+    ///
+    /// 边界条件：
+    /// - 只有处于拖动状态时才更新宽度。
+    /// - 宽度会被限制在左侧最小宽度和右侧最小可用空间之间，避免任一面板不可用。
+    fn resize_splitter(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if !self.is_resizing_splitter {
+            return;
+        }
+
+        self.left_panel_width = Self::clamp_left_panel_width(
+            f32::from(event.position.x),
+            f32::from(window.bounds().size.width),
+        );
+        context.notify();
+    }
+
+    /// 结束拖动左右分栏分割线。
+    ///
+    /// 业务意图：
+    /// - 鼠标左键释放后退出调整模式，后续鼠标移动不再改变分栏宽度。
+    ///
+    /// 边界条件：
+    /// - 当前不做宽度持久化，因此释放动作只影响内存状态。
+    fn stop_resizing_splitter(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        _context: &mut Context<Self>,
+    ) {
+        self.is_resizing_splitter = false;
+    }
+
+    /// 将左侧区域宽度限制在可用范围内。
+    ///
+    /// 业务意图：
+    /// - 分割线拖动必须保留左右两栏的基本可用空间。
+    /// - 独立函数便于后续为该边界逻辑补充单元测试。
+    ///
+    /// 边界条件：
+    /// - 如果窗口极窄导致右侧最小宽度无法满足，仍优先保证左侧不低于最小宽度。
+    /// - 当前只使用窗口总宽度计算，工具栏高度不影响水平分割。
+    fn clamp_left_panel_width(requested_width: f32, window_width: f32) -> f32 {
+        let max_left_width = (window_width - SPLITTER_VISIBLE_WIDTH - RIGHT_PANEL_MIN_WIDTH)
+            .max(LEFT_PANEL_MIN_WIDTH);
+        requested_width.clamp(LEFT_PANEL_MIN_WIDTH, max_left_width)
+    }
+
+    /// 渲染未显示左侧目录树时的主内容提示。
+    ///
+    /// 业务意图：
+    /// - 用户明确要求未加载日志时不显示左侧区域，因此主内容区需要占满窗口剩余空间。
+    /// - 提示文案直接说明下一步动作，避免空白内容区让用户误以为界面卡住。
+    ///
+    /// 边界条件：
+    /// - 加载中和加载失败也使用同一块主内容区提示，不提前显示左侧栏。
+    /// - 当前提示不承载按钮，避免和顶部“加载日志”入口形成重复操作路径。
+    fn render_primary_content_message(&self) -> impl IntoElement {
+        let palette = self.palette();
+        if let LogTreeLoadState::Loading { message } = &self.load_state {
+            return div()
+                .id("primary-content-loading-message")
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .size_full()
+                .px_4()
+                .bg(rgb(palette.background))
+                .child(Self::render_loading_spinner(palette.accent))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(palette.muted_text))
+                        .text_center()
+                        .child(message.clone()),
+                );
+        }
+
+        let (icon, icon_color, title, description) = match &self.load_state {
+            LogTreeLoadState::Empty => (
+                Icon::FileText,
+                palette.muted_text,
+                "请先加载日志".to_string(),
+                "点击左上角“加载日志”，选择日志文件、目录或压缩包。".to_string(),
+            ),
+            LogTreeLoadState::Failed { message } => (
+                Icon::FileX,
+                palette.error,
+                "加载日志失败".to_string(),
+                message.clone(),
+            ),
+            LogTreeLoadState::Loaded(_) => (
+                Icon::FileText,
+                palette.muted_text,
+                String::new(),
+                String::new(),
+            ),
+            LogTreeLoadState::Loading { .. } => unreachable!("加载态已在上方提前返回"),
+        };
+
+        div()
+            .id("primary-content-message")
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .size_full()
+            .px_4()
+            .bg(rgb(palette.background))
+            .child(Self::render_lucide_icon(Some(icon), 32.0, 28.0, icon_color))
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(palette.text))
+                    .child(title),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(palette.muted_text))
+                    .child(description),
+            )
+    }
+
+    /// 渲染右侧日志工作区。
+    ///
+    /// 业务意图：
+    /// - 加载日志后但尚未打开任何文件时，右侧给出“点击左侧日志文件查看内容”的友好提示。
+    /// - 打开文件后显示 tab 栏、编码切换工具条和只读日志正文；单日志模式隐藏 tab 栏，把空间留给正文。
+    /// - 搜索结果面板打开后作为底部分栏参与布局，日志正文和滚动条高度会自动扣除面板高度。
+    ///
+    /// 边界条件：
+    /// - 当前不持久化 tab，不支持拖拽重排，也不实现复制菜单。
+    fn render_right_log_panel(&self, context: &mut Context<Self>) -> impl IntoElement {
+        let content = if self.open_tabs.is_empty() {
+            div()
+                .id("right-log-panel-empty")
+                .flex()
+                .flex_1()
+                .size_full()
+                .child(self.render_loaded_right_empty_message())
+        } else if self.should_hide_log_tree_panel() {
+            div()
+                .id("right-log-panel-single-tab")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .size_full()
+                .child(self.render_active_log_tab(context))
+        } else {
+            div()
+                .id("right-log-panel-tabs")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .size_full()
+                .child(self.render_log_tab_bar(context))
+                .child(self.render_active_log_tab(context))
+        };
+
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .size_full()
+            .overflow_hidden()
+            .child(content)
+            .child(self.render_search_results_panel(context))
+            .child(self.render_popup_dismiss_overlay(context))
+            .child(self.render_tab_context_menu(context))
+            .child(self.render_log_viewer_context_menu(context))
+            .child(self.render_search_results_context_menu(context))
+            .child(self.render_encoding_dropdown_menu(context))
+    }
+
+    /// 读取搜索输入框当前文本、选择范围和组合文本范围的快照。
+    ///
+    /// 业务意图：
+    /// - `SearchTextInputElement` 在 GPUI 绘制阶段只拿到 `App` 上下文，不能直接借用搜索窗口视图状态。
+    /// - 通过主视图提供只读快照，保证绘制、命中测试和 IME 状态都来自同一份业务状态。
+    fn search_text_snapshot(
+        &self,
+        input_kind: SearchTextInputKind,
+    ) -> Option<(String, Range<usize>, Option<Range<usize>>)> {
+        let dialog = self.search_dialog.as_ref()?;
+        let (text, selection_range, marked_range) = Self::search_text_state(dialog, input_kind);
+        Some((text.to_string(), selection_range, marked_range))
+    }
+
+    /// 保存搜索输入框最近一次 GPUI 文本排版结果。
+    ///
+    /// 业务意图：
+    /// - 鼠标点击和拖拽必须根据真实字形宽度转换成文本下标；缓存 `ShapedLine` 后可以复用 GPUI 的命中算法。
+    /// - 分开保存关键字和目录输入框，避免两个输入框在同一帧绘制后互相覆盖命中数据。
+    fn store_search_text_layout(
+        &mut self,
+        input_kind: SearchTextInputKind,
+        line: ShapedLine,
+        bounds: Bounds<Pixels>,
+    ) {
+        match input_kind {
+            SearchTextInputKind::Query => {
+                self.search_query_last_layout = Some(line);
+                self.search_query_last_bounds = Some(bounds);
+            }
+            SearchTextInputKind::DirectoryTarget => {
+                self.search_directory_last_layout = Some(line);
+                self.search_directory_last_bounds = Some(bounds);
+            }
+        }
+    }
+
+    /// 开始搜索输入框的鼠标选择。
+    ///
+    /// 业务意图：
+    /// - 单击定位光标，Shift+单击扩展当前选择，双击选择当前词，三连击选中整段输入。
+    /// - 选择逻辑写在 `MainView` 中，保证搜索关键字和目录目标输入框行为一致。
+    fn start_search_text_mouse_selection(
+        &mut self,
+        input_kind: SearchTextInputKind,
+        event: &MouseDownEvent,
+        context: &mut Context<Self>,
+    ) {
+        let index = self.search_text_index_for_point(input_kind, event.position);
+        let Some(dialog) = self.search_dialog.as_mut() else {
+            return;
+        };
+        let (text, selection_range, marked_range) = Self::search_text_state_mut(dialog, input_kind);
+        *marked_range = None;
+        match event.click_count {
+            0 | 1 => {
+                if event.modifiers.shift {
+                    selection_range.end = index;
+                    *selection_range = Self::clamp_search_text_range(text, selection_range.clone());
+                } else {
+                    *selection_range = index..index;
+                }
+                self.search_text_selection_drag = Some((input_kind, selection_range.start));
+            }
+            2 => {
+                *selection_range = Self::search_text_word_range_for_index(text, index);
+                self.search_text_selection_drag = None;
+            }
+            _ => {
+                *selection_range = 0..text.len();
+                self.search_text_selection_drag = None;
+            }
+        }
+        self.touch_search_text_cursor_activity();
+        context.notify();
+    }
+
+    /// 鼠标拖拽时更新搜索输入框选区终点。
+    fn update_search_text_mouse_selection(
+        &mut self,
+        position: Point<Pixels>,
+        context: &mut Context<Self>,
+    ) {
+        let Some((input_kind, anchor)) = self.search_text_selection_drag else {
+            return;
+        };
+        let index = self.search_text_index_for_point(input_kind, position);
+        if let Some(dialog) = self.search_dialog.as_mut() {
+            let (text, selection_range, marked_range) =
+                Self::search_text_state_mut(dialog, input_kind);
+            *marked_range = None;
+            *selection_range = Self::clamp_search_text_range(text, anchor..index);
+            self.touch_search_text_cursor_activity();
+            context.notify();
+        }
+    }
+
+    /// 结束搜索输入框鼠标拖拽选择。
+    fn finish_search_text_mouse_selection(&mut self, context: &mut Context<Self>) {
+        if self.search_text_selection_drag.take().is_some() {
+            context.notify();
+        }
+    }
+
+    /// 根据鼠标窗口坐标返回搜索输入框中的 UTF-8 字节下标。
+    ///
+    /// 边界条件：
+    /// - 如果输入框尚未完成首次绘制，没有可用字形布局，则回退到文本末尾，避免点击导致越界。
+    /// - 如果点击发生在文本区域上下之外，分别夹到开头和末尾，符合单行系统输入框的常见行为。
+    fn search_text_index_for_point(
+        &self,
+        input_kind: SearchTextInputKind,
+        position: Point<Pixels>,
+    ) -> usize {
+        let Some((text, _, _)) = self.search_text_snapshot(input_kind) else {
+            return 0;
+        };
+        let (layout, bounds) = match input_kind {
+            SearchTextInputKind::Query => (
+                self.search_query_last_layout.as_ref(),
+                self.search_query_last_bounds.as_ref(),
+            ),
+            SearchTextInputKind::DirectoryTarget => (
+                self.search_directory_last_layout.as_ref(),
+                self.search_directory_last_bounds.as_ref(),
+            ),
+        };
+        let (Some(layout), Some(bounds)) = (layout, bounds) else {
+            return text.len();
+        };
+        if position.y < bounds.top() {
+            return 0;
+        }
+        if position.y > bounds.bottom() {
+            return text.len();
+        }
+        layout
+            .closest_index_for_x(position.x - bounds.left())
+            .min(text.len())
+    }
+
+    /// 返回双击时应选择的输入词范围。
+    ///
+    /// 业务意图：
+    /// - 搜索关键字和目录路径中都可能出现中文、英文、数字和路径分隔符；双击选择连续非空白片段更符合搜索场景。
+    /// - 如果点击在空白上，则选择连续空白，和常见文本输入框行为保持一致。
+    fn search_text_word_range_for_index(text: &str, index: usize) -> Range<usize> {
+        if text.is_empty() {
+            return 0..0;
+        }
+        let index = Self::clamp_search_text_range(text, index..index).start;
+        let current = text[index..]
+            .chars()
+            .next()
+            .or_else(|| text[..index].chars().next_back());
+        let Some(current) = current else {
+            return 0..0;
+        };
+        let select_whitespace = current.is_whitespace();
+        let mut start = 0usize;
+        for (byte_index, character) in text[..index].char_indices().rev() {
+            if character.is_whitespace() != select_whitespace {
+                start = byte_index + character.len_utf8();
+                break;
+            }
+        }
+        let mut end = text.len();
+        for (relative_index, character) in text[index..].char_indices() {
+            if character.is_whitespace() != select_whitespace {
+                end = index + relative_index;
+                break;
+            }
+        }
+        start..end
+    }
+
+    /// 标记搜索输入框光标刚发生用户活动。
+    ///
+    /// 业务意图：
+    /// - 输入、点击定位、拖拽和方向键移动都会改变用户对光标位置的关注点；这些动作之后光标需要保持常亮 1 秒。
+    /// - 集中更新时间戳，避免键盘、鼠标和 IME 提交路径出现不同的闪烁节奏。
+    fn touch_search_text_cursor_activity(&mut self) {
+        self.search_text_cursor_last_activity = Instant::now();
+    }
+
+    /// 判断当前输入框光标在本帧是否应显示。
+    ///
+    /// 业务意图：
+    /// - 搜索输入框现在由 GPUI 文本元素绘制，不再使用普通 `div().with_animation(...)` 光标。
+    /// - 输入或移动发生后的极短时间内保持可见，随后立即按 500ms 亮、500ms 灭的节奏闪烁。
+    ///
+    /// 边界条件：
+    /// - `Instant` 是单调时间，适合处理系统时间调整、时区变化或休眠恢复后的相对时间判断。
+    fn search_text_cursor_visible(&self) -> bool {
+        let elapsed = self.search_text_cursor_last_activity.elapsed();
+        Self::search_text_cursor_visible_for_elapsed(elapsed)
+    }
+
+    /// 根据距离最近一次光标活动的时间计算光标可见性。
+    ///
+    /// 业务意图：
+    /// - 将时间规则拆成纯函数，便于单元测试锁定“活动后 1 秒常亮，之后闪烁”的产品行为。
+    fn search_text_cursor_visible_for_elapsed(elapsed: Duration) -> bool {
+        if elapsed < Duration::from_millis(120) {
+            return true;
+        }
+        elapsed.as_millis() % 1000 < 500
+    }
+
+    /// 处理搜索对话框中任一文本输入框的基础编辑按键。
+    ///
+    /// 业务意图：
+    /// - 查询词和目录目标都只需要单行文本能力，复用同一套退格、删除和组合文本清理逻辑可避免两处行为不一致。
+    /// - 普通字符输入交给 `EntityInputHandler`，这里不处理 `key_char`，从而保留中文 IME 的平台提交路径。
+    fn handle_search_text_key_down(
+        &mut self,
+        input_kind: SearchTextInputKind,
+        event: &KeyDownEvent,
+        context: &mut Context<Self>,
+    ) {
+        if Self::is_paste_keystroke(&event.keystroke) {
+            let clipboard_text = context
+                .read_from_clipboard()
+                .and_then(|item| item.text())
+                .map(|text| Self::sanitize_search_input_text(&text));
+            if let Some(text) = clipboard_text {
+                let text_is_not_empty = !text.is_empty();
+                if text_is_not_empty {
+                    if let Some(dialog) = self.search_dialog.as_mut() {
+                        let (input_text, selection_range, marked_range) =
+                            Self::search_text_state_mut(dialog, input_kind);
+                        Self::replace_search_text_selection(
+                            input_text,
+                            selection_range,
+                            marked_range,
+                            &text,
+                        );
+                        if input_kind == SearchTextInputKind::Query {
+                            dialog.current_file_match_count = None;
+                        }
+                    }
+                    self.touch_search_text_cursor_activity();
+                    context.stop_propagation();
+                    context.notify();
+                    return;
+                }
+            }
+            context.stop_propagation();
+            return;
+        }
+
+        let Some(dialog) = self.search_dialog.as_mut() else {
+            return;
+        };
+        let (text, selection_range, marked_range) = Self::search_text_state_mut(dialog, input_kind);
+
+        if Self::is_copy_keystroke(&event.keystroke) {
+            if selection_range.start != selection_range.end {
+                let range = Self::clamp_search_text_range(text, selection_range.clone());
+                if range.start < range.end {
+                    context.write_to_clipboard(ClipboardItem::new_string(text[range].to_string()));
+                }
+            }
+            context.stop_propagation();
+            return;
+        }
+
+        if Self::is_select_all_keystroke(&event.keystroke) {
+            *marked_range = None;
+            *selection_range = 0..text.len();
+            self.touch_search_text_cursor_activity();
+            context.stop_propagation();
+            context.notify();
+            return;
+        }
+
+        match event.keystroke.key.as_str() {
+            "left" => {
+                *marked_range = None;
+                if event.keystroke.modifiers.shift {
+                    selection_range.end =
+                        Self::previous_search_text_boundary(text, selection_range.end);
+                    *selection_range = Self::clamp_search_text_range(text, selection_range.clone());
+                } else if selection_range.start != selection_range.end {
+                    *selection_range = selection_range.start..selection_range.start;
+                } else {
+                    let cursor = Self::previous_search_text_boundary(text, selection_range.end);
+                    *selection_range = cursor..cursor;
+                }
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "right" => {
+                *marked_range = None;
+                if event.keystroke.modifiers.shift {
+                    selection_range.end =
+                        Self::next_search_text_boundary(text, selection_range.end);
+                    *selection_range = Self::clamp_search_text_range(text, selection_range.clone());
+                } else if selection_range.start != selection_range.end {
+                    *selection_range = selection_range.end..selection_range.end;
+                } else {
+                    let cursor = Self::next_search_text_boundary(text, selection_range.end);
+                    *selection_range = cursor..cursor;
+                }
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "up" => {
+                *marked_range = None;
+                *selection_range = 0..0;
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "down" => {
+                *marked_range = None;
+                let cursor = text.len();
+                *selection_range = cursor..cursor;
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "backspace" => {
+                if let Some(range) = marked_range.take().or_else(|| {
+                    (selection_range.start != selection_range.end).then(|| selection_range.clone())
+                }) {
+                    text.replace_range(range.clone(), "");
+                    *selection_range = range.start..range.start;
+                } else if let Some((previous_index, _)) =
+                    text[..selection_range.end].char_indices().next_back()
+                {
+                    text.replace_range(previous_index..selection_range.end, "");
+                    *selection_range = previous_index..previous_index;
+                }
+                if input_kind == SearchTextInputKind::Query {
+                    self.clear_search_current_file_match_count();
+                }
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "delete" => {
+                if let Some(range) = marked_range.take().or_else(|| {
+                    (selection_range.start != selection_range.end).then(|| selection_range.clone())
+                }) {
+                    text.replace_range(range.clone(), "");
+                    *selection_range = range.start..range.start;
+                } else if let Some((next_index, next_character)) =
+                    text[selection_range.end..].char_indices().next()
+                {
+                    let start = selection_range.end + next_index;
+                    let end = start + next_character.len_utf8();
+                    text.replace_range(start..end, "");
+                    *selection_range = start..start;
+                }
+                if input_kind == SearchTextInputKind::Query {
+                    self.clear_search_current_file_match_count();
+                }
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "enter" | "escape" => {
+                // Enter 和 Escape 由全局快捷键处理，保持搜索框只负责文本编辑。
+            }
+            _ => {}
+        }
+    }
+
+    /// 返回指定输入槽位的可变文本、选择范围和组合范围。
+    ///
+    /// 实现原因：
+    /// - Rust 需要在同一分支中同时借用三个字段，封装后可以让按键处理和 IME 回调共享同一套字段选择逻辑。
+    fn search_text_state_mut(
+        dialog: &mut SearchDialogState,
+        input_kind: SearchTextInputKind,
+    ) -> (&mut String, &mut Range<usize>, &mut Option<Range<usize>>) {
+        match input_kind {
+            SearchTextInputKind::Query => (
+                &mut dialog.query,
+                &mut dialog.selection_range,
+                &mut dialog.marked_range,
+            ),
+            SearchTextInputKind::DirectoryTarget => (
+                &mut dialog.directory_target,
+                &mut dialog.directory_selection_range,
+                &mut dialog.directory_marked_range,
+            ),
+        }
+    }
+
+    /// 返回指定输入槽位的只读文本、选择范围和组合范围。
+    fn search_text_state(
+        dialog: &SearchDialogState,
+        input_kind: SearchTextInputKind,
+    ) -> (&str, Range<usize>, Option<Range<usize>>) {
+        match input_kind {
+            SearchTextInputKind::Query => (
+                &dialog.query,
+                dialog.selection_range.clone(),
+                dialog.marked_range.clone(),
+            ),
+            SearchTextInputKind::DirectoryTarget => (
+                &dialog.directory_target,
+                dialog.directory_selection_range.clone(),
+                dialog.directory_marked_range.clone(),
+            ),
+        }
+    }
+
+    /// 用给定文本替换搜索输入框当前选区。
+    ///
+    /// 业务意图：
+    /// - 平台 IME 提交、快捷键粘贴和日志查看器粘贴到搜索框都需要同一套替换规则。
+    /// - 统一处理组合文本、选区和光标位置，可以避免关键字输入框与目录输入框行为不一致。
+    fn replace_search_text_selection(
+        text: &mut String,
+        selection_range: &mut Range<usize>,
+        marked_range: &mut Option<Range<usize>>,
+        replacement: &str,
+    ) {
+        let range = marked_range
+            .take()
+            .unwrap_or_else(|| Self::clamp_search_text_range(text, selection_range.clone()));
+        text.replace_range(range.clone(), replacement);
+        let cursor = range.start + replacement.len();
+        *selection_range = cursor..cursor;
+    }
+
+    /// 用剪贴板文本覆盖搜索关键字。
+    ///
+    /// 业务意图：
+    /// - 日志查看器是只读区域，`Ctrl+V` 的产品语义是把剪贴板内容作为新的搜索关键字，而不是继续编辑
+    ///   `prepare_search_dialog_state` 可能根据日志选区预填出来的旧文本。
+    /// - 封装为纯状态辅助函数，便于测试“覆盖而非追加”的关键边界。
+    fn replace_search_query_with_clipboard_text(dialog: &mut SearchDialogState, text: String) {
+        let cursor = text.len();
+        dialog.query = text;
+        dialog.selection_range = cursor..cursor;
+        dialog.marked_range = None;
+        dialog.current_file_match_count = None;
+        dialog.message = "已粘贴剪贴板文本，按 Enter 或点击搜索".to_string();
+    }
+
+    /// 判断是否为搜索输入框全选快捷键。
+    ///
+    /// 业务意图：
+    /// - macOS 使用 `Cmd+A`，Windows 使用 `Ctrl+A`，部分输入路径会把 `Ctrl+A` 编码成 ASCII 控制字符。
+    /// - 搜索关键字和目录输入框必须统一识别这些形态，避免只能输入却不能选择已有内容。
+    fn is_select_all_keystroke(keystroke: &Keystroke) -> bool {
+        Self::keystroke_matches_letter_or_control_code(keystroke, "a", CONTROL_A_CODE)
+            && (keystroke.modifiers.control
+                || keystroke.modifiers.platform
+                || Self::keystroke_matches_control_code(keystroke, CONTROL_A_CODE))
+    }
+
+    /// 将搜索输入框内部 UTF-8 范围夹到合法字符边界。
+    ///
+    /// 边界条件：
+    /// - 鼠标命中、平台输入和快捷键都可能给出超过文本长度或反向的范围。
+    /// - Rust `String::replace_range` 只能接受 UTF-8 字符边界，因此这里统一转换为最近的安全边界。
+    fn clamp_search_text_range(text: &str, range: Range<usize>) -> Range<usize> {
+        let start = Self::search_input_clamp_byte_index(text, range.start);
+        let end = Self::search_input_clamp_byte_index(text, range.end);
+        start.min(end)..start.max(end)
+    }
+
+    /// 将任意字节下标夹到搜索输入文本的 UTF-8 字符边界。
+    fn search_input_clamp_byte_index(text: &str, index: usize) -> usize {
+        if index >= text.len() {
+            return text.len();
+        }
+        if text.is_char_boundary(index) {
+            return index;
+        }
+        text.char_indices()
+            .map(|(byte_index, _)| byte_index)
+            .take_while(|byte_index| *byte_index < index)
+            .last()
+            .unwrap_or(0)
+    }
+
+    /// 返回当前光标左侧的前一个 UTF-8 字符边界。
+    ///
+    /// 业务意图：
+    /// - 方向键移动必须按用户可见字符边界前进，不能把中文、emoji 或其它多字节字符切成非法 `String` 范围。
+    fn previous_search_text_boundary(text: &str, offset: usize) -> usize {
+        let offset = Self::search_input_clamp_byte_index(text, offset);
+        text[..offset]
+            .char_indices()
+            .next_back()
+            .map(|(index, _)| index)
+            .unwrap_or(0)
+    }
+
+    /// 返回当前光标右侧的下一个 UTF-8 字符边界。
+    fn next_search_text_boundary(text: &str, offset: usize) -> usize {
+        let offset = Self::search_input_clamp_byte_index(text, offset);
+        text[offset..]
+            .char_indices()
+            .nth(1)
+            .map(|(index, _)| offset + index)
+            .unwrap_or(text.len())
+    }
+
+    /// 根据当前窗口焦点判断平台输入应写入哪个搜索文本框。
+    ///
+    /// 边界条件：
+    /// - 如果两个输入框都未聚焦，默认写入查询词，保证 `Ctrl+F` 打开后立即输入仍符合用户预期。
+    fn active_search_text_input_kind(&self, window: &Window) -> SearchTextInputKind {
+        if self.search_directory_focus.is_focused(window) {
+            SearchTextInputKind::DirectoryTarget
+        } else {
+            SearchTextInputKind::Query
+        }
+    }
+
+    /// 将 UTF-16 范围转换为搜索查询词内部可安全切片的 UTF-8 字节范围。
+    ///
+    /// 业务意图：
+    /// - 平台输入协议按 UTF-16 字符计数，Rust `String` 必须按 UTF-8 字节边界切片。
+    /// - 所有中文输入、组合文本替换和候选词提交都必须通过该转换，避免把多字节字符切坏。
+    fn search_input_range_from_utf16(query: &str, range_utf16: Range<usize>) -> Range<usize> {
+        let start = Self::search_input_byte_index_from_utf16(query, range_utf16.start);
+        let end = Self::search_input_byte_index_from_utf16(query, range_utf16.end);
+        start.min(end)..end.max(start)
+    }
+
+    /// 将搜索查询词内部 UTF-8 字节范围转换为平台输入协议需要的 UTF-16 范围。
+    fn search_input_range_to_utf16(query: &str, range: Range<usize>) -> Range<usize> {
+        let start = Self::search_input_utf16_offset_from_byte(query, range.start);
+        let end = Self::search_input_utf16_offset_from_byte(query, range.end);
+        start..end
+    }
+
+    /// 把 UTF-16 偏移映射到 UTF-8 字节边界。
+    ///
+    /// 边界条件：
+    /// - 如果平台给出超过文本长度的偏移，统一夹到字符串末尾。
+    /// - 如果偏移落在代理对或多字节字符内部，返回该字符起点，保证后续 `replace_range` 安全。
+    fn search_input_byte_index_from_utf16(query: &str, target_utf16: usize) -> usize {
+        let mut utf16_cursor = 0usize;
+        for (byte_index, character) in query.char_indices() {
+            if utf16_cursor >= target_utf16 {
+                return byte_index;
+            }
+            utf16_cursor += character.len_utf16();
+        }
+        query.len()
+    }
+
+    /// 把 UTF-8 字节边界映射到 UTF-16 偏移。
+    fn search_input_utf16_offset_from_byte(query: &str, byte_index: usize) -> usize {
+        query
+            .char_indices()
+            .take_while(|(index, _)| *index < byte_index)
+            .map(|(_, character)| character.len_utf16())
+            .sum()
+    }
+
+    /// 清理平台输入文本，确保搜索框保持单行普通文本。
+    fn sanitize_search_input_text(text: &str) -> String {
+        text.replace(['\n', '\r'], "")
+    }
+
+    /// 渲染搜索选项复选框。
+    fn render_checkbox(checked: bool, palette: AppThemePalette) -> gpui::Stateful<gpui::Div> {
+        let checkbox = div()
+            .id("search-checkbox")
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(14.0))
+            .h(px(14.0))
+            .rounded(px(3.0))
+            .border_1()
+            .border_color(rgb(if checked {
+                palette.accent
+            } else {
+                palette.border
+            }))
+            .bg(rgb(if checked {
+                palette.accent
+            } else {
+                palette.input
+            }));
+
+        if checked {
+            checkbox.child(Self::render_lucide_icon(
+                Some(Icon::Check),
+                10.0,
+                10.0,
+                palette.on_accent,
+            ))
+        } else {
+            checkbox
+        }
+    }
+
+    /// 判断搜索按钮是否具备基本启动条件。
+    fn search_can_start(&self, dialog: &SearchDialogState) -> bool {
+        !dialog.query.trim().is_empty() && self.active_tab_id.is_some()
+    }
+
+    /// 判断当前文件计数按钮是否可用。
+    ///
+    /// 业务意图：
+    /// - 计数按钮只统计当前已经打开并成功解码的活动文件，不触发后台读取，也不扫描当前目录。
+    /// - 空关键字没有统计意义；加载中或失败 tab 也不能提供可靠计数。
+    fn search_can_count_current_file(&self, dialog: &SearchDialogState) -> bool {
+        !dialog.query.trim().is_empty() && self.active_log_tab_document().is_some()
+    }
+
+    /// 返回当前激活 tab 的文档。
+    ///
+    /// 边界条件：
+    /// - 没有活动 tab、tab 已关闭、仍在加载或打开失败时都返回 `None`，调用方据此展示不可用状态。
+    fn active_log_tab_document(&self) -> Option<LogTabDocument> {
+        let active_tab_id = self.active_tab_id?;
+        let active_tab = self.open_tabs.iter().find(|tab| tab.id == active_tab_id)?;
+        match &active_tab.state {
+            LogTabState::Ready { document } => Some(document.clone()),
+            LogTabState::Loading { .. } | LogTabState::Failed { .. } => None,
+        }
+    }
+
+    /// 清空当前文件计数缓存。
+    ///
+    /// 业务意图：
+    /// - 查询词、大小写选项、活动 tab 或解码内容变化后，旧计数不再代表当前条件，必须清空。
+    fn clear_search_current_file_match_count(&mut self) {
+        if let Some(dialog) = self.search_dialog.as_mut() {
+            dialog.current_file_match_count = None;
+        }
+    }
+
+    /// 统计搜索关键字在当前文件中的出现次数。
+    ///
+    /// 业务意图：
+    /// - 该动作由搜索窗口“计数”按钮触发，只针对当前激活文件的已解码内容，给用户一个轻量的命中规模反馈。
+    /// - 计数结果以片段出现次数为单位，同一行多次出现会累加；完整搜索按钮仍负责生成结果面板和跳转明细。
+    fn count_search_query_in_current_file(&mut self, context: &mut Context<Self>) {
+        let Some(dialog) = self.search_dialog.as_ref() else {
+            return;
+        };
+        let options = SearchOptions {
+            query: dialog.query.trim().to_string(),
+            case_sensitive: dialog.case_sensitive,
+        };
+        if options.is_empty_query() {
+            self.update_search_dialog_message("请输入要计数的关键字", context);
+            return;
+        }
+        let Some(document) = self.active_log_tab_document() else {
+            self.update_search_dialog_message("当前文件未打开完成，无法计数", context);
+            return;
+        };
+        let count = match document {
+            LogTabDocument::InMemory(document) => {
+                count_query_occurrences(&document.lines, &options)
+            }
+            LogTabDocument::Paged(document) => count_query_occurrences_paged(&document, &options),
+        };
+        if let Some(dialog) = self.search_dialog.as_mut() {
+            dialog.current_file_match_count = Some(count);
+            dialog.message = format!("当前文件命中 {count} 次");
+        }
+        context.notify();
+    }
+}
+
+include!("app_impl/search_results_methods.rs");
+
+impl MainView {
+    fn render_splitter_hit_overlay(&self, context: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("content-splitter-hit-overlay")
+            .absolute()
+            .left(px(0.0))
+            .top(px(0.0))
+            .h_full()
+            .w(px(SPLITTER_OVERLAY_HIT_WIDTH))
+            .cursor_col_resize()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(Self::start_resizing_splitter),
+            )
+    }
+
+    /// 渲染已加载目录树但尚未打开文件时的右侧提示。
+    ///
+    /// 业务意图：
+    /// - 用户完成“加载日志”后，下一步是从左侧树选择具体日志文件，右侧需要明确指引当前空态。
+    fn render_loaded_right_empty_message(&self) -> impl IntoElement {
+        let palette = self.palette();
+        div()
+            .id("loaded-right-empty-message")
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .size_full()
+            .px_4()
+            .bg(rgb(palette.background))
+            .child(Self::render_lucide_icon(
+                Some(Icon::FileSearch),
+                34.0,
+                30.0,
+                palette.muted_text,
+            ))
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(palette.text))
+                    .child("点击左侧日志文件查看内容"),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(palette.muted_text))
+                    .child("支持普通日志文件和压缩包内日志文件。"),
+            )
+    }
+
+    /// 渲染右侧 tab 栏。
+    ///
+    /// 业务意图：
+    /// - 每个打开的日志文件对应一个 tab，用户可以在多个日志之间快速切换。
+    /// - tab 上的右键菜单提供关闭当前、关闭其他和关闭所有三个命令。
+    /// - tab 标题完整展示，超出可视宽度时通过横向滚动和两侧箭头访问。
+    fn render_log_tab_bar(&self, context: &mut Context<Self>) -> impl IntoElement {
+        let tabs = self
+            .open_tabs
+            .iter()
+            .map(|tab| {
+                (
+                    tab.id,
+                    tab.title.clone(),
+                    self.active_tab_id == Some(tab.id),
+                )
+            })
+            .collect::<Vec<_>>();
+        let tab_elements = tabs
+            .into_iter()
+            .map(|(tab_id, title, active)| self.render_log_tab(tab_id, title, active, context))
+            .collect::<Vec<_>>();
+
+        div()
+            .id("log-tab-bar")
+            .relative()
+            .flex()
+            .items_center()
+            .h(px(LOG_TAB_BAR_HEIGHT))
+            .flex_none()
+            .overflow_hidden()
+            .bg(rgb(self.palette().panel))
+            .border_b_1()
+            .border_color(rgb(self.palette().border))
+            .child(self.render_tab_scroll_button(Icon::ChevronLeft, -LOG_TAB_SCROLL_STEP, context))
+            .child(
+                div()
+                    .id("log-tab-scroll-viewport")
+                    .flex()
+                    .items_end()
+                    .h_full()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_x_scroll()
+                    .scrollbar_width(px(0.0))
+                    .track_scroll(&self.tab_bar_scroll_handle)
+                    .children(tab_elements),
+            )
+            .child(self.render_tab_scroll_button(Icon::ChevronRight, LOG_TAB_SCROLL_STEP, context))
+    }
+
+    /// 渲染 tab 栏横向滚动箭头。
+    ///
+    /// 业务意图：
+    /// - 打开的日志较多时，用户可以通过左右箭头移动 tab 栏，而不需要依赖触控板横向滚动。
+    /// - 按钮始终显示，符合用户“tab页签两边显示滚动箭头”的要求。
+    fn render_tab_scroll_button(
+        &self,
+        icon: Icon,
+        delta: f32,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let palette = self.palette();
+        div()
+            .id(SharedString::from(format!("tab-scroll-{}", delta)))
+            .flex()
+            .items_center()
+            .justify_center()
+            .h_full()
+            .w(px(LOG_TAB_SCROLL_BUTTON_WIDTH))
+            .flex_none()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.panel))
+            .text_color(rgb(palette.muted_text))
+            .cursor_pointer()
+            .hover(move |button| {
+                button
+                    .bg(rgb(palette.surface))
+                    .text_color(rgb(palette.accent))
+            })
+            .when(delta < 0.0, |button| button.border_r_1())
+            .when(delta > 0.0, |button| button.border_l_1())
+            .child(Self::render_lucide_icon(
+                Some(icon),
+                14.0,
+                14.0,
+                palette.muted_text,
+            ))
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, _window, context| {
+                    view.scroll_tab_bar(delta, context);
+                }),
+            )
+    }
+
+    /// 按给定像素距离横向滚动 tab 栏。
+    ///
+    /// 业务意图：
+    /// - `ScrollHandle` 的偏移量向左滚动时为负值，因此向右箭头需要减少 x 偏移。
+    /// - 滚动结果限制在 `[最大负偏移, 0]`，避免箭头点击后出现空白区域。
+    fn scroll_tab_bar(&mut self, delta: f32, context: &mut Context<Self>) {
+        let current_offset = self.tab_bar_scroll_handle.offset();
+        let max_scroll = self.tab_bar_scroll_handle.max_offset().width;
+        let next_x = (current_offset.x - px(delta)).clamp(-max_scroll, px(0.0));
+        self.tab_bar_scroll_handle
+            .set_offset(point(next_x, current_offset.y));
+        self.tab_context_menu = None;
+        self.encoding_dropdown_menu = None;
+        self.log_viewer_context_menu = None;
+        context.notify();
+    }
+
+    /// 渲染单个日志 tab。
+    ///
+    /// 业务意图：
+    /// - 左键激活 tab，右键打开 tab 操作菜单。
+    /// - tab 标题完整展示，不做省略；关闭按钮放在右侧，便于快速收起单个日志。
+    fn render_log_tab(
+        &self,
+        tab_id: usize,
+        title: String,
+        active: bool,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let palette = self.palette();
+        let background = if active {
+            palette.background
+        } else {
+            palette.panel
+        };
+        div()
+            .id(SharedString::from(format!("log-tab-{}", tab_id)))
+            .flex()
+            .items_center()
+            .h(px(LOG_TAB_BAR_HEIGHT - 1.0))
+            .min_w(px(96.0))
+            .flex_none()
+            .px_3()
+            .gap_1()
+            .border_r_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(background))
+            .text_sm()
+            .text_color(rgb(if active {
+                palette.text
+            } else {
+                palette.muted_text
+            }))
+            .cursor_pointer()
+            .hover(move |tab| tab.bg(rgb(palette.surface)))
+            .child(Self::render_lucide_icon(
+                Some(Icon::FileText),
+                14.0,
+                13.0,
+                palette.muted_text,
+            ))
+            .child(div().flex_none().whitespace_nowrap().child(title))
+            .child(self.render_tab_close_button(tab_id, context))
+            .on_click(
+                context.listener(move |view, event: &ClickEvent, _window, context| {
+                    if event.standard_click() {
+                        view.activate_tab(tab_id);
+                        context.notify();
+                    }
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(move |view, event: &MouseDownEvent, _window, context| {
+                    view.open_tab_context_menu(
+                        tab_id,
+                        f32::from(event.position.x),
+                        f32::from(event.position.y),
+                        context,
+                    );
+                }),
+            )
+    }
+
+    /// 渲染 tab 右侧关闭按钮。
+    ///
+    /// 业务意图：
+    /// - 每个 tab 都提供明确的关闭入口，避免用户只能通过右键菜单关闭。
+    /// - 关闭后按 `close_tab` 的统一规则切换激活 tab，并清理相关弹层状态。
+    fn render_tab_close_button(
+        &self,
+        tab_id: usize,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let palette = self.palette();
+        div()
+            .id(SharedString::from(format!("log-tab-close-{}", tab_id)))
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(LOG_TAB_CLOSE_BUTTON_WIDTH))
+            .h(px(LOG_TAB_CLOSE_BUTTON_WIDTH))
+            .flex_none()
+            .rounded(px(3.0))
+            .text_color(rgb(palette.muted_text))
+            .hover(move |button| button.bg(rgb(palette.hover)).text_color(rgb(palette.text)))
+            .child(Self::render_lucide_icon(
+                Some(Icon::X),
+                12.0,
+                12.0,
+                palette.muted_text,
+            ))
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, _window, context| {
+                    view.close_tab(tab_id);
+                    view.tab_context_menu = None;
+                    view.encoding_dropdown_menu = None;
+                    context.notify();
+                }),
+            )
+    }
+
+    /// 渲染当前激活 tab 的内容。
+    ///
+    /// 业务意图：
+    /// - 激活 tab 统一显示编码工具条；正文根据读取状态显示加载、错误或日志虚拟列表。
+    fn render_active_log_tab(&self, context: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let Some(active_tab_id) = self.active_tab_id else {
+            return div()
+                .id("active-log-tab-empty")
+                .flex()
+                .flex_1()
+                .child(self.render_loaded_right_empty_message());
+        };
+        let Some(tab) = self.open_tabs.iter().find(|tab| tab.id == active_tab_id) else {
+            return div()
+                .id("active-log-tab-missing")
+                .flex()
+                .flex_1()
+                .child(self.render_loaded_right_empty_message());
+        };
+
+        div()
+            .id("active-log-tab")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .overflow_hidden()
+            .child(self.render_log_document_toolbar(tab, context))
+            .child(self.render_log_tab_body(tab, context))
+    }
+
+    /// 渲染当前日志文档工具条。
+    ///
+    /// 业务意图：
+    /// - 左侧不再放置独立编码控件，避免挤占日志正文起点上方空间。
+    /// - 工具条右侧把实际编码直接渲染成编码选择器，同时展示来源、识别方式和行数。
+    fn render_log_document_toolbar(
+        &self,
+        tab: &OpenLogTab,
+        context: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let source_kind = match &tab.source {
+            LogFileSource::LocalFile { .. } => "本地文件",
+            LogFileSource::ArchiveMember { .. } => "压缩包内文件",
+            LogFileSource::MaterializedArchiveMember { .. } => "压缩包内文件",
+            LogFileSource::NestedArchiveMember { .. } => "嵌套压缩包内文件",
+        };
+        let encoding_button_label = Self::log_tab_encoding_selector_label(tab);
+        let status = match &tab.state {
+            LogTabState::Ready { document } => {
+                // 状态栏展示编码来源和行数；实际编码本身由右侧内联编码选择器负责显示和切换。
+                let encoding_source = if document.detected_automatically() {
+                    "自动识别"
+                } else {
+                    "手动选择"
+                };
+                let replacement_warning = if document.had_replacements() {
+                    " · 含替换字符"
+                } else {
+                    ""
+                };
+                format!(
+                    "{} · {}{}",
+                    encoding_source,
+                    document.status_line_label(),
+                    replacement_warning
+                )
+            }
+            LogTabState::Loading { .. } => "正在处理".to_string(),
+            LogTabState::Failed { .. } => "需要选择正确编码或重新加载".to_string(),
+        };
+        let palette = self.palette();
+
+        div()
+            .id("log-document-toolbar")
+            .flex()
+            .items_center()
+            .justify_end()
+            .h(px(LOG_DOCUMENT_TOOLBAR_HEIGHT))
+            .flex_none()
+            .px_3()
+            .gap_2()
+            .bg(rgb(palette.panel))
+            .border_b_1()
+            .border_color(rgb(palette.border))
+            .child(
+                div()
+                    .id("log-document-status-group")
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap_1()
+                    .flex_1()
+                    .min_w_0()
+                    .text_xs()
+                    .text_color(rgb(palette.muted_text))
+                    .child(div().flex_none().child(source_kind))
+                    .child(Self::render_status_separator(palette))
+                    .child(self.render_encoding_selector(
+                        tab.id,
+                        encoding_button_label,
+                        matches!(tab.state, LogTabState::Ready { .. }) || tab.raw_bytes.is_some(),
+                        palette,
+                        context,
+                    ))
+                    .child(Self::render_status_separator(palette))
+                    .child(div().min_w_0().truncate().child(status)),
+            )
+    }
+
+    /// 返回日志工具条编码选择器应展示的文案。
+    ///
+    /// 业务意图：
+    /// - 自动模式下按钮展示实际检测出的编码，方便用户理解当前文件最终按什么编码打开。
+    /// - 手动模式下按钮必须优先展示用户选择的编码，即使底层解码出的文本编码枚举与自动检测结果相同，
+    ///   也不能回退成检测结果，否则用户会误以为“编码切换选择无效”。
+    ///
+    /// 边界条件：
+    /// - 加载中或解码失败时没有稳定的文档编码，此时直接展示当前选择，保证失败后仍能看到正在尝试的编码。
+    fn log_tab_encoding_selector_label(tab: &OpenLogTab) -> &'static str {
+        match tab.encoding_choice {
+            EncodingChoice::Auto => match &tab.state {
+                LogTabState::Ready { document } => document.encoding_label(),
+                LogTabState::Loading { .. } | LogTabState::Failed { .. } => {
+                    EncodingChoice::Auto.label()
+                }
+            },
+            EncodingChoice::Manual(encoding) => encoding.label(),
+        }
+    }
+
+    /// 渲染编码切换控件。
+    ///
+    /// 业务意图：
+    /// - 编码选项改为紧凑下拉框，避免多个编码按钮平铺占用顶部工具条。
+    /// - “自动”重新执行检测流程，手动选项按指定编码重新解码原始字节。
+    /// - 原始字节未读取完成前保持禁用，避免用户提前选择编码导致 UI 状态和实际解码结果不一致。
+    fn render_encoding_selector(
+        &self,
+        tab_id: usize,
+        display_label: &'static str,
+        enabled: bool,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("encoding-selector")
+            .flex()
+            .items_center()
+            .flex_none()
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "encoding-dropdown-button-{}",
+                        tab_id
+                    )))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .w(px(ENCODING_DROPDOWN_BUTTON_WIDTH))
+                    .h(px(ENCODING_DROPDOWN_BUTTON_HEIGHT))
+                    .px_2()
+                    .rounded(px(4.0))
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.input))
+                    .text_xs()
+                    .text_color(rgb(if enabled {
+                        palette.text
+                    } else {
+                        palette.muted_text
+                    }))
+                    .when(enabled, |button| {
+                        button.cursor_pointer().hover(move |button| {
+                            button
+                                .border_color(rgb(palette.accent))
+                                .bg(rgb(palette.hover))
+                        })
+                    })
+                    .when(!enabled, |button| button.opacity(0.62))
+                    .child(display_label)
+                    .child(Self::render_lucide_icon(
+                        Some(Icon::ChevronDown),
+                        12.0,
+                        12.0,
+                        palette.muted_text,
+                    ))
+                    .on_click(context.listener(
+                        move |view, event: &ClickEvent, _window, context| {
+                            if enabled {
+                                let position = event.position();
+                                view.toggle_encoding_dropdown(
+                                    tab_id,
+                                    f32::from(position.x),
+                                    f32::from(position.y),
+                                    context,
+                                );
+                            }
+                        },
+                    )),
+            )
+    }
+
+    /// 渲染右侧状态栏中的点状分隔符。
+    ///
+    /// 业务意图：
+    /// - 来源、编码选择器、识别方式和行数属于同一组状态信息，用轻量分隔符维持可读性。
+    /// - 单独函数可以避免多个位置重复硬编码颜色和文本。
+    fn render_status_separator(palette: AppThemePalette) -> gpui::Div {
+        div()
+            .flex_none()
+            .text_color(rgb(palette.muted_text))
+            .child("·")
+    }
+
+    /// 切换编码下拉框展开状态。
+    ///
+    /// 业务意图：
+    /// - 同一个 tab 再次点击编码框会收起菜单；点击其它 tab 的编码框会切换到新的菜单。
+    /// - 打开编码菜单时收起 tab 右键菜单，避免两个弹层同时争抢点击区域。
+    fn toggle_encoding_dropdown(
+        &mut self,
+        tab_id: usize,
+        window_x: f32,
+        window_y: f32,
+        context: &mut Context<Self>,
+    ) {
+        if !self
+            .open_tabs
+            .iter()
+            .any(|tab| tab.id == tab_id && matches!(tab.state, LogTabState::Ready { .. }))
+        {
+            // 编码菜单必须等内存原始字节或分页文档可用后才能打开，避免用户在加载过程中选择编码但无法立即解析。
+            self.encoding_dropdown_menu = None;
+            self.tab_context_menu = None;
+            self.search_results_context_menu = None;
+            self.log_viewer_context_menu = None;
+            context.notify();
+            return;
+        }
+
+        let is_same_menu_open = self
+            .encoding_dropdown_menu
+            .as_ref()
+            .is_some_and(|menu| menu.tab_id == tab_id);
+        self.encoding_dropdown_menu = if is_same_menu_open {
+            None
+        } else {
+            Some(EncodingDropdownMenu {
+                tab_id,
+                x: self.encoding_dropdown_menu_x(window_x),
+                y: Self::encoding_dropdown_menu_y(window_y),
+            })
+        };
+        self.tab_context_menu = None;
+        self.search_results_context_menu = None;
+        self.log_viewer_context_menu = None;
+        context.notify();
+    }
+
+    /// 根据点击位置计算编码菜单在右侧工作区内的横坐标。
+    ///
+    /// 业务意图：
+    /// - 编码选择器位于右侧状态栏，状态栏内容会随来源类型、识别状态和行数变化。
+    /// - GPUI 当前没有直接暴露按钮布局矩形给点击监听，因此用点击点近似还原按钮左缘，让菜单跟随按钮打开。
+    ///
+    /// 边界条件：
+    /// - 点击按钮文字或箭头会带来几个像素的偏差，但菜单仍紧邻编码按钮，不会回到旧版左侧固定位置。
+    fn encoding_dropdown_menu_x(&self, window_x: f32) -> f32 {
+        let panel_x = (window_x - self.right_panel_left_offset()).max(0.0);
+        (panel_x - ENCODING_DROPDOWN_BUTTON_WIDTH / 2.0).max(0.0)
+    }
+
+    /// 根据点击位置计算编码菜单在右侧工作区内的纵坐标。
+    ///
+    /// 业务意图：
+    /// - 菜单应出现在编码按钮下方；点击位置通常位于按钮中部，因此加上半个按钮高度和固定间隔。
+    fn encoding_dropdown_menu_y(window_y: f32) -> f32 {
+        (window_y - TOOLBAR_HEIGHT
+            + ENCODING_DROPDOWN_BUTTON_HEIGHT / 2.0
+            + ENCODING_DROPDOWN_MENU_GAP)
+            .max(0.0)
+    }
+
+    /// 返回编码下拉框的手动编码选项。
+    ///
+    /// 业务意图：
+    /// - 打开日志时仍默认自动识别；下拉菜单只承载用户主动纠正编码的手动选项。
+    /// - 用户要求去除菜单中的“自动”，因此这里不再把 `EncodingChoice::Auto` 作为可点击项渲染。
+    /// - UI 渲染和点击处理共享同一组选项，避免菜单项和编码解析能力不一致。
+    fn encoding_choices() -> Vec<EncodingChoice> {
+        LogTextEncoding::manual_options()
+            .into_iter()
+            .map(EncodingChoice::Manual)
+            .collect()
+    }
+
+    /// 渲染编码下拉菜单。
+    ///
+    /// 业务意图：
+    /// - 菜单作为右侧工作区内部弹层绘制，视觉上贴在当前 tab 的编码选择框下方。
+    /// - 选择任一编码后复用当前 tab 保存的原始字节重新解析，并立即收起菜单。
+    fn render_encoding_dropdown_menu(
+        &self,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let Some(menu) = &self.encoding_dropdown_menu else {
+            return div().id("encoding-dropdown-menu-empty").hidden();
+        };
+        let Some(tab) = self.open_tabs.iter().find(|tab| tab.id == menu.tab_id) else {
+            return div().id("encoding-dropdown-menu-missing").hidden();
+        };
+        let tab_id = tab.id;
+        let selected_choice = tab.encoding_choice;
+        let palette = self.palette();
+        let menu_items = Self::encoding_choices()
+            .into_iter()
+            .map(|choice| {
+                self.render_encoding_dropdown_item(
+                    tab_id,
+                    choice,
+                    choice == selected_choice,
+                    palette,
+                    context,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        div()
+            .id("encoding-dropdown-menu")
+            .absolute()
+            .left(px(menu.x))
+            .top(px(menu.y))
+            .w(px(ENCODING_DROPDOWN_WIDTH))
+            .py_1()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.menu))
+            .shadow_lg()
+            .children(menu_items)
+    }
+
+    /// 渲染编码下拉菜单单项。
+    ///
+    /// 业务意图：
+    /// - 当前选中编码通过浅蓝背景标识；点击其它项会触发重新解码。
+    /// - 菜单项使用左键按下立即处理，而不是等待 click 合成事件；编码菜单上方有关闭遮罩，
+    ///   这样可以避免鼠标按下和释放之间弹层状态变化导致选择事件丢失。
+    fn render_encoding_dropdown_item(
+        &self,
+        tab_id: usize,
+        choice: EncodingChoice,
+        selected: bool,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let item = div()
+            .id(SharedString::from(format!(
+                "encoding-dropdown-item-{}-{}",
+                tab_id,
+                choice.label()
+            )))
+            .flex()
+            .items_center()
+            .justify_between()
+            .h(px(ENCODING_DROPDOWN_ITEM_HEIGHT))
+            .px_2()
+            .text_xs()
+            .text_color(rgb(if selected {
+                palette.accent
+            } else {
+                palette.text
+            }))
+            .bg(rgb(if selected {
+                palette.selected
+            } else {
+                palette.menu
+            }))
+            .cursor_pointer()
+            .hover(move |item| item.bg(rgb(palette.hover)).text_color(rgb(palette.accent)))
+            .child(choice.label());
+
+        let item = if selected {
+            item.child(Self::render_lucide_icon(
+                Some(Icon::Check),
+                12.0,
+                12.0,
+                palette.accent,
+            ))
+        } else {
+            item
+        };
+
+        item.on_mouse_down(
+            MouseButton::Left,
+            context.listener(move |view, _event: &MouseDownEvent, _window, context| {
+                view.select_tab_encoding(tab_id, choice, context);
+                context.stop_propagation();
+            }),
+        )
+    }
+}
+
+include!("app_impl/log_viewer_methods.rs");
+
+impl MainView {
+    fn open_tab_context_menu(
+        &mut self,
+        tab_id: usize,
+        window_x: f32,
+        window_y: f32,
+        context: &mut Context<Self>,
+    ) {
+        // GPUI 鼠标事件给出的是窗口内容坐标，而右键菜单作为右侧面板内部的绝对定位元素渲染。
+        // 这里把坐标转换到右侧面板局部坐标，避免菜单因为左侧目录树和顶部工具栏的偏移而显示到错误位置。
+        let panel_x = (window_x - self.right_panel_left_offset()).max(0.0);
+        let panel_y = (window_y - TOOLBAR_HEIGHT).max(0.0);
+        self.activate_tab(tab_id);
+        self.tab_context_menu = Some(TabContextMenu {
+            tab_id,
+            x: panel_x,
+            y: panel_y,
+        });
+        self.search_results_context_menu = None;
+        self.encoding_dropdown_menu = None;
+        self.log_viewer_context_menu = None;
+        context.notify();
+    }
+
+    /// 渲染 tab 右键菜单。
+    ///
+    /// 业务意图：
+    /// - 自绘菜单保证 macOS 和 Windows 的 tab 关闭命令行为一致，不依赖平台窗口系统菜单。
+    fn render_tab_context_menu(&self, context: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let Some(menu) = &self.tab_context_menu else {
+            return div().id("tab-context-menu-empty").hidden();
+        };
+        let tab_id = menu.tab_id;
+        let palette = self.palette();
+
+        div()
+            .id("tab-context-menu")
+            .absolute()
+            .left(px(menu.x))
+            .top(px(menu.y))
+            .w(px(TAB_CONTEXT_MENU_WIDTH))
+            .py_1()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.menu))
+            .shadow_lg()
+            .child(self.render_tab_context_menu_item(
+                tab_id,
+                TabContextMenuAction::Current,
+                "关闭当前",
+                palette,
+                context,
+            ))
+            .child(self.render_tab_context_menu_item(
+                tab_id,
+                TabContextMenuAction::OtherTabs,
+                "关闭其他",
+                palette,
+                context,
+            ))
+            .child(self.render_tab_context_menu_item(
+                tab_id,
+                TabContextMenuAction::AllTabs,
+                "关闭所有",
+                palette,
+                context,
+            ))
+    }
+
+    /// 渲染 tab 右键菜单单项。
+    ///
+    /// 业务意图：
+    /// - 菜单项在鼠标按下时立即执行关闭命令并收起菜单，和左侧目录树右键菜单保持一致。
+    /// - 自绘弹层同时存在透明关闭遮罩，使用 `mouse_down` 可以避免 `click` 在菜单收起或鼠标轻微移动后丢失。
+    fn render_tab_context_menu_item(
+        &self,
+        tab_id: usize,
+        action: TabContextMenuAction,
+        label: &'static str,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(SharedString::from(format!("tab-menu-{}-{}", tab_id, label)))
+            .flex()
+            .items_center()
+            .h(px(TAB_CONTEXT_MENU_ITEM_HEIGHT))
+            .px_3()
+            .text_sm()
+            .text_color(rgb(palette.text))
+            .cursor_pointer()
+            .hover(move |item| item.bg(rgb(palette.hover)))
+            .child(label)
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(move |view, _event: &MouseDownEvent, _window, context| {
+                    view.handle_tab_context_menu_action(tab_id, action, context);
+                    context.stop_propagation();
+                }),
+            )
+    }
+
+    /// 执行 tab 右键菜单命令。
+    ///
+    /// 业务意图：
+    /// - 三个关闭命令集中处理，保证关闭后 active tab 和菜单状态一致。
+    fn handle_tab_context_menu_action(
+        &mut self,
+        tab_id: usize,
+        action: TabContextMenuAction,
+        context: &mut Context<Self>,
+    ) {
+        // 先收起所有右侧弹层，再执行关闭动作，避免“关闭所有”后旧菜单仍参与下一帧命中测试。
+        self.tab_context_menu = None;
+        self.encoding_dropdown_menu = None;
+        self.search_results_context_menu = None;
+        self.log_viewer_context_menu = None;
+        match action {
+            TabContextMenuAction::Current => self.close_tab(tab_id),
+            TabContextMenuAction::OtherTabs => self.close_other_tabs(tab_id),
+            TabContextMenuAction::AllTabs => self.close_all_tabs(),
+        }
+        context.notify();
+    }
+
+    /// 关闭指定 tab。
+    ///
+    /// 边界条件：
+    /// - 如果关闭的是当前激活 tab，则优先激活当前位置后面的 tab，否则激活前一个 tab。
+    fn close_tab(&mut self, tab_id: usize) {
+        let Some(index) = self.open_tabs.iter().position(|tab| tab.id == tab_id) else {
+            return;
+        };
+        let closed_tab = self.open_tabs.remove(index);
+        Self::cleanup_tab_paged_resources(&closed_tab);
+
+        if self.active_tab_id == Some(tab_id) {
+            self.active_tab_id = self
+                .open_tabs
+                .get(index)
+                .or_else(|| {
+                    index
+                        .checked_sub(1)
+                        .and_then(|previous| self.open_tabs.get(previous))
+                })
+                .map(|tab| tab.id);
+            self.clear_search_current_file_match_count();
+        }
+        if let Some(active_tab_id) = self.active_tab_id {
+            self.scroll_tab_bar_to_tab(active_tab_id);
+        }
+        if self
+            .encoding_dropdown_menu
+            .as_ref()
+            .is_some_and(|menu| menu.tab_id == tab_id)
+        {
+            self.encoding_dropdown_menu = None;
+        }
+        if self
+            .log_scrollbar_drag
+            .is_some_and(|drag| drag.tab_id == tab_id)
+        {
+            self.log_scrollbar_drag = None;
+        }
+        if self
+            .log_viewer_context_menu
+            .as_ref()
+            .is_some_and(|menu| menu.tab_id == tab_id)
+        {
+            self.log_viewer_context_menu = None;
+        }
+    }
+
+    /// 关闭指定 tab 之外的所有 tab。
+    ///
+    /// 业务意图：
+    /// - 保留右键点击的 tab，并把它设为当前激活 tab。
+    fn close_other_tabs(&mut self, tab_id: usize) {
+        let mut retained = Vec::new();
+        for tab in self.open_tabs.drain(..) {
+            if tab.id == tab_id {
+                retained.push(tab);
+            } else {
+                Self::cleanup_tab_paged_resources(&tab);
+            }
+        }
+        self.open_tabs = retained;
+        self.active_tab_id = self.open_tabs.first().map(|tab| tab.id);
+        self.clear_search_current_file_match_count();
+        self.tab_bar_scroll_handle
+            .set_offset(point(px(0.0), px(0.0)));
+        if self
+            .encoding_dropdown_menu
+            .as_ref()
+            .is_some_and(|menu| menu.tab_id != tab_id)
+        {
+            self.encoding_dropdown_menu = None;
+        }
+        if self
+            .log_scrollbar_drag
+            .is_some_and(|drag| drag.tab_id != tab_id)
+        {
+            self.log_scrollbar_drag = None;
+        }
+        if self
+            .log_viewer_context_menu
+            .as_ref()
+            .is_some_and(|menu| menu.tab_id != tab_id)
+        {
+            self.log_viewer_context_menu = None;
+        }
+    }
+
+    /// 关闭所有日志 tab。
+    ///
+    /// 业务意图：
+    /// - 清空右侧工作区后回到“点击左侧日志文件查看内容”的友好提示。
+    fn close_all_tabs(&mut self) {
+        for tab in &self.open_tabs {
+            Self::cleanup_tab_paged_resources(tab);
+        }
+        self.open_tabs.clear();
+        self.active_tab_id = None;
+        self.tab_context_menu = None;
+        self.encoding_dropdown_menu = None;
+        self.search_results_context_menu = None;
+        self.log_viewer_context_menu = None;
+        self.log_scrollbar_drag = None;
+        self.tab_bar_scroll_handle = ScrollHandle::new();
+        self.clear_search_current_file_match_count();
+    }
+
+    /// 清理 tab 关联的分页临时文件。
+    ///
+    /// 业务意图：
+    /// - 压缩包内超大日志会物化到应用临时目录，tab 关闭后应立即释放磁盘空间。
+    /// - 普通本地大文件没有 `materialized_temp_path`，不会被误删。
+    fn cleanup_tab_paged_resources(tab: &OpenLogTab) {
+        if let LogTabState::Ready {
+            document: LogTabDocument::Paged(document),
+        } = &tab.state
+        {
+            if let Some(temp_path) = document.materialized_temp_path.as_deref() {
+                cleanup_materialized_file(temp_path);
+            }
+        }
+    }
+
+    /// 渲染左右分栏内容区域。
+    ///
+    /// 业务意图：
+    /// - 未加载日志时主内容区占满剩余空间并显示友好提示，不出现空的左侧目录区域。
+    /// - 加载完成后切换为左右两栏，左侧展示目录树，右侧展示日志 tab 工作区或点击文件提示。
+    ///
+    /// 边界条件：
+    /// - 当前只有加载完成状态显示可拖动分割线；未加载、加载中或失败状态不显示分割线。
+    /// - 没有打开任何日志 tab 时，右侧只显示下一步提示，不创建空白占位 tab。
+    /// - 当前分割宽度仅在内存中生效，不跨启动保存。
+    fn render_content(&self, context: &mut Context<Self>) -> impl IntoElement {
+        let palette = self.palette();
+        if !matches!(self.load_state, LogTreeLoadState::Loaded(_)) {
+            return div()
+                .id("log-content-empty-state")
+                .flex()
+                .flex_1()
+                .size_full()
+                .bg(rgb(palette.background))
+                .child(self.render_primary_content_message());
+        }
+
+        if self.should_hide_log_tree_panel() {
+            return div()
+                .id("log-content-single-log-view")
+                .flex()
+                .flex_1()
+                .size_full()
+                .bg(rgb(palette.background))
+                .child(
+                    div()
+                        .id("right-log-panel-single-log")
+                        .relative()
+                        .h_full()
+                        .flex_1()
+                        .bg(rgb(palette.background))
+                        .overflow_hidden()
+                        .child(self.render_right_log_panel(context)),
+                );
+        }
+
+        div()
+            .id("log-content-split-view")
+            .flex()
+            .flex_1()
+            .size_full()
+            .bg(rgb(palette.background))
+            .on_mouse_move(context.listener(Self::handle_content_mouse_move))
+            .on_mouse_up(
+                MouseButton::Left,
+                context.listener(Self::handle_content_mouse_up),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                context.listener(Self::handle_content_mouse_up),
+            )
+            .child(
+                div()
+                    .id("left-log-panel")
+                    .h_full()
+                    .w(px(self.left_panel_width))
+                    .flex_none()
+                    .overflow_hidden()
+                    .child(self.render_log_tree_panel(context)),
+            )
+            .child(self.render_splitter(context))
+            .child(
+                div()
+                    .id("right-log-panel")
+                    .relative()
+                    .h_full()
+                    .flex_1()
+                    .bg(rgb(palette.background))
+                    .overflow_hidden()
+                    .child(self.render_right_log_panel(context))
+                    .child(self.render_splitter_hit_overlay(context)),
+            )
+    }
+
+    /// 判断当前加载结果是否应隐藏左侧目录树。
+    ///
+    /// 业务意图：
+    /// - 当用户加载的内容最终只有一个可打开日志时，左侧树没有选择价值，应把完整空间留给日志浏览。
+    /// - 多文件目录或压缩包仍显示左侧树，便于用户选择、右键保存和线程分析。
+    fn should_hide_log_tree_panel(&self) -> bool {
+        matches!(
+            &self.load_state,
+            LogTreeLoadState::Loaded(tree_state) if tree_state.single_log_source().is_some()
+        )
+    }
+
+    /// 返回右侧日志工作区相对窗口内容区左侧的横向偏移。
+    ///
+    /// 业务意图：
+    /// - 右键菜单和编码下拉菜单由窗口坐标转换到右侧面板局部坐标，必须和当前布局是否隐藏左侧树保持一致。
+    /// - 单日志模式没有左侧树和分割线，偏移为 0；多文件模式仍扣除左侧树宽度和分割线宽度。
+    fn right_panel_left_offset(&self) -> f32 {
+        if self.should_hide_log_tree_panel() {
+            0.0
+        } else {
+            self.left_panel_width + SPLITTER_VISIBLE_WIDTH
+        }
+    }
+
+    /// 渲染左右两栏之间的可拖动分割线。
+    ///
+    /// 业务意图：
+    /// - 分割线提供明确的拖动命中区域，让用户可以动态调整左右区域宽度。
+    /// - 可见部分保持 1px 细线，透明命中区由右侧内容覆盖层提供，避免右侧出现白色拖动间隔。
+    ///
+    /// 边界条件：
+    /// - 当前只支持水平拖动，不能双击重置，也不能通过键盘调整。
+    /// - 该元素只承担视觉线条和左侧边界拖动；右侧扩展命中区由 `render_splitter_hit_overlay` 提供。
+    fn render_splitter(&self, context: &mut Context<Self>) -> impl IntoElement {
+        // 拖动中使用略深的线条颜色，提供清晰反馈；非拖动状态保持轻量，避免抢占内容注意力。
+        let line_color = if self.is_resizing_splitter {
+            0x94a3b8
+        } else {
+            self.palette().border
+        };
+
+        div()
+            .id("content-splitter")
+            .flex()
+            .items_center()
+            .justify_center()
+            .h_full()
+            .w(px(SPLITTER_VISIBLE_WIDTH))
+            .flex_none()
+            .cursor_col_resize()
+            .bg(rgb(line_color))
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(Self::start_resizing_splitter),
+            )
+    }
+
+    /// 渲染另存为同名文件确认弹窗。
+    ///
+    /// 业务意图：
+    /// - 目标目录已有同名文件时，必须先让用户在“跳过”和“覆盖”之间明确选择，避免后台任务静默覆盖用户文件。
+    ///
+    /// 边界条件：
+    /// - 弹窗作为主窗口内模态层绘制，遮挡底层日志区域并拦截鼠标事件，防止用户在确认前继续触发其它操作。
+    fn render_save_overwrite_confirm_dialog(
+        &self,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let Some(dialog) = &self.save_overwrite_confirm_dialog else {
+            return div().id("save-overwrite-confirm-empty").hidden();
+        };
+        let palette = self.palette();
+        let mut backdrop = rgb(0x000000);
+        backdrop.a = 0.34;
+
+        div()
+            .id("save-overwrite-confirm")
+            .absolute()
+            .left(px(0.0))
+            .right(px(0.0))
+            .top(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(backdrop)
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    context.stop_propagation();
+                }),
+            )
+            .child(
+                div()
+                    .w(px(420.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.surface))
+                    .shadow_lg()
+                    .p_4()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(palette.text))
+                            .child("目标目录已有同名文件"),
+                    )
+                    .child(
+                        div()
+                            .mt_2()
+                            .text_sm()
+                            .line_height(px(20.0))
+                            .text_color(rgb(palette.muted_text))
+                            .child(format!(
+                                "发现 {} 个目标文件已存在。请选择跳过这些文件，或覆盖目标目录中的同名文件。",
+                                dialog.conflict_count
+                            )),
+                    )
+                    .child(
+                        div()
+                            .mt_2()
+                            .px_2()
+                            .py_1()
+                            .rounded(px(5.0))
+                            .bg(rgb(palette.input))
+                            .text_xs()
+                            .text_color(rgb(palette.muted_text))
+                            .child(format!("示例：{}", dialog.first_conflict_path.display())),
+                    )
+                    .child(
+                        div()
+                            .mt_4()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(self.render_save_overwrite_button(
+                                "跳过",
+                                SaveConflictPolicy::SkipExisting,
+                                false,
+                                palette,
+                                context,
+                            ))
+                            .child(self.render_save_overwrite_button(
+                                "覆盖",
+                                SaveConflictPolicy::OverwriteExisting,
+                                true,
+                                palette,
+                                context,
+                            )),
+                    ),
+            )
+    }
+
+    /// 渲染另存为冲突确认按钮。
+    ///
+    /// 业务意图：
+    /// - “跳过”是保守操作，“覆盖”是破坏性操作；通过不同视觉权重帮助用户理解风险。
+    fn render_save_overwrite_button(
+        &self,
+        label: &'static str,
+        conflict_policy: SaveConflictPolicy,
+        primary: bool,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(SharedString::from(format!("save-overwrite-{label}")))
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(30.0))
+            .px_4()
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(rgb(if primary {
+                palette.accent
+            } else {
+                palette.border
+            }))
+            .bg(rgb(if primary {
+                palette.accent
+            } else {
+                palette.panel
+            }))
+            .text_sm()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(if primary {
+                palette.on_accent
+            } else {
+                palette.text
+            }))
+            .cursor_pointer()
+            .hover(move |button| {
+                button.bg(rgb(if primary {
+                    palette.accent_hover
+                } else {
+                    palette.hover
+                }))
+            })
+            .child(label)
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, _window, context| {
+                    view.handle_save_overwrite_choice(conflict_policy, context);
+                }),
+            )
+    }
+}
+
+impl EntityInputHandler for MainView {
+    /// 返回指定 UTF-16 范围内的搜索框文本。
+    ///
+    /// 业务意图：
+    /// - 平台输入法需要查询当前文本片段以管理候选词、组合文本和替换范围。
+    /// - 搜索框内部保存 UTF-8 字符串，因此这里必须进行 UTF-16 到 UTF-8 的安全转换。
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        window: &mut Window,
+        _context: &mut Context<Self>,
+    ) -> Option<String> {
+        let input_kind = self.active_search_text_input_kind(window);
+        let dialog = self.search_dialog.as_ref()?;
+        let (text, _, _) = Self::search_text_state(dialog, input_kind);
+        let range = Self::search_input_range_from_utf16(text, range_utf16);
+        adjusted_range.replace(Self::search_input_range_to_utf16(text, range.clone()));
+        Some(text[range].to_string())
+    }
+
+    /// 返回搜索框当前选择范围。
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        window: &mut Window,
+        _context: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let input_kind = self.active_search_text_input_kind(window);
+        let dialog = self.search_dialog.as_ref()?;
+        let (text, selection_range, _) = Self::search_text_state(dialog, input_kind);
+        Some(UTF16Selection {
+            range: Self::search_input_range_to_utf16(text, selection_range),
+            reversed: false,
+        })
+    }
+
+    /// 返回输入法当前组合文本范围。
+    fn marked_text_range(
+        &self,
+        window: &mut Window,
+        _context: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        let input_kind = self.active_search_text_input_kind(window);
+        let dialog = self.search_dialog.as_ref()?;
+        let (text, _, marked_range) = Self::search_text_state(dialog, input_kind);
+        marked_range.map(|range| Self::search_input_range_to_utf16(text, range))
+    }
+
+    /// 清除输入法组合文本状态。
+    fn unmark_text(&mut self, window: &mut Window, context: &mut Context<Self>) {
+        let input_kind = self.active_search_text_input_kind(window);
+        if let Some(dialog) = self.search_dialog.as_mut() {
+            let (_, _, marked_range) = Self::search_text_state_mut(dialog, input_kind);
+            *marked_range = None;
+        }
+        context.notify();
+    }
+
+    /// 用平台提交文本替换搜索框中的指定范围。
+    ///
+    /// 业务意图：
+    /// - 中文 IME 候选词确认后会通过该入口提交最终文本，不能再依赖按键字符。
+    /// - 替换范围优先采用平台指定范围，其次采用组合文本范围，最后使用普通选择范围。
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let input_kind = self.active_search_text_input_kind(window);
+        let Some(dialog) = self.search_dialog.as_mut() else {
+            return;
+        };
+        let replacement = Self::sanitize_search_input_text(text);
+        let (target_text, selection_range, marked_range) =
+            Self::search_text_state_mut(dialog, input_kind);
+        let range = range_utf16
+            .map(|range| Self::search_input_range_from_utf16(target_text, range))
+            .or_else(|| marked_range.clone())
+            .unwrap_or_else(|| selection_range.clone());
+        let range = Self::clamp_search_text_range(target_text, range);
+        target_text.replace_range(range.clone(), &replacement);
+        let cursor = range.start + replacement.len();
+        *selection_range = cursor..cursor;
+        *marked_range = None;
+        if input_kind == SearchTextInputKind::Query {
+            self.clear_search_current_file_match_count();
+        }
+        self.touch_search_text_cursor_activity();
+        context.notify();
+    }
+
+    /// 用平台组合文本替换搜索框中的指定范围，并保留组合状态。
+    ///
+    /// 边界条件：
+    /// - 输入法可能多次更新同一段组合文本，必须优先替换旧 `marked_range`，避免拼音或候选词重复追加。
+    /// - 搜索框只支持单行文本，因此组合文本中的换行会被移除。
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range_utf16: Option<Range<usize>>,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let input_kind = self.active_search_text_input_kind(window);
+        let Some(dialog) = self.search_dialog.as_mut() else {
+            return;
+        };
+        let replacement = Self::sanitize_search_input_text(new_text);
+        let (target_text, selection_range, marked_range) =
+            Self::search_text_state_mut(dialog, input_kind);
+        let range = range_utf16
+            .map(|range| Self::search_input_range_from_utf16(target_text, range))
+            .or_else(|| marked_range.clone())
+            .unwrap_or_else(|| selection_range.clone());
+        let range = Self::clamp_search_text_range(target_text, range);
+        target_text.replace_range(range.clone(), &replacement);
+
+        if replacement.is_empty() {
+            *marked_range = None;
+        } else {
+            *marked_range = Some(range.start..range.start + replacement.len());
+        }
+
+        let selected_range = new_selected_range_utf16
+            .map(|utf16_range| Self::search_input_range_from_utf16(&replacement, utf16_range))
+            .map(|relative_range| {
+                range.start + relative_range.start..range.start + relative_range.end
+            })
+            .unwrap_or_else(|| {
+                let cursor = range.start + replacement.len();
+                cursor..cursor
+            });
+        *selection_range = selected_range;
+        if input_kind == SearchTextInputKind::Query {
+            self.clear_search_current_file_match_count();
+        }
+        self.touch_search_text_cursor_activity();
+        context.notify();
+    }
+
+    /// 返回指定文本范围在屏幕上的边界，用于放置 IME 候选窗口。
+    ///
+    /// 实现原因：
+    /// - 搜索输入框采用 GPUI 官方示例的自定义文本元素实现，最近一次 `ShapedLine` 可以提供真实字符位置。
+    /// - 如果首次绘制前布局不可用，则回退到输入框整体边界，保证候选窗口仍贴近控件。
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        window: &mut Window,
+        _context: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let input_kind = self.active_search_text_input_kind(window);
+        let dialog = self.search_dialog.as_ref()?;
+        let (text, _, _) = Self::search_text_state(dialog, input_kind);
+        let range = Self::search_input_range_from_utf16(text, range_utf16);
+        let layout = match input_kind {
+            SearchTextInputKind::Query => self.search_query_last_layout.as_ref(),
+            SearchTextInputKind::DirectoryTarget => self.search_directory_last_layout.as_ref(),
+        };
+        let Some(layout) = layout else {
+            return Some(element_bounds);
+        };
+        Some(Bounds::from_corners(
+            point(
+                element_bounds.left() + layout.x_for_index(range.start),
+                element_bounds.top(),
+            ),
+            point(
+                element_bounds.left() + layout.x_for_index(range.end),
+                element_bounds.bottom(),
+            ),
+        ))
+    }
+
+    /// 根据鼠标位置返回文本插入点。
+    ///
+    /// 边界条件：
+    /// - 平台 IME 可能通过该入口查询鼠标位置对应的字符；这里复用 GPUI 文本布局命中逻辑。
+    /// - 如果布局尚不可用，则回退到文本末尾，避免平台输入协议收到非法下标。
+    fn character_index_for_point(
+        &mut self,
+        point: gpui::Point<Pixels>,
+        window: &mut Window,
+        _context: &mut Context<Self>,
+    ) -> Option<usize> {
+        let input_kind = self.active_search_text_input_kind(window);
+        let dialog = self.search_dialog.as_ref()?;
+        let (text, _, _) = Self::search_text_state(dialog, input_kind);
+        let utf8_index = self.search_text_index_for_point(input_kind, point);
+        Some(Self::search_input_utf16_offset_from_byte(text, utf8_index))
+    }
+}
+
+impl Render for MainView {
+    /// 渲染主窗口内容。
+    ///
+    /// 实现原因：
+    /// - 顶部工具栏提供全局入口，内容区提供左右分栏和左侧日志目录树。
+    /// - 右侧主内容区仍不放占位文案，避免用户误以为日志正文、诊断或设置功能已经完成。
+    fn render(&mut self, _window: &mut Window, context: &mut Context<Self>) -> impl IntoElement {
+        let palette = self.palette();
+
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(rgb(palette.background))
+            .track_focus(&self.root_focus_handle)
+            .key_context("main-view-root")
+            .on_key_down(context.listener(Self::handle_root_key_down))
+            .on_action(
+                context.listener(|view, _: &OpenSearchDialog, window, context| {
+                    view.schedule_open_search_dialog(window, context);
+                }),
+            )
+            .on_mouse_move(context.listener(Self::handle_root_mouse_move))
+            .on_mouse_up(
+                MouseButton::Left,
+                context.listener(Self::handle_root_mouse_up),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                context.listener(Self::handle_root_mouse_up),
+            )
+            .can_drop(|dragged, _window, _app| dragged.is::<ExternalPaths>())
+            .on_drop(
+                context.listener(|view, external_paths: &ExternalPaths, _window, context| {
+                    // GPUI 会把系统文件拖放转成 `ExternalPaths`；这里只取真实文件系统路径，
+                    // 目录、普通文件和压缩包的具体解释仍交给加载模块统一处理。
+                    view.start_log_source_load(
+                        external_paths.paths().to_vec(),
+                        "正在加载拖入的日志".to_string(),
+                        context,
+                    );
+                }),
+            )
+            .child(self.render_toolbar(context))
+            .child(self.render_content(context))
+            .child(self.render_save_overwrite_confirm_dialog(context))
+    }
+}
+
+/// 程序入口。
+///
+/// 业务意图：
+/// - 初始化 GPUI 应用并创建唯一主窗口。
+/// - 当前阶段挂载窗口、工具栏、目录树、日志 tab 工作区和编码切换入口，暂不挂载菜单栏或配置系统。
+///
+/// 错误处理：
+/// - 主窗口创建失败意味着桌面应用无法进入可交互状态，属于启动期不可恢复错误。
+/// - 这里使用 `expect` 并配套中文错误说明，是为了让开发期和测试期能直接暴露
+///   窗口系统、图形环境或 GPUI 初始化问题；普通业务错误后续不得采用这种处理方式。
+pub(crate) fn run() {
+    let application = Application::new();
+    let open_url_target: Rc<RefCell<Option<(WindowHandle<MainView>, AsyncApp)>>> =
+        Rc::new(RefCell::new(None));
+    let pending_open_urls: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    {
+        let open_url_target = Rc::clone(&open_url_target);
+        let pending_open_urls = Rc::clone(&pending_open_urls);
+        application.on_open_urls(move |urls| {
+            let paths = log_source_paths_from_open_urls(urls.clone());
+            if paths.is_empty() {
+                return;
+            }
+
+            if let Some((main_view, async_app)) = open_url_target.borrow_mut().as_mut() {
+                // macOS/Finder 会在应用已经启动后继续通过 open-url 回调交付文件；此时直接复用主窗口加载流程。
+                // 如果主窗口已关闭，`update` 返回错误即可忽略，避免平台回调引发 panic。
+                main_view
+                    .update(async_app, |view, window, context| {
+                        view.start_log_source_load(
+                            paths,
+                            "正在加载拖入的日志".to_string(),
+                            context,
+                        );
+                        window.activate_window();
+                    })
+                    .ok();
+            } else {
+                // 某些平台可能在主窗口创建前触发 open-url；先暂存，主窗口完成初始化后再统一处理。
+                pending_open_urls.borrow_mut().extend(urls);
+            }
+        });
+    }
+
+    application.run(move |app| {
+        // 清理异常退出遗留的超大日志物化目录，避免压缩包大成员长期占用系统临时磁盘。
+        cleanup_stale_large_log_cache();
+        // 启动参数在 Windows 拖拽到程序图标、开发期命令行启动等场景中承载待打开路径。
+        // macOS Dock/Finder 的“用应用打开”通常走下方 `on_open_urls` 回调，因此两条入口都保留。
+        let launch_paths = log_source_paths_from_launch_arguments();
+        app.bind_keys([
+            KeyBinding::new("ctrl-f", OpenSearchDialog, None),
+            KeyBinding::new("cmd-f", OpenSearchDialog, None),
+        ]);
+        // 注册 Lucide 图标字体和内置 JetBrains Mono 正文字体，确保 macOS 和 Windows 上的图标与日志等宽字体
+        // 不依赖运行环境预装字体；如果注册失败，核心界面视觉无法可靠渲染，启动期应直接暴露错误。
+        app.text_system()
+            .add_fonts(vec![
+                Cow::Borrowed(LUCIDE_FONT_BYTES),
+                Cow::Borrowed(JETBRAINS_MONO_REGULAR_FONT_BYTES),
+            ])
+            .expect("注册内置字体失败，工具栏图标或日志正文等宽字体无法可靠渲染");
+
+        let main_display_id = primary_display_id(app);
+        let window_options = WindowOptions {
+            // 显式设置系统标题栏标题，保证 macOS 和 Windows 的原生窗口标题都使用产品名。
+            // 后续如果标题需要包含文件名或状态，应在业务规则明确后统一修改这里的标题策略。
+            titlebar: Some(TitlebarOptions {
+                title: Some(MAIN_WINDOW_TITLE.into()),
+                ..Default::default()
+            }),
+            // 使用统一启动策略决定主窗口边界：历史宽高优先，其次小屏最大化，最后大屏固定 1600x900 居中。
+            // 这里不恢复历史位置，并且显式绑定主显示器，避免多屏环境下计算居中和实际打开使用不同屏幕。
+            window_bounds: Some(build_main_window_bounds(app)),
+            display_id: main_display_id,
+            ..Default::default()
+        };
+
+        let main_view = app
+            .open_window(window_options, |window, app| {
+                let view = app.new(|context| {
+                    let mut view = MainView::new(context);
+                    view.system_window_appearance = window.appearance();
+                    view.window_appearance_subscription = Some(context.observe_window_appearance(
+                        window,
+                        |view, window, context| {
+                            view.set_system_window_appearance(window.appearance(), context);
+                        },
+                    ));
+                    view
+                });
+                // 主窗口关闭时只保存宽高，不保存位置或最大化状态。
+                // 保存失败不阻止关闭，避免配置目录权限问题影响日志查看客户端退出。
+                window.on_window_should_close(app, |window, _app| {
+                    let bounds = window.window_bounds().get_bounds();
+                    let width = bounds.size.width / px(1.0);
+                    let height = bounds.size.height / px(1.0);
+                    if let Some(size) = MainWindowSizePreference::new(width, height) {
+                        save_main_window_size_preference(size);
+                    }
+                    true
+                });
+                window.focus(&view.read(app).root_focus_handle);
+                view
+            })
+            .expect("创建 LogClinic 主窗口失败，应用无法继续启动");
+        let _ = main_view.update(app, |view, _window, context| {
+            // 主窗口句柄只能在 `open_window` 成功返回后获得；回填到主视图供独立工具窗口激活主窗口使用。
+            view.main_window = Some(main_view);
+            if !launch_paths.is_empty() {
+                view.start_log_source_load(
+                    launch_paths,
+                    "正在加载启动传入的日志".to_string(),
+                    context,
+                );
+            }
+            context.notify();
+        });
+        let async_app_for_open_urls = app.to_async();
+        let pending_paths = log_source_paths_from_open_urls(pending_open_urls.take());
+        if !pending_paths.is_empty() {
+            main_view
+                .update(app, |view, window, context| {
+                    view.start_log_source_load(
+                        pending_paths,
+                        "正在加载拖入的日志".to_string(),
+                        context,
+                    );
+                    window.activate_window();
+                })
+                .ok();
+        }
+        *open_url_target.borrow_mut() = Some((main_view, async_app_for_open_urls));
+        let main_view_for_keys = main_view;
+        let subscription = app.intercept_keystrokes(move |event, window, app| {
+            // GPUI 0.2.2 在 macOS 上会从 Objective-C `keyEquivalent` 回调进入这里；该回调不能让 Rust panic
+            // 继续向外 unwind，否则运行时会直接 abort。快捷键处理本身不是不可恢复业务，因此这里在边界处兜住
+            // 我们自己的状态更新异常，并让事件继续按默认路径传播，避免一次快捷键输入击穿整个进程。
+            let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                main_view_for_keys
+                    .update(app, |view, _window, context| {
+                        view.handle_global_keystroke(event.keystroke.clone(), window, context)
+                    })
+                    .unwrap_or(false)
+            }))
+            .unwrap_or(false);
+            if handled {
+                app.stop_propagation();
+            }
+        });
+        main_view
+            .update(app, |view, _window, _context| {
+                view.global_keystroke_subscription = Some(subscription);
+            })
+            .ok();
+    });
+}
+
+include!("app_impl/tests.rs");
