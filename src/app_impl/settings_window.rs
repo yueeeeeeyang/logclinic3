@@ -190,7 +190,6 @@ impl SettingsWindowView {
             .id("settings-general-tab")
             .flex()
             .flex_col()
-            .gap_3()
             .size_full()
             .p_4()
             .bg(rgb(palette.background))
@@ -199,6 +198,7 @@ impl SettingsWindowView {
                     .flex()
                     .items_center()
                     .gap_2()
+                    .mb_3()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(palette.text))
@@ -208,21 +208,97 @@ impl SettingsWindowView {
                         16.0,
                         palette.muted_text,
                     ))
-                    .child("主题设置"),
+                    .child("通用设置"),
             )
             .child(
-                div().flex().flex_col().gap_2().children(
-                    ThemePreference::all()
-                        .iter()
-                        .copied()
-                        .map(|option| self.render_theme_option(option, theme, palette, context)),
-                ),
+                div()
+                    .flex()
+                    .flex_col()
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.surface))
+                    .child(self.render_theme_setting_row(theme, palette, context))
+                    .child(div().h(px(1.0)).mx_3().bg(rgb(palette.border)))
+                    .child(self.render_log_font_size_setting(
+                        log_viewer_font_size,
+                        palette,
+                        context,
+                    )),
             )
-            .child(self.render_log_font_size_setting(log_viewer_font_size, palette, context))
     }
 
-    /// 渲染单个主题选项。
-    fn render_theme_option(
+    /// 渲染主题设置行。
+    ///
+    /// 业务意图：
+    /// - 通用设置中的每个设置项都采用“左侧说明、右侧控件”的结构，避免主题选择占用三张大卡片而日志字号只有一行造成视觉不协调。
+    /// - 主题选项使用分段按钮，可以保持信息密度，同时与工具栏、页签等现有轻量控件风格一致。
+    fn render_theme_setting_row(
+        &self,
+        selected_theme: ThemePreference,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Div {
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .min_h(px(70.0))
+            .px_4()
+            .py_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(MainView::render_lucide_icon(
+                        Some(Icon::Palette),
+                        18.0,
+                        18.0,
+                        palette.muted_text,
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(palette.text))
+                                    .child("主题设置"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(palette.muted_text))
+                                    .child("选择界面明暗外观"),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .p_1()
+                    .rounded(px(7.0))
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.input))
+                    .children(ThemePreference::all().iter().copied().map(|option| {
+                        self.render_theme_segment_option(option, selected_theme, palette, context)
+                    })),
+            )
+    }
+
+    /// 渲染主题分段选项按钮。
+    ///
+    /// 业务意图：
+    /// - 分段按钮把三个互斥主题选项放在同一控件内，视觉上与字号步进器同属“右侧控件”。
+    /// - 选中态使用应用强调色和选中背景，明暗主题下都沿用主程序的基础调色板。
+    fn render_theme_segment_option(
         &self,
         option: ThemePreference,
         selected_theme: ThemePreference,
@@ -237,52 +313,43 @@ impl SettingsWindowView {
             )))
             .flex()
             .items_center()
-            .justify_between()
-            .h(px(40.0))
-            .px_3()
+            .justify_center()
+            .gap_1()
+            .h(px(30.0))
+            .px_2()
             .rounded(px(6.0))
-            .border_1()
-            .border_color(rgb(if selected {
-                palette.accent
-            } else {
-                palette.border
-            }))
             .bg(rgb(if selected {
                 palette.selected
             } else {
-                palette.surface
+                palette.input
             }))
             .cursor_pointer()
             .hover(move |row| row.bg(rgb(palette.hover)))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .text_sm()
-                    .text_color(rgb(palette.text))
-                    .child(MainView::render_lucide_icon(
-                        Some(option.icon()),
-                        16.0,
-                        15.0,
-                        palette.muted_text,
-                    ))
-                    .child(option.label()),
-            )
             .child(MainView::render_lucide_icon(
-                Some(if selected {
-                    Icon::CheckCircle2
-                } else {
-                    Icon::Circle
-                }),
-                16.0,
-                15.0,
+                Some(if selected { Icon::Check } else { option.icon() }),
+                14.0,
+                14.0,
                 if selected {
                     palette.accent
                 } else {
                     palette.muted_text
                 },
             ))
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(if selected {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .text_color(rgb(if selected {
+                        palette.accent
+                    } else {
+                        palette.text
+                    }))
+                    .child(option.label()),
+            )
             .on_click(
                 context.listener(move |view, _event: &ClickEvent, _window, context| {
                     view.select_theme(option, context);
@@ -306,33 +373,39 @@ impl SettingsWindowView {
             .flex()
             .items_center()
             .justify_between()
-            .h(px(44.0))
-            .px_3()
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(rgb(palette.border))
-            .bg(rgb(palette.surface))
+            .min_h(px(70.0))
+            .px_4()
+            .py_3()
             .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .gap_1()
+                    .items_center()
+                    .gap_3()
+                    .child(MainView::render_lucide_icon(
+                        Some(Icon::Type),
+                        18.0,
+                        18.0,
+                        palette.muted_text,
+                    ))
                     .child(
                         div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(palette.text))
-                            .child("日志显示字号"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(palette.muted_text))
-                            .child(format!(
-                                "范围 {}px - {}px，默认 {}px",
-                                LOG_VIEWER_MIN_FONT_SIZE.round(),
-                                LOG_VIEWER_MAX_FONT_SIZE.round(),
-                                LOG_VIEWER_DEFAULT_FONT_SIZE.round()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(palette.text))
+                                    .child("日志显示字号"),
+                            )
+                            .child(div().text_xs().text_color(rgb(palette.muted_text)).child(
+                                format!(
+                                    "范围 {}px - {}px，默认 {}px",
+                                    LOG_VIEWER_MIN_FONT_SIZE.round(),
+                                    LOG_VIEWER_MAX_FONT_SIZE.round(),
+                                    LOG_VIEWER_DEFAULT_FONT_SIZE.round()
+                                ),
                             )),
                     ),
             )
@@ -358,7 +431,7 @@ impl SettingsWindowView {
                             .rounded(px(5.0))
                             .border_1()
                             .border_color(rgb(palette.border))
-                            .bg(rgb(palette.input))
+                            .bg(rgb(palette.surface))
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(palette.text))

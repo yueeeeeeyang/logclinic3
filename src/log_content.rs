@@ -29,7 +29,10 @@ use zip::ZipArchive;
 use crate::highlighting::{
     HighlightMode, PrecomputedHighlights, SyntaxTheme, prepare_highlighting,
 };
-use crate::log_loader::{ArchiveFormat, LogFileSource, normalize_archive_member_path};
+use crate::log_loader::{
+    ArchiveFormat, LogFileSource, is_single_gzip_member_path, normalize_archive_member_path,
+    single_gzip_member_display_name, single_gzip_member_path_for_archive,
+};
 
 /// 单个日志 tab 允许缓存的最大原始字节数。
 ///
@@ -141,7 +144,7 @@ pub struct DecodedLogDocument {
     ///
     /// 边界条件：
     /// - 行尾 `\n` 会被移除，Windows 行尾中的 `\r` 也会被去掉，便于右侧按行渲染。
-    /// - 行集合可能来自 200MB 级别日志，使用 `Arc` 共享给当前文件搜索任务，避免 UI 线程复制整份日志。
+    /// - 行集合可能来自较大的内存模式日志，使用 `Arc` 共享给当前文件搜索任务，避免 UI 线程复制整份日志。
     pub lines: Arc<Vec<String>>,
     /// 字符数量最多的日志行下标，用于右侧虚拟列表测量横向内容宽度。
     ///
@@ -397,12 +400,23 @@ fn write_temporary_nested_archive_bytes(
 /// - 这里只根据文件名扩展名判断格式，和加载层 `ArchiveFormat::from_path` 保持一致。
 fn archive_format_for_source(source: &LogFileSource) -> Option<ArchiveFormat> {
     match source {
-        LogFileSource::LocalFile { path } => ArchiveFormat::from_path(path),
+        LogFileSource::LocalFile { path } => ArchiveFormat::from_file(path),
         LogFileSource::ArchiveMember { member_path, .. } => {
+            if is_single_gzip_member_path(member_path) {
+                return None;
+            }
             ArchiveFormat::from_path(Path::new(member_path))
         }
-        LogFileSource::MaterializedArchiveMember { member_path, .. } => {
-            ArchiveFormat::from_path(Path::new(member_path))
+        LogFileSource::MaterializedArchiveMember {
+            member_path,
+            temp_path,
+            ..
+        } => {
+            if is_single_gzip_member_path(member_path) {
+                return None;
+            }
+            ArchiveFormat::from_file(temp_path)
+                .or_else(|| ArchiveFormat::from_path(Path::new(member_path)))
         }
         LogFileSource::NestedArchiveMember {
             nested_member_path, ..
@@ -458,9 +472,15 @@ fn read_archive_member(
     archive_format: ArchiveFormat,
     member_path: &str,
 ) -> Result<Vec<u8>, LogContentError> {
+    let archive_format = if archive_format == ArchiveFormat::TarGz {
+        ArchiveFormat::from_file(archive_path).unwrap_or(archive_format)
+    } else {
+        archive_format
+    };
     match archive_format {
         ArchiveFormat::Zip => read_zip_member(archive_path, member_path),
         ArchiveFormat::Rar => read_rar_member(archive_path, member_path),
+        ArchiveFormat::Tar => read_tar_member(archive_path, member_path),
         ArchiveFormat::TarGz => read_tar_gz_member(archive_path, member_path),
         ArchiveFormat::SevenZ => read_7z_member(archive_path, member_path),
     }
@@ -479,8 +499,10 @@ fn read_archive_member_from_bytes(
     member_path: &str,
     label: &str,
 ) -> Result<Vec<u8>, LogContentError> {
+    let archive_format = archive_format.resolve_from_bytes(archive_bytes);
     match archive_format {
         ArchiveFormat::Zip => read_zip_member_from_bytes(archive_bytes, member_path, label),
+        ArchiveFormat::Tar => read_tar_member_from_bytes(archive_bytes, member_path, label),
         ArchiveFormat::TarGz => read_tar_gz_member_from_bytes(archive_bytes, member_path, label),
         ArchiveFormat::SevenZ => read_7z_member_from_bytes(archive_bytes, member_path, label),
         ArchiveFormat::Rar => Err(LogContentError::new(format!(
@@ -504,6 +526,11 @@ fn read_single_file_archive_from_path(
     archive_format: ArchiveFormat,
 ) -> Result<Vec<u8>, LogContentError> {
     let label = archive_path.display().to_string();
+    let archive_format = if archive_format == ArchiveFormat::TarGz {
+        ArchiveFormat::from_file(archive_path).unwrap_or(archive_format)
+    } else {
+        archive_format
+    };
     let member_path =
         single_file_archive_member_path_from_path(archive_path, archive_format, label.as_str())?;
     read_archive_member(archive_path, archive_format, &member_path)
@@ -523,8 +550,10 @@ fn read_single_file_archive_from_bytes(
     label: &str,
     context_label: &str,
 ) -> Result<Vec<u8>, LogContentError> {
+    let archive_format = archive_format.resolve_from_bytes(archive_bytes);
     match archive_format {
         ArchiveFormat::Zip => read_single_file_zip_from_bytes(archive_bytes, label),
+        ArchiveFormat::Tar => read_single_file_tar_from_bytes(archive_bytes, label),
         ArchiveFormat::TarGz => read_single_file_tar_gz_from_bytes(archive_bytes, label),
         ArchiveFormat::SevenZ => read_single_file_7z_from_bytes(archive_bytes, label),
         ArchiveFormat::Rar => Err(LogContentError::new(format!(
@@ -546,6 +575,7 @@ pub(crate) fn single_file_archive_member_path_from_path(
     match archive_format {
         ArchiveFormat::Zip => single_file_zip_member_path(archive_path, label),
         ArchiveFormat::Rar => single_file_rar_member_path(archive_path, label),
+        ArchiveFormat::Tar => single_file_tar_member_path(archive_path, label),
         ArchiveFormat::TarGz => single_file_tar_gz_member_path(archive_path, label),
         ArchiveFormat::SevenZ => single_file_7z_member_path(archive_path, label),
     }
@@ -617,6 +647,49 @@ fn single_file_rar_member_path(
     require_single_archive_member(single_member, label)
 }
 
+/// 从 TAR 文件目录中找出唯一普通文件成员路径。
+///
+/// 业务意图：
+/// - 支持 `.tar` 文件，以及扩展名误写成 `.tar.gz` 但真实内容为纯 tar 的日志包。
+/// - 只返回成员路径，不读取正文；真正读取仍走按成员匹配的流式路径。
+fn single_file_tar_member_path(
+    archive_path: &Path,
+    label: &str,
+) -> Result<String, LogContentError> {
+    let file = File::open(archive_path).map_err(|error| {
+        LogContentError::new(format!(
+            "无法打开 TAR 压缩包 {}：{}",
+            archive_path.display(),
+            error
+        ))
+    })?;
+    let mut archive = TarArchive::new(BufReader::new(file));
+    let entries = archive
+        .entries()
+        .map_err(|error| LogContentError::new(format!("无法读取 TAR 目录：{}", error)))?;
+    let mut single_member = None;
+
+    for entry in entries {
+        let mut entry =
+            entry.map_err(|error| LogContentError::new(format!("无法读取 TAR 条目：{}", error)))?;
+        if entry.header().entry_type().is_dir() {
+            continue;
+        }
+
+        let entry_path = entry
+            .path()
+            .map_err(|error| LogContentError::new(format!("无法读取 TAR 条目路径：{}", error)))?;
+        let raw_name = entry_path.to_string_lossy();
+        let normalized = normalize_archive_member_path(&raw_name).map_err(|reason| {
+            LogContentError::new(format!("{} 内包含非法 TAR 条目：{}", label, reason))
+        })?;
+        remember_single_archive_member(&mut single_member, normalized, label)?;
+        drain_tar_entry(&mut entry, label)?;
+    }
+
+    require_single_archive_member(single_member, label)
+}
+
 /// 从 TAR.GZ 文件目录中找出唯一普通文件成员路径。
 fn single_file_tar_gz_member_path(
     archive_path: &Path,
@@ -631,14 +704,31 @@ fn single_file_tar_gz_member_path(
     })?;
     let decoder = GzDecoder::new(BufReader::new(file));
     let mut archive = TarArchive::new(decoder);
-    let entries = archive
-        .entries()
-        .map_err(|error| LogContentError::new(format!("无法读取 TAR.GZ 目录：{}", error)))?;
+    let entries = match archive.entries() {
+        Ok(entries) => entries,
+        Err(error) => {
+            if single_gzip_payload_is_readable_from_path(archive_path) {
+                return Ok(single_gzip_member_path_for_archive(archive_path));
+            }
+            return Err(LogContentError::new(format!(
+                "无法读取 TAR.GZ 目录：{}",
+                error
+            )));
+        }
+    };
     let mut single_member = None;
+    let mut entry_errors = Vec::new();
 
     for entry in entries {
-        let entry = entry
-            .map_err(|error| LogContentError::new(format!("无法读取 TAR.GZ 条目：{}", error)))?;
+        let mut entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                // 扩展名为 `.tar.gz` 的单文件 gzip 日志会在这里表现为 tar 条目错误。
+                // 先延迟错误，循环结束后若没有任何有效文件成员，再尝试按单 gzip 日志打开。
+                entry_errors.push(error.to_string());
+                continue;
+            }
+        };
         if entry.header().entry_type().is_dir() {
             continue;
         }
@@ -651,6 +741,20 @@ fn single_file_tar_gz_member_path(
             LogContentError::new(format!("{} 内包含非法 TAR.GZ 条目：{}", label, reason))
         })?;
         remember_single_archive_member(&mut single_member, normalized, label)?;
+        drain_tar_entry(&mut entry, label)?;
+    }
+
+    if single_member.is_none()
+        && !entry_errors.is_empty()
+        && single_gzip_payload_is_readable_from_path(archive_path)
+    {
+        return Ok(single_gzip_member_path_for_archive(archive_path));
+    }
+    if let Some(error) = entry_errors.into_iter().next() {
+        return Err(LogContentError::new(format!(
+            "无法读取 TAR.GZ 条目：{}",
+            error
+        )));
     }
 
     require_single_archive_member(single_member, label)
@@ -751,6 +855,55 @@ fn read_single_file_zip_from_bytes(
     read_reader_to_vec_with_limit(&mut entry, Some(size), &member_label)
 }
 
+/// 从内存 TAR 字节中读取唯一普通文件。
+///
+/// 业务意图：
+/// - 外层压缩包中的纯 tar 成员可以直接基于内存字节扫描，不需要落盘。
+/// - 只有确认内部恰好一个普通文件时才返回正文，避免多文件包误打开第一个文件。
+fn read_single_file_tar_from_bytes(
+    archive_bytes: &[u8],
+    label: &str,
+) -> Result<Vec<u8>, LogContentError> {
+    let mut archive = TarArchive::new(Cursor::new(archive_bytes));
+    let entries = archive
+        .entries()
+        .map_err(|error| LogContentError::new(format!("无法读取嵌套 TAR 目录：{}", error)))?;
+    let mut single_member = None;
+    let mut single_bytes = None;
+
+    for entry in entries {
+        let mut entry = entry
+            .map_err(|error| LogContentError::new(format!("无法读取嵌套 TAR 条目：{}", error)))?;
+        if entry.header().entry_type().is_dir() {
+            continue;
+        }
+
+        let entry_path = entry.path().map_err(|error| {
+            LogContentError::new(format!("无法读取嵌套 TAR 条目路径：{}", error))
+        })?;
+        let raw_name = entry_path.to_string_lossy();
+        let normalized = normalize_archive_member_path(&raw_name).map_err(|reason| {
+            LogContentError::new(format!("{} 内包含非法 TAR 条目：{}", label, reason))
+        })?;
+        remember_single_archive_member(&mut single_member, normalized.clone(), label)?;
+        let size = entry.size();
+        ensure_size_within_limit(size, &normalized)?;
+        single_bytes = Some(read_reader_to_vec_with_limit(
+            &mut entry,
+            Some(size),
+            &normalized,
+        )?);
+    }
+
+    require_single_archive_member(single_member, label)?;
+    single_bytes.ok_or_else(|| {
+        LogContentError::new(format!(
+            "{} 内没有可打开的普通文件，无法直接显示日志内容",
+            label
+        ))
+    })
+}
+
 /// 从内存 TAR.GZ 字节中读取唯一普通文件。
 ///
 /// 业务意图：
@@ -761,16 +914,22 @@ fn read_single_file_tar_gz_from_bytes(
 ) -> Result<Vec<u8>, LogContentError> {
     let decoder = GzDecoder::new(Cursor::new(archive_bytes));
     let mut archive = TarArchive::new(decoder);
-    let entries = archive
-        .entries()
-        .map_err(|error| LogContentError::new(format!("无法读取嵌套 TAR.GZ 目录：{}", error)))?;
+    let entries = match archive.entries() {
+        Ok(entries) => entries,
+        Err(_) => return read_single_gzip_payload_from_bytes(archive_bytes, label),
+    };
     let mut single_member = None;
     let mut single_bytes = None;
+    let mut entry_errors = Vec::new();
 
     for entry in entries {
-        let mut entry = entry.map_err(|error| {
-            LogContentError::new(format!("无法读取嵌套 TAR.GZ 条目：{}", error))
-        })?;
+        let mut entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                entry_errors.push(error.to_string());
+                continue;
+            }
+        };
         if entry.header().entry_type().is_dir() {
             continue;
         }
@@ -790,6 +949,16 @@ fn read_single_file_tar_gz_from_bytes(
             Some(size),
             &normalized,
         )?);
+    }
+
+    if single_member.is_none() && !entry_errors.is_empty() {
+        return read_single_gzip_payload_from_bytes(archive_bytes, label);
+    }
+    if let Some(error) = entry_errors.into_iter().next() {
+        return Err(LogContentError::new(format!(
+            "无法读取嵌套 TAR.GZ 条目：{}",
+            error
+        )));
     }
 
     require_single_archive_member(single_member, label)?;
@@ -945,11 +1114,59 @@ fn read_rar_member(archive_path: &Path, member_path: &str) -> Result<Vec<u8>, Lo
     )))
 }
 
+/// 从 TAR 压缩包中读取成员。
+///
+/// 业务意图：
+/// - 支持纯 `.tar` 归档和扩展名误写成 `.tar.gz` 的纯 tar 日志包。
+/// - 读取时顺序跳过非目标条目，找到目标后才把正文读入内存或触发大小上限错误。
+fn read_tar_member(archive_path: &Path, member_path: &str) -> Result<Vec<u8>, LogContentError> {
+    let file = File::open(archive_path).map_err(|error| {
+        LogContentError::new(format!(
+            "无法打开 TAR 压缩包 {}：{}",
+            archive_path.display(),
+            error
+        ))
+    })?;
+    let mut archive = TarArchive::new(BufReader::new(file));
+    let entries = archive
+        .entries()
+        .map_err(|error| LogContentError::new(format!("无法读取 TAR 目录：{}", error)))?;
+
+    for entry in entries {
+        let mut entry =
+            entry.map_err(|error| LogContentError::new(format!("无法读取 TAR 条目：{}", error)))?;
+        let entry_path = entry
+            .path()
+            .map_err(|error| LogContentError::new(format!("无法读取 TAR 条目路径：{}", error)))?;
+        let raw_name = entry_path.to_string_lossy().to_string();
+        if entry.header().entry_type().is_dir() {
+            continue;
+        }
+        if normalize_archive_member_path(&raw_name).ok().as_deref() != Some(member_path) {
+            drain_tar_entry(&mut entry, member_path)?;
+            continue;
+        }
+
+        let size = entry.size();
+        ensure_size_within_limit(size, member_path)?;
+        return read_reader_to_vec_with_limit(&mut entry, Some(size), member_path);
+    }
+
+    Err(LogContentError::new(format!(
+        "TAR 压缩包中未找到成员 {}",
+        member_path
+    )))
+}
+
 /// 从 tar.gz 或 tgz 压缩包中读取成员。
 ///
 /// 业务意图：
 /// - gzip 层和 tar 条目遍历都走 reader，不把成员写入临时目录。
 fn read_tar_gz_member(archive_path: &Path, member_path: &str) -> Result<Vec<u8>, LogContentError> {
+    if is_single_gzip_member_path(member_path) {
+        return read_single_gzip_payload_from_path(archive_path, member_path);
+    }
+
     let file = File::open(archive_path).map_err(|error| {
         LogContentError::new(format!(
             "无法打开 TAR.GZ 压缩包 {}：{}",
@@ -969,10 +1186,12 @@ fn read_tar_gz_member(archive_path: &Path, member_path: &str) -> Result<Vec<u8>,
         let entry_path = entry.path().map_err(|error| {
             LogContentError::new(format!("无法读取 TAR.GZ 条目路径：{}", error))
         })?;
-        let raw_name = entry_path.to_string_lossy();
-        if entry.header().entry_type().is_dir()
-            || normalize_archive_member_path(&raw_name).ok().as_deref() != Some(member_path)
-        {
+        let raw_name = entry_path.to_string_lossy().to_string();
+        if entry.header().entry_type().is_dir() {
+            continue;
+        }
+        if normalize_archive_member_path(&raw_name).ok().as_deref() != Some(member_path) {
+            drain_tar_entry(&mut entry, member_path)?;
             continue;
         }
 
@@ -1052,12 +1271,56 @@ fn read_zip_member_from_bytes(
     )))
 }
 
+/// 从内存 TAR 字节中读取指定成员。
+///
+/// 业务意图：
+/// - 多文件内层 TAR 在左侧树展开后，用户点击具体文件时需要从内存中的内层 tar 字节定位该成员。
+fn read_tar_member_from_bytes(
+    archive_bytes: &[u8],
+    member_path: &str,
+    label: &str,
+) -> Result<Vec<u8>, LogContentError> {
+    let mut archive = TarArchive::new(Cursor::new(archive_bytes));
+    let entries = archive.entries().map_err(|error| {
+        LogContentError::new(format!("无法读取嵌套 TAR {} 的目录：{}", label, error))
+    })?;
+
+    for entry in entries {
+        let mut entry = entry
+            .map_err(|error| LogContentError::new(format!("无法读取嵌套 TAR 条目：{}", error)))?;
+        let entry_path = entry.path().map_err(|error| {
+            LogContentError::new(format!("无法读取嵌套 TAR 条目路径：{}", error))
+        })?;
+        let raw_name = entry_path.to_string_lossy().to_string();
+        if entry.header().entry_type().is_dir() {
+            continue;
+        }
+        if normalize_archive_member_path(&raw_name).ok().as_deref() != Some(member_path) {
+            drain_tar_entry(&mut entry, member_path)?;
+            continue;
+        }
+
+        let size = entry.size();
+        ensure_size_within_limit(size, member_path)?;
+        return read_reader_to_vec_with_limit(&mut entry, Some(size), member_path);
+    }
+
+    Err(LogContentError::new(format!(
+        "嵌套压缩包 {} 中未找到日志文件：{}",
+        label, member_path
+    )))
+}
+
 /// 从内存 TAR.GZ 字节中读取指定成员。
 fn read_tar_gz_member_from_bytes(
     archive_bytes: &[u8],
     member_path: &str,
     label: &str,
 ) -> Result<Vec<u8>, LogContentError> {
+    if is_single_gzip_member_path(member_path) {
+        return read_single_gzip_payload_from_bytes(archive_bytes, member_path);
+    }
+
     let decoder = GzDecoder::new(Cursor::new(archive_bytes));
     let mut archive = TarArchive::new(decoder);
     let entries = archive.entries().map_err(|error| {
@@ -1071,10 +1334,12 @@ fn read_tar_gz_member_from_bytes(
         let entry_path = entry.path().map_err(|error| {
             LogContentError::new(format!("无法读取嵌套 TAR.GZ 条目路径：{}", error))
         })?;
-        let raw_name = entry_path.to_string_lossy();
-        if entry.header().entry_type().is_dir()
-            || normalize_archive_member_path(&raw_name).ok().as_deref() != Some(member_path)
-        {
+        let raw_name = entry_path.to_string_lossy().to_string();
+        if entry.header().entry_type().is_dir() {
+            continue;
+        }
+        if normalize_archive_member_path(&raw_name).ok().as_deref() != Some(member_path) {
+            drain_tar_entry(&mut entry, member_path)?;
             continue;
         }
 
@@ -1087,6 +1352,77 @@ fn read_tar_gz_member_from_bytes(
         "嵌套压缩包 {} 中未找到日志文件：{}",
         label, member_path
     )))
+}
+
+/// 从本地 `.tar.gz` 文件中按“单个 gzip 日志”读取解压内容。
+///
+/// 业务意图：
+/// - 兼容扩展名是 `.tar.gz`，但实际没有 tar 目录、只包含一个 gzip 日志流的文件。
+/// - 读取结果仍受 200MB 内存模式上限保护；超过阈值的文件会在分页路径中走物化读取。
+fn read_single_gzip_payload_from_path(
+    archive_path: &Path,
+    member_path: &str,
+) -> Result<Vec<u8>, LogContentError> {
+    let file = File::open(archive_path).map_err(|error| {
+        LogContentError::new(format!(
+            "无法打开 GZIP 日志 {}：{}",
+            archive_path.display(),
+            error
+        ))
+    })?;
+    let decoder = GzDecoder::new(BufReader::new(file));
+    let label = single_gzip_member_display_name(member_path);
+    read_reader_to_vec_with_limit(decoder, None, &label)
+}
+
+/// 从内存字节中按“单个 gzip 日志”读取解压内容。
+///
+/// 业务意图：
+/// - 外层压缩包内可能包含单文件 gzip 日志并使用 `.tar.gz` 命名；该路径不能依赖本地文件 seek。
+/// - 使用 `Cursor` 保持读取逻辑纯内存、无临时文件副作用。
+fn read_single_gzip_payload_from_bytes(
+    archive_bytes: &[u8],
+    label: &str,
+) -> Result<Vec<u8>, LogContentError> {
+    let decoder = GzDecoder::new(Cursor::new(archive_bytes));
+    let display_label = if is_single_gzip_member_path(label) {
+        single_gzip_member_display_name(label)
+    } else {
+        label.to_string()
+    };
+    read_reader_to_vec_with_limit(decoder, None, &display_label)
+}
+
+/// 判断本地 gzip 层是否可以开始解压。
+///
+/// 业务意图：
+/// - 单文件 gzip fallback 只应处理“gzip 有效但不是 tar”的文件，不能把损坏压缩包误判为普通日志。
+fn single_gzip_payload_is_readable_from_path(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let mut decoder = GzDecoder::new(BufReader::new(file));
+    let mut probe = [0_u8; 1];
+    decoder.read(&mut probe).is_ok()
+}
+
+/// 排空 TAR 条目正文，推进顺序流到下一个条目头。
+///
+/// 业务意图：
+/// - TAR.GZ 是顺序格式；读取目录、查找唯一文件或查找指定成员时，即使当前条目不是目标，也必须消费正文。
+/// - 如果不排空，后续条目读取会把文件内容误识别为 tar 头，表现为“条目读取失败”或“路径读取失败”。
+///
+/// 边界条件：
+/// - 该函数只把内容丢到 `io::sink()`，不改变内存上限策略，也不缓存日志正文。
+fn drain_tar_entry<R: Read>(
+    entry: &mut tar::Entry<'_, R>,
+    label: &str,
+) -> Result<(), LogContentError> {
+    io::copy(entry, &mut io::sink())
+        .map(|_| ())
+        .map_err(|error| {
+            LogContentError::new(format!("跳过 TAR.GZ 条目 {} 失败：{}", label, error))
+        })
 }
 
 /// 从内存 7Z 字节中读取指定成员。
@@ -1401,8 +1737,10 @@ mod tests {
     //! - UI tab 行为由主界面逻辑和手动验收覆盖，本模块只验证读字节和解码数据的正确性。
 
     use super::*;
+    use flate2::{Compression, write::GzEncoder};
     use std::io::{self, Cursor, Write};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tar::Builder as TarBuilder;
 
     /// 验证 UTF-8 BOM 会被自动识别并在解码时移除。
     #[test]
@@ -1533,6 +1871,74 @@ mod tests {
         Ok(())
     }
 
+    /// 验证读取 TAR.GZ 后续成员前会跳过前置成员正文。
+    ///
+    /// 业务意图：
+    /// - 用户在左侧树点击 TAR.GZ 内第二个及后续文件时，读取逻辑必须顺序排空前面的文件内容。
+    /// - 否则 gzip/tar 流会停留在前一个文件正文位置，导致后续成员匹配失败或报条目读取错误。
+    #[test]
+    fn 读取_tar_gz_后续成员原始字节() -> Result<(), Box<dyn Error>> {
+        let temp_dir = unique_temp_dir("logclinic3-tar-gz-content-test")?;
+        let archive_path = temp_dir.join("logs.tar.gz");
+        write_test_tar_gz(
+            &archive_path,
+            &[
+                ("first.log", b"INFO first".as_slice()),
+                ("second.log", b"INFO second".as_slice()),
+            ],
+        )?;
+
+        let bytes = read_log_source_bytes(&LogFileSource::ArchiveMember {
+            archive_path: archive_path.clone(),
+            archive_format: ArchiveFormat::TarGz,
+            member_path: "second.log".to_string(),
+        })?;
+
+        assert_eq!(&bytes[..], b"INFO second");
+        fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    /// 验证扩展名为 `.tar.gz` 的单文件 gzip 日志可以直接读取正文。
+    ///
+    /// 业务意图：
+    /// - 目录树 fallback 会生成虚拟成员路径；单文件直接打开也会先识别唯一虚拟成员，再按 gzip 解压读取。
+    /// - 该测试覆盖读取链路，避免 UI 能看到节点但点击后仍报 TAR.GZ 条目读取失败。
+    #[test]
+    fn 读取_tar_gz_单文件gzip原始字节() -> Result<(), Box<dyn Error>> {
+        let temp_dir = unique_temp_dir("logclinic3-single-gzip-content-test")?;
+        let archive_path = temp_dir.join("single.tar.gz");
+        write_test_gzip(&archive_path, b"INFO gzip only")?;
+
+        let bytes = read_log_source_bytes(&LogFileSource::LocalFile {
+            path: archive_path.clone(),
+        })?;
+
+        assert_eq!(&bytes[..], b"INFO gzip only");
+        fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    /// 验证扩展名误写为 `.tar.gz` 的纯 tar 文件会按真实 TAR 内容读取。
+    ///
+    /// 业务意图：
+    /// - 用户现场样本是纯 tar 归档，但文件名带 `.tar.gz`。
+    /// - 读取链路需要复用内容探测结果，避免单文件打开或分页物化继续走 gzip 解码。
+    #[test]
+    fn 读取_tar_扩展名误写为_tar_gz_原始字节() -> Result<(), Box<dyn Error>> {
+        let temp_dir = unique_temp_dir("logclinic3-plain-tar-content-test")?;
+        let archive_path = temp_dir.join("wrong-name.tar.gz");
+        write_test_tar(&archive_path, &[("only.log", b"INFO plain tar".as_slice())])?;
+
+        let bytes = read_log_source_bytes(&LogFileSource::LocalFile {
+            path: archive_path.clone(),
+        })?;
+
+        assert_eq!(&bytes[..], b"INFO plain tar");
+        fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
     /// 验证外层压缩包里的单文件 ZIP 成员会继续读取内部唯一文件，而不是把 ZIP 二进制当作日志文本。
     #[test]
     fn 读取外层_zip_中的单文件_zip_成员原始字节() -> Result<(), Box<dyn Error>> {
@@ -1654,5 +2060,61 @@ mod tests {
             std::env::temp_dir().join(format!("{}-{}-{}", prefix, std::process::id(), nanos));
         fs::create_dir_all(&path)?;
         Ok(path)
+    }
+
+    /// 写入测试用 TAR.GZ 文件。
+    ///
+    /// 业务意图：
+    /// - TAR.GZ 顺序读取问题需要真实 gzip + tar 流才能覆盖，不能用普通内存字节替代。
+    fn write_test_tar_gz(path: &Path, files: &[(&str, &[u8])]) -> io::Result<()> {
+        let file = File::create(path)?;
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut builder = TarBuilder::new(encoder);
+
+        for (name, bytes) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(name)?;
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, *bytes)?;
+        }
+
+        let encoder = builder.into_inner()?;
+        encoder.finish()?;
+        Ok(())
+    }
+
+    /// 写入测试用未压缩 TAR 文件。
+    ///
+    /// 业务意图：
+    /// - 用真实 tar header 覆盖扩展名误写时的内容探测和读取路径。
+    fn write_test_tar(path: &Path, files: &[(&str, &[u8])]) -> io::Result<()> {
+        let file = File::create(path)?;
+        let mut builder = TarBuilder::new(file);
+
+        for (name, bytes) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(name)?;
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, *bytes)?;
+        }
+
+        builder.finish()?;
+        Ok(())
+    }
+
+    /// 写入测试用单文件 gzip 日志。
+    ///
+    /// 业务意图：
+    /// - 用真实 gzip 流覆盖 `.tar.gz` 非 tar 内容的兼容读取路径。
+    fn write_test_gzip(path: &Path, bytes: &[u8]) -> io::Result<()> {
+        let file = File::create(path)?;
+        let mut encoder = GzEncoder::new(file, Compression::default());
+        encoder.write_all(bytes)?;
+        encoder.finish()?;
+        Ok(())
     }
 }

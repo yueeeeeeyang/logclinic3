@@ -31,7 +31,7 @@ const ABOUT_FEATURE_GUIDES: &[FeatureGuide] = &[
     },
     FeatureGuide {
         title: "大日志正常打开",
-        guide: "打开超过阈值的大文件时会使用分页浏览，先显示可见区域，滚动和搜索时再按需读取内容。",
+        guide: "打开超过 30MB 的大文件时会使用分页浏览，先显示可见区域，滚动和搜索时再按需读取内容。",
     },
     FeatureGuide {
         title: "线程日志分析功能",

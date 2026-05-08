@@ -7,6 +7,7 @@
 # 关键约束：
 # - 该脚本只产出可执行文件，不生成 MSI/NSIS 安装器；如果后续需要安装向导，应另行引入专门安装器工具链。
 # - 字体资源当前通过 Rust `include_bytes!` 编译进二进制，不需要额外复制 assets 目录。
+# - 程序图标来自 `assets/icons/LogClinic.ico`，由 `build.rs` 在 Windows target 构建时嵌入最终 `.exe`。
 # - 如果目标 Rust target 未安装，脚本会提示 `rustup target add`，避免构建阶段出现难懂的链接错误。
 #
 # 用法示例：

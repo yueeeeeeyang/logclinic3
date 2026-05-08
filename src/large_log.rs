@@ -2,20 +2,20 @@
 //!
 //! 业务意图：
 //! - 小文件继续使用已有 `DecodedLogDocument`，保留完整语法高亮、快速计数和内存内搜索体验。
-//! - 超过 200MB 的普通文件或压缩包成员进入分页模式，只建立行索引并按需读取可见文本。
+//! - 超过 30MB 的普通文件或压缩包成员进入分页模式，只建立行索引并按需读取可见文本。
 //! - UI 层通过 `LogTabDocument` 消费统一文档模型，避免后续编码切换、搜索和渲染继续假设所有日志都在内存中。
 //!
 //! 关键约束：
 //! - 本地普通大文件不复制，直接分页读取原路径；压缩包成员必须物化成临时文件才能 seek。
-//! - 只有大小超过内存阈值时才切入分页模式，小文件行为尽量保持不变。
-//! - 压缩包成员无法廉价获知解压后大小时，先尝试旧的内存读取；只有命中 200MB 上限错误才转入物化分页。
+//! - 只有大小超过分页阈值时才切入分页模式，小文件行为尽量保持不变。
+//! - 压缩包成员如果无法在打开前廉价获知解压后大小，会先按现有读取路径拿到字节；一旦超过 30MB 阈值即丢弃内存文档并改走物化分页。
 
 use std::{fs, path::Path, sync::Arc};
 
 use crate::{
     archive_materializer::{cleanup_materialized_file, materialize_source_for_paging},
     log_content::{
-        DecodedLogDocument, EncodingChoice, LogContentError, MAX_LOG_FILE_BYTES, decode_log_bytes,
+        DecodedLogDocument, EncodingChoice, LogContentError, decode_log_bytes,
         read_log_source_bytes,
     },
     log_loader::{ArchiveFormat, LogFileSource},
@@ -25,13 +25,14 @@ use crate::{
 /// 超大日志分页阈值。
 ///
 /// 业务意图：
-/// - 阈值沿用既有 200MB 内存保护线，避免同一文件在打开和搜索路径出现不同判断。
-pub const LARGE_LOG_THRESHOLD_BYTES: u64 = MAX_LOG_FILE_BYTES;
+/// - 用户要求日志超过 30MB 就切换到分页模式，降低打开中等偏大日志时的内存占用和 UI 压力。
+/// - 该阈值只决定“浏览模式”；`log_content::MAX_LOG_FILE_BYTES` 仍作为内存读取硬上限，防止压缩包成员声明大小异常时一次性读爆内存。
+pub const LARGE_LOG_THRESHOLD_BYTES: u64 = 30 * 1024 * 1024;
 
 /// tab 可渲染的日志文档。
 #[derive(Clone, Debug)]
 pub enum LogTabDocument {
-    /// 200MB 以内的小文件完整解码后保存在内存中。
+    /// 30MB 以内的小文件完整解码后保存在内存中。
     InMemory(DecodedLogDocument),
     /// 超大文件按行索引分页读取。
     Paged(PagedLogDocument),
@@ -141,16 +142,25 @@ pub fn open_log_source_for_tab(
     }
 
     match read_log_source_bytes(&source) {
-        Ok(raw_bytes) => match decode_log_bytes(&raw_bytes, encoding_choice, source_name) {
-            Ok(document) => Ok(LargeLogOpenResult::InMemoryReady {
-                raw_bytes,
-                document,
-            }),
-            Err(error) => Ok(LargeLogOpenResult::InMemoryDecodeFailed {
-                raw_bytes,
-                message: error.to_string(),
-            }),
-        },
+        Ok(raw_bytes) => {
+            // 压缩包成员、单文件压缩包和嵌套压缩包有时只有读取后才能拿到真实解压大小。
+            // 一旦超过 30MB 产品阈值，就立即改用分页物化管线，避免最终 tab 持有整份日志文本和原始字节。
+            if raw_bytes.len() as u64 > LARGE_LOG_THRESHOLD_BYTES {
+                return open_source_as_paged(source, encoding_choice, source_name)
+                    .map(|document| LargeLogOpenResult::PagedReady { document });
+            }
+
+            match decode_log_bytes(&raw_bytes, encoding_choice, source_name) {
+                Ok(document) => Ok(LargeLogOpenResult::InMemoryReady {
+                    raw_bytes,
+                    document,
+                }),
+                Err(error) => Ok(LargeLogOpenResult::InMemoryDecodeFailed {
+                    raw_bytes,
+                    message: error.to_string(),
+                }),
+            }
+        }
         Err(error) if should_retry_as_paged(&source, &error) => {
             open_source_as_paged(source, encoding_choice, source_name)
                 .map(|document| LargeLogOpenResult::PagedReady { document })
@@ -192,7 +202,7 @@ fn should_open_local_file_as_paged(source: &LogFileSource) -> Result<bool, LogCo
     let LogFileSource::LocalFile { path } = source else {
         return Ok(false);
     };
-    if ArchiveFormat::from_path(path).is_some() {
+    if ArchiveFormat::from_file(path).is_some() {
         return Ok(false);
     }
     let len = fs::metadata(path)
@@ -215,10 +225,75 @@ fn should_retry_as_paged(source: &LogFileSource, error: &LogContentError) -> boo
     }
 
     match source {
-        LogFileSource::LocalFile { path } => ArchiveFormat::from_path(path).is_some(),
+        LogFileSource::LocalFile { path } => ArchiveFormat::from_file(path).is_some(),
         LogFileSource::MaterializedArchiveMember { member_path, .. } => {
             ArchiveFormat::from_path(Path::new(member_path)).is_some()
         }
         LogFileSource::ArchiveMember { .. } | LogFileSource::NestedArchiveMember { .. } => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! 大小文件打开策略测试。
+    //!
+    //! 业务意图：
+    //! - 分页阈值直接影响日志打开模式和内存占用，必须用边界测试锁定“超过 30MB 才分页”的规则。
+    //! - 测试通过 `set_len` 创建稀疏文件，不写入真实 30MB 数据，避免单元测试拖慢或占用磁盘。
+
+    use std::{env, fs, fs::File};
+
+    use super::*;
+
+    /// 构造唯一的分页阈值测试文件路径。
+    ///
+    /// 边界条件：
+    /// - 路径包含进程 ID 和测试名称，避免并行测试互相覆盖。
+    fn test_large_log_path(name: &str) -> std::path::PathBuf {
+        env::temp_dir().join(format!(
+            "logclinic-large-threshold-test-{}-{}.log",
+            std::process::id(),
+            name
+        ))
+    }
+
+    /// 创建指定长度的本地日志测试文件。
+    ///
+    /// 业务意图：
+    /// - 打开策略只依赖文件元数据长度，因此不需要写入真实日志内容。
+    fn create_sized_test_file(name: &str, len: u64) -> std::path::PathBuf {
+        let path = test_large_log_path(name);
+        let _ = fs::remove_file(&path);
+        let file = File::create(&path).expect("分页阈值测试应能创建临时文件");
+        file.set_len(len).expect("分页阈值测试应能设置临时文件长度");
+        path
+    }
+
+    /// 验证超过 30MB 的普通日志直接进入分页模式。
+    #[test]
+    fn 超过三十兆的普通日志会进入分页模式() {
+        let path = create_sized_test_file("above", LARGE_LOG_THRESHOLD_BYTES + 1);
+        let source = LogFileSource::LocalFile { path: path.clone() };
+
+        assert!(
+            should_open_local_file_as_paged(&source).expect("应能读取测试文件大小"),
+            "超过 30MB 的普通文件应直接分页打开"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// 验证等于 30MB 的普通日志仍保留内存模式。
+    #[test]
+    fn 等于三十兆的普通日志仍使用内存模式() {
+        let path = create_sized_test_file("equal", LARGE_LOG_THRESHOLD_BYTES);
+        let source = LogFileSource::LocalFile { path: path.clone() };
+
+        assert!(
+            !should_open_local_file_as_paged(&source).expect("应能读取测试文件大小"),
+            "阈值规则是严格超过 30MB 才分页"
+        );
+
+        let _ = fs::remove_file(path);
     }
 }

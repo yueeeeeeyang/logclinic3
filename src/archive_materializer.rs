@@ -12,7 +12,7 @@
 
 use std::{
     fs::{self, File},
-    io::{self, BufReader, BufWriter},
+    io::{self, BufReader, BufWriter, Read},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -23,7 +23,10 @@ use zip::ZipArchive;
 
 use crate::{
     log_content::{LogContentError, single_file_archive_member_path_from_path},
-    log_loader::{ArchiveFormat, LogFileSource, normalize_archive_member_path},
+    log_loader::{
+        ArchiveFormat, LogFileSource, is_single_gzip_member_path, normalize_archive_member_path,
+        single_gzip_member_display_name,
+    },
 };
 
 /// 物化完成后的日志来源。
@@ -111,7 +114,7 @@ pub fn materialize_source_for_paging(
 ) -> Result<MaterializedLogSource, LogContentError> {
     match source {
         LogFileSource::LocalFile { path } => {
-            if let Some(format) = ArchiveFormat::from_path(path) {
+            if let Some(format) = ArchiveFormat::from_file(path) {
                 let label = path.display().to_string();
                 let member_path =
                     single_file_archive_member_path_from_path(path, format, label.as_str())?;
@@ -146,7 +149,9 @@ pub fn materialize_source_for_paging(
         } => {
             // 7Z 加载阶段已经把成员写成可 seek 的本地临时文件；分页管线直接复用该文件。
             // 如果成员本身又是单文件压缩包，则沿用普通本地文件规则先物化唯一内部日志。
-            if let Some(format) = ArchiveFormat::from_path(Path::new(member_path)) {
+            if let Some(format) = ArchiveFormat::from_file(temp_path)
+                .or_else(|| ArchiveFormat::from_path(Path::new(member_path)))
+            {
                 let member_path =
                     single_file_archive_member_path_from_path(temp_path, format, member_path)?;
                 let nested_source = LogFileSource::ArchiveMember {
@@ -252,9 +257,16 @@ fn materialize_archive_member(
         })?;
     }
 
+    let archive_format = if *archive_format == ArchiveFormat::TarGz {
+        ArchiveFormat::from_file(archive_path).unwrap_or(*archive_format)
+    } else {
+        *archive_format
+    };
+
     match archive_format {
         ArchiveFormat::Zip => materialize_zip_member(archive_path, member_path, &temp_path)?,
         ArchiveFormat::Rar => materialize_rar_member(archive_path, member_path, &temp_path)?,
+        ArchiveFormat::Tar => materialize_tar_member(archive_path, member_path, &temp_path)?,
         ArchiveFormat::TarGz => materialize_tar_gz_member(archive_path, member_path, &temp_path)?,
         ArchiveFormat::SevenZ => materialize_7z_member(archive_path, member_path, &temp_path)?,
     }
@@ -271,7 +283,9 @@ fn materialize_archive_member(
 
     // 如果物化出来的成员本身仍是单文件压缩包，继续物化内部唯一普通文件。
     // 这样“单文件压缩包当作文件本身打开”的既有行为在分页模式下保持一致。
-    if let Some(nested_format) = ArchiveFormat::from_path(Path::new(member_path)) {
+    if let Some(nested_format) = ArchiveFormat::from_file(&temp_path)
+        .or_else(|| ArchiveFormat::from_path(Path::new(member_path)))
+    {
         let label = member_path.to_string();
         let nested_member =
             single_file_archive_member_path_from_path(&temp_path, nested_format, label.as_str())?;
@@ -413,12 +427,68 @@ fn materialize_rar_member(
     )))
 }
 
+/// 物化 TAR 成员。
+///
+/// 业务意图：
+/// - 纯 tar 内部的大日志需要先写成可 seek 的本地临时文件，再交给分页索引读取。
+/// - 扩展名误写成 `.tar.gz` 的纯 tar 日志包也会走到这里，避免错误使用 gzip 解码。
+fn materialize_tar_member(
+    archive_path: &Path,
+    member_path: &str,
+    temp_path: &Path,
+) -> Result<(), LogContentError> {
+    let file = File::open(archive_path).map_err(|error| {
+        LogContentError::new(format!(
+            "无法打开 TAR 压缩包 {}：{}",
+            archive_path.display(),
+            error
+        ))
+    })?;
+    let mut archive = TarArchive::new(BufReader::new(file));
+    let entries = archive
+        .entries()
+        .map_err(|error| LogContentError::new(format!("无法读取 TAR 目录：{}", error)))?;
+    for entry in entries {
+        let mut entry =
+            entry.map_err(|error| LogContentError::new(format!("无法读取 TAR 条目：{}", error)))?;
+        let entry_path = entry
+            .path()
+            .map_err(|error| LogContentError::new(format!("无法读取 TAR 条目路径：{}", error)))?;
+        let raw_name = entry_path.to_string_lossy();
+        let normalized = normalize_archive_member_path(&raw_name)
+            .map_err(|reason| LogContentError::new(format!("TAR 条目路径非法：{}", reason)))?;
+        if normalized != member_path {
+            drain_tar_entry(&mut entry, member_path)?;
+            continue;
+        }
+        let mut writer = BufWriter::new(File::create(temp_path).map_err(|error| {
+            LogContentError::new(format!(
+                "无法创建临时日志文件 {}：{}",
+                temp_path.display(),
+                error
+            ))
+        })?);
+        io::copy(&mut entry, &mut writer)
+            .map_err(|error| LogContentError::new(format!("无法物化 TAR 成员：{}", error)))?;
+        return Ok(());
+    }
+
+    Err(LogContentError::new(format!(
+        "TAR 压缩包中未找到成员 {}",
+        member_path
+    )))
+}
+
 /// 物化 TAR.GZ 成员。
 fn materialize_tar_gz_member(
     archive_path: &Path,
     member_path: &str,
     temp_path: &Path,
 ) -> Result<(), LogContentError> {
+    if is_single_gzip_member_path(member_path) {
+        return materialize_single_gzip_payload(archive_path, member_path, temp_path);
+    }
+
     let file = File::open(archive_path).map_err(|error| {
         LogContentError::new(format!(
             "无法打开 TAR.GZ 压缩包 {}：{}",
@@ -441,6 +511,7 @@ fn materialize_tar_gz_member(
         let normalized = normalize_archive_member_path(&raw_name)
             .map_err(|reason| LogContentError::new(format!("TAR.GZ 条目路径非法：{}", reason)))?;
         if normalized != member_path {
+            drain_tar_entry(&mut entry, member_path)?;
             continue;
         }
         let mut writer = BufWriter::new(File::create(temp_path).map_err(|error| {
@@ -459,6 +530,60 @@ fn materialize_tar_gz_member(
         "TAR.GZ 压缩包中未找到成员 {}",
         member_path
     )))
+}
+
+/// 将“单个 gzip 日志”流式物化到分页临时文件。
+///
+/// 业务意图：
+/// - 超过分页阈值的 `.tar.gz` 单 gzip 日志不能先完整读入内存，需要直接解压到临时文件再复用分页索引。
+/// - 该路径和普通 TAR.GZ 成员物化共用同一个目标文件生命周期，tab 关闭或重新加载时由上层清理。
+fn materialize_single_gzip_payload(
+    archive_path: &Path,
+    member_path: &str,
+    temp_path: &Path,
+) -> Result<(), LogContentError> {
+    let file = File::open(archive_path).map_err(|error| {
+        LogContentError::new(format!(
+            "无法打开 GZIP 日志 {}：{}",
+            archive_path.display(),
+            error
+        ))
+    })?;
+    let mut decoder = GzDecoder::new(BufReader::new(file));
+    let mut writer = BufWriter::new(File::create(temp_path).map_err(|error| {
+        LogContentError::new(format!(
+            "无法创建临时日志文件 {}：{}",
+            temp_path.display(),
+            error
+        ))
+    })?);
+    io::copy(&mut decoder, &mut writer).map_err(|error| {
+        LogContentError::new(format!(
+            "无法物化 GZIP 日志 {}：{}",
+            single_gzip_member_display_name(member_path),
+            error
+        ))
+    })?;
+    Ok(())
+}
+
+/// 排空 TAR 条目正文，推进顺序流到下一个条目头。
+///
+/// 业务意图：
+/// - TAR.GZ 成员物化需要顺序查找目标条目；每个非目标文件条目也必须读完，否则下一次迭代会把文件内容当作 tar 头。
+/// - 内容只写入 `io::sink()`，不会额外占用内存或创建临时文件。
+fn drain_tar_entry<R: Read>(
+    entry: &mut tar::Entry<'_, R>,
+    member_path: &str,
+) -> Result<(), LogContentError> {
+    io::copy(entry, &mut io::sink())
+        .map(|_| ())
+        .map_err(|error| {
+            LogContentError::new(format!(
+                "跳过 TAR.GZ 非目标条目以读取 {} 失败：{}",
+                member_path, error
+            ))
+        })
 }
 
 /// 物化 7Z 成员。

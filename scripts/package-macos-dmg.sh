@@ -9,6 +9,7 @@
 # 关键约束：
 # - 该脚本必须在 macOS 上运行，因为 `.dmg` 依赖系统自带的 `hdiutil`。
 # - 字体资源当前通过 Rust `include_bytes!` 编译进二进制，不需要额外复制 assets 目录到 bundle。
+# - 应用图标来自 `assets/icons/LogClinic.icns`，如果替换源图，应先运行 `scripts/generate-app-icons.py` 重新生成。
 # - 如果需要签名，可通过 `CODESIGN_IDENTITY="Developer ID Application: ..."` 环境变量启用；未设置时保持未签名产物。
 #
 # 产物：
@@ -55,6 +56,7 @@ APP_MACOS_DIR="${APP_CONTENTS_DIR}/MacOS"
 APP_RESOURCES_DIR="${APP_CONTENTS_DIR}/Resources"
 DMG_STAGING_DIR="${DIST_DIR}/dmg-staging"
 DMG_PATH="${DIST_DIR}/${APP_NAME}-${VERSION}-macos.dmg"
+ICON_SOURCE_PATH="${REPO_ROOT}/assets/icons/LogClinic.icns"
 
 rm -rf "${APP_DIR}" "${DMG_STAGING_DIR}" "${DMG_PATH}"
 mkdir -p "${APP_MACOS_DIR}" "${APP_RESOURCES_DIR}" "${DMG_STAGING_DIR}"
@@ -62,8 +64,15 @@ mkdir -p "${APP_MACOS_DIR}" "${APP_RESOURCES_DIR}" "${DMG_STAGING_DIR}"
 cp "${REPO_ROOT}/target/release/${BINARY_NAME}" "${APP_MACOS_DIR}/${APP_NAME}"
 chmod +x "${APP_MACOS_DIR}/${APP_NAME}"
 
+if [[ ! -f "${ICON_SOURCE_PATH}" ]]; then
+  echo "缺少应用图标：${ICON_SOURCE_PATH}" >&2
+  echo "请先运行：python3 scripts/generate-app-icons.py <源PNG路径>" >&2
+  exit 1
+fi
+cp "${ICON_SOURCE_PATH}" "${APP_RESOURCES_DIR}/LogClinic.icns"
+
 # 业务意图：生成最小可用 Info.plist，让 Finder 能识别 `.app`，并把版本号写入系统显示信息。
-# 边界条件：当前没有应用图标资源，因此不声明 CFBundleIconFile，避免引用不存在的 icns 导致 Finder 显示异常。
+# 边界条件：`CFBundleIconFile` 必须对应 Resources 下的 `.icns` 文件名，否则 Finder 和 Dock 会回退到默认应用图标。
 cat >"${APP_CONTENTS_DIR}/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -77,6 +86,8 @@ cat >"${APP_CONTENTS_DIR}/Info.plist" <<PLIST
   <string>${APP_NAME}</string>
   <key>CFBundleIdentifier</key>
   <string>${BUNDLE_IDENTIFIER}</string>
+  <key>CFBundleIconFile</key>
+  <string>LogClinic.icns</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>

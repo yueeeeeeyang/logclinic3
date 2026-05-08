@@ -183,10 +183,77 @@ pub enum ArchiveFormat {
     Zip,
     /// RAR 压缩包。
     Rar,
+    /// 未压缩的 tar 归档。
+    ///
+    /// 业务意图：
+    /// - 部分现场文件扩展名可能写成 `.tar.gz`，但真实内容是纯 tar；需要用内容探测纠正格式。
+    /// - 单独支持 `.tar` 也能复用同一套目录树、分页和搜索链路。
+    Tar,
     /// gzip 压缩的 tar 归档，包含 `.tar.gz` 和 `.tgz`。
     TarGz,
     /// 7-Zip 压缩包。
     SevenZ,
+}
+
+/// 单文件 gzip fallback 在内部来源路径中使用的虚拟前缀。
+///
+/// 业务意图：
+/// - 一些用户文件使用 `.tar.gz` 扩展名，但实际内容只是“单个日志文件经过 gzip 压缩”，不是 tar 归档。
+/// - 目录树仍需要为它生成一个可点击的文件节点，因此用一个不会来自正常压缩包路径的内部前缀标记该虚拟成员。
+///
+/// 边界条件：
+/// - 该前缀只在进程内作为 `LogFileSource::ArchiveMember::member_path` 使用，不展示给用户，也不写回磁盘。
+/// - 正常 tar 条目路径不会经过该分支；真实条目仍使用安全归一化后的 `/` 分隔路径。
+pub(crate) const SINGLE_GZIP_MEMBER_PREFIX: &str = "__logclinic_single_gzip__/";
+
+/// 为“单个 gzip 日志”生成稳定的虚拟成员路径。
+///
+/// 业务意图：
+/// - 用户看到的根节点仍是原始 `.tar.gz` 文件，子文件节点使用去掉压缩扩展名后的名称，避免显示内部实现前缀。
+/// - 虚拟路径需要稳定，才能让 tab 去重、分页物化和另存为逻辑复用现有压缩包成员入口。
+pub(crate) fn single_gzip_member_path_for_archive(path: &Path) -> String {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "解压内容".to_string());
+    let lower_name = file_name.to_ascii_lowercase();
+    let display_name = if lower_name.ends_with(".tar.gz") {
+        file_name
+            .get(..file_name.len().saturating_sub(".tar.gz".len()))
+            .unwrap_or("解压内容")
+            .to_string()
+    } else if lower_name.ends_with(".tgz") {
+        file_name
+            .get(..file_name.len().saturating_sub(".tgz".len()))
+            .unwrap_or("解压内容")
+            .to_string()
+    } else {
+        file_name
+    };
+    let display_name = if display_name.trim().is_empty() {
+        "解压内容".to_string()
+    } else {
+        display_name
+    };
+
+    format!("{SINGLE_GZIP_MEMBER_PREFIX}{display_name}")
+}
+
+/// 判断成员路径是否表示单文件 gzip fallback。
+///
+/// 边界条件：
+/// - 该判断只看内部前缀，不读取文件内容；真实 gzip 可读性由扫描或读取阶段分别校验。
+pub(crate) fn is_single_gzip_member_path(member_path: &str) -> bool {
+    member_path.starts_with(SINGLE_GZIP_MEMBER_PREFIX)
+}
+
+/// 返回单文件 gzip fallback 的用户可见文件名。
+pub(crate) fn single_gzip_member_display_name(member_path: &str) -> String {
+    member_path
+        .strip_prefix(SINGLE_GZIP_MEMBER_PREFIX)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("解压内容")
+        .to_string()
 }
 
 /// 左侧目录树中文件节点的可打开来源。
@@ -307,12 +374,26 @@ impl LogFileSource {
     pub fn display_name(&self) -> String {
         match self {
             Self::LocalFile { path } => display_name_for_path(path),
+            Self::ArchiveMember {
+                archive_format: ArchiveFormat::TarGz,
+                member_path,
+                ..
+            } if is_single_gzip_member_path(member_path) => {
+                single_gzip_member_display_name(member_path)
+            }
             Self::ArchiveMember { member_path, .. } => member_path
                 .rsplit('/')
                 .next()
                 .filter(|name| !name.is_empty())
                 .unwrap_or(member_path)
                 .to_string(),
+            Self::MaterializedArchiveMember {
+                archive_format: ArchiveFormat::TarGz,
+                member_path,
+                ..
+            } if is_single_gzip_member_path(member_path) => {
+                single_gzip_member_display_name(member_path)
+            }
             Self::MaterializedArchiveMember { member_path, .. } => member_path
                 .rsplit('/')
                 .next()
@@ -340,12 +421,15 @@ impl ArchiveFormat {
     ///
     /// 边界条件：
     /// - 文件名无法转为字符串时采用有损转换，仅用于扩展名判断，不影响真实路径打开。
-    /// - 当前不把 `.tar` 视为支持格式，因为用户本轮明确要求的是 `.tar.gz`。
     pub fn from_path(path: &Path) -> Option<Self> {
         let file_name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
 
         if file_name.ends_with(".tar.gz") || file_name.ends_with(".tgz") {
             return Some(Self::TarGz);
+        }
+
+        if file_name.ends_with(".tar") {
+            return Some(Self::Tar);
         }
 
         if file_name.ends_with(".zip") {
@@ -363,6 +447,36 @@ impl ArchiveFormat {
         None
     }
 
+    /// 根据路径和文件头识别当前支持的压缩包格式。
+    ///
+    /// 业务意图：
+    /// - 用户提供的真实样本 `2日志.tar.gz` 扩展名是 `.tar.gz`，但文件头是纯 tar。
+    /// - 本地文件可以读取少量头部字节，因此加载树和单文件打开应优先相信内容探测结果，避免错误进入 gzip 解码器。
+    ///
+    /// 边界条件：
+    /// - 只有 `.tar.gz/.tgz` 需要纠偏；ZIP、RAR、7Z 仍按扩展名交给各自库返回明确错误。
+    /// - 头部读取失败时回退扩展名判断，让原有错误展示路径继续工作。
+    pub(crate) fn from_file(path: &Path) -> Option<Self> {
+        let declared = Self::from_path(path)?;
+        if declared == Self::TarGz && path_looks_like_plain_tar(path) {
+            return Some(Self::Tar);
+        }
+        Some(declared)
+    }
+
+    /// 对已读入内存的嵌套压缩包做 `.tar.gz` 内容纠偏。
+    ///
+    /// 业务意图：
+    /// - ZIP/RAR/7Z/TAR 内部也可能存在扩展名写错的 `.tar.gz` 条目。
+    /// - 目录树展开和点击读取都需要在进入 gzip 解码前检查 tar 头，避免嵌套场景继续报 “TAR.GZ 条目读取失败”。
+    pub(crate) fn resolve_from_bytes(self, bytes: &[u8]) -> Self {
+        if self == Self::TarGz && bytes_look_like_plain_tar(bytes) {
+            Self::Tar
+        } else {
+            self
+        }
+    }
+
     /// 返回适合展示在目录树元信息中的格式名称。
     ///
     /// 边界条件：
@@ -371,10 +485,29 @@ impl ArchiveFormat {
         match self {
             Self::Zip => "ZIP",
             Self::Rar => "RAR",
+            Self::Tar => "TAR",
             Self::TarGz => "TAR.GZ",
             Self::SevenZ => "7Z",
         }
     }
+}
+
+/// 判断本地文件头是否符合常见 POSIX/GNU tar 归档。
+///
+/// 业务意图：
+/// - tar 文件在偏移 257 处通常有 `ustar` 标记；读取这个小范围即可区分“纯 tar”与“gzip 包裹的 tar”。
+/// - 该函数只用于纠正扩展名误写，不用于安全校验；真正的目录解析仍交给 `tar` crate。
+fn path_looks_like_plain_tar(path: &Path) -> bool {
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut header = [0_u8; 262];
+    file.read_exact(&mut header).is_ok() && bytes_look_like_plain_tar(&header)
+}
+
+/// 判断内存字节是否符合常见 POSIX/GNU tar 归档头。
+pub(crate) fn bytes_look_like_plain_tar(bytes: &[u8]) -> bool {
+    bytes.len() >= 262 && &bytes[257..262] == b"ustar"
 }
 
 /// 日志加载阶段的致命错误。
@@ -516,7 +649,7 @@ fn load_single_source(
     }
 
     if metadata.is_file() {
-        if let Some(format) = ArchiveFormat::from_path(path) {
+        if let Some(format) = ArchiveFormat::from_file(path) {
             let mut root = TreeNode {
                 label,
                 kind: LogTreeEntryKind::Archive,
@@ -655,6 +788,7 @@ fn scan_archive(
     match format {
         ArchiveFormat::Zip => scan_zip_archive(path, root, error_count, temporary_paths),
         ArchiveFormat::Rar => scan_rar_archive(path, root, error_count, temporary_paths),
+        ArchiveFormat::Tar => scan_tar_archive(path, root, error_count, temporary_paths),
         ArchiveFormat::TarGz => scan_tar_gz_archive(path, root, error_count, temporary_paths),
         ArchiveFormat::SevenZ => scan_7z_archive(path, root, error_count, temporary_paths),
     }
@@ -816,6 +950,102 @@ fn scan_rar_archive(
     Ok(())
 }
 
+/// 扫描未压缩 TAR 归档目录项。
+///
+/// 业务意图：
+/// - 兼容真实格式为 tar、但扩展名可能被写成 `.tar.gz` 的现场日志包。
+/// - TAR 和 TAR.GZ 的目录模型相同，差异只在是否先经过 gzip 解码。
+///
+/// 边界条件：
+/// - TAR 是顺序格式，扫描目录时仍需消费每个文件条目正文，才能继续读取后续条目。
+/// - 嵌套压缩包会先尝试小文件内存扫描，多文件内层压缩包作为目录展开。
+fn scan_tar_archive(
+    path: &Path,
+    root: &mut TreeNode,
+    error_count: &mut usize,
+    temporary_paths: &mut Vec<PathBuf>,
+) -> Result<(), LogLoadError> {
+    let file = File::open(path).map_err(|error| {
+        LogLoadError::new(format!("无法打开 TAR 压缩包 {}：{}", path.display(), error))
+    })?;
+    let mut archive = TarArchive::new(BufReader::new(file));
+    let entries = archive
+        .entries()
+        .map_err(|error| LogLoadError::new(format!("无法读取 TAR 目录：{}", error)))?;
+
+    for entry in entries {
+        let mut entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                *error_count += 1;
+                root.add_error_child("TAR 条目读取失败", "读取失败", error.to_string());
+                continue;
+            }
+        };
+
+        let entry_path = match entry.path() {
+            Ok(path) => path,
+            Err(error) => {
+                *error_count += 1;
+                root.add_error_child("TAR 路径读取失败", "路径错误", error.to_string());
+                continue;
+            }
+        };
+        let raw_name = entry_path.to_string_lossy().to_string();
+        let is_directory = entry.header().entry_type().is_dir();
+        let size = entry.size();
+        let mut replaced_with_nested_tree = false;
+        let mut entry_drained = false;
+
+        if !is_directory && let Some(nested_format) = ArchiveFormat::from_path(Path::new(&raw_name))
+        {
+            if let Some(nested_tree) = read_nested_archive_tree_from_reader(
+                &mut entry,
+                Some(size),
+                nested_format,
+                path,
+                ArchiveFormat::Tar,
+                &raw_name,
+                error_count,
+                temporary_paths,
+            ) {
+                add_nested_archive_tree(root, &raw_name, nested_tree, error_count);
+                replaced_with_nested_tree = true;
+            }
+            if let Err(error) = drain_tar_entry(&mut entry) {
+                *error_count += 1;
+                root.add_error_child("TAR 条目跳过失败", "读取失败", error.to_string());
+                continue;
+            }
+            entry_drained = true;
+            if replaced_with_nested_tree {
+                continue;
+            }
+        }
+
+        if !is_directory
+            && !entry_drained
+            && let Err(error) = drain_tar_entry(&mut entry)
+        {
+            *error_count += 1;
+            root.add_error_child("TAR 条目跳过失败", "读取失败", error.to_string());
+            continue;
+        }
+
+        add_archive_entry(
+            root,
+            path,
+            ArchiveFormat::Tar,
+            &raw_name,
+            is_directory,
+            Some(size),
+            error_count,
+        );
+    }
+
+    Ok(())
+}
+
 /// 扫描 tar.gz 或 tgz 压缩包目录项。
 ///
 /// 业务意图：
@@ -839,16 +1069,31 @@ fn scan_tar_gz_archive(
     })?;
     let decoder = GzDecoder::new(BufReader::new(file));
     let mut archive = TarArchive::new(decoder);
-    let entries = archive
-        .entries()
-        .map_err(|error| LogLoadError::new(format!("无法读取 TAR.GZ 目录：{}", error)))?;
+    let entries = match archive.entries() {
+        Ok(entries) => entries,
+        Err(error) => {
+            if add_single_gzip_payload_entry(path, root) {
+                return Ok(());
+            }
+            return Err(LogLoadError::new(format!(
+                "无法读取 TAR.GZ 目录：{}",
+                error
+            )));
+        }
+    };
+    let mut valid_entry_count = 0usize;
+    let mut deferred_entry_errors = Vec::new();
 
     for entry in entries {
         let mut entry = match entry {
-            Ok(entry) => entry,
+            Ok(entry) => {
+                valid_entry_count += 1;
+                entry
+            }
             Err(error) => {
-                *error_count += 1;
-                root.add_error_child("TAR.GZ 条目读取失败", "读取失败", error.to_string());
+                // tar crate 会在 gzip 内容不是 tar 头时从迭代器返回条目错误。
+                // 这里先延迟展示错误，等循环结束后确认是否可以按“单文件 gzip 日志”降级处理。
+                deferred_entry_errors.push(error.to_string());
                 continue;
             }
         };
@@ -864,9 +1109,11 @@ fn scan_tar_gz_archive(
         let raw_name = entry_path.to_string_lossy().to_string();
         let is_directory = entry.header().entry_type().is_dir();
         let size = entry.size();
-        if !is_directory
-            && let Some(nested_format) = ArchiveFormat::from_path(Path::new(&raw_name))
-            && let Some(nested_tree) = read_nested_archive_tree_from_reader(
+        let mut replaced_with_nested_tree = false;
+        let mut entry_drained = false;
+        if !is_directory && let Some(nested_format) = ArchiveFormat::from_path(Path::new(&raw_name))
+        {
+            if let Some(nested_tree) = read_nested_archive_tree_from_reader(
                 &mut entry,
                 Some(size),
                 nested_format,
@@ -875,9 +1122,27 @@ fn scan_tar_gz_archive(
                 &raw_name,
                 error_count,
                 temporary_paths,
-            )
+            ) {
+                add_nested_archive_tree(root, &raw_name, nested_tree, error_count);
+                replaced_with_nested_tree = true;
+            }
+            if let Err(error) = drain_tar_entry(&mut entry) {
+                *error_count += 1;
+                root.add_error_child("TAR.GZ 条目跳过失败", "读取失败", error.to_string());
+                continue;
+            }
+            entry_drained = true;
+            if replaced_with_nested_tree {
+                continue;
+            }
+        }
+
+        if !is_directory
+            && !entry_drained
+            && let Err(error) = drain_tar_entry(&mut entry)
         {
-            add_nested_archive_tree(root, &raw_name, nested_tree, error_count);
+            *error_count += 1;
+            root.add_error_child("TAR.GZ 条目跳过失败", "读取失败", error.to_string());
             continue;
         }
 
@@ -892,7 +1157,78 @@ fn scan_tar_gz_archive(
         );
     }
 
+    if valid_entry_count == 0
+        && !deferred_entry_errors.is_empty()
+        && add_single_gzip_payload_entry(path, root)
+    {
+        return Ok(());
+    }
+
+    for error in deferred_entry_errors {
+        *error_count += 1;
+        root.add_error_child("TAR.GZ 条目读取失败", "读取失败", error);
+    }
+
     Ok(())
+}
+
+/// 在 TAR 目录读取失败时尝试把 `.tar.gz` 当作“单个 gzip 日志”展示。
+///
+/// 业务意图：
+/// - 真实世界中经常出现扩展名叫 `.tar.gz`，但内容只是 `gzip log` 的文件。
+/// - 这类文件没有 tar 目录，继续按 TAR.GZ 展示错误会让用户无法打开；确认 gzip 层可读后，挂载一个虚拟文件节点复用后续读取逻辑。
+///
+/// 边界条件：
+/// - 只有在 tar 条目完全不可读时才调用该 fallback；正常 TAR.GZ 不受影响。
+/// - 这里最多读取解压后的 1 字节用于校验，不把日志内容加载到内存。
+fn add_single_gzip_payload_entry(path: &Path, root: &mut TreeNode) -> bool {
+    if !single_gzip_payload_is_readable(path) {
+        return false;
+    }
+
+    let member_path = single_gzip_member_path_for_archive(path);
+    let label = single_gzip_member_display_name(&member_path);
+    let meta = fs::metadata(path)
+        .ok()
+        .map(|metadata| format!("GZIP {}", format_byte_size(metadata.len())))
+        .or_else(|| Some("GZIP".to_string()));
+    root.add_leaf_path(
+        &[label],
+        LogTreeEntryKind::File,
+        meta,
+        Some(LogFileSource::ArchiveMember {
+            archive_path: path.to_path_buf(),
+            archive_format: ArchiveFormat::TarGz,
+            member_path,
+        }),
+        None,
+    );
+    true
+}
+
+/// 判断 gzip 层是否至少可以正常开始解压。
+///
+/// 业务意图：
+/// - 该函数只用于区分“不是 tar 但 gzip 有效”和“文件损坏/不是 gzip”，避免把真正损坏的压缩包误展示成日志。
+fn single_gzip_payload_is_readable(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let mut decoder = GzDecoder::new(BufReader::new(file));
+    let mut probe = [0_u8; 1];
+    decoder.read(&mut probe).is_ok()
+}
+
+/// 排空 TAR 条目正文，推进顺序流到下一个条目头。
+///
+/// 业务意图：
+/// - TAR.GZ 没有 ZIP 那样的中央目录，遍历下一个条目前必须消费当前条目的正文。
+/// - 目录树扫描只需要路径和大小，但也要把正文读到 `io::sink()`，否则下一次迭代会把正文误读成 tar 头并显示“条目读取失败”。
+///
+/// 边界条件：
+/// - 这里不把内容保存到内存或磁盘，只顺序丢弃，因此不会改变点击文件时的真实读取来源。
+fn drain_tar_entry<R: Read>(entry: &mut tar::Entry<'_, R>) -> io::Result<()> {
+    io::copy(entry, &mut io::sink()).map(|_| ())
 }
 
 /// 扫描 7z 压缩包目录项。
@@ -1236,6 +1572,11 @@ fn read_nested_archive_tree_from_path(
     error_count: &mut usize,
     temporary_paths: &mut Vec<PathBuf>,
 ) -> Option<TreeNode> {
+    let nested_format = if nested_format == ArchiveFormat::TarGz {
+        ArchiveFormat::from_file(archive_path).unwrap_or(nested_format)
+    } else {
+        nested_format
+    };
     let segments = split_archive_entry_path(archive_member_path).ok()?;
     let label = segments.last()?.clone();
     let mut nested_root = TreeNode::new(label, LogTreeEntryKind::Directory);
@@ -1329,6 +1670,8 @@ fn read_nested_archive_tree_from_reader(
         return None;
     }
 
+    let nested_format = nested_format.resolve_from_bytes(&bytes);
+
     if nested_format == ArchiveFormat::Rar {
         let temp_path =
             materialize_nested_archive_bytes_for_scan(&bytes, archive_member_path, temporary_paths)
@@ -1349,6 +1692,15 @@ fn read_nested_archive_tree_from_reader(
     let mut nested_root = TreeNode::new(label, LogTreeEntryKind::Directory);
     match nested_format {
         ArchiveFormat::Zip => scan_nested_zip_archive(
+            &bytes,
+            &mut nested_root,
+            outer_archive_path,
+            outer_archive_format,
+            archive_member_path,
+            nested_format,
+            error_count,
+        ),
+        ArchiveFormat::Tar => scan_nested_tar_archive(
             &bytes,
             &mut nested_root,
             outer_archive_path,
@@ -1452,6 +1804,53 @@ fn scan_nested_zip_archive(
     Ok(())
 }
 
+/// 扫描内存中的 TAR 内层压缩包。
+///
+/// 业务意图：
+/// - 外层压缩包中的 `.tar` 或误命名 `.tar.gz` 成员，如果包含多个文件，需要在左侧树中作为目录展开。
+/// - 该函数不经过 gzip 解码，专门处理纯 tar 字节。
+fn scan_nested_tar_archive(
+    archive_bytes: &[u8],
+    root: &mut TreeNode,
+    outer_archive_path: &Path,
+    outer_archive_format: ArchiveFormat,
+    archive_member_path: &str,
+    nested_archive_format: ArchiveFormat,
+    error_count: &mut usize,
+) -> Result<(), LogLoadError> {
+    let mut archive = TarArchive::new(Cursor::new(archive_bytes));
+    let entries = archive
+        .entries()
+        .map_err(|error| LogLoadError::new(format!("无法读取嵌套 TAR 目录：{}", error)))?;
+    for entry in entries {
+        let mut entry = entry
+            .map_err(|error| LogLoadError::new(format!("无法读取嵌套 TAR 条目：{}", error)))?;
+        let entry_path = entry
+            .path()
+            .map_err(|error| LogLoadError::new(format!("无法读取嵌套 TAR 条目路径：{}", error)))?;
+        let raw_name = entry_path.to_string_lossy().to_string();
+        let is_directory = entry.header().entry_type().is_dir();
+        let size = entry.size();
+        if !is_directory {
+            drain_tar_entry(&mut entry).map_err(|error| {
+                LogLoadError::new(format!("无法跳过嵌套 TAR 条目内容：{}", error))
+            })?;
+        }
+        add_nested_archive_entry(
+            root,
+            outer_archive_path,
+            outer_archive_format,
+            archive_member_path,
+            nested_archive_format,
+            &raw_name,
+            is_directory,
+            Some(size),
+            error_count,
+        );
+    }
+    Ok(())
+}
+
 /// 扫描内存中的 TAR.GZ 内层压缩包。
 fn scan_nested_tar_gz_archive(
     archive_bytes: &[u8],
@@ -1468,21 +1867,28 @@ fn scan_nested_tar_gz_archive(
         .entries()
         .map_err(|error| LogLoadError::new(format!("无法读取嵌套 TAR.GZ 目录：{}", error)))?;
     for entry in entries {
-        let entry = entry
+        let mut entry = entry
             .map_err(|error| LogLoadError::new(format!("无法读取嵌套 TAR.GZ 条目：{}", error)))?;
         let entry_path = entry.path().map_err(|error| {
             LogLoadError::new(format!("无法读取嵌套 TAR.GZ 条目路径：{}", error))
         })?;
-        let raw_name = entry_path.to_string_lossy();
+        let raw_name = entry_path.to_string_lossy().to_string();
+        let is_directory = entry.header().entry_type().is_dir();
+        let size = entry.size();
+        if !is_directory {
+            drain_tar_entry(&mut entry).map_err(|error| {
+                LogLoadError::new(format!("无法跳过嵌套 TAR.GZ 条目内容：{}", error))
+            })?;
+        }
         add_nested_archive_entry(
             root,
             outer_archive_path,
             outer_archive_format,
             archive_member_path,
             nested_archive_format,
-            raw_name.as_ref(),
-            entry.header().entry_type().is_dir(),
-            Some(entry.size()),
+            &raw_name,
+            is_directory,
+            Some(size),
             error_count,
         );
     }
@@ -2058,8 +2464,10 @@ mod tests {
     //! - UI 交互由后续桌面验收或自动化截图覆盖，本模块只验证数据结构构建规则。
 
     use super::*;
+    use flate2::{Compression, write::GzEncoder};
     use std::io::{self, Cursor, Write};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tar::Builder as TarBuilder;
     use zip::write::SimpleFileOptions;
 
     /// 验证复合压缩包扩展名和大小写扩展名都能识别。
@@ -2072,6 +2480,10 @@ mod tests {
         assert_eq!(
             ArchiveFormat::from_path(Path::new("logs.TGZ")),
             Some(ArchiveFormat::TarGz)
+        );
+        assert_eq!(
+            ArchiveFormat::from_path(Path::new("logs.tar")),
+            Some(ArchiveFormat::Tar)
         );
         assert_eq!(
             ArchiveFormat::from_path(Path::new("logs.zip")),
@@ -2162,6 +2574,121 @@ mod tests {
         assert_eq!(rows[2].label, "access.log");
         assert!(!rows[2].has_children);
         assert_eq!(rows[3].label, "b.log");
+    }
+
+    /// 验证 TAR.GZ 扫描会消费非目标条目正文并继续读取后续条目。
+    ///
+    /// 业务意图：
+    /// - TAR.GZ 是顺序流，目录树扫描虽然只展示路径，也必须排空每个文件正文才能移动到下一个条目。
+    /// - 该测试构造两个文件，确保第一个文件内容不会被误读成第二个 tar 头并产生“条目读取失败”。
+    #[test]
+    fn tar_gz_扫描会列出多个文件条目() -> Result<(), Box<dyn Error>> {
+        let temp_root = unique_temp_dir("logclinic3-tar-gz-tree-test")?;
+        let archive_path = temp_root.join("logs.tar.gz");
+        write_test_tar_gz(
+            &archive_path,
+            &[
+                ("logs/first.log", b"INFO first".as_slice()),
+                ("logs/second.log", b"INFO second".as_slice()),
+            ],
+        )?;
+
+        let loaded = load_log_sources(vec![archive_path.clone()])?;
+        let file_labels = loaded
+            .rows
+            .iter()
+            .filter(|row| row.kind == LogTreeEntryKind::File)
+            .map(|row| row.label.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(loaded.error_count, 0);
+        assert!(file_labels.contains(&"first.log"));
+        assert!(file_labels.contains(&"second.log"));
+
+        fs::remove_dir_all(temp_root)?;
+        Ok(())
+    }
+
+    /// 验证 `.tar.gz` 扩展名但实际是单个 gzip 日志时不会显示 TAR 条目错误。
+    ///
+    /// 业务意图：
+    /// - 用户现场文件名可能叫 `xxx.tar.gz`，但内容只是 gzip 压缩的单个日志，而不是 tar 归档。
+    /// - 目录树应生成一个可点击文件节点，后续读取链路再按虚拟成员路径解压 gzip 内容。
+    #[test]
+    fn tar_gz_单文件gzip会作为文件节点展示() -> Result<(), Box<dyn Error>> {
+        let temp_root = unique_temp_dir("logclinic3-single-gzip-tree-test")?;
+        let archive_path = temp_root.join("single.tar.gz");
+        write_test_gzip(&archive_path, b"INFO gzip only")?;
+
+        let loaded = load_log_sources(vec![archive_path.clone()])?;
+        let fallback_row = loaded
+            .rows
+            .iter()
+            .find(|row| row.label == "single")
+            .expect("单文件 gzip fallback 应显示为去掉压缩扩展名的文件节点");
+
+        assert_eq!(loaded.error_count, 0);
+        assert_eq!(fallback_row.kind, LogTreeEntryKind::File);
+        assert!(matches!(
+            fallback_row.source.as_ref(),
+            Some(LogFileSource::ArchiveMember {
+                archive_path: source_archive_path,
+                archive_format: ArchiveFormat::TarGz,
+                member_path,
+            }) if source_archive_path == &archive_path
+                && is_single_gzip_member_path(member_path)
+        ));
+
+        fs::remove_dir_all(temp_root)?;
+        Ok(())
+    }
+
+    /// 验证扩展名为 `.tar.gz` 但文件头是纯 tar 时按 TAR 加载。
+    ///
+    /// 业务意图：
+    /// - 用户提供的现场样本就是这种扩展名与真实格式不一致的文件。
+    /// - 加载树必须根据内容纠偏，否则会错误进入 gzip 解码并显示 “TAR.GZ 条目读取失败”。
+    #[test]
+    fn tar_gz_扩展名纯tar会按tar目录加载() -> Result<(), Box<dyn Error>> {
+        let temp_root = unique_temp_dir("logclinic3-plain-tar-tree-test")?;
+        let archive_path = temp_root.join("wrong-name.tar.gz");
+        write_test_tar(
+            &archive_path,
+            &[
+                ("logs/first.log", b"INFO first".as_slice()),
+                ("logs/second.log", b"INFO second".as_slice()),
+            ],
+        )?;
+
+        assert_eq!(
+            ArchiveFormat::from_file(&archive_path),
+            Some(ArchiveFormat::Tar)
+        );
+        let loaded = load_log_sources(vec![archive_path.clone()])?;
+        let root_row = loaded
+            .rows
+            .iter()
+            .find(|row| row.label == "wrong-name.tar.gz")
+            .expect("压缩包根节点应保留用户看到的原始文件名");
+        let second_row = loaded
+            .rows
+            .iter()
+            .find(|row| row.label == "second.log")
+            .expect("纯 tar 内部文件应正常出现在目录树");
+
+        assert_eq!(loaded.error_count, 0);
+        assert_eq!(root_row.meta.as_deref(), Some("TAR"));
+        assert!(matches!(
+            second_row.source.as_ref(),
+            Some(LogFileSource::ArchiveMember {
+                archive_path: source_archive_path,
+                archive_format: ArchiveFormat::Tar,
+                member_path,
+            }) if source_archive_path == &archive_path && member_path == "logs/second.log"
+        ));
+
+        fs::remove_dir_all(temp_root)?;
+        Ok(())
     }
 
     /// 验证目录扫描不会跟随符号链接。
@@ -2278,5 +2805,61 @@ mod tests {
         let path = std::env::temp_dir().join(format!("{}-{}", prefix, nanos));
         fs::create_dir_all(&path)?;
         Ok(path)
+    }
+
+    /// 写入测试用 TAR.GZ 文件。
+    ///
+    /// 业务意图：
+    /// - 多个测试都需要构造真实 gzip 包裹的 tar 顺序流，集中封装可以避免遗漏 header checksum 或 gzip finish。
+    fn write_test_tar_gz(path: &Path, files: &[(&str, &[u8])]) -> io::Result<()> {
+        let file = File::create(path)?;
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut builder = TarBuilder::new(encoder);
+
+        for (name, bytes) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(name)?;
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, *bytes)?;
+        }
+
+        let encoder = builder.into_inner()?;
+        encoder.finish()?;
+        Ok(())
+    }
+
+    /// 写入测试用未压缩 TAR 文件。
+    ///
+    /// 业务意图：
+    /// - 用同样的 tar header 构造真实纯 tar 包，覆盖扩展名误写时的内容探测分支。
+    fn write_test_tar(path: &Path, files: &[(&str, &[u8])]) -> io::Result<()> {
+        let file = File::create(path)?;
+        let mut builder = TarBuilder::new(file);
+
+        for (name, bytes) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(name)?;
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, *bytes)?;
+        }
+
+        builder.finish()?;
+        Ok(())
+    }
+
+    /// 写入测试用单文件 gzip 日志。
+    ///
+    /// 业务意图：
+    /// - 覆盖“扩展名是 `.tar.gz` 但 gzip 内容不是 tar 归档”的兼容路径。
+    fn write_test_gzip(path: &Path, bytes: &[u8]) -> io::Result<()> {
+        let file = File::create(path)?;
+        let mut encoder = GzEncoder::new(file, Compression::default());
+        encoder.write_all(bytes)?;
+        encoder.finish()?;
+        Ok(())
     }
 }
