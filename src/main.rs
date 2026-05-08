@@ -22,15 +22,15 @@ use std::{
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyWindowHandle, App, AppContext, Application, Bounds, ClickEvent, ClipboardItem, Context,
-    DisplayId, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, FontWeight,
-    GlobalElementId, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, Keystroke,
-    LayoutId, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, ParentElement, PathPromptOptions, Pixels, Point, Render, ScrollHandle,
-    ScrollStrategy, ShapedLine, SharedString, StatefulInteractiveElement, Style, Styled as _,
-    StyledText, TextRun, TitlebarOptions, UTF16Selection, UnderlineStyle, UniformListScrollHandle,
-    Window, WindowAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, actions, div,
-    fill, point, px, relative, rgb, size, uniform_list,
+    Animation, AnimationExt as _, AnyWindowHandle, App, AppContext, Application, Bounds,
+    ClickEvent, ClipboardItem, Context, DisplayId, Element, ElementId, ElementInputHandler, Entity,
+    EntityInputHandler, FontWeight, GlobalElementId, InteractiveElement, IntoElement, KeyBinding,
+    KeyDownEvent, Keystroke, LayoutId, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, PathPromptOptions, Pixels, Point,
+    Render, ScrollHandle, ScrollStrategy, ShapedLine, SharedString, StatefulInteractiveElement,
+    Style, Styled as _, StyledText, TextRun, TitlebarOptions, UTF16Selection, UnderlineStyle,
+    UniformListScrollHandle, Window, WindowAppearance, WindowBounds, WindowHandle, WindowKind,
+    WindowOptions, actions, div, fill, point, px, relative, rgb, size, uniform_list,
 };
 use lucide_icons::{Icon, LUCIDE_FONT_BYTES};
 
@@ -4318,6 +4318,21 @@ struct LogTreeRowRenderData {
     meta: Option<String>,
 }
 
+/// 左侧目录树普通点击触发的主动作。
+///
+/// 业务意图：
+/// - 目录树需要同时支持“单击打开/展开”和 Shift、Ctrl/Command 多选；集中描述主动作可以避免点击处理里散落判断。
+/// - 该动作不携带真实文件来源，文件来源仍由调用点从加载层传入，避免测试辅助类型复制路径模型。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogTreePrimaryClickAction {
+    /// 不执行打开或展开，只保留选择变化。
+    None,
+    /// 打开当前日志文件到右侧 tab。
+    OpenSource,
+    /// 展开或收起当前目录/压缩包节点。
+    ToggleNode,
+}
+
 /// 左侧目录树右键菜单状态。
 ///
 /// 业务意图：
@@ -5092,17 +5107,7 @@ impl MainView {
                 };
 
                 view.update(app, |view, context| {
-                    // 新一轮加载会替换左侧来源树；旧 tab 的来源可能已经不属于当前树，因此同步清空右侧工作区。
-                    view.open_tabs.clear();
-                    view.active_tab_id = None;
-                    view.tab_context_menu = None;
-                    view.encoding_dropdown_menu = None;
-                    view.log_tree_context_menu = None;
-                    view.log_tree_selected_node_ids.clear();
-                    view.log_tree_selection_anchor = None;
-                    view.log_scrollbar_drag = None;
-                    view.log_tree_scrollbar_drag = None;
-                    view.tab_bar_scroll_handle = ScrollHandle::new();
+                    view.clear_workspace_for_new_log_load();
                     view.load_state = LogTreeLoadState::Loading {
                         message: loading_message,
                     };
@@ -5134,6 +5139,40 @@ impl MainView {
                 .ok();
             })
             .detach();
+    }
+
+    /// 清理重新加载日志前依赖旧来源树的工作区状态。
+    ///
+    /// 业务意图：
+    /// - 用户重新加载日志后，右侧 tab 和搜索结果都不应继续展示旧目录树中的文件，否则会误以为这些结果来自新加载内容。
+    /// - 清理集中在一个函数里，避免后续新增右侧工作区状态时只清 tab、漏掉搜索结果或弹层。
+    ///
+    /// 边界条件：
+    /// - 搜索窗口本身不强制关闭，保留用户输入的关键字；但正在运行的搜索会被置为无效，旧后台回调无法继续写回结果面板。
+    /// - 只清理会引用旧日志来源的数据，不重置主题、窗口、左侧宽度等会话级偏好。
+    fn clear_workspace_for_new_log_load(&mut self) {
+        self.open_tabs.clear();
+        self.active_tab_id = None;
+        self.tab_context_menu = None;
+        self.encoding_dropdown_menu = None;
+        self.log_tree_context_menu = None;
+        self.log_tree_selected_node_ids.clear();
+        self.log_tree_selection_anchor = None;
+        self.log_scrollbar_drag = None;
+        self.log_tree_scrollbar_drag = None;
+        self.tab_bar_scroll_handle = ScrollHandle::new();
+
+        self.search_results_panel = None;
+        self.search_results_resize_drag = None;
+        self.search_results_scrollbar_drag = None;
+        self.search_results_context_menu = None;
+        self.next_search_job_id += 1;
+        if let Some(dialog) = self.search_dialog.as_mut() {
+            dialog.current_file_match_count = None;
+            dialog.is_searching = false;
+            dialog.progress = SearchProgress::default();
+            dialog.message = "日志已重新加载，请重新打开文件后搜索".to_string();
+        }
     }
 
     /// 渲染一个 Lucide 字体图标。
@@ -5572,12 +5611,13 @@ impl MainView {
     /// 处理左侧目录树左键按下。
     ///
     /// 业务意图：
-    /// - 单击只改变目录树选择，不再直接打开日志；双击文件打开日志，双击目录或压缩包节点展开/收起。
+    /// - 普通单击会选中并立即打开日志，或展开/收起目录和多文件压缩包节点。
     /// - Shift 和 Ctrl/Command 多选都基于当前可见行顺序，符合常见文件树操作习惯。
     ///
     /// 边界条件：
     /// - 错误节点或不可打开节点也允许选中，方便用户保持视觉上下文；后续文件操作会只筛选可读取来源。
-    /// - 鼠标三击及以上按双击处理，避免快速点击文件时既清空选择又不执行任何动作。
+    /// - 带修饰键的点击只更新多选集合，不触发打开或展开，避免用户批量选择时意外切换右侧日志。
+    /// - 双击事件的第二次按下不再重复执行主动作，避免目录被“展开后立刻收起”。
     fn handle_log_tree_left_mouse_down(
         &mut self,
         node_id: usize,
@@ -5598,14 +5638,54 @@ impl MainView {
         self.encoding_dropdown_menu = None;
         self.search_results_context_menu = None;
 
-        if event.click_count >= 2 {
-            if let Some(source) = source {
+        match Self::log_tree_primary_action_for_click(
+            source.is_some(),
+            can_toggle,
+            event.modifiers.shift,
+            event.modifiers.control || event.modifiers.platform,
+            event.click_count,
+        ) {
+            LogTreePrimaryClickAction::OpenSource => {
+                let Some(source) = source else {
+                    context.notify();
+                    return;
+                };
                 self.open_log_file(source, context);
-            } else if can_toggle {
+            }
+            LogTreePrimaryClickAction::ToggleNode => {
                 self.toggle_log_tree_node(node_id, context);
             }
+            LogTreePrimaryClickAction::None => {}
         }
         context.notify();
+    }
+
+    /// 计算目录树普通点击是否要触发打开或展开。
+    ///
+    /// 业务意图：
+    /// - 用户要求日志和目录都从双击改为单击触发，但左侧树仍要保留多选能力。
+    /// - 只有第一次普通左键按下会执行主动作；双击产生的第二次事件会被忽略，避免目录状态来回翻转。
+    ///
+    /// 边界条件：
+    /// - 同时存在文件来源和可展开子节点时优先打开文件，用于单文件压缩包按文件本身处理的场景。
+    /// - Shift、Ctrl、Command 任一修饰键存在时不触发主动作，确保多选行为只改变选择集合。
+    fn log_tree_primary_action_for_click(
+        has_source: bool,
+        can_toggle: bool,
+        shift: bool,
+        multi_select_modifier: bool,
+        click_count: usize,
+    ) -> LogTreePrimaryClickAction {
+        if shift || multi_select_modifier || click_count != 1 {
+            return LogTreePrimaryClickAction::None;
+        }
+        if has_source {
+            LogTreePrimaryClickAction::OpenSource
+        } else if can_toggle {
+            LogTreePrimaryClickAction::ToggleNode
+        } else {
+            LogTreePrimaryClickAction::None
+        }
     }
 
     /// 根据鼠标点击和修饰键更新目录树选择集合。
@@ -10621,6 +10701,8 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 当前选中编码通过浅蓝背景标识；点击其它项会触发重新解码。
+    /// - 菜单项使用左键按下立即处理，而不是等待 click 合成事件；编码菜单上方有关闭遮罩，
+    ///   这样可以避免鼠标按下和释放之间弹层状态变化导致选择事件丢失。
     fn render_encoding_dropdown_item(
         &self,
         tab_id: usize,
@@ -10666,9 +10748,11 @@ impl MainView {
             item
         };
 
-        item.on_click(
-            context.listener(move |view, _event: &ClickEvent, _window, context| {
+        item.on_mouse_down(
+            MouseButton::Left,
+            context.listener(move |view, _event: &MouseDownEvent, _window, context| {
                 view.select_tab_encoding(tab_id, choice, context);
+                context.stop_propagation();
             }),
         )
     }
@@ -10684,12 +10768,7 @@ impl MainView {
     ) -> impl IntoElement {
         let palette = self.palette();
         match &tab.state {
-            LogTabState::Loading { message } => self.render_log_tab_state_message(
-                Icon::Loader,
-                palette.muted_text,
-                "正在打开日志",
-                message,
-            ),
+            LogTabState::Loading { message } => self.render_log_tab_loading_message(message),
             LogTabState::Failed { message } => self.render_log_tab_state_message(
                 Icon::FileX,
                 palette.error,
@@ -10699,6 +10778,86 @@ impl MainView {
             LogTabState::Ready { document } => {
                 self.render_log_document_viewer(tab, document, context)
             }
+        }
+    }
+
+    /// 渲染日志打开中的动态提示。
+    ///
+    /// 业务意图：
+    /// - 大日志读取和解码已经在后台执行，但静态图标会让用户误以为窗口卡死；这里使用 GPUI 循环动画持续旋转加载图标。
+    /// - 该动画只在 `Loading` 状态渲染，加载完成或失败后会随状态切换自动移除，不需要额外保存动画状态。
+    ///
+    /// 边界条件：
+    /// - 动画只影响图标层，不触碰后台读取任务；即使文件很大，UI 线程仍只负责轻量重绘。
+    /// - 使用稳定 ID 让同一个 tab 的加载状态重绘时复用动画进度，避免文案更新导致旋转重新从 0 开始。
+    fn render_log_tab_loading_message(&self, message: &str) -> gpui::Stateful<gpui::Div> {
+        let palette = self.palette();
+        div()
+            .id("log-tab-loading-message")
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .flex_1()
+            .size_full()
+            .px_4()
+            .bg(rgb(palette.background))
+            .child(Self::render_loading_spinner(palette.accent))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(palette.muted_text))
+                    .text_center()
+                    .child(message.to_string()),
+            )
+    }
+
+    /// 渲染循环脉冲的加载图标。
+    ///
+    /// 业务意图：
+    /// - GPUI 0.2.2 只有 SVG 元素支持旋转变换；这里使用三个点的透明度脉冲，避免为加载态额外引入 SVG 资源。
+    /// - 三个点错峰变化，用户在打开大文件时能持续看到“仍在处理”的动态反馈。
+    fn render_loading_spinner(icon_color: u32) -> impl IntoElement {
+        div()
+            .id("log-tab-loading-dots")
+            .flex()
+            .items_center()
+            .gap_1()
+            .h(px(28.0))
+            .children((0..3).map(move |index| Self::render_loading_dot(index, icon_color)))
+    }
+
+    /// 渲染单个加载脉冲点。
+    ///
+    /// 业务意图：
+    /// - 每个点使用相同动画周期但不同相位，形成从左到右流动的加载感。
+    /// - 点元素尺寸固定，动画期间只改变透明度，避免布局抖动。
+    fn render_loading_dot(index: usize, icon_color: u32) -> impl IntoElement {
+        div()
+            .id(SharedString::from(format!("log-tab-loading-dot-{index}")))
+            .w(px(8.0))
+            .h(px(8.0))
+            .rounded(px(4.0))
+            .bg(rgb(icon_color))
+            .with_animation(
+                SharedString::from(format!("log-tab-loading-dot-animation-{index}")),
+                Animation::new(Duration::from_millis(900)).repeat(),
+                move |dot, delta| dot.opacity(Self::loading_dot_opacity(delta, index as f32 / 3.0)),
+            )
+    }
+
+    /// 计算加载脉冲点在某一动画进度下的透明度。
+    ///
+    /// 业务意图：
+    /// - 把动画数学逻辑拆成纯函数，避免渲染闭包里出现难以验证的魔法数字。
+    /// - 返回值保持在可见范围内，即使窗口长时间停留在加载态也不会出现完全不可见的点。
+    fn loading_dot_opacity(delta: f32, phase_offset: f32) -> f32 {
+        let phase = (delta + phase_offset).fract();
+        if phase < 0.5 {
+            0.35 + phase * 1.3
+        } else {
+            1.0 - (phase - 0.5) * 1.3
         }
     }
 
@@ -12769,6 +12928,61 @@ mod tests {
 
         assert_eq!(selected, HashSet::from([1, 3]));
         assert_eq!(anchor, Some(3));
+    }
+
+    /// 验证左侧目录树普通单击会执行打开或展开主动作。
+    ///
+    /// 业务意图：
+    /// - 用户要求日志和目录从双击改为单击触发；该测试锁定文件优先打开、目录展开的判断规则。
+    /// - 单文件压缩包会同时表现为压缩包节点和文件来源，因此有来源时必须优先打开，不能误判为展开目录。
+    #[test]
+    fn 左侧树普通单击触发打开或展开() {
+        assert_eq!(
+            MainView::log_tree_primary_action_for_click(true, false, false, false, 1),
+            LogTreePrimaryClickAction::OpenSource
+        );
+        assert_eq!(
+            MainView::log_tree_primary_action_for_click(false, true, false, false, 1),
+            LogTreePrimaryClickAction::ToggleNode
+        );
+        assert_eq!(
+            MainView::log_tree_primary_action_for_click(true, true, false, false, 1),
+            LogTreePrimaryClickAction::OpenSource
+        );
+    }
+
+    /// 验证多选和双击后续事件不会重复执行目录树主动作。
+    ///
+    /// 业务意图：
+    /// - Shift/Ctrl/Command 点击要服务多选，不应顺带打开文件或展开目录。
+    /// - 双击会产生第二次鼠标按下事件，如果不忽略会导致目录展开后立刻收起。
+    #[test]
+    fn 左侧树多选和双击后续事件不触发主动作() {
+        assert_eq!(
+            MainView::log_tree_primary_action_for_click(true, false, true, false, 1),
+            LogTreePrimaryClickAction::None
+        );
+        assert_eq!(
+            MainView::log_tree_primary_action_for_click(false, true, false, true, 1),
+            LogTreePrimaryClickAction::None
+        );
+        assert_eq!(
+            MainView::log_tree_primary_action_for_click(false, true, false, false, 2),
+            LogTreePrimaryClickAction::None
+        );
+    }
+
+    /// 验证日志加载脉冲点透明度始终保持可见。
+    ///
+    /// 业务意图：
+    /// - 大日志打开期间加载态需要持续动起来；透明度计算不能返回 0，否则某些相位会让动画看起来停顿。
+    /// - 该测试只覆盖纯数学边界，实际动画帧由 GPUI 在渲染层驱动。
+    #[test]
+    fn 日志加载脉冲透明度保持可见范围() {
+        for delta in [0.0, 0.25, 0.5, 0.75, 0.99] {
+            let opacity = MainView::loading_dot_opacity(delta, 1.0 / 3.0);
+            assert!((0.35..=1.0).contains(&opacity));
+        }
     }
 
     /// 验证另存为路径保留本地文件名和压缩包内部层级。
