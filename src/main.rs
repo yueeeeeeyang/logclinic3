@@ -110,6 +110,13 @@ const MAIN_WINDOW_SIZE_FILE_NAME: &str = "window-size.txt";
 /// - 文件内容保持为简单英文枚举值，避免仅为单个配置新增 JSON/TOML 依赖。
 const THEME_PREFERENCE_FILE_NAME: &str = "theme-preference.txt";
 
+/// 日志显示字号偏好文件名。
+///
+/// 业务意图：
+/// - 日志字号是用户明确调整的阅读偏好，需要像主题一样跨启动恢复。
+/// - 文件只保存一个像素值，继续使用简单文本格式，避免为单项设置引入完整配置依赖。
+const LOG_VIEWER_FONT_SIZE_FILE_NAME: &str = "log-viewer-font-size.txt";
+
 /// 左侧目录树右键菜单宽度。
 ///
 /// 业务意图：
@@ -494,6 +501,89 @@ fn save_theme_preference(preference: ThemePreference) {
     }
 }
 
+/// 获取日志显示字号偏好文件路径。
+fn log_viewer_font_size_preference_path() -> Option<PathBuf> {
+    app_config_dir().map(|dir| dir.join(LOG_VIEWER_FONT_SIZE_FILE_NAME))
+}
+
+/// 规范化日志显示字号。
+///
+/// 业务意图：
+/// - 设置页、配置读取和测试都通过同一套边界规则，避免 UI 可选范围与磁盘配置可接受范围不一致。
+///
+/// 边界条件：
+/// - NaN、无穷大、过小或过大的值都视为无效配置；合法值按 1px 粒度取整，保证设置按钮显示稳定整数 px。
+fn normalize_log_viewer_font_size(value: f32) -> Option<f32> {
+    if !value.is_finite() {
+        return None;
+    }
+    let rounded = value.round();
+    if (LOG_VIEWER_MIN_FONT_SIZE..=LOG_VIEWER_MAX_FONT_SIZE).contains(&rounded) {
+        Some(rounded)
+    } else {
+        None
+    }
+}
+
+/// 解析日志显示字号配置文本。
+///
+/// 边界条件：
+/// - 配置文件可能被用户手工修改；格式错误、空文本和超出范围都返回 `None`，调用方回退默认 12px。
+fn parse_log_viewer_font_size_preference(raw: &str) -> Option<f32> {
+    normalize_log_viewer_font_size(raw.trim().parse::<f32>().ok()?)
+}
+
+/// 序列化日志显示字号配置。
+fn serialize_log_viewer_font_size_preference(font_size: f32) -> String {
+    format!("{}\n", font_size.round())
+}
+
+/// 从指定文件读取日志显示字号。
+///
+/// 错误处理：
+/// - 文件缺失、读取失败或内容损坏都不影响应用启动，统一由调用方回退默认字号。
+fn read_log_viewer_font_size_preference(path: &Path) -> Option<f32> {
+    let raw = fs::read_to_string(path).ok()?;
+    parse_log_viewer_font_size_preference(&raw)
+}
+
+/// 将日志显示字号写入指定文件。
+fn write_log_viewer_font_size_preference(path: &Path, font_size: f32) -> io::Result<()> {
+    let Some(font_size) = normalize_log_viewer_font_size(font_size) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "日志显示字号超出允许范围",
+        ));
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serialize_log_viewer_font_size_preference(font_size))
+}
+
+/// 读取日志显示字号偏好。
+///
+/// 业务意图：
+/// - 日志正文是应用最核心的长时间阅读区域，用户调整字号后应在下次启动恢复。
+fn load_log_viewer_font_size_preference() -> f32 {
+    log_viewer_font_size_preference_path()
+        .and_then(|path| read_log_viewer_font_size_preference(&path))
+        .unwrap_or(LOG_VIEWER_DEFAULT_FONT_SIZE)
+}
+
+/// 保存日志显示字号偏好。
+///
+/// 错误处理：
+/// - 写入失败不影响当前会话的字号调整，仅输出开发期诊断，避免配置目录权限问题阻断 UI 操作。
+fn save_log_viewer_font_size_preference(font_size: f32) {
+    let Some(path) = log_viewer_font_size_preference_path() else {
+        return;
+    };
+    if let Err(error) = write_log_viewer_font_size_preference(&path, font_size) {
+        eprintln!("保存日志显示字号偏好失败：{}：{}", path.display(), error);
+    }
+}
+
 /// 顶部工具栏的固定高度。
 ///
 /// 业务意图：
@@ -768,6 +858,17 @@ const LOG_VIEWER_TEXT_LEFT_PADDING: f32 = 8.0;
 /// - 用户指定使用 JetBrains Mono，并要求内置到程序中，因此启动时会注册随项目打包的字体字节。
 const LOG_VIEWER_FONT_FAMILY: &str = "JetBrains Mono";
 
+/// 日志查看器中制表符按固定 4 列展开。
+///
+/// 业务意图：
+/// - 一些日志用 `\t` 分隔字段，VS Code 等编辑器会按 tab stop 展开，所以列之间看起来有稳定间隔。
+/// - GPUI 当前直接渲染 `\t` 时宽度不符合日志阅读预期，字段会贴在一起；这里在显示层展开为空格。
+///
+/// 边界条件：
+/// - 这里只改变视觉显示，不改原始日志文本；复制、搜索、另存为仍保留文件里的真实 `\t`。
+/// - tab stop 按用户要求固定为 4 列，暂不做设置项，避免影响现有信息密度。
+const LOG_VIEWER_TAB_WIDTH: usize = 4;
+
 /// 内置 JetBrains Mono Regular 字体数据。
 ///
 /// 业务意图：
@@ -779,12 +880,30 @@ const LOG_VIEWER_FONT_FAMILY: &str = "JetBrains Mono";
 const JETBRAINS_MONO_REGULAR_FONT_BYTES: &[u8] =
     include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
 
-/// 日志正文基础字号。
+/// 日志正文默认字号。
 ///
 /// 边界条件：
-/// - 用户要求默认字号调整为 12px；当前继续沿用 22px 行高，保证单屏可见行数和滚动计算稳定。
-/// - 如果后续允许用户自定义字号，行高也必须同步配置，避免虚拟列表等高假设失效。
-const LOG_VIEWER_FONT_SIZE: f32 = 12.0;
+/// - 用户要求默认字号为 12px；当前继续沿用 22px 行高，保证单屏可见行数和滚动计算稳定。
+/// - 设置页只调整文字字号，不改变固定行高和信息密度。
+const LOG_VIEWER_DEFAULT_FONT_SIZE: f32 = 12.0;
+
+/// 日志正文可设置的最小字号。
+///
+/// 边界条件：
+/// - 过小字体会导致中文、英文和符号在长时间阅读时难以辨认，因此设置页不允许继续减小。
+const LOG_VIEWER_MIN_FONT_SIZE: f32 = 10.0;
+
+/// 日志正文可设置的最大字号。
+///
+/// 边界条件：
+/// - 当前日志行高仍保持固定密度；过大字体可能与行高冲突并影响虚拟列表测量，因此先限制到 20px。
+const LOG_VIEWER_MAX_FONT_SIZE: f32 = 20.0;
+
+/// 日志字号设置的单次调整步长。
+///
+/// 业务意图：
+/// - 1px 步进足够细，用户可以在不改变布局密度的前提下微调阅读舒适度。
+const LOG_VIEWER_FONT_SIZE_STEP: f32 = 1.0;
 
 /// 日志正文滚动条可见宽度。
 ///
@@ -1413,12 +1532,26 @@ struct LogLineRenderData {
     tab_id: usize,
     /// 0 基日志行号。
     line_index: usize,
-    /// 当前行正文。
+    /// 当前行原始正文。
+    ///
+    /// 业务意图：
+    /// - 鼠标选择、复制和搜索都必须继续使用日志文件里的真实文本，不能因为显示层展开 `\t` 而改写内容。
     line: String,
-    /// 当前行语法高亮与选区高亮范围，范围必须是 UTF-8 字节边界。
+    /// 当前行用于视觉渲染的正文。
+    ///
+    /// 业务意图：
+    /// - `\t` 会在显示层按固定 tab stop 展开为空格，让日志列间距与常见编辑器一致。
+    /// - 该字段只用于 `StyledText`，不参与复制或保存。
+    display_line: String,
+    /// 当前行语法高亮与选区高亮范围，范围基于 `display_line` 的 UTF-8 字节边界。
     highlights: Vec<(Range<usize>, gpui::HighlightStyle)>,
     /// 行号列宽度。
     line_number_width: f32,
+    /// 当前日志显示字号。
+    ///
+    /// 业务意图：
+    /// - 日志正文渲染由静态辅助函数完成，必须显式传入当前设置字号，避免继续读取旧的固定常量。
+    font_size: f32,
     /// 横向滚动时行号列的反向补偿偏移。
     horizontal_line_number_offset: Pixels,
     /// 当前行是否是搜索结果跳转后的目标行。
@@ -1431,6 +1564,25 @@ struct LogLineRenderData {
     suppress_hover: bool,
     /// 当前主题调色板。
     palette: AppThemePalette,
+}
+
+/// 日志行显示层展开结果。
+///
+/// 业务意图：
+/// - 日志原文里的 `\t` 需要按固定 4 列 tab stop 展示为空格，但选区、搜索高亮和鼠标命中仍要回到原始文本。
+/// - 该结构同时保存原始字节下标和显示字节下标的双向映射，避免中文、多字节字符和 tab 混合时出现高亮错位。
+///
+/// 边界条件：
+/// - 映射数组长度分别为原始文本和显示文本的 `len + 1`，保证行尾位置也能安全换算。
+/// - 对于 UTF-8 多字节字符的内部字节，映射会回退到字符起点；正常业务范围都应落在字符边界。
+#[derive(Debug, PartialEq, Eq)]
+struct ExpandedLogLine {
+    /// 展开 tab 后用于渲染的文本。
+    text: String,
+    /// 原始文本字节下标到显示文本字节下标的映射。
+    original_to_display_bytes: Vec<usize>,
+    /// 显示文本字节下标到原始文本字节下标的映射。
+    display_to_original_bytes: Vec<usize>,
 }
 
 /// 日志正文自绘滚动条的方向。
@@ -1531,7 +1683,7 @@ enum SearchTextInputKind {
 /// - 当前页签状态只存在于进程内，不写入配置文件；后续若需要记忆页签，应先定义设置持久化策略。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsTab {
-    /// 通用设置页签，当前承载主题设置。
+    /// 通用设置页签，当前承载主题和日志显示字号设置。
     General,
     /// 模型设置页签，当前按需求留白。
     Model,
@@ -3019,6 +3171,25 @@ impl SettingsWindowView {
         context.notify();
     }
 
+    /// 调整日志显示字号。
+    ///
+    /// 业务意图：
+    /// - 用户在通用设置中点击加减按钮后，应立即刷新日志正文和搜索结果预览，并写入配置供下次启动恢复。
+    ///
+    /// 边界条件：
+    /// - 调整结果超出允许范围时不写入，避免设置按钮或损坏状态把日志字号推到不可读或挤破行高的值。
+    fn adjust_log_viewer_font_size(&mut self, delta: f32, context: &mut Context<Self>) {
+        self.main_view.update(context, |view, context| {
+            let target = view.log_viewer_font_size + delta;
+            if let Some(font_size) = normalize_log_viewer_font_size(target) {
+                view.log_viewer_font_size = font_size;
+                save_log_viewer_font_size_preference(font_size);
+                context.notify();
+            }
+        });
+        context.notify();
+    }
+
     /// 渲染左侧页签栏。
     fn render_tab_sidebar(
         &self,
@@ -3102,11 +3273,14 @@ impl SettingsWindowView {
         &self,
         active_tab: SettingsTab,
         theme: ThemePreference,
+        log_viewer_font_size: f32,
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         match active_tab {
-            SettingsTab::General => self.render_general_tab(theme, palette, context),
+            SettingsTab::General => {
+                self.render_general_tab(theme, log_viewer_font_size, palette, context)
+            }
             SettingsTab::Model => self.render_model_tab(palette),
         }
     }
@@ -3114,10 +3288,11 @@ impl SettingsWindowView {
     /// 渲染通用页签。
     ///
     /// 业务意图：
-    /// - 通用页签当前只承载主题设置，未来可继续加入语言、字体等全局体验类配置。
+    /// - 通用页签当前承载主题和日志显示字号，未来可继续加入语言等全局体验类配置。
     fn render_general_tab(
         &self,
         theme: ThemePreference,
+        log_viewer_font_size: f32,
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -3153,6 +3328,7 @@ impl SettingsWindowView {
                         .map(|option| self.render_theme_option(option, theme, palette, context)),
                 ),
             )
+            .child(self.render_log_font_size_setting(log_viewer_font_size, palette, context))
     }
 
     /// 渲染单个主题选项。
@@ -3224,6 +3400,138 @@ impl SettingsWindowView {
             )
     }
 
+    /// 渲染日志显示字号设置。
+    ///
+    /// 业务意图：
+    /// - 日志正文是长时间阅读区域，通用设置中提供字号微调，让用户在不改变布局密度的前提下改善可读性。
+    /// - 当前只提供加减步进，不提供任意输入框，避免非法文本、过大字号和固定行高冲突。
+    fn render_log_font_size_setting(
+        &self,
+        log_viewer_font_size: f32,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("settings-log-font-size")
+            .flex()
+            .items_center()
+            .justify_between()
+            .h(px(44.0))
+            .px_3()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.surface))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(palette.text))
+                            .child("日志显示字号"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(palette.muted_text))
+                            .child(format!(
+                                "范围 {}px - {}px，默认 {}px",
+                                LOG_VIEWER_MIN_FONT_SIZE.round(),
+                                LOG_VIEWER_MAX_FONT_SIZE.round(),
+                                LOG_VIEWER_DEFAULT_FONT_SIZE.round()
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(self.render_log_font_size_button(
+                        "-",
+                        log_viewer_font_size > LOG_VIEWER_MIN_FONT_SIZE,
+                        -LOG_VIEWER_FONT_SIZE_STEP,
+                        palette,
+                        context,
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(54.0))
+                            .h(px(28.0))
+                            .rounded(px(5.0))
+                            .border_1()
+                            .border_color(rgb(palette.border))
+                            .bg(rgb(palette.input))
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(palette.text))
+                            .child(format!("{}px", log_viewer_font_size.round())),
+                    )
+                    .child(self.render_log_font_size_button(
+                        "+",
+                        log_viewer_font_size < LOG_VIEWER_MAX_FONT_SIZE,
+                        LOG_VIEWER_FONT_SIZE_STEP,
+                        palette,
+                        context,
+                    )),
+            )
+    }
+
+    /// 渲染日志字号调整按钮。
+    ///
+    /// 边界条件：
+    /// - 到达最小或最大字号时按钮仍保留占位但降低透明度，避免右侧控件宽度跳动。
+    fn render_log_font_size_button(
+        &self,
+        label: &'static str,
+        enabled: bool,
+        delta: f32,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(SharedString::from(format!(
+                "settings-log-font-size-{label}"
+            )))
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(28.0))
+            .h(px(28.0))
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.panel))
+            .text_sm()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(if enabled {
+                palette.text
+            } else {
+                palette.muted_text
+            }))
+            .when(enabled, |button| {
+                button
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(rgb(palette.hover)))
+            })
+            .when(!enabled, |button| button.opacity(0.55))
+            .child(label)
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, _window, context| {
+                    if enabled {
+                        view.adjust_log_viewer_font_size(delta, context);
+                    }
+                }),
+            )
+    }
+
     /// 渲染模型页签。
     ///
     /// 业务意图：
@@ -3242,11 +3550,12 @@ impl Render for SettingsWindowView {
     /// 业务意图：
     /// - 设置窗口内容由左侧页签和右侧内容组成，根节点填满独立窗口，避免系统标题栏下方出现未绘制区域。
     fn render(&mut self, _window: &mut Window, context: &mut Context<Self>) -> impl IntoElement {
-        let (active_tab, theme, palette) = {
+        let (active_tab, theme, log_viewer_font_size, palette) = {
             let main_view = self.main_view.read(context);
             (
                 main_view.settings_active_tab,
                 main_view.theme_preference,
+                main_view.log_viewer_font_size,
                 main_view.palette(),
             )
         };
@@ -3263,7 +3572,13 @@ impl Render for SettingsWindowView {
                     .flex_col()
                     .flex_1()
                     .min_w_0()
-                    .child(self.render_content(active_tab, theme, palette, context)),
+                    .child(self.render_content(
+                        active_tab,
+                        theme,
+                        log_viewer_font_size,
+                        palette,
+                        context,
+                    )),
             )
     }
 }
@@ -4461,8 +4776,41 @@ enum LogTreeContextMenuAction {
 struct SaveSelectedLogsResult {
     /// 成功写入的文件数量。
     saved_count: usize,
+    /// 因用户选择“跳过”而未覆盖的同名文件数量。
+    skipped_count: usize,
     /// 失败的文件数量。
     failed_count: usize,
+}
+
+/// 另存为遇到同名目标文件时的处理策略。
+///
+/// 业务意图：
+/// - 用户要求目标目录已有同名文件时必须弹窗确认，并提供“跳过”和“覆盖”两种明确选择。
+/// - 策略作为纯数据传入后台保存函数，避免 UI 弹窗逻辑和文件复制逻辑耦合。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SaveConflictPolicy {
+    /// 跳过已存在的目标文件。
+    SkipExisting,
+    /// 覆盖已存在的目标文件。
+    OverwriteExisting,
+}
+
+/// 另存为同名文件确认弹窗状态。
+///
+/// 业务意图：
+/// - 批量另存为可能一次命中多个同名文件；主窗口只弹一次确认，用户选择后对本次保存任务统一应用。
+///
+/// 边界条件：
+/// - 这里只保存必要展示信息和待保存来源，不保存文件句柄；确认后仍按原管线重新物化和复制来源。
+struct SaveOverwriteConfirmDialog {
+    /// 待保存的日志来源。
+    sources: Vec<LogFileSource>,
+    /// 用户选择的目标目录。
+    target_directory: PathBuf,
+    /// 已存在目标路径数量。
+    conflict_count: usize,
+    /// 首个冲突目标路径，用于弹窗展示具体示例，避免用户无法判断风险。
+    first_conflict_path: PathBuf,
 }
 
 /// 用户通过“加载日志”按钮选择的路径来源类型。
@@ -4639,6 +4987,15 @@ struct MainView {
     /// - 重新加载、切换 tab、关闭 tab 或切换编码时应清空，避免菜单作用到已经失效的正文选区。
     log_viewer_context_menu: Option<LogViewerContextMenu>,
 
+    /// 另存为同名文件覆盖确认弹窗。
+    ///
+    /// 业务意图：
+    /// - 用户选择目标目录后，如果检测到同名文件，必须暂停保存并让用户明确选择“跳过”或“覆盖”。
+    ///
+    /// 边界条件：
+    /// - 弹窗只作用于当前这一次另存为任务；用户取消或完成后必须清空，避免后续保存误用旧来源。
+    save_overwrite_confirm_dialog: Option<SaveOverwriteConfirmDialog>,
+
     /// 日志正文自绘滚动条的拖动状态。
     ///
     /// 业务意图：
@@ -4714,7 +5071,7 @@ struct MainView {
     ///
     /// 业务意图：
     /// - 当前设置窗口包含“通用”和“模型”两个页签，该字段保存当前会话内最后访问的页签。
-    /// - 默认打开“通用”，符合用户要求第一个页签先提供主题设置。
+    /// - 默认打开“通用”，符合用户要求第一个页签先提供通用显示设置。
     settings_active_tab: SettingsTab,
 
     /// 当前主题偏好。
@@ -4723,6 +5080,15 @@ struct MainView {
     /// - 通用页签提供主题选择，字段驱动全应用基础调色板并在用户修改后写入配置文件。
     /// - 配置缺失或损坏时默认“跟随系统”，避免在用户未主动选择前改变现有视觉表现。
     theme_preference: ThemePreference,
+
+    /// 日志正文显示字号，单位为 GPUI 逻辑像素。
+    ///
+    /// 业务意图：
+    /// - 通用页签允许用户微调日志正文阅读字号；字段驱动日志正文、搜索结果预览和鼠标命中测量。
+    ///
+    /// 边界条件：
+    /// - 只保存合法范围内的整数 px；行高暂不随字号变化，保证大日志虚拟列表信息密度不被设置改变。
+    log_viewer_font_size: f32,
 
     /// 当前窗口系统外观。
     ///
@@ -4871,6 +5237,7 @@ impl MainView {
             tab_context_menu: None,
             encoding_dropdown_menu: None,
             log_viewer_context_menu: None,
+            save_overwrite_confirm_dialog: None,
             log_scrollbar_drag: None,
             log_tree_scrollbar_drag: None,
             search_dialog: None,
@@ -4881,6 +5248,7 @@ impl MainView {
             settings_window_open_pending: false,
             settings_active_tab: SettingsTab::General,
             theme_preference: load_theme_preference(),
+            log_viewer_font_size: load_log_viewer_font_size_preference(),
             system_window_appearance: WindowAppearance::Light,
             window_appearance_subscription: None,
             search_dialog_open_pending: false,
@@ -5309,6 +5677,7 @@ impl MainView {
         self.encoding_dropdown_menu = None;
         self.log_viewer_context_menu = None;
         self.log_tree_context_menu = None;
+        self.save_overwrite_confirm_dialog = None;
         self.log_tree_selected_node_ids.clear();
         self.log_tree_selection_anchor = None;
         self.log_scrollbar_drag = None;
@@ -6161,19 +6530,67 @@ impl MainView {
                     return;
                 };
 
+                view.update(app, |view, context| {
+                    let conflicts = Self::save_target_conflicts(&sources, &target_directory);
+                    if let Some(first_conflict_path) = conflicts.first().cloned() {
+                        view.save_overwrite_confirm_dialog = Some(SaveOverwriteConfirmDialog {
+                            sources,
+                            target_directory,
+                            conflict_count: conflicts.len(),
+                            first_conflict_path,
+                        });
+                        view.log_tree_context_menu = None;
+                        view.log_viewer_context_menu = None;
+                    } else {
+                        view.spawn_save_log_sources_to_directory(
+                            sources,
+                            target_directory,
+                            SaveConflictPolicy::OverwriteExisting,
+                            context,
+                        );
+                    }
+                    context.notify();
+                })
+                .ok();
+            })
+            .detach();
+    }
+
+    /// 启动后台另存为任务。
+    ///
+    /// 业务意图：
+    /// - 选择目录、同名确认和右键菜单都可能触发真正保存；集中封装后台任务可以保证统计、菜单清理和 UI 刷新一致。
+    fn spawn_save_log_sources_to_directory(
+        &mut self,
+        sources: Vec<LogFileSource>,
+        target_directory: PathBuf,
+        conflict_policy: SaveConflictPolicy,
+        context: &mut Context<Self>,
+    ) {
+        context
+            .spawn(async move |view, app| {
                 let result = app
                     .background_executor()
                     .spawn(async move {
-                        Self::save_log_sources_to_directory(&sources, &target_directory)
+                        Self::save_log_sources_to_directory(
+                            &sources,
+                            &target_directory,
+                            conflict_policy,
+                        )
                     })
                     .await;
 
                 view.update(app, |view, context| {
                     // 当前没有全局状态栏；这里只保留静默完成策略，避免批量保存失败影响日志查看流程。
                     // 统计结果通过局部变量消费，确保后台错误不会被误认为需要中断 UI。
-                    let _ = (result.saved_count, result.failed_count);
+                    let _ = (
+                        result.saved_count,
+                        result.skipped_count,
+                        result.failed_count,
+                    );
                     view.log_tree_context_menu = None;
                     view.log_viewer_context_menu = None;
+                    view.save_overwrite_confirm_dialog = None;
                     context.notify();
                 })
                 .ok();
@@ -6184,21 +6601,27 @@ impl MainView {
     /// 把多个日志来源写入目标目录。
     ///
     /// 业务意图：
-    /// - 本地文件保存为目标目录下的原文件名；压缩包成员按成员路径创建子目录，保留压缩包内部层级。
+    /// - 所有来源都直接保存到目标目录下，只保留最终文件名，不保留本地父目录或压缩包内部目录层级。
     /// - 使用分页物化管线把来源转换成可复制的本地文件，避免 10GB+ 日志另存为时把完整内容读入内存。
     ///
     /// 边界条件：
     /// - 目标路径的父目录会按需创建；权限不足、同名目录冲突或源文件消失都会记为单文件失败。
-    /// - 如果多个来源映射到同一目标文件，后写入者会覆盖先写入者；这是“按原文件名保存”的直接结果。
+    /// - 如果目标文件已存在，按用户在确认弹窗中选择的策略跳过或覆盖；覆盖会调用 `fs::copy` 直接替换文件内容。
     fn save_log_sources_to_directory(
         sources: &[LogFileSource],
         target_directory: &Path,
+        conflict_policy: SaveConflictPolicy,
     ) -> SaveSelectedLogsResult {
         let mut saved_count = 0usize;
+        let mut skipped_count = 0usize;
         let mut failed_count = 0usize;
         for source in sources {
             let relative_path = Self::save_relative_path_for_source(source);
             let target_path = target_directory.join(relative_path);
+            if target_path.exists() && conflict_policy == SaveConflictPolicy::SkipExisting {
+                skipped_count += 1;
+                continue;
+            }
             let write_result = (|| -> Result<(), LogContentError> {
                 if let Some(parent) = target_path.parent() {
                     fs::create_dir_all(parent).map_err(|error| {
@@ -6235,49 +6658,82 @@ impl MainView {
 
         SaveSelectedLogsResult {
             saved_count,
+            skipped_count,
             failed_count,
         }
+    }
+
+    /// 计算本次另存为会命中的已有目标路径。
+    ///
+    /// 业务意图：
+    /// - 在真正写入前先发现同名文件，才能弹出“跳过/覆盖”确认，而不是后台任务静默覆盖。
+    ///
+    /// 边界条件：
+    /// - 这里按最终目标路径是否存在判断，包括同名普通文件、目录或符号链接；同名目录后续即使选择覆盖也会按写入失败统计。
+    fn save_target_conflicts(sources: &[LogFileSource], target_directory: &Path) -> Vec<PathBuf> {
+        sources
+            .iter()
+            .map(|source| target_directory.join(Self::save_relative_path_for_source(source)))
+            .filter(|target_path| target_path.exists())
+            .collect()
+    }
+
+    /// 处理另存为同名文件确认弹窗的用户选择。
+    ///
+    /// 业务意图：
+    /// - 用户点击“跳过”或“覆盖”后，当前弹窗对应的保存任务才可以继续进入后台复制阶段。
+    ///
+    /// 边界条件：
+    /// - 弹窗可能已被其它状态变化清空；此时点击事件直接忽略，避免重复启动保存任务。
+    fn handle_save_overwrite_choice(
+        &mut self,
+        conflict_policy: SaveConflictPolicy,
+        context: &mut Context<Self>,
+    ) {
+        let Some(dialog) = self.save_overwrite_confirm_dialog.take() else {
+            return;
+        };
+        self.spawn_save_log_sources_to_directory(
+            dialog.sources,
+            dialog.target_directory,
+            conflict_policy,
+            context,
+        );
+        context.notify();
     }
 
     /// 返回日志来源另存为时使用的相对路径。
     ///
     /// 业务意图：
-    /// - 本地文件只保留原文件名；压缩包成员保留内部路径层级，满足用户对归档内目录结构的要求。
+    /// - 本地文件、压缩包成员、已物化 7z 成员和嵌套压缩包成员都只保留最终文件名，满足“直接保存到目标目录”的要求。
     ///
     /// 边界条件：
-    /// - 压缩包成员路径已经由加载层安全归一化，这里仍按 `/` 拆分成 `PathBuf`，避免把分隔符当作文件名写入。
+    /// - 如果不同来源最终文件名相同，会映射到同一个目标文件，并继续触发同名文件“跳过/覆盖”确认。
+    /// - 来源路径可能异常为空或以分隔符结尾，此时回退为 `log.txt`，避免生成空目标路径。
     fn save_relative_path_for_source(source: &LogFileSource) -> PathBuf {
+        fn file_name_from_member_path(member_path: &str) -> PathBuf {
+            member_path
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .next_back()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("log.txt"))
+        }
+
         match source {
             LogFileSource::LocalFile { path } => path
                 .file_name()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("log.txt")),
-            LogFileSource::ArchiveMember { member_path, .. } => member_path
-                .split('/')
-                .filter(|part| !part.is_empty())
-                .fold(PathBuf::new(), |mut path, part| {
-                    path.push(part);
-                    path
-                }),
-            LogFileSource::MaterializedArchiveMember { member_path, .. } => member_path
-                .split('/')
-                .filter(|part| !part.is_empty())
-                .fold(PathBuf::new(), |mut path, part| {
-                    path.push(part);
-                    path
-                }),
+            LogFileSource::ArchiveMember { member_path, .. } => {
+                file_name_from_member_path(member_path)
+            }
+            LogFileSource::MaterializedArchiveMember { member_path, .. } => {
+                file_name_from_member_path(member_path)
+            }
             LogFileSource::NestedArchiveMember {
-                archive_member_path,
-                nested_member_path,
-                ..
-            } => archive_member_path
-                .split('/')
-                .chain(nested_member_path.split('/'))
-                .filter(|part| !part.is_empty())
-                .fold(PathBuf::new(), |mut path, part| {
-                    path.push(part);
-                    path
-                }),
+                nested_member_path, ..
+            } => file_name_from_member_path(nested_member_path),
         }
     }
 
@@ -7594,6 +8050,117 @@ impl MainView {
         };
 
         text[..safe_byte_index].chars().count()
+    }
+
+    /// 将日志行中的制表符展开为显示用空格，并保留原始文本到显示文本的字节映射。
+    ///
+    /// 业务意图：
+    /// - 日志字段常用 `\t` 分隔，直接渲染会导致不同平台或 GPUI 文本系统下间隔过窄，字段看起来粘连。
+    /// - 展开时按固定 4 列 tab stop 计算空格数，而不是简单替换成 4 个空格，才能让后续列落在稳定边界。
+    ///
+    /// 边界条件：
+    /// - 这里只处理单行文本，换行已经由日志解码阶段拆分。
+    /// - UTF-8 多字节字符在 JetBrains Mono 下仍按一个字符列推进；中文全角宽度不在本次 tab 对齐规则内扩展。
+    fn expanded_log_line_for_display(line: &str) -> ExpandedLogLine {
+        let mut text = String::with_capacity(line.len());
+        let mut original_to_display_bytes = vec![0; line.len() + 1];
+        let mut display_to_original_bytes = vec![0];
+        let mut display_column = 0usize;
+
+        for (original_start, character) in line.char_indices() {
+            let original_end = original_start + character.len_utf8();
+            let display_start = text.len();
+
+            if character == '\t' {
+                let spaces = LOG_VIEWER_TAB_WIDTH - (display_column % LOG_VIEWER_TAB_WIDTH);
+                for offset in 0..spaces {
+                    text.push(' ');
+                    display_to_original_bytes.push(if offset == 0 {
+                        original_start
+                    } else {
+                        original_end
+                    });
+                }
+                display_column += spaces;
+            } else {
+                text.push(character);
+                for _ in display_start..text.len() {
+                    display_to_original_bytes.push(original_start);
+                }
+                display_column += 1;
+            }
+
+            let display_end = text.len();
+            for original_byte in original_start..original_end {
+                original_to_display_bytes[original_byte] = display_start;
+            }
+            original_to_display_bytes[original_end] = display_end;
+            display_to_original_bytes[display_end] = original_end;
+        }
+
+        original_to_display_bytes[line.len()] = text.len();
+        display_to_original_bytes[text.len()] = line.len();
+
+        ExpandedLogLine {
+            text,
+            original_to_display_bytes,
+            display_to_original_bytes,
+        }
+    }
+
+    /// 将原始日志字节下标换算为展开后的显示字节下标。
+    ///
+    /// 业务意图：
+    /// - 语法高亮、搜索高亮和选区高亮都是基于原始日志文本计算的，渲染前必须同步平移到显示文本。
+    fn display_byte_index_for_original_byte(
+        expanded: &ExpandedLogLine,
+        byte_index: usize,
+    ) -> usize {
+        expanded
+            .original_to_display_bytes
+            .get(byte_index)
+            .copied()
+            .unwrap_or_else(|| expanded.text.len())
+    }
+
+    /// 将显示文本字节下标换算回原始日志字节下标。
+    ///
+    /// 业务意图：
+    /// - 鼠标命中测试发生在展开后的显示文本上，但选区状态保存原始文本字符列；这里负责把二者接回同一坐标系。
+    fn original_byte_index_for_display_byte(
+        expanded: &ExpandedLogLine,
+        byte_index: usize,
+    ) -> usize {
+        expanded
+            .display_to_original_bytes
+            .get(byte_index)
+            .copied()
+            .unwrap_or_else(|| expanded.original_to_display_bytes.len().saturating_sub(1))
+    }
+
+    /// 将基于原始日志文本的高亮范围映射到展开后的显示文本。
+    ///
+    /// 业务意图：
+    /// - tab 展开后显示文本长度变长，如果继续使用原始字节范围，搜索命中、语法高亮和选区背景都会向左错位。
+    /// - 映射时保留原来的 `HighlightStyle`，只调整字节范围。
+    ///
+    /// 边界条件：
+    /// - 空范围或越界范围会被压缩到安全边界后丢弃，避免传给 GPUI 非法高亮区间。
+    fn map_log_highlights_to_display(
+        highlights: Vec<(Range<usize>, gpui::HighlightStyle)>,
+        expanded: &ExpandedLogLine,
+    ) -> Vec<(Range<usize>, gpui::HighlightStyle)> {
+        let original_len = expanded.original_to_display_bytes.len().saturating_sub(1);
+        highlights
+            .into_iter()
+            .filter_map(|(range, style)| {
+                let start = range.start.min(original_len);
+                let end = range.end.min(original_len);
+                let display_start = Self::display_byte_index_for_original_byte(expanded, start);
+                let display_end = Self::display_byte_index_for_original_byte(expanded, end);
+                (display_start < display_end).then_some((display_start..display_end, style))
+            })
+            .collect()
     }
 
     /// 返回当前激活文件所在目录的展示标签。
@@ -10517,7 +11084,7 @@ impl MainView {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(LOG_VIEWER_FONT_SIZE))
+                    .text_size(px(self.log_viewer_font_size))
                     .font_family(LOG_VIEWER_FONT_FAMILY)
                     .text_color(rgb(palette.text))
                     .child(StyledText::new(preview_text).with_highlights(highlights)),
@@ -11669,10 +12236,18 @@ impl MainView {
                                                         )
                                                         .collect();
                                                     }
+                                                    let expanded_line =
+                                                        Self::expanded_log_line_for_display(&line);
+                                                    let display_highlights =
+                                                        Self::map_log_highlights_to_display(
+                                                            line_highlights,
+                                                            &expanded_line,
+                                                        );
                                                     Some((
                                                         index,
                                                         line,
-                                                        line_highlights,
+                                                        expanded_line.text,
+                                                        display_highlights,
                                                         highlighted_search_line == Some(index),
                                                     ))
                                             })
@@ -11682,15 +12257,23 @@ impl MainView {
 
                                 lines
                                     .into_iter()
-                                    .map(|(index, line, highlights, search_highlighted)| {
+                                    .map(|(
+                                        index,
+                                        line,
+                                        display_line,
+                                        highlights,
+                                        search_highlighted,
+                                    )| {
                                         let horizontal_line_number_offset =
                                             -row_scroll_handle.0.borrow().base_handle.offset().x;
                                         Self::render_log_line(LogLineRenderData {
                                             tab_id,
                                             line_index: index,
                                             line,
+                                            display_line,
                                             highlights,
                                             line_number_width,
+                                            font_size: view.log_viewer_font_size,
                                             horizontal_line_number_offset,
                                             search_highlighted,
                                             suppress_hover: view.search_results_resize_drag.is_some()
@@ -12315,9 +12898,10 @@ impl MainView {
 
         let mut text_style = window.text_style();
         text_style.font_family = LOG_VIEWER_FONT_FAMILY.into();
-        text_style.font_size = px(LOG_VIEWER_FONT_SIZE).into();
+        text_style.font_size = px(self.log_viewer_font_size).into();
+        let expanded_line = Self::expanded_log_line_for_display(line);
         let run = TextRun {
-            len: line.len(),
+            len: expanded_line.text.len(),
             font: text_style.font(),
             color: text_style.color,
             background_color: None,
@@ -12326,13 +12910,15 @@ impl MainView {
         };
         let font_size = text_style.font_size.to_pixels(window.rem_size());
         let shaped_line = window.text_system().shape_line(
-            SharedString::from(line.to_string()),
+            SharedString::from(expanded_line.text.clone()),
             font_size,
             &[run],
             None,
         );
-        let byte_index = shaped_line.closest_index_for_x(text_relative_x);
-        let column = Self::char_column_for_byte_index(line, byte_index);
+        let display_byte_index = shaped_line.closest_index_for_x(text_relative_x);
+        let original_byte_index =
+            Self::original_byte_index_for_display_byte(&expanded_line, display_byte_index);
+        let column = Self::char_column_for_byte_index(line, original_byte_index);
 
         Some(LogTextPosition { line_index, column })
     }
@@ -12403,8 +12989,10 @@ impl MainView {
             tab_id,
             line_index,
             line,
+            display_line,
             highlights,
             line_number_width,
+            font_size,
             horizontal_line_number_offset,
             search_highlighted,
             suppress_hover,
@@ -12420,7 +13008,7 @@ impl MainView {
             )))
             .relative()
             .h(px(LOG_VIEWER_ROW_HEIGHT))
-            .text_size(px(LOG_VIEWER_FONT_SIZE))
+            .text_size(px(font_size))
             .line_height(px(LOG_VIEWER_ROW_HEIGHT))
             .font_family(LOG_VIEWER_FONT_FAMILY)
             .when(search_highlighted, |row| {
@@ -12439,7 +13027,7 @@ impl MainView {
                     .pr_2()
                     .whitespace_nowrap()
                     .text_color(rgb(palette.text))
-                    .child(StyledText::new(line).with_highlights(highlights)),
+                    .child(StyledText::new(display_line).with_highlights(highlights)),
             )
             .child(
                 div()
@@ -12557,6 +13145,18 @@ impl MainView {
             .border_color(rgb(palette.border))
             .bg(rgb(palette.menu))
             .shadow_lg()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    context.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    context.stop_propagation();
+                }),
+            )
             .child(self.render_log_viewer_context_menu_item(
                 tab_id,
                 LogViewerContextMenuAction::Copy,
@@ -12609,9 +13209,8 @@ impl MainView {
             })
             .when(!enabled, |item| item.opacity(0.55))
             .child(label)
-            .on_mouse_down(
-                MouseButton::Left,
-                context.listener(move |view, _event: &MouseDownEvent, _window, context| {
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, _window, context| {
                     if enabled {
                         view.handle_log_viewer_context_menu_action(tab_id, action, context);
                     }
@@ -12639,17 +13238,33 @@ impl MainView {
                 let _ = self.copy_selected_log_text_for_tab(tab_id, context);
             }
             LogViewerContextMenuAction::SaveAs => {
-                if let Some(source) = self
-                    .open_tabs
-                    .iter()
-                    .find(|tab| tab.id == tab_id)
-                    .map(|tab| tab.source.clone())
-                {
+                if let Some(source) = self.log_viewer_save_source_for_tab(tab_id) {
                     self.save_log_sources_as(vec![source], context);
                 }
             }
         }
         context.notify();
+    }
+
+    /// 返回日志正文右键菜单绑定 tab 的另存为来源。
+    ///
+    /// 业务意图：
+    /// - 正文右键菜单命令应始终作用于打开菜单时所在的 tab，不能依赖当前激活 tab，避免用户切换 tab 后保存错文件。
+    fn log_viewer_save_source_for_tab(&self, tab_id: usize) -> Option<LogFileSource> {
+        Self::log_viewer_save_source_for_tab_from_tabs(&self.open_tabs, tab_id)
+    }
+
+    /// 从打开 tab 集合中查找正文右键菜单绑定的另存为来源。
+    ///
+    /// 业务意图：
+    /// - 拆成纯函数便于测试，避免右键菜单另存为入口因为 tab 查找错误而无声失败。
+    fn log_viewer_save_source_for_tab_from_tabs(
+        tabs: &[OpenLogTab],
+        tab_id: usize,
+    ) -> Option<LogFileSource> {
+        tabs.iter()
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.source.clone())
     }
 
     /// 打开 tab 右键菜单。
@@ -13040,6 +13655,157 @@ impl MainView {
                 context.listener(Self::start_resizing_splitter),
             )
     }
+
+    /// 渲染另存为同名文件确认弹窗。
+    ///
+    /// 业务意图：
+    /// - 目标目录已有同名文件时，必须先让用户在“跳过”和“覆盖”之间明确选择，避免后台任务静默覆盖用户文件。
+    ///
+    /// 边界条件：
+    /// - 弹窗作为主窗口内模态层绘制，遮挡底层日志区域并拦截鼠标事件，防止用户在确认前继续触发其它操作。
+    fn render_save_overwrite_confirm_dialog(
+        &self,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let Some(dialog) = &self.save_overwrite_confirm_dialog else {
+            return div().id("save-overwrite-confirm-empty").hidden();
+        };
+        let palette = self.palette();
+        let mut backdrop = rgb(0x000000);
+        backdrop.a = 0.34;
+
+        div()
+            .id("save-overwrite-confirm")
+            .absolute()
+            .left(px(0.0))
+            .right(px(0.0))
+            .top(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(backdrop)
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    context.stop_propagation();
+                }),
+            )
+            .child(
+                div()
+                    .w(px(420.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.surface))
+                    .shadow_lg()
+                    .p_4()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(palette.text))
+                            .child("目标目录已有同名文件"),
+                    )
+                    .child(
+                        div()
+                            .mt_2()
+                            .text_sm()
+                            .line_height(px(20.0))
+                            .text_color(rgb(palette.muted_text))
+                            .child(format!(
+                                "发现 {} 个目标文件已存在。请选择跳过这些文件，或覆盖目标目录中的同名文件。",
+                                dialog.conflict_count
+                            )),
+                    )
+                    .child(
+                        div()
+                            .mt_2()
+                            .px_2()
+                            .py_1()
+                            .rounded(px(5.0))
+                            .bg(rgb(palette.input))
+                            .text_xs()
+                            .text_color(rgb(palette.muted_text))
+                            .child(format!("示例：{}", dialog.first_conflict_path.display())),
+                    )
+                    .child(
+                        div()
+                            .mt_4()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(self.render_save_overwrite_button(
+                                "跳过",
+                                SaveConflictPolicy::SkipExisting,
+                                false,
+                                palette,
+                                context,
+                            ))
+                            .child(self.render_save_overwrite_button(
+                                "覆盖",
+                                SaveConflictPolicy::OverwriteExisting,
+                                true,
+                                palette,
+                                context,
+                            )),
+                    ),
+            )
+    }
+
+    /// 渲染另存为冲突确认按钮。
+    ///
+    /// 业务意图：
+    /// - “跳过”是保守操作，“覆盖”是破坏性操作；通过不同视觉权重帮助用户理解风险。
+    fn render_save_overwrite_button(
+        &self,
+        label: &'static str,
+        conflict_policy: SaveConflictPolicy,
+        primary: bool,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(SharedString::from(format!("save-overwrite-{label}")))
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(30.0))
+            .px_4()
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(rgb(if primary {
+                palette.accent
+            } else {
+                palette.border
+            }))
+            .bg(rgb(if primary {
+                palette.accent
+            } else {
+                palette.panel
+            }))
+            .text_sm()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(if primary {
+                palette.on_accent
+            } else {
+                palette.text
+            }))
+            .cursor_pointer()
+            .hover(move |button| {
+                button.bg(rgb(if primary {
+                    palette.accent_hover
+                } else {
+                    palette.hover
+                }))
+            })
+            .child(label)
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, _window, context| {
+                    view.handle_save_overwrite_choice(conflict_policy, context);
+                }),
+            )
+    }
 }
 
 impl EntityInputHandler for MainView {
@@ -13286,6 +14052,7 @@ impl Render for MainView {
             )
             .child(self.render_toolbar(context))
             .child(self.render_content(context))
+            .child(self.render_save_overwrite_confirm_dialog(context))
     }
 }
 
@@ -13577,6 +14344,30 @@ mod tests {
     fn test_theme_preference_file_path(name: &str) -> PathBuf {
         env::temp_dir().join(format!(
             "logclinic3-theme-test-{}-{}",
+            std::process::id(),
+            name
+        ))
+    }
+
+    /// 构造唯一的日志字号配置测试路径。
+    ///
+    /// 业务意图：
+    /// - 日志字号配置和主题配置一样写入应用配置目录；测试使用独立临时路径，避免污染开发机真实偏好。
+    fn test_log_font_size_file_path(name: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "logclinic3-log-font-size-test-{}-{}",
+            std::process::id(),
+            name
+        ))
+    }
+
+    /// 构造唯一的另存为测试目录。
+    ///
+    /// 业务意图：
+    /// - 另存为测试会真实创建源文件和目标文件，必须隔离到临时目录并带进程 ID，避免覆盖开发机文件。
+    fn test_save_as_directory(name: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "logclinic3-save-as-test-{}-{}",
             std::process::id(),
             name
         ))
@@ -13935,6 +14726,48 @@ mod tests {
         let _ = fs::remove_dir_all(&directory_path);
     }
 
+    /// 验证日志显示字号配置只接受允许范围内的数值。
+    ///
+    /// 业务意图：
+    /// - 设置页提供 10px 到 20px 的字号调整；配置文件被手工修改时也必须遵守同一边界，避免日志正文不可读或挤破固定行高。
+    #[test]
+    fn 日志显示字号配置解析合法值和损坏值() {
+        assert_eq!(
+            parse_log_viewer_font_size_preference("12\n"),
+            Some(LOG_VIEWER_DEFAULT_FONT_SIZE)
+        );
+        assert_eq!(parse_log_viewer_font_size_preference("15.4"), Some(15.0));
+        assert_eq!(parse_log_viewer_font_size_preference(""), None);
+        assert_eq!(parse_log_viewer_font_size_preference("broken"), None);
+        assert_eq!(
+            parse_log_viewer_font_size_preference(&(LOG_VIEWER_MIN_FONT_SIZE - 1.0).to_string()),
+            None
+        );
+        assert_eq!(
+            parse_log_viewer_font_size_preference(&(LOG_VIEWER_MAX_FONT_SIZE + 1.0).to_string()),
+            None
+        );
+    }
+
+    /// 验证日志显示字号配置可以完成写入和读取往返。
+    ///
+    /// 边界条件：
+    /// - 写入函数需要自动创建父目录；非法字号应返回错误，而不是写入损坏配置。
+    #[test]
+    fn 日志显示字号配置可以读写往返() {
+        let path = test_log_font_size_file_path("roundtrip").join(LOG_VIEWER_FONT_SIZE_FILE_NAME);
+
+        write_log_viewer_font_size_preference(&path, 14.0).expect("日志字号配置应能写入临时目录");
+        assert_eq!(read_log_viewer_font_size_preference(&path), Some(14.0));
+
+        assert!(write_log_viewer_font_size_preference(&path, 99.0).is_err());
+
+        let _ = fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
     /// 验证用户强制主题优先于系统外观。
     ///
     /// 业务意图：
@@ -14162,12 +14995,12 @@ mod tests {
         }
     }
 
-    /// 验证另存为路径保留本地文件名和压缩包内部层级。
+    /// 验证另存为路径只保留最终文件名。
     ///
     /// 业务意图：
-    /// - 批量保存时本地文件不应带出原始绝对目录；压缩包成员则必须保留内部路径，避免同名文件互相覆盖。
+    /// - 用户要求另存为直接保存到目标目录，不保留本地父目录、压缩包内部目录或嵌套压缩包路径。
     #[test]
-    fn 另存为路径保留文件名和压缩包层级() {
+    fn 另存为路径只保留最终文件名() {
         let local = LogFileSource::LocalFile {
             path: PathBuf::from("/tmp/a/server.log"),
         };
@@ -14178,6 +15011,13 @@ mod tests {
             member_path: "a/app.log".to_string(),
             temp_path: PathBuf::from("/tmp/LogClinic/sevenz/a/app.log"),
         };
+        let nested_archive = LogFileSource::NestedArchiveMember {
+            outer_archive_path: PathBuf::from("/tmp/logs.zip"),
+            outer_archive_format: ArchiveFormat::Zip,
+            archive_member_path: "nested/inner.zip".to_string(),
+            nested_archive_format: ArchiveFormat::Zip,
+            nested_member_path: "logs/error.log".to_string(),
+        };
 
         assert_eq!(
             MainView::save_relative_path_for_source(&local),
@@ -14185,12 +15025,88 @@ mod tests {
         );
         assert_eq!(
             MainView::save_relative_path_for_source(&archive),
-            PathBuf::from("thread").join("2026").join("thread.log")
+            PathBuf::from("thread.log")
         );
         assert_eq!(
             MainView::save_relative_path_for_source(&materialized_archive),
-            PathBuf::from("a").join("app.log")
+            PathBuf::from("app.log")
         );
+        assert_eq!(
+            MainView::save_relative_path_for_source(&nested_archive),
+            PathBuf::from("error.log")
+        );
+    }
+
+    /// 验证另存为会在写入前发现目标目录中的同名文件。
+    ///
+    /// 业务意图：
+    /// - 用户要求同名文件必须弹窗确认，因此保存管线在后台复制前需要先计算冲突目标路径。
+    #[test]
+    fn 另存为会检测目标目录同名文件() {
+        let root = test_save_as_directory("conflict-detect");
+        let source_dir = root.join("source");
+        let target_dir = root.join("target");
+        fs::create_dir_all(&source_dir).expect("测试源目录应能创建");
+        fs::create_dir_all(&target_dir).expect("测试目标目录应能创建");
+        let source_path = source_dir.join("server.log");
+        let target_path = target_dir.join("server.log");
+        fs::write(&source_path, "new").expect("测试源文件应能写入");
+        fs::write(&target_path, "old").expect("测试目标文件应能写入");
+
+        let source = LogFileSource::LocalFile { path: source_path };
+        let conflicts = MainView::save_target_conflicts(&[source], &target_dir);
+
+        assert_eq!(conflicts, vec![target_path]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 验证另存为同名文件时跳过和覆盖策略。
+    ///
+    /// 业务意图：
+    /// - 弹窗中的“跳过”必须保留目标文件原内容，“覆盖”必须用源文件内容替换目标文件。
+    #[test]
+    fn 另存为同名文件支持跳过和覆盖策略() {
+        let root = test_save_as_directory("conflict-policy");
+        let source_dir = root.join("source");
+        let target_dir = root.join("target");
+        fs::create_dir_all(&source_dir).expect("测试源目录应能创建");
+        fs::create_dir_all(&target_dir).expect("测试目标目录应能创建");
+        let source_path = source_dir.join("server.log");
+        let target_path = target_dir.join("server.log");
+        fs::write(&source_path, "new-content").expect("测试源文件应能写入");
+        fs::write(&target_path, "old-content").expect("测试目标文件应能写入");
+        let source = LogFileSource::LocalFile {
+            path: source_path.clone(),
+        };
+
+        let skipped = MainView::save_log_sources_to_directory(
+            std::slice::from_ref(&source),
+            &target_dir,
+            SaveConflictPolicy::SkipExisting,
+        );
+        assert_eq!(skipped.saved_count, 0);
+        assert_eq!(skipped.skipped_count, 1);
+        assert_eq!(skipped.failed_count, 0);
+        assert_eq!(
+            fs::read_to_string(&target_path).expect("跳过后目标文件仍应可读"),
+            "old-content"
+        );
+
+        let overwritten = MainView::save_log_sources_to_directory(
+            &[source],
+            &target_dir,
+            SaveConflictPolicy::OverwriteExisting,
+        );
+        assert_eq!(overwritten.saved_count, 1);
+        assert_eq!(overwritten.skipped_count, 0);
+        assert_eq!(overwritten.failed_count, 0);
+        assert_eq!(
+            fs::read_to_string(&target_path).expect("覆盖后目标文件仍应可读"),
+            "new-content"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// 验证 Java thread dump 会解析出快照和线程状态。
@@ -14534,6 +15450,54 @@ mod tests {
         assert_eq!(MainView::char_column_for_byte_index(text, 5), 3);
     }
 
+    /// 验证日志正文显示层会按固定 4 列 tab stop 展开制表符。
+    ///
+    /// 业务意图：
+    /// - 用户反馈用 tab 分隔的日志列在当前查看器里贴在一起，显示层必须模拟常见编辑器的 tab stop 行为。
+    /// - 这里验证不是简单替换成固定 4 个空格，而是根据当前显示列补齐到下一个 4 列边界。
+    #[test]
+    fn 日志显示层会按四列展开制表符() {
+        let expanded = MainView::expanded_log_line_for_display("a\tb\tc");
+
+        assert_eq!(expanded.text, "a   b   c");
+    }
+
+    /// 验证 tab 展开后原始高亮范围会同步映射到显示文本范围。
+    ///
+    /// 业务意图：
+    /// - 搜索命中、语法高亮和选区高亮都基于原始日志文本计算；tab 展开后必须平移范围，否则高亮会落在错误字符上。
+    #[test]
+    fn 日志高亮范围会映射到制表符展开后的文本() {
+        let expanded = MainView::expanded_log_line_for_display("a\tERROR");
+        let highlights =
+            MainView::map_log_highlights_to_display(vec![(2..7, Default::default())], &expanded);
+
+        assert_eq!(expanded.text, "a   ERROR");
+        assert_eq!(highlights[0].0, 4..9);
+    }
+
+    /// 验证显示文本命中位置可以回到原始日志字节位置。
+    ///
+    /// 业务意图：
+    /// - 鼠标选择发生在展开后的可见文本上，但复制和选区状态必须指向原始日志字符列，才能保留真实 `\t`。
+    #[test]
+    fn 制表符展开后的命中位置会映射回原始文本() {
+        let expanded = MainView::expanded_log_line_for_display("a\tb");
+
+        assert_eq!(
+            MainView::original_byte_index_for_display_byte(&expanded, 0),
+            0
+        );
+        assert_eq!(
+            MainView::original_byte_index_for_display_byte(&expanded, 2),
+            1
+        );
+        assert_eq!(
+            MainView::original_byte_index_for_display_byte(&expanded, 4),
+            2
+        );
+    }
+
     /// 验证搜索结果预览会去掉命中行前后空白。
     ///
     /// 业务意图：
@@ -14594,6 +15558,63 @@ mod tests {
         };
 
         assert_eq!(MainView::log_tab_encoding_selector_label(&tab), "GBK");
+    }
+
+    /// 验证日志正文右键另存为按菜单绑定 tab 查找来源。
+    ///
+    /// 业务意图：
+    /// - 正文右键菜单打开后不应依赖当前激活 tab；另存为必须使用菜单绑定 tab 的来源，否则会出现点击菜单无反应或保存错文件。
+    #[test]
+    fn 日志正文右键另存为按绑定_tab_查找来源() {
+        let first_source = LogFileSource::LocalFile {
+            path: PathBuf::from("first.log"),
+        };
+        let second_source = LogFileSource::LocalFile {
+            path: PathBuf::from("second.log"),
+        };
+        let tabs = vec![
+            OpenLogTab {
+                id: 10,
+                source: first_source.clone(),
+                source_key: "local:first.log".to_string(),
+                title: "first.log".to_string(),
+                encoding_choice: EncodingChoice::Auto,
+                raw_bytes: None,
+                state: LogTabState::Loading {
+                    message: "测试加载中".to_string(),
+                },
+                scroll_handle: UniformListScrollHandle::new(),
+                pending_scroll_to_line: None,
+                highlighted_search_line: None,
+                text_selection: None,
+                selection_drag_anchor: None,
+            },
+            OpenLogTab {
+                id: 20,
+                source: second_source.clone(),
+                source_key: "local:second.log".to_string(),
+                title: "second.log".to_string(),
+                encoding_choice: EncodingChoice::Auto,
+                raw_bytes: None,
+                state: LogTabState::Loading {
+                    message: "测试加载中".to_string(),
+                },
+                scroll_handle: UniformListScrollHandle::new(),
+                pending_scroll_to_line: None,
+                highlighted_search_line: None,
+                text_selection: None,
+                selection_drag_anchor: None,
+            },
+        ];
+
+        assert_eq!(
+            MainView::log_viewer_save_source_for_tab_from_tabs(&tabs, 20),
+            Some(second_source)
+        );
+        assert_eq!(
+            MainView::log_viewer_save_source_for_tab_from_tabs(&tabs, 99),
+            None
+        );
     }
 
     /// 验证单文件压缩包会返回内部成员来源，供 UI 点击压缩包根节点时直接打开。
