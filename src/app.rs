@@ -1044,6 +1044,28 @@ const SEARCH_RESULTS_CONTEXT_MENU_WIDTH: f32 = 132.0;
 /// - 菜单项只显示单行中文命令，不承载二级菜单。
 const SEARCH_RESULTS_CONTEXT_MENU_ITEM_HEIGHT: f32 = 30.0;
 
+/// 加载日志来源菜单宽度。
+///
+/// 业务意图：
+/// - Windows 原生选择器不能混选文件和目录，因此工具栏“加载日志”需要先给出两个明确入口。
+/// - 菜单宽度要容纳“文件/压缩包”文案和图标，同时不遮挡后续工具栏按钮。
+const LOAD_SOURCE_MENU_WIDTH: f32 = 164.0;
+
+/// 加载日志来源菜单单项高度。
+///
+/// 业务意图：
+/// - 与目录树右键菜单保持接近的点击高度，让鼠标操作体验一致。
+const LOAD_SOURCE_MENU_ITEM_HEIGHT: f32 = 34.0;
+
+/// 加载日志来源菜单到工具栏底部的间隔。
+const LOAD_SOURCE_MENU_TOP_GAP: f32 = 4.0;
+
+/// 加载日志来源菜单相对点击位置的横向回退。
+///
+/// 业务意图：
+/// - 点击通常落在按钮文字或图标中部，菜单向左回退后能更自然地贴住“加载日志”按钮。
+const LOAD_SOURCE_MENU_POINTER_BACKTRACK: f32 = 24.0;
+
 /// 搜索对话框默认宽度。
 ///
 /// 业务意图：
@@ -2112,6 +2134,18 @@ struct TabContextMenu {
     y: f32,
 }
 
+/// 加载日志来源菜单状态。
+///
+/// 业务意图：
+/// - Windows 不支持文件和目录混选时，工具栏按钮先展示自绘菜单，让用户明确进入文件/压缩包选择器或目录选择器。
+/// - 菜单坐标使用窗口内容区坐标，作为主窗口根节点的绝对定位元素渲染，避免受左右分栏是否显示影响。
+struct LoadSourceMenu {
+    /// 菜单左上角的窗口内容区横坐标。
+    x: f32,
+    /// 菜单左上角的窗口内容区纵坐标。
+    y: f32,
+}
+
 /// 编码选择下拉框状态。
 ///
 /// 业务意图：
@@ -2305,6 +2339,10 @@ struct SaveOverwriteConfirmDialog {
 enum LoadPromptKind {
     /// 选择普通文件、目录或压缩包来源。
     LogSources,
+    /// 选择普通文件或压缩包来源。
+    LogFilesOrArchives,
+    /// 选择目录来源。
+    LogDirectories,
 }
 
 impl LoadPromptKind {
@@ -2312,18 +2350,31 @@ impl LoadPromptKind {
     ///
     /// 业务意图：
     /// - `files` 和 `directories` 同时开启，让 macOS 能像常见桌面工具一样在一次对话框里选择文件或目录。
+    /// - Windows 和部分 Linux 后端不支持文件、目录混选，此时优先显示文件，保证 ZIP/RAR/7Z/TAR.GZ 等压缩包可直接选择。
     /// - `multiple` 保持为 `true`，允许用户一次加载多个文件、目录或压缩包来源。
     ///
     /// 边界条件：
     /// - GPUI 0.2.2 的 `PathPromptOptions` 不提供扩展名过滤字段，因此压缩包类型由加载层识别。
-    /// - GPUI 0.2.2 的 Windows 后端对混选支持有限，后续 Windows 真机验收时如不满足需要补专用文件/目录入口。
-    fn to_prompt_options(self) -> PathPromptOptions {
+    /// - 不支持混选的平台如果仍传 `directories=true`，Windows 会进入只选目录模式，导致用户看不到压缩包文件。
+    fn to_prompt_options(self, can_select_mixed_files_and_dirs: bool) -> PathPromptOptions {
         match self {
             Self::LogSources => PathPromptOptions {
                 files: true,
-                directories: true,
+                directories: can_select_mixed_files_and_dirs,
                 multiple: true,
                 prompt: Some("选择日志来源".into()),
+            },
+            Self::LogFilesOrArchives => PathPromptOptions {
+                files: true,
+                directories: false,
+                multiple: true,
+                prompt: Some("选择日志文件或压缩包".into()),
+            },
+            Self::LogDirectories => PathPromptOptions {
+                files: false,
+                directories: true,
+                multiple: true,
+                prompt: Some("选择日志目录".into()),
             },
         }
     }
@@ -2335,6 +2386,8 @@ impl LoadPromptKind {
     fn loading_message(self) -> &'static str {
         match self {
             Self::LogSources => "正在扫描已选择的日志来源...",
+            Self::LogFilesOrArchives => "正在扫描已选择的日志文件或压缩包...",
+            Self::LogDirectories => "正在扫描已选择的日志目录...",
         }
     }
 }
@@ -2455,6 +2508,12 @@ struct MainView {
     /// 边界条件：
     /// - 菜单只在当前窗口内显示，不跨 tab 或跨加载持久化。
     tab_context_menu: Option<TabContextMenu>,
+
+    /// 当前打开的加载日志来源菜单。
+    ///
+    /// 业务意图：
+    /// - 仅在 Windows 等不支持文件/目录混选的平台使用；菜单打开期间点击空白区域或选择任一项都会收起。
+    load_source_menu: Option<LoadSourceMenu>,
 
     /// 当前打开的编码下拉框。
     ///
@@ -2741,6 +2800,7 @@ impl MainView {
             active_tab_id: None,
             next_tab_id: 1,
             tab_context_menu: None,
+            load_source_menu: None,
             encoding_dropdown_menu: None,
             log_viewer_context_menu: None,
             save_overwrite_confirm_dialog: None,
@@ -2841,7 +2901,7 @@ impl MainView {
     ///
     /// 边界条件：
     /// - 按钮左内边距为 0，使图标左缘和加载后目录树标题左缘使用同一条基准线。
-    /// - 当前通过 GPUI 的路径选择器同时请求文件和目录；Windows 混选能力需在后续真机验收中确认。
+    /// - Windows 原生选择器不能在同一个对话框里同时选择文件和目录，因此加载入口会先弹出来源类型菜单。
     fn render_load_toolbar_button(&self, context: &mut Context<Self>) -> impl IntoElement {
         let action = &TOOLBAR_ACTIONS[0];
         let palette = self.palette();
@@ -3048,14 +3108,19 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 用户点击“加载日志”后必须立即看到系统选择器反馈，避免工具栏按钮看起来没有响应。
-    /// - 选择器允许选择文件、目录和压缩包；具体来源类型由加载模块根据路径和元数据判断。
+    /// - 支持混选的平台直接打开文件/目录混选选择器；Windows 等不支持混选的平台先展示来源类型菜单。
     fn open_log_sources_prompt(
         &mut self,
-        _event: &ClickEvent,
+        event: &ClickEvent,
         _window: &mut Window,
         context: &mut Context<Self>,
     ) {
-        self.begin_path_prompt(LoadPromptKind::LogSources, context);
+        if Self::should_show_load_source_menu() {
+            let position = event.position();
+            self.toggle_load_source_menu(f32::from(position.x), context);
+        } else {
+            self.begin_path_prompt(LoadPromptKind::LogSources, context);
+        }
     }
 
     /// 从工具栏打开 HPROF 文件选择器。
@@ -3153,6 +3218,168 @@ impl MainView {
             .detach();
     }
 
+    /// 判断当前平台是否需要先展示“加载日志”来源类型菜单。
+    ///
+    /// 业务意图：
+    /// - GPUI 0.2.2 的 Windows 和 Linux 后端目前不能在同一个系统对话框里混选文件与目录。
+    /// - Windows 用户已经反馈只看到目录、看不到压缩包，因此这些平台先让用户选择“文件/压缩包”或“目录”。
+    ///
+    /// 边界条件：
+    /// - macOS 后端支持混选，继续保持一次打开系统选择器的原有高效路径。
+    fn should_show_load_source_menu() -> bool {
+        cfg!(any(target_os = "windows", target_os = "linux"))
+    }
+
+    /// 切换加载日志来源类型菜单。
+    ///
+    /// 业务意图：
+    /// - 用户在 Windows 上点击“加载日志”时先看到两个明确入口，避免系统选择器隐藏压缩包文件。
+    /// - 再次点击工具栏按钮会收起菜单，符合下拉按钮的常见交互预期。
+    fn toggle_load_source_menu(&mut self, window_x: f32, context: &mut Context<Self>) {
+        self.load_source_menu = if self.load_source_menu.is_some() {
+            None
+        } else {
+            Some(LoadSourceMenu {
+                x: Self::load_source_menu_x(window_x),
+                y: TOOLBAR_HEIGHT + LOAD_SOURCE_MENU_TOP_GAP,
+            })
+        };
+        self.tab_context_menu = None;
+        self.encoding_dropdown_menu = None;
+        self.log_viewer_context_menu = None;
+        self.log_tree_context_menu = None;
+        self.search_results_context_menu = None;
+        context.notify();
+    }
+
+    /// 计算加载日志来源菜单的横坐标。
+    ///
+    /// 边界条件：
+    /// - 点击可能落在按钮图标或文字上，横向回退后再限制到窗口左边界，避免菜单超出可见区域。
+    fn load_source_menu_x(window_x: f32) -> f32 {
+        (window_x - LOAD_SOURCE_MENU_POINTER_BACKTRACK).max(0.0)
+    }
+
+    /// 执行加载日志来源菜单命令。
+    ///
+    /// 业务意图：
+    /// - 菜单项只负责选择系统对话框类型；最终路径扫描仍复用 `begin_path_prompt`，保证文件、目录、拖拽入口共用加载流程。
+    fn select_load_source_kind(
+        &mut self,
+        prompt_kind: LoadPromptKind,
+        context: &mut Context<Self>,
+    ) {
+        self.load_source_menu = None;
+        self.begin_path_prompt(prompt_kind, context);
+        context.notify();
+    }
+
+    /// 渲染加载日志来源菜单的关闭遮罩。
+    ///
+    /// 业务意图：
+    /// - 菜单打开后用户点击菜单外任意位置都应收起，避免悬浮菜单长期遮挡工具栏或内容区。
+    fn render_load_source_menu_dismiss_overlay(
+        &self,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        if self.load_source_menu.is_none() {
+            return div().id("load-source-menu-dismiss-overlay-empty").hidden();
+        }
+
+        div()
+            .id("load-source-menu-dismiss-overlay")
+            .absolute()
+            .left(px(0.0))
+            .top(px(0.0))
+            .size_full()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|view, _event: &MouseDownEvent, _window, context| {
+                    view.load_source_menu = None;
+                    context.notify();
+                    context.stop_propagation();
+                }),
+            )
+    }
+
+    /// 渲染加载日志来源类型菜单。
+    ///
+    /// 业务意图：
+    /// - Windows 不能混选文件和目录时，通过两个自绘菜单项明确区分“文件/压缩包”和“目录”入口。
+    /// - 菜单作为根节点弹层渲染，不受日志目录树是否已经加载、是否隐藏左侧树影响。
+    fn render_load_source_menu(&self, context: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let Some(menu) = &self.load_source_menu else {
+            return div().id("load-source-menu-empty").hidden();
+        };
+        let palette = self.palette();
+
+        div()
+            .id("load-source-menu")
+            .absolute()
+            .left(px(menu.x))
+            .top(px(menu.y))
+            .w(px(LOAD_SOURCE_MENU_WIDTH))
+            .py_1()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.menu))
+            .shadow_lg()
+            .child(self.render_load_source_menu_item(
+                LoadPromptKind::LogFilesOrArchives,
+                Icon::FileArchive,
+                "文件/压缩包",
+                palette,
+                context,
+            ))
+            .child(self.render_load_source_menu_item(
+                LoadPromptKind::LogDirectories,
+                Icon::FolderOpen,
+                "目录",
+                palette,
+                context,
+            ))
+    }
+
+    /// 渲染加载日志来源菜单单项。
+    ///
+    /// 业务意图：
+    /// - 菜单项用图标区分文件/压缩包和目录，减少 Windows 下需要理解系统选择器模式的负担。
+    fn render_load_source_menu_item(
+        &self,
+        prompt_kind: LoadPromptKind,
+        icon: Icon,
+        label: &'static str,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(SharedString::from(format!("load-source-menu-{label}")))
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(LOAD_SOURCE_MENU_ITEM_HEIGHT))
+            .px_3()
+            .text_sm()
+            .text_color(rgb(palette.text))
+            .cursor_pointer()
+            .hover(move |item| item.bg(rgb(palette.hover)).text_color(rgb(palette.accent)))
+            .child(Self::render_lucide_icon(
+                Some(icon),
+                16.0,
+                15.0,
+                palette.muted_text,
+            ))
+            .child(label)
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(move |view, _event: &MouseDownEvent, _window, context| {
+                    view.select_load_source_kind(prompt_kind, context);
+                    context.stop_propagation();
+                }),
+            )
+    }
+
     /// 在当前主视图更新结束后打开设置窗口。
     ///
     /// 业务意图：
@@ -3194,17 +3421,22 @@ impl MainView {
     /// 业务意图：
     /// - 系统选择器必须在前台应用上下文中打开；文件系统扫描可能较慢，因此放到后台执行器。
     /// - 新一轮扫描完成前会清空旧 tab，避免右侧继续展示不属于当前来源树的日志内容。
+    /// - Windows 后端不能混选文件和目录，打开选择器前必须根据平台能力生成参数，避免只显示目录而隐藏压缩包文件。
     ///
     /// 边界条件：
     /// - 用户取消选择时保持现有目录树不变。
     /// - 当前不支持取消后台扫描；如果用户连续触发多次加载，后完成的任务会覆盖先完成的任务。
     fn begin_path_prompt(&mut self, prompt_kind: LoadPromptKind, context: &mut Context<Self>) {
-        let options = prompt_kind.to_prompt_options();
+        self.load_source_menu = None;
         let loading_message = prompt_kind.loading_message().to_string();
 
         context
             .spawn(async move |view, app| {
-                let receiver = match app.update(|app| app.prompt_for_paths(options)) {
+                let receiver = match app.update(|app| {
+                    let options =
+                        prompt_kind.to_prompt_options(app.can_select_mixed_files_and_dirs());
+                    app.prompt_for_paths(options)
+                }) {
                     Ok(receiver) => receiver,
                     Err(error) => {
                         view.update(app, |view, context| {
@@ -8422,6 +8654,8 @@ impl Render for MainView {
             )
             .child(self.render_toolbar(context))
             .child(self.render_content(context))
+            .child(self.render_load_source_menu_dismiss_overlay(context))
+            .child(self.render_load_source_menu(context))
             .child(self.render_save_overwrite_confirm_dialog(context))
     }
 }

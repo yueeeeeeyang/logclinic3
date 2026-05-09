@@ -137,6 +137,59 @@ mod tests {
         );
     }
 
+    /// 验证支持混选的平台会同时允许选择文件和目录。
+    ///
+    /// 业务意图：
+    /// - macOS 选择器支持文件和目录混选，加载入口应保留一次选择多个日志文件、压缩包和目录的工作流。
+    #[test]
+    fn 加载日志选择器在支持混选平台允许文件和目录() {
+        let options = LoadPromptKind::LogSources.to_prompt_options(true);
+
+        assert!(options.files, "支持混选时应允许选择普通日志和压缩包文件");
+        assert!(options.directories, "支持混选时应继续允许选择目录");
+        assert!(options.multiple, "加载日志应允许一次选择多个来源");
+    }
+
+    /// 验证不支持混选的平台优先展示文件。
+    ///
+    /// 业务意图：
+    /// - Windows 原生文件选择器的 `FOS_PICKFOLDERS` 会切换成只选目录模式；如果仍传 `directories=true`，
+    ///   用户点击“加载日志”时就看不到 ZIP/RAR/7Z/TAR.GZ 等压缩包文件。
+    #[test]
+    fn 加载日志选择器在不支持混选平台优先显示文件() {
+        let options = LoadPromptKind::LogSources.to_prompt_options(false);
+
+        assert!(options.files, "Windows 必须能看到普通日志和压缩包文件");
+        assert!(!options.directories, "不支持混选时不能进入只选目录模式");
+        assert!(options.multiple, "文件选择模式仍应允许一次选择多个来源");
+    }
+
+    /// 验证文件/压缩包菜单项只打开文件选择器。
+    ///
+    /// 业务意图：
+    /// - Windows 菜单中的“文件/压缩包”必须让系统对话框展示 ZIP/RAR/7Z/TAR.GZ 等文件，不能再次落入只选目录模式。
+    #[test]
+    fn 加载日志文件压缩包菜单项只允许选择文件() {
+        let options = LoadPromptKind::LogFilesOrArchives.to_prompt_options(false);
+
+        assert!(options.files, "文件/压缩包入口应展示文件");
+        assert!(!options.directories, "文件/压缩包入口不能切换到目录模式");
+        assert!(options.multiple, "文件/压缩包入口应允许多选");
+    }
+
+    /// 验证目录菜单项只打开目录选择器。
+    ///
+    /// 业务意图：
+    /// - Windows 菜单中的“目录”必须保留加载整个目录树的能力，避免修复压缩包可见性时丢掉目录加载入口。
+    #[test]
+    fn 加载日志目录菜单项只允许选择目录() {
+        let options = LoadPromptKind::LogDirectories.to_prompt_options(false);
+
+        assert!(!options.files, "目录入口不应展示普通文件");
+        assert!(options.directories, "目录入口应打开目录选择模式");
+        assert!(options.multiple, "目录入口应允许一次选择多个目录");
+    }
+
     /// 验证合法配置文本可以解析为窗口宽高。
     ///
     /// 业务意图：
