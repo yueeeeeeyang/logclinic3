@@ -11,6 +11,7 @@
 mod app;
 mod archive_materializer;
 mod highlighting;
+mod hprof;
 mod large_log;
 mod launch;
 mod line_index;

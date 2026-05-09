@@ -64,6 +64,9 @@ actions!(logclinic, [OpenSearchDialog]);
 /// 关于独立窗口功能域。
 #[path = "app_impl/about_window.rs"]
 mod about_window;
+/// HPROF dump 分析独立窗口功能域。
+#[path = "app_impl/hprof_analysis.rs"]
+mod hprof_analysis;
 /// 左侧日志目录树功能域。
 #[path = "app_impl/log_tree_methods.rs"]
 mod log_tree_methods;
@@ -88,6 +91,7 @@ mod tests;
 mod thread_analysis;
 
 use about_window::AboutWindowView;
+use hprof_analysis::HprofAnalysisWindowView;
 use search_window::SearchDialogWindowView;
 use settings_window::SettingsWindowView;
 use thread_analysis::{
@@ -223,6 +227,18 @@ const THREAD_ANALYSIS_POPUP_OFFSET: f32 = 12.0;
 /// 业务意图：
 /// - 气泡贴边会影响阴影和边框识别，保留边距也能减少被系统标题栏或窗口边框裁切的风险。
 const THREAD_ANALYSIS_POPUP_MARGIN: f32 = 8.0;
+
+/// HPROF 分析窗口默认宽度。
+///
+/// 业务意图：
+/// - Dominator tree 需要同时展示对象名、类型、对象 ID、shallow size 和 retained size，因此复用线程分析窗口量级的宽度。
+const HPROF_ANALYSIS_WINDOW_WIDTH: f32 = 1040.0;
+
+/// HPROF 分析窗口默认高度。
+///
+/// 业务意图：
+/// - HPROF Top retained 列表和进度详情都需要足够纵向空间，避免首屏只能看到少量对象行。
+const HPROF_ANALYSIS_WINDOW_HEIGHT: f32 = 720.0;
 
 /// 可持久化的主窗口宽高。
 ///
@@ -1170,6 +1186,7 @@ struct ToolbarAction {
 ///
 /// 业务意图：
 /// - “加载日志”使用 `FileText`，表达日志文本文件入口。
+/// - “HPROF解析”使用 `ChartNoAxesCombined`，表达对 JVM heap dump 做对象关系分析。
 /// - “搜索”使用 `Search`，提供鼠标入口打开搜索窗口，避免快捷键异常时用户无法触达搜索能力。
 /// - “智能诊断”使用 `Stethoscope`，表达对日志问题进行诊断和定位，比脑回路图标更贴近按钮语义。
 /// - “设置”使用 `Settings`，表达配置入口；“关于”使用 `Info`，表达产品信息入口。
@@ -1180,6 +1197,10 @@ const TOOLBAR_ACTIONS: &[ToolbarAction] = &[
     ToolbarAction {
         icon: Icon::FileText,
         label: "加载日志",
+    },
+    ToolbarAction {
+        icon: Icon::ChartNoAxesCombined,
+        label: "HPROF解析",
     },
     ToolbarAction {
         icon: Icon::Search,
@@ -2509,6 +2530,13 @@ struct MainView {
     /// - 句柄只服务当前会话；关闭窗口后由回调清空。
     thread_analysis_window: Option<WindowHandle<ThreadAnalysisWindowView>>,
 
+    /// HPROF dump 分析独立窗口句柄。
+    ///
+    /// 业务意图：
+    /// - HPROF dominator tree 是独立工作视图，重复点击工具栏并选择新文件时复用已有窗口，避免堆叠多个重型分析窗口。
+    /// - 句柄只服务当前会话；关闭窗口后由回调清空，后台任务通过窗口自身的取消标记停止。
+    hprof_analysis_window: Option<WindowHandle<HprofAnalysisWindowView>>,
+
     /// 设置窗口打开请求是否已经排队到下一帧。
     ///
     /// 业务意图：
@@ -2702,6 +2730,7 @@ impl MainView {
             settings_window: None,
             about_window: None,
             thread_analysis_window: None,
+            hprof_analysis_window: None,
             settings_window_open_pending: false,
             about_window_open_pending: false,
             settings_active_tab: SettingsTab::General,
@@ -2775,8 +2804,9 @@ impl MainView {
             .border_b_1()
             .border_color(rgb(palette.border))
             .child(self.render_load_toolbar_button(context))
+            .child(self.render_hprof_toolbar_button(context))
             .child(self.render_search_toolbar_button(context))
-            .child(Self::render_toolbar_button(&TOOLBAR_ACTIONS[2], palette))
+            .child(Self::render_toolbar_button(&TOOLBAR_ACTIONS[3], palette))
             .child(self.render_settings_toolbar_button(context))
             .child(self.render_about_toolbar_button(context))
     }
@@ -2819,6 +2849,39 @@ impl MainView {
             .on_click(context.listener(Self::open_log_sources_prompt))
     }
 
+    /// 构建“HPROF解析”工具栏按钮。
+    ///
+    /// 业务意图：
+    /// - HPROF dump 是独立于日志树的诊断入口，按钮放在“加载日志”之后，符合先选普通日志或 dump 再进入分析的排障顺序。
+    /// - 点击后只允许选择单个本地文件；扩展名和 header 校验在后台分析窗口中完成，避免 GPUI 文件选择器能力差异影响逻辑。
+    fn render_hprof_toolbar_button(&self, context: &mut Context<Self>) -> impl IntoElement {
+        let action = &TOOLBAR_ACTIONS[1];
+        let palette = self.palette();
+
+        div()
+            .id(SharedString::from(action.label))
+            .flex()
+            .items_center()
+            .gap_1()
+            .flex_none()
+            .px(px(TOOLBAR_BUTTON_HORIZONTAL_PADDING))
+            .py(px(TOOLBAR_BUTTON_VERTICAL_PADDING))
+            .text_sm()
+            .text_color(rgb(palette.text))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .hover(move |button| button.text_color(rgb(palette.accent)))
+            .active(|button| button.opacity(0.82))
+            .child(Self::render_lucide_icon(
+                Some(action.icon),
+                TOOLBAR_BUTTON_ICON_WIDTH,
+                TOOLBAR_BUTTON_ICON_SIZE,
+                palette.muted_text,
+            ))
+            .child(action.label)
+            .on_click(context.listener(Self::open_hprof_from_toolbar))
+    }
+
     /// 构建“搜索”工具栏按钮。
     ///
     /// 业务意图：
@@ -2829,7 +2892,7 @@ impl MainView {
     /// - 点击按钮来自鼠标事件，不处于 macOS key equivalent 回调栈中，因此可以直接打开或激活独立搜索窗口。
     /// - 如果日志正文已有选区，沿用快捷键入口的预填逻辑，把选中文本写入搜索关键字。
     fn render_search_toolbar_button(&self, context: &mut Context<Self>) -> impl IntoElement {
-        let action = &TOOLBAR_ACTIONS[1];
+        let action = &TOOLBAR_ACTIONS[2];
         let palette = self.palette();
 
         div()
@@ -2899,7 +2962,7 @@ impl MainView {
     /// - 设置入口现在有真实独立窗口，重复点击应激活已有窗口，避免用户打开多个配置窗口后状态不一致。
     /// - 视觉样式保持和其它工具栏按钮一致，避免设置入口因为已接入功能而破坏顶部工具栏节奏。
     fn render_settings_toolbar_button(&self, context: &mut Context<Self>) -> impl IntoElement {
-        let action = &TOOLBAR_ACTIONS[3];
+        let action = &TOOLBAR_ACTIONS[4];
         let palette = self.palette();
 
         div()
@@ -2932,7 +2995,7 @@ impl MainView {
     /// - 关于入口放在设置按钮之后，用于查看软件名称、版本、作者和特色功能，不影响日志查看主流程。
     /// - 重复点击应激活已有关于窗口，避免用户打开多个内容相同的窗口。
     fn render_about_toolbar_button(&self, context: &mut Context<Self>) -> impl IntoElement {
-        let action = &TOOLBAR_ACTIONS[4];
+        let action = &TOOLBAR_ACTIONS[5];
         let palette = self.palette();
 
         div()
@@ -2971,6 +3034,20 @@ impl MainView {
         context: &mut Context<Self>,
     ) {
         self.begin_path_prompt(LoadPromptKind::LogSources, context);
+    }
+
+    /// 从工具栏打开 HPROF 文件选择器。
+    ///
+    /// 业务意图：
+    /// - HPROF 分析只接受单个 dump 文件，不依赖当前日志树状态，也不会清空已经加载的日志工作区。
+    /// - 选择器本身无法过滤 `.hprof/.bin`，因此这里只负责拿到路径，真正校验由分析窗口后台任务执行并展示错误。
+    fn open_hprof_from_toolbar(
+        &mut self,
+        _event: &ClickEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.begin_hprof_file_prompt(context);
     }
 
     /// 从工具栏按钮打开搜索窗口。
@@ -3013,6 +3090,45 @@ impl MainView {
         context: &mut Context<Self>,
     ) {
         self.schedule_open_about_window(window, context);
+    }
+
+    /// 打开 HPROF 文件选择器，并在确认后打开分析窗口。
+    ///
+    /// 边界条件：
+    /// - 用户取消选择时不改变现有 UI。
+    /// - 当前只取第一个路径；`multiple=false` 已要求系统选择器只返回单个文件，但这里仍防御性处理平台差异。
+    fn begin_hprof_file_prompt(&mut self, context: &mut Context<Self>) {
+        let main_view = context.entity();
+        context
+            .spawn(async move |_view, app| {
+                let options = PathPromptOptions {
+                    files: true,
+                    directories: false,
+                    multiple: false,
+                    prompt: Some("选择 HPROF dump 文件".into()),
+                };
+                let receiver = match app.update(|app| app.prompt_for_paths(options)) {
+                    Ok(receiver) => receiver,
+                    Err(_error) => return,
+                };
+                let selected_path = match receiver.await {
+                    Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                    Ok(Ok(None)) | Ok(Err(_)) | Err(_) => None,
+                };
+                let Some(selected_path) = selected_path else {
+                    return;
+                };
+
+                app.update(move |app| {
+                    Self::open_hprof_analysis_window_after_main_update(
+                        main_view,
+                        selected_path,
+                        app,
+                    );
+                })
+                .ok();
+            })
+            .detach();
     }
 
     /// 在当前主视图更新结束后打开设置窗口。
@@ -4918,6 +5034,96 @@ impl MainView {
                 main_view.update(app, |view, context| {
                     view.about_window = None;
                     view.about_window_open_pending = false;
+                    context.notify();
+                });
+            }
+        }
+    }
+
+    /// 在 `MainView` 更新租借结束后打开 HPROF 分析窗口。
+    ///
+    /// 业务意图：
+    /// - HPROF 分析窗口会观察主视图主题，因此窗口创建必须发生在当前主视图更新闭包之外，避免重入读取同一实体。
+    /// - 如果已有 HPROF 分析窗口仍有效，直接复用窗口并启动新文件分析；窗口内部会取消旧后台任务。
+    ///
+    /// 边界条件：
+    /// - 创建失败时只清理窗口句柄，不影响主日志查看工作区。
+    fn open_hprof_analysis_window_after_main_update(
+        main_view: Entity<MainView>,
+        file_path: PathBuf,
+        app: &mut App,
+    ) {
+        let existing_hprof_window = main_view.update(app, |view, context| {
+            view.tab_context_menu = None;
+            view.encoding_dropdown_menu = None;
+            view.search_results_context_menu = None;
+            view.log_viewer_context_menu = None;
+            context.notify();
+            view.hprof_analysis_window
+        });
+
+        if let Some(hprof_window) = existing_hprof_window {
+            let file_path_for_existing = file_path.clone();
+            if hprof_window
+                .update(app, |window_view, window, context| {
+                    window_view.start_new_analysis(file_path_for_existing, context);
+                    window.activate_window();
+                })
+                .is_ok()
+            {
+                return;
+            }
+            main_view.update(app, |view, _| {
+                view.hprof_analysis_window = None;
+            });
+        }
+
+        let main_view_for_window = main_view.clone();
+        let main_view_for_close = main_view.clone();
+        let file_path_for_window = file_path.clone();
+        let hprof_window_options = WindowOptions {
+            titlebar: Some(TitlebarOptions {
+                title: Some("HPROF 解析".into()),
+                ..Default::default()
+            }),
+            window_bounds: Some(WindowBounds::centered(
+                size(
+                    px(HPROF_ANALYSIS_WINDOW_WIDTH),
+                    px(HPROF_ANALYSIS_WINDOW_HEIGHT),
+                ),
+                app,
+            )),
+            is_resizable: true,
+            is_minimizable: true,
+            window_min_size: Some(size(px(720.0), px(420.0))),
+            ..Default::default()
+        };
+
+        match app.open_window(hprof_window_options, move |window, app| {
+            window.on_window_should_close(app, move |_, app| {
+                main_view_for_close.update(app, |view, context| {
+                    view.hprof_analysis_window = None;
+                    context.notify();
+                });
+                true
+            });
+            app.new(|context| {
+                HprofAnalysisWindowView::new(
+                    main_view_for_window,
+                    file_path_for_window.clone(),
+                    context,
+                )
+            })
+        }) {
+            Ok(hprof_window) => {
+                main_view.update(app, |view, context| {
+                    view.hprof_analysis_window = Some(hprof_window);
+                    context.notify();
+                });
+            }
+            Err(_error) => {
+                main_view.update(app, |view, context| {
+                    view.hprof_analysis_window = None;
                     context.notify();
                 });
             }
