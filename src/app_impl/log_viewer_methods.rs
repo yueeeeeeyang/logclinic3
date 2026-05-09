@@ -2,7 +2,7 @@
 //
 // 业务意图：
 // - 这些方法仍属于 `MainView` 的实现块，但物理上从 `app.rs` 拆出，降低根文件体积。
-// - 本阶段不改变 tab、编码切换、分页日志、选区、复制、搜索高亮、右键菜单和滚动条行为。
+// - 分页日志在本文件内使用窗口化渲染，避免超大行号对应的绝对像素坐标触发 `f32` 精度问题。
 //
 // 边界条件：
 // - 该文件作为 `app` 的子模块自行声明 `impl MainView`，跨模块调用通过 `pub(super)` 方法显式暴露。
@@ -159,6 +159,24 @@ impl MainView {
     /// - 使用 GPUI `uniform_list` 只渲染可见日志行，避免大文件滚动时为全部行创建元素。
     /// - 行号和正文分栏显示，正文按日志级别做轻量高亮。
     pub(super) fn render_log_document_viewer(
+        &self,
+        tab: &OpenLogTab,
+        document: &LogTabDocument,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        if let LogTabDocument::Paged(document) = document {
+            return self.render_paged_log_document_viewer(tab, document, context);
+        }
+
+        self.render_uniform_log_document_viewer(tab, document, context)
+    }
+
+    /// 渲染普通内存日志正文查看器。
+    ///
+    /// 业务意图：
+    /// - 小文件行数有限，继续使用 GPUI `uniform_list` 可以复用成熟的虚拟列表、滚轮和横向测量能力。
+    /// - 超大分页日志改走窗口化渲染，避免完整行数乘以固定行高后产生过大的 `f32` 坐标。
+    fn render_uniform_log_document_viewer(
         &self,
         tab: &OpenLogTab,
         document: &LogTabDocument,
@@ -356,6 +374,7 @@ impl MainView {
                                             line_number_width,
                                             font_size: view.log_viewer_font_size,
                                             horizontal_line_number_offset,
+                                            horizontal_content_offset: px(0.0),
                                             search_highlighted,
                                             suppress_hover: view.search_results_resize_drag.is_some()
                                                 || view.log_scrollbar_drag.is_some(),
@@ -383,6 +402,162 @@ impl MainView {
                     line_number_width,
                     context,
                 )),
+        )
+    }
+
+    /// 渲染分页日志正文查看器。
+    ///
+    /// 业务意图：
+    /// - 分页日志可能有数千万行，完整 `uniform_list` 会把行号乘以固定行高后交给 `f32` 像素坐标，滚到深处会出现行间距和重叠。
+    /// - 这里只渲染当前视口附近的一小段真实行号，纵向滚动位置由 `PagedLogScrollState` 的 `f64` 逻辑坐标保存。
+    /// - 行号、选区、高亮和右键菜单仍复用普通日志行渲染逻辑，保证两种模式的视觉行为一致。
+    fn render_paged_log_document_viewer(
+        &self,
+        tab: &OpenLogTab,
+        document: &paged_document::PagedLogDocument,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let tab_id = tab.id;
+        let line_count = document.line_count();
+        let line_number_width = Self::log_viewer_line_number_width(line_count);
+        let palette = self.palette();
+        let syntax_theme = self.effective_theme().syntax_theme();
+        let viewport_handle = tab.paged_viewport_handle.clone();
+        let viewport_height = viewport_handle.bounds().size.height;
+        let visible_rows = Self::paged_log_visible_row_capacity(viewport_height);
+        let max_vertical_scroll =
+            Self::paged_log_vertical_max_scroll_px(line_count, viewport_height);
+        let scroll_top = tab.paged_scroll.top_px.clamp(0.0, max_vertical_scroll);
+        let (first_line_index, fractional_top) =
+            Self::paged_log_visible_start(scroll_top, line_count);
+        let horizontal_content_offset = px(-(tab.paged_scroll.left_px as f32));
+        let text_selection = tab.text_selection.clone();
+        let highlighted_search_line = tab.highlighted_search_line;
+
+        let rows = (0..visible_rows)
+            .filter_map(|row_offset| {
+                let line_index = first_line_index.checked_add(row_offset)?;
+                if line_index >= line_count {
+                    return None;
+                }
+                let line = document.read_line(line_index).ok().flatten()?.text;
+                let mut line_highlights =
+                    highlight_line(document.highlight_mode, &line, None, syntax_theme);
+                if let Some(selection) = &text_selection
+                    && let Some(range) =
+                        Self::selected_byte_range_for_line(selection, line_index, &line)
+                {
+                    // 分页模式仍需要和内存模式一样先合并语法高亮和选区高亮，避免重叠范围让 GPUI 文本绘制错位。
+                    line_highlights = gpui::combine_highlights(
+                        line_highlights,
+                        [(range, Self::log_text_selection_highlight_style())],
+                    )
+                    .collect();
+                }
+                let expanded_line = Self::expanded_log_line_for_display(&line);
+                let display_highlights =
+                    Self::map_log_highlights_to_display(line_highlights, &expanded_line);
+                let row_top = row_offset as f32 * LOG_VIEWER_ROW_HEIGHT - fractional_top;
+
+                Some(
+                    div()
+                        .absolute()
+                        .left(px(0.0))
+                        .right(px(0.0))
+                        .top(px(row_top))
+                        .h(px(LOG_VIEWER_ROW_HEIGHT))
+                        .child(Self::render_log_line(
+                            LogLineRenderData {
+                                tab_id,
+                                line_index,
+                                line,
+                                display_line: expanded_line.text,
+                                highlights: display_highlights,
+                                line_number_width,
+                                font_size: self.log_viewer_font_size,
+                                horizontal_line_number_offset: px(0.0),
+                                horizontal_content_offset,
+                                search_highlighted: highlighted_search_line == Some(line_index),
+                                suppress_hover: self.search_results_resize_drag.is_some()
+                                    || self.log_scrollbar_drag.is_some(),
+                                palette,
+                            },
+                            context,
+                        )),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let viewer = div()
+            .id(SharedString::from(format!("log-viewer-{}", tab_id)))
+            .flex()
+            .flex_col()
+            .flex_1()
+            .overflow_hidden()
+            .bg(rgb(palette.background));
+
+        let viewer = if let Some(warning) = document.warning.as_deref() {
+            viewer.child(
+                div()
+                    .flex_none()
+                    .px_3()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(if self.effective_theme() == EffectiveTheme::Dark {
+                        0xffd33d
+                    } else {
+                        0x9a6700
+                    }))
+                    .bg(rgb(palette.search_highlight))
+                    .border_b_1()
+                    .border_color(rgb(palette.border))
+                    .child(warning.to_string()),
+            )
+        } else {
+            viewer
+        };
+
+        viewer.child(
+            div()
+                .id("log-viewer-body")
+                .relative()
+                .flex()
+                .flex_1()
+                .overflow_hidden()
+                .bg(rgb(palette.background))
+                .track_scroll(&viewport_handle)
+                .on_scroll_wheel(context.listener(
+                    move |view, event: &ScrollWheelEvent, _window, context| {
+                        view.handle_paged_log_scroll_wheel(tab_id, event, context);
+                        context.stop_propagation();
+                    },
+                ))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    context.listener(move |view, event: &MouseDownEvent, _window, context| {
+                        view.open_log_viewer_context_menu(
+                            tab_id,
+                            f32::from(event.position.x),
+                            f32::from(event.position.y),
+                            context,
+                        );
+                        context.stop_propagation();
+                    }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(0.0))
+                        .top(px(0.0))
+                        .h_full()
+                        .w(px(line_number_width))
+                        .bg(rgb(palette.panel))
+                        .border_r_1()
+                        .border_color(rgb(palette.border)),
+                )
+                .children(rows)
+                .child(self.render_log_vertical_scrollbar_for_tab(tab, context))
+                .child(self.render_log_horizontal_scrollbar_for_tab(tab, context)),
         )
     }
 
@@ -494,6 +669,106 @@ impl MainView {
             )
     }
 
+    /// 按 tab 当前文档类型渲染日志纵向滚动条。
+    ///
+    /// 业务意图：
+    /// - 分页日志的滚动位置由应用侧 `f64` 状态维护，不能再读取 `uniform_list` 的完整内容高度。
+    /// - 滚动条仍复用同一套拖动入口，让普通模式和分页模式的交互保持一致。
+    fn render_log_vertical_scrollbar_for_tab(
+        &self,
+        tab: &OpenLogTab,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let palette = self.palette();
+        let tab_id = tab.id;
+        let Some(metrics) = self
+            .log_scrollbar_metrics_for_tab(tab, LogScrollbarAxis::Vertical)
+            .or_else(|| match &tab.state {
+                LogTabState::Ready {
+                    document: LogTabDocument::Paged(document),
+                } => Self::fallback_log_vertical_scrollbar_metrics(document.line_count()),
+                LogTabState::Ready {
+                    document: LogTabDocument::InMemory(_),
+                }
+                | LogTabState::Loading { .. }
+                | LogTabState::Failed { .. } => None,
+            })
+        else {
+            return div().id("log-vertical-scrollbar-empty").hidden();
+        };
+
+        div()
+            .id(SharedString::from(format!(
+                "log-vertical-scrollbar-{}",
+                tab_id
+            )))
+            .absolute()
+            .top(metrics.thumb_start)
+            .right(px(LOG_VIEWER_SCROLLBAR_PADDING))
+            .w(px(LOG_VIEWER_SCROLLBAR_WIDTH))
+            .h(metrics.thumb_length)
+            .rounded(px(LOG_VIEWER_SCROLLBAR_WIDTH / 2.0))
+            .bg(rgb(palette.scrollbar))
+            .cursor_pointer()
+            .hover(move |thumb| thumb.bg(rgb(palette.scrollbar_hover)))
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(move |view, event: &MouseDownEvent, _window, context| {
+                    view.start_log_scrollbar_drag(
+                        tab_id,
+                        LogScrollbarAxis::Vertical,
+                        event,
+                        context,
+                    );
+                    context.notify();
+                }),
+            )
+    }
+
+    /// 按 tab 当前文档类型渲染日志横向滚动条。
+    ///
+    /// 业务意图：
+    /// - 分页日志使用最长行估算横向内容宽度，只把可见行放进布局树，避免超大行数触发布局精度问题。
+    fn render_log_horizontal_scrollbar_for_tab(
+        &self,
+        tab: &OpenLogTab,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let palette = self.palette();
+        let tab_id = tab.id;
+        let Some(metrics) = self.log_scrollbar_metrics_for_tab(tab, LogScrollbarAxis::Horizontal)
+        else {
+            return div().id("log-horizontal-scrollbar-empty").hidden();
+        };
+
+        div()
+            .id(SharedString::from(format!(
+                "log-horizontal-scrollbar-{}",
+                tab_id
+            )))
+            .absolute()
+            .left(metrics.thumb_start)
+            .bottom(px(LOG_VIEWER_SCROLLBAR_PADDING))
+            .w(metrics.thumb_length)
+            .h(px(LOG_VIEWER_SCROLLBAR_WIDTH))
+            .rounded(px(LOG_VIEWER_SCROLLBAR_WIDTH / 2.0))
+            .bg(rgb(palette.scrollbar))
+            .cursor_pointer()
+            .hover(move |thumb| thumb.bg(rgb(palette.scrollbar_hover)))
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(move |view, event: &MouseDownEvent, _window, context| {
+                    view.start_log_scrollbar_drag(
+                        tab_id,
+                        LogScrollbarAxis::Horizontal,
+                        event,
+                        context,
+                    );
+                    context.notify();
+                }),
+            )
+    }
+
     /// 计算日志纵向滚动条滑块位置和高度。
     ///
     /// 业务意图：
@@ -526,6 +801,7 @@ impl MainView {
             track_start,
             track_length,
             max_scroll,
+            max_scroll_px: f64::from(max_scroll),
         })
     }
 
@@ -567,6 +843,210 @@ impl MainView {
             track_start,
             track_length,
             max_scroll,
+            max_scroll_px: f64::from(max_scroll),
+        })
+    }
+
+    /// 计算分页日志当前视口需要渲染的行数。
+    ///
+    /// 业务意图：
+    /// - 分页模式只把视口附近行放进布局树，行数必须足以覆盖当前窗口高度和小幅滚动缓冲。
+    /// - 视口尺寸首帧为空时使用固定保守值，避免布局回填前显示空白。
+    pub(super) fn paged_log_visible_row_capacity(viewport_height: Pixels) -> usize {
+        if viewport_height > px(0.0) {
+            (f32::from(viewport_height) / LOG_VIEWER_ROW_HEIGHT).ceil() as usize
+                + PAGED_LOG_RENDER_BUFFER_ROWS
+        } else {
+            PAGED_LOG_FALLBACK_VISIBLE_ROWS
+        }
+    }
+
+    /// 将分页日志的逻辑滚动像素换算为首个可见真实行号和行内偏移。
+    ///
+    /// 业务意图：
+    /// - 真实滚动位置使用 `f64` 保存，但渲染行只需要落在当前视口内的小像素坐标。
+    /// - 返回的 `fractional_top` 始终小于单行高度，用于让首行在平滑滚动时只偏移很小的距离。
+    pub(super) fn paged_log_visible_start(scroll_top_px: f64, line_count: usize) -> (usize, f32) {
+        if line_count == 0 {
+            return (0, 0.0);
+        }
+
+        let row_height = f64::from(px(LOG_VIEWER_ROW_HEIGHT));
+        let max_first_line = line_count.saturating_sub(1) as f64;
+        let safe_scroll_top = scroll_top_px.max(0.0);
+        let first_line = (safe_scroll_top / row_height)
+            .floor()
+            .clamp(0.0, max_first_line) as usize;
+        let fractional_top =
+            (safe_scroll_top - first_line as f64 * row_height).clamp(0.0, row_height) as f32;
+
+        (first_line, fractional_top)
+    }
+
+    /// 返回分页日志纵向最大逻辑滚动距离。
+    ///
+    /// 业务意图：
+    /// - 内容总高度可能远超 `f32` 精度稳定区，因此这里全程用 `f64` 计算。
+    /// - 视口高度尚未测量时使用一行高度兜底，避免除以零或产生负数。
+    pub(super) fn paged_log_vertical_max_scroll_px(
+        line_count: usize,
+        viewport_height: Pixels,
+    ) -> f64 {
+        let row_height = f64::from(px(LOG_VIEWER_ROW_HEIGHT));
+        let content_height = line_count as f64 * row_height;
+        let viewport_height = f64::from(viewport_height).max(row_height);
+        (content_height - viewport_height).max(0.0)
+    }
+
+    /// 计算分页日志跳转到目标行时应使用的纵向滚动位置。
+    ///
+    /// 业务意图：
+    /// - 搜索结果和线程分析跳转都希望目标行出现在视口中间，而不是贴在顶部或底部。
+    /// - 行号越界时按最后一行处理，避免旧搜索结果遇到外部文件变化时产生非法滚动位置。
+    pub(super) fn paged_log_scroll_top_for_line(
+        line_index: usize,
+        line_count: usize,
+        viewport_height: Pixels,
+    ) -> f64 {
+        if line_count == 0 {
+            return 0.0;
+        }
+
+        let row_height = f64::from(px(LOG_VIEWER_ROW_HEIGHT));
+        let viewport_height = f64::from(viewport_height).max(row_height);
+        let safe_line_index = line_index.min(line_count.saturating_sub(1));
+        let line_center = safe_line_index as f64 * row_height + row_height / 2.0;
+        let target_top = line_center - viewport_height / 2.0;
+        target_top.clamp(
+            0.0,
+            Self::paged_log_vertical_max_scroll_px(line_count, px(viewport_height as f32)),
+        )
+    }
+
+    /// 估算分页日志横向内容宽度。
+    ///
+    /// 业务意图：
+    /// - 分页模式不能再让 GPUI 测量完整最长行，因为那会重新创建超大虚拟列表。
+    /// - 这里读取行索引记录的最长候选行并按等宽字体估算宽度，足够驱动横向滚动条范围；鼠标选区仍使用真实 shaping。
+    fn paged_log_estimated_content_width(
+        document: &paged_document::PagedLogDocument,
+        line_number_width: f32,
+        font_size: f32,
+    ) -> f64 {
+        let fallback_columns = document
+            .line_index
+            .get(document.longest_line_index)
+            .map(|entry| entry.byte_len as usize)
+            .unwrap_or(0);
+        let display_columns = document
+            .read_line(document.longest_line_index)
+            .ok()
+            .flatten()
+            .map(|line| {
+                Self::expanded_log_line_for_display(&line.text)
+                    .text
+                    .chars()
+                    .count()
+            })
+            .unwrap_or(fallback_columns);
+        let char_width = (font_size * PAGED_LOG_MONOSPACE_WIDTH_RATIO).max(1.0);
+        f64::from(
+            line_number_width
+                + LOG_VIEWER_TEXT_LEFT_PADDING
+                + display_columns as f32 * char_width
+                + LOG_VIEWER_SCROLLBAR_WIDTH * 3.0,
+        )
+    }
+
+    /// 返回分页日志横向最大逻辑滚动距离。
+    fn paged_log_horizontal_max_scroll_px(
+        document: &paged_document::PagedLogDocument,
+        viewport_width: Pixels,
+        line_number_width: f32,
+        font_size: f32,
+    ) -> f64 {
+        let content_width =
+            Self::paged_log_estimated_content_width(document, line_number_width, font_size);
+        (content_width - f64::from(viewport_width).max(1.0)).max(0.0)
+    }
+
+    /// 计算分页日志纵向滚动条滑块。
+    fn paged_log_vertical_scrollbar_metrics(
+        tab: &OpenLogTab,
+        document: &paged_document::PagedLogDocument,
+    ) -> Option<LogScrollbarMetrics> {
+        let viewport_height = tab.paged_viewport_handle.bounds().size.height;
+        if viewport_height <= px(0.0) {
+            return None;
+        }
+
+        let line_count = document.line_count();
+        let max_scroll_px = Self::paged_log_vertical_max_scroll_px(line_count, viewport_height);
+        if max_scroll_px <= 0.0 {
+            return None;
+        }
+
+        let content_height = line_count as f64 * f64::from(px(LOG_VIEWER_ROW_HEIGHT));
+        let track_start = px(LOG_VIEWER_SCROLLBAR_PADDING);
+        let track_length = (viewport_height - track_start * 2.0).max(px(1.0));
+        let min_thumb_length = px(LOG_VIEWER_SCROLLBAR_MIN_THUMB_HEIGHT).min(track_length);
+        let thumb_length = (viewport_height * (f64::from(viewport_height) / content_height) as f32)
+            .clamp(min_thumb_length, track_length);
+        let movable_length = (track_length - thumb_length).max(px(0.0));
+        let scroll_ratio = (tab.paged_scroll.top_px / max_scroll_px).clamp(0.0, 1.0) as f32;
+        let thumb_start = track_start + movable_length * scroll_ratio;
+
+        Some(LogScrollbarMetrics {
+            thumb_start,
+            thumb_length,
+            track_start,
+            track_length,
+            max_scroll: px(max_scroll_px.min(f64::from(f32::MAX)) as f32),
+            max_scroll_px,
+        })
+    }
+
+    /// 计算分页日志横向滚动条滑块。
+    fn paged_log_horizontal_scrollbar_metrics(
+        tab: &OpenLogTab,
+        document: &paged_document::PagedLogDocument,
+        font_size: f32,
+    ) -> Option<LogScrollbarMetrics> {
+        let viewport_width = tab.paged_viewport_handle.bounds().size.width;
+        if viewport_width <= px(0.0) {
+            return None;
+        }
+
+        let line_number_width = Self::log_viewer_line_number_width(document.line_count());
+        let max_scroll_px = Self::paged_log_horizontal_max_scroll_px(
+            document,
+            viewport_width,
+            line_number_width,
+            font_size,
+        );
+        if max_scroll_px <= 0.0 {
+            return None;
+        }
+
+        let content_width = f64::from(viewport_width) + max_scroll_px;
+        let track_start = px(line_number_width + LOG_VIEWER_SCROLLBAR_PADDING);
+        let track_right_padding =
+            px(LOG_VIEWER_SCROLLBAR_WIDTH + LOG_VIEWER_SCROLLBAR_PADDING * 2.0);
+        let track_length = (viewport_width - track_start - track_right_padding).max(px(1.0));
+        let min_thumb_length = px(LOG_VIEWER_SCROLLBAR_MIN_THUMB_HEIGHT).min(track_length);
+        let thumb_length = (track_length * (f64::from(viewport_width) / content_width) as f32)
+            .clamp(min_thumb_length, track_length);
+        let movable_length = (track_length - thumb_length).max(px(0.0));
+        let scroll_ratio = (tab.paged_scroll.left_px / max_scroll_px).clamp(0.0, 1.0) as f32;
+        let thumb_start = track_start + movable_length * scroll_ratio;
+
+        Some(LogScrollbarMetrics {
+            thumb_start,
+            thumb_length,
+            track_start,
+            track_length,
+            max_scroll: px(max_scroll_px.min(f64::from(f32::MAX)) as f32),
+            max_scroll_px,
         })
     }
 
@@ -588,7 +1068,57 @@ impl MainView {
             track_start: px(LOG_VIEWER_SCROLLBAR_PADDING),
             track_length: px(LOG_VIEWER_SCROLLBAR_MIN_THUMB_HEIGHT),
             max_scroll: px(0.0),
+            max_scroll_px: 0.0,
         })
+    }
+
+    /// 处理分页日志正文滚轮滚动。
+    ///
+    /// 业务意图：
+    /// - 分页模式的纵向总高度不能交给 GPUI 滚动容器，因此滚轮事件直接更新应用侧 `PagedLogScrollState`。
+    /// - Windows 的 Shift+滚轮和横向滚轮会产生 `delta.x`，这里同步支持横向滚动，保持和普通日志查看器一致。
+    ///
+    /// 边界条件：
+    /// - 视口尚未完成测量时仍允许更新纵向位置；横向范围依赖视口宽度，未测量时会自然保持 0。
+    pub(super) fn handle_paged_log_scroll_wheel(
+        &mut self,
+        tab_id: usize,
+        event: &ScrollWheelEvent,
+        context: &mut Context<Self>,
+    ) {
+        let font_size = self.log_viewer_font_size;
+        let pixel_delta = event.delta.pixel_delta(px(20.0));
+        {
+            let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+                return;
+            };
+            let LogTabState::Ready {
+                document: LogTabDocument::Paged(document),
+            } = &tab.state
+            else {
+                return;
+            };
+
+            let viewport_bounds = tab.paged_viewport_handle.bounds();
+            let line_number_width = Self::log_viewer_line_number_width(document.line_count());
+            let max_vertical_scroll = Self::paged_log_vertical_max_scroll_px(
+                document.line_count(),
+                viewport_bounds.size.height,
+            );
+            let max_horizontal_scroll = Self::paged_log_horizontal_max_scroll_px(
+                document,
+                viewport_bounds.size.width,
+                line_number_width,
+                font_size,
+            );
+
+            tab.paged_scroll.top_px = (tab.paged_scroll.top_px - f64::from(pixel_delta.y))
+                .clamp(0.0, max_vertical_scroll);
+            tab.paged_scroll.left_px = (tab.paged_scroll.left_px - f64::from(pixel_delta.x))
+                .clamp(0.0, max_horizontal_scroll);
+        }
+        self.log_viewer_context_menu = None;
+        context.notify();
     }
 
     /// 开始拖动日志正文滚动条滑块。
@@ -609,14 +1139,13 @@ impl MainView {
         let Some(tab) = self.open_tabs.iter().find(|tab| tab.id == tab_id) else {
             return;
         };
-        let Some(metrics) = Self::log_scrollbar_metrics_for_tab(tab, axis) else {
+        let Some(metrics) = self.log_scrollbar_metrics_for_tab(tab, axis) else {
             return;
         };
         if metrics.max_scroll <= px(0.0) {
             return;
         }
-        let Some(viewport_origin) =
-            Self::uniform_list_viewport_axis_origin(&tab.scroll_handle, axis)
+        let Some(viewport_origin) = Self::log_scrollbar_viewport_axis_origin_for_tab(tab, axis)
         else {
             return;
         };
@@ -656,22 +1185,34 @@ impl MainView {
             return;
         }
 
-        let Some(tab) = self.open_tabs.iter().find(|tab| tab.id == drag.tab_id) else {
-            self.log_scrollbar_drag = None;
-            context.notify();
-            return;
-        };
-        let Some(metrics) = Self::log_scrollbar_metrics_for_tab(tab, drag.axis) else {
-            self.log_scrollbar_drag = None;
-            context.notify();
-            return;
-        };
-        let Some(viewport_origin) =
-            Self::uniform_list_viewport_axis_origin(&tab.scroll_handle, drag.axis)
-        else {
-            self.log_scrollbar_drag = None;
-            context.notify();
-            return;
+        let (metrics, viewport_origin, is_paged) = {
+            let Some(tab) = self.open_tabs.iter().find(|tab| tab.id == drag.tab_id) else {
+                self.log_scrollbar_drag = None;
+                context.notify();
+                return;
+            };
+            let Some(metrics) = self.log_scrollbar_metrics_for_tab(tab, drag.axis) else {
+                self.log_scrollbar_drag = None;
+                context.notify();
+                return;
+            };
+            let Some(viewport_origin) =
+                Self::log_scrollbar_viewport_axis_origin_for_tab(tab, drag.axis)
+            else {
+                self.log_scrollbar_drag = None;
+                context.notify();
+                return;
+            };
+            (
+                metrics,
+                viewport_origin,
+                matches!(
+                    &tab.state,
+                    LogTabState::Ready {
+                        document: LogTabDocument::Paged(_)
+                    }
+                ),
+            )
         };
 
         let pointer_position = match drag.axis {
@@ -686,21 +1227,38 @@ impl MainView {
         let requested_thumb_start = pointer_position - viewport_origin - drag.cursor_offset;
         let thumb_start =
             requested_thumb_start.clamp(metrics.track_start, metrics.track_start + movable_length);
-        let scroll_offset =
-            metrics.max_scroll * ((thumb_start - metrics.track_start) / movable_length);
-        let base_scroll_handle = {
-            // `UniformListScrollHandle` 包装了真正的 `ScrollHandle`；这里克隆句柄后释放借用，再写入偏移。
-            // 这样可以避免在 RefCell 借用仍存活时触发内部可变借用，保持滚动同步逻辑清晰。
-            tab.scroll_handle.0.borrow().base_handle.clone()
-        };
-        let current_offset = base_scroll_handle.offset();
+        let scroll_ratio = f64::from((thumb_start - metrics.track_start) / movable_length);
+        let scroll_offset_px = metrics.max_scroll_px * scroll_ratio;
 
-        match drag.axis {
-            LogScrollbarAxis::Vertical => {
-                base_scroll_handle.set_offset(point(current_offset.x, -scroll_offset));
+        if is_paged {
+            if let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.id == drag.tab_id) {
+                match drag.axis {
+                    LogScrollbarAxis::Vertical => {
+                        tab.paged_scroll.top_px =
+                            scroll_offset_px.clamp(0.0, metrics.max_scroll_px);
+                    }
+                    LogScrollbarAxis::Horizontal => {
+                        tab.paged_scroll.left_px =
+                            scroll_offset_px.clamp(0.0, metrics.max_scroll_px);
+                    }
+                }
             }
-            LogScrollbarAxis::Horizontal => {
-                base_scroll_handle.set_offset(point(-scroll_offset, current_offset.y));
+        } else if let Some(tab) = self.open_tabs.iter().find(|tab| tab.id == drag.tab_id) {
+            let scroll_offset = px(scroll_offset_px as f32);
+            let base_scroll_handle = {
+                // `UniformListScrollHandle` 包装了真正的 `ScrollHandle`；这里克隆句柄后释放借用，再写入偏移。
+                // 这样可以避免在 RefCell 借用仍存活时触发内部可变借用，保持滚动同步逻辑清晰。
+                tab.scroll_handle.0.borrow().base_handle.clone()
+            };
+            let current_offset = base_scroll_handle.offset();
+
+            match drag.axis {
+                LogScrollbarAxis::Vertical => {
+                    base_scroll_handle.set_offset(point(current_offset.x, -scroll_offset));
+                }
+                LogScrollbarAxis::Horizontal => {
+                    base_scroll_handle.set_offset(point(-scroll_offset, current_offset.y));
+                }
             }
         }
         context.notify();
@@ -749,7 +1307,7 @@ impl MainView {
         let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.id == tab_id) else {
             return;
         };
-        if !matches!(tab.state, LogTabState::Ready { .. }) {
+        if !matches!(&tab.state, LogTabState::Ready { .. }) {
             return;
         }
 
@@ -963,8 +1521,19 @@ impl MainView {
         };
 
         let line_number_width = Self::log_viewer_line_number_width(document.line_count());
-        let scroll_state = tab.scroll_handle.0.borrow();
-        let bounds = scroll_state.base_handle.bounds();
+        let (bounds, horizontal_offset) = match document {
+            LogTabDocument::Paged(_) => (
+                tab.paged_viewport_handle.bounds(),
+                px(-(tab.paged_scroll.left_px as f32)),
+            ),
+            LogTabDocument::InMemory(_) => {
+                let scroll_state = tab.scroll_handle.0.borrow();
+                (
+                    scroll_state.base_handle.bounds(),
+                    scroll_state.base_handle.offset().x,
+                )
+            }
+        };
         if bounds.size.width <= px(0.0) {
             return Some(LogTextPosition {
                 line_index,
@@ -973,7 +1542,7 @@ impl MainView {
         }
 
         let text_origin_x = bounds.left()
-            + scroll_state.base_handle.offset().x
+            + horizontal_offset
             + px(line_number_width + LOG_VIEWER_TEXT_LEFT_PADDING);
         let text_relative_x = pointer_x - text_origin_x;
         if line.is_empty() || text_relative_x <= px(0.0) {
@@ -1028,18 +1597,62 @@ impl MainView {
     /// - 渲染、按下和拖动都复用同一套测量函数；横向滚动条需要根据当前日志行数计算行号列宽。
     /// - 只有处于已解码状态的 tab 才可能产生横向滚动条，因为加载和失败状态没有正文列表。
     pub(super) fn log_scrollbar_metrics_for_tab(
+        &self,
         tab: &OpenLogTab,
         axis: LogScrollbarAxis,
     ) -> Option<LogScrollbarMetrics> {
-        match axis {
-            LogScrollbarAxis::Vertical => Self::log_vertical_scrollbar_metrics(&tab.scroll_handle),
-            LogScrollbarAxis::Horizontal => match &tab.state {
-                LogTabState::Ready { document } => Self::log_horizontal_scrollbar_metrics(
+        match &tab.state {
+            LogTabState::Ready {
+                document: LogTabDocument::Paged(document),
+            } => match axis {
+                LogScrollbarAxis::Vertical => {
+                    Self::paged_log_vertical_scrollbar_metrics(tab, document)
+                }
+                LogScrollbarAxis::Horizontal => Self::paged_log_horizontal_scrollbar_metrics(
+                    tab,
+                    document,
+                    self.log_viewer_font_size,
+                ),
+            },
+            LogTabState::Ready {
+                document: LogTabDocument::InMemory(document),
+            } => match axis {
+                LogScrollbarAxis::Vertical => {
+                    Self::log_vertical_scrollbar_metrics(&tab.scroll_handle)
+                }
+                LogScrollbarAxis::Horizontal => Self::log_horizontal_scrollbar_metrics(
                     &tab.scroll_handle,
                     Self::log_viewer_line_number_width(document.line_count()),
                 ),
-                LogTabState::Loading { .. } | LogTabState::Failed { .. } => None,
             },
+            LogTabState::Loading { .. } | LogTabState::Failed { .. } => None,
+        }
+    }
+
+    /// 取得日志正文滚动条视口在当前轴向上的窗口坐标起点。
+    ///
+    /// 业务意图：
+    /// - 普通日志使用 `uniform_list` 的底层 `ScrollHandle` bounds。
+    /// - 分页日志使用独立视口测量句柄，避免为了坐标换算重新依赖完整虚拟列表。
+    fn log_scrollbar_viewport_axis_origin_for_tab(
+        tab: &OpenLogTab,
+        axis: LogScrollbarAxis,
+    ) -> Option<Pixels> {
+        let bounds = match &tab.state {
+            LogTabState::Ready {
+                document: LogTabDocument::Paged(_),
+            } => tab.paged_viewport_handle.bounds(),
+            LogTabState::Ready {
+                document: LogTabDocument::InMemory(_),
+            }
+            | LogTabState::Loading { .. }
+            | LogTabState::Failed { .. } => tab.scroll_handle.0.borrow().base_handle.bounds(),
+        };
+
+        match axis {
+            LogScrollbarAxis::Vertical if bounds.size.height > px(0.0) => Some(bounds.top()),
+            LogScrollbarAxis::Horizontal if bounds.size.width > px(0.0) => Some(bounds.left()),
+            LogScrollbarAxis::Vertical | LogScrollbarAxis::Horizontal => None,
         }
     }
 
@@ -1065,7 +1678,7 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 行号固定宽度，正文使用等宽字体并保持不换行，符合日志查看器常见阅读习惯。
-    /// - 横向滚动时整行会被 GPUI 列表整体平移，因此行号单元格需要用反向偏移补偿，确保行号视觉固定。
+    /// - 普通列表横向滚动时整行会被 GPUI 平移，分页窗口化渲染时只平移正文；两个偏移由调用方分别传入。
     /// - 日志级别高亮只作用于等级关键字，不改变整行背景，避免大面积颜色干扰扫描。
     /// - 搜索结果跳转的目标行允许使用整行背景提示，这是定位反馈，不属于语法高亮规则。
     pub(super) fn render_log_line(
@@ -1081,6 +1694,7 @@ impl MainView {
             line_number_width,
             font_size,
             horizontal_line_number_offset,
+            horizontal_content_offset,
             search_highlighted,
             suppress_hover,
             palette,
@@ -1106,6 +1720,8 @@ impl MainView {
             })
             .child(
                 div()
+                    .relative()
+                    .left(horizontal_content_offset)
                     .flex()
                     .items_center()
                     .flex_none()

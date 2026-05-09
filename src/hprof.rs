@@ -17,30 +17,32 @@ use std::{
     error::Error,
     fmt::{self, Display},
     fs::File,
-    io::{self, Read},
+    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
+use crc32fast::Hasher as Crc32Hasher;
 use memmap2::Mmap;
-use petgraph::graph::DiGraph;
 use rustc_hash::{FxHashMap, FxHashSet};
+use serde::{Deserialize, Serialize};
 
 /// HPROF 对象 ID。
 ///
 /// 业务意图：
 /// - JVM HPROF 支持 4 字节或 8 字节对象 ID；内部统一提升为 `u64`，避免 UI 和算法层反复分支。
 pub(crate) type HprofObjectId = u64;
-
-/// 虚拟 GC 根节点 ID。
+/// dominator 内部连续节点编号。
 ///
-/// 边界条件：
-/// - HPROF 对象 ID 来自 dump 文件；使用 `u64::MAX` 作为虚拟根，正常 JVM dump 几乎不会生成该对象 ID。
-/// - 如果真实 dump 恰好包含该 ID，解析结果仍可读，但该对象会和虚拟根冲突；后续如需彻底规避可改为单独枚举节点。
-pub(crate) const HPROF_VIRTUAL_ROOT_ID: HprofObjectId = u64::MAX;
+/// 业务意图：
+/// - 5GB dump 中对象和边数量很大，LT 算法会为每个节点维护多组数组；用 `u32` 替代 `usize` 可以把这些热数组内存减半。
+type HprofNodeId = u32;
+/// `u32` 节点数组中的无效哨兵值。
+const HPROF_INVALID_NODE: HprofNodeId = HprofNodeId::MAX;
 
 /// 第一版 dominator 结果默认展示的 retained size Top N。
 ///
@@ -80,6 +82,31 @@ const HPROF_MAT_ARRAY_HEADER_SIZE: u64 = 16;
 /// 业务意图：
 /// - START_THREAD 通常已经包含线程名；这里仅为少数缺失记录提供兜底，限制长度可以避免把业务大 byte array 作为字符串缓存。
 const HPROF_THREAD_STRING_FALLBACK_MAX_ELEMENTS: u32 = 4096;
+/// HPROF sidecar 缓存 schema 版本。
+///
+/// 业务意图：
+/// - sidecar 是跨进程、跨版本复用的磁盘格式；任何二进制布局、MAT 语义或结果字段变化都必须 bump 版本，避免误读旧索引。
+const HPROF_SIDECAR_SCHEMA_VERSION: u32 = 3;
+/// HPROF MAT 兼容语义版本。
+///
+/// 业务意图：
+/// - 即使磁盘字段布局不变，只要 Reference 语义、ClassLoader 合成边或 shallow size model 发生变化，也必须让旧缓存失效。
+const HPROF_MAT_SEMANTICS_VERSION: u32 = 1;
+/// 源 dump 首尾快速校验块大小。
+const HPROF_SIDECAR_CHECKSUM_BYTES: u64 = 1024 * 1024;
+/// 大 dump 缓存目录不可写时触发硬错误的阈值。
+const HPROF_SIDECAR_REQUIRED_BYTES: u64 = 1024 * 1024 * 1024;
+/// sidecar v3 写入缓冲区大小。
+///
+/// 业务意图：
+/// - 5GB dump 的结果索引可能包含数百万对象和子节点记录；大缓冲可以显著降低 macOS/Windows 上的系统调用次数，
+///   避免最后“写入索引”阶段因为碎片化小写入拖慢。
+const HPROF_SIDECAR_WRITER_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+/// sidecar v3 批量编码记录数。
+///
+/// 边界条件：
+/// - chunk 太小会回到频繁写入，太大又会拉高写索引阶段的瞬时内存；65,536 条与已有进度节流保持一致。
+const HPROF_SIDECAR_RECORD_CHUNK: usize = 65_536;
 
 /// HPROF 顶层记录：UTF8 字符串。
 const TAG_STRING_IN_UTF8: u8 = 0x01;
@@ -156,6 +183,10 @@ const FIELD_TYPE_LONG: u8 = 11;
 /// - UI 需要展示详细解析进度；阶段枚举让后台任务可以稳定表达当前耗时集中在哪一步。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HprofAnalysisStage {
+    /// 正在检查 sidecar 缓存是否可复用。
+    CheckingCache,
+    /// 正在从 sidecar 缓存恢复结果。
+    LoadingCache,
     /// 校验用户选择的路径和文件头。
     Validating,
     /// 正在读取 HPROF header。
@@ -172,6 +203,8 @@ pub(crate) enum HprofAnalysisStage {
     ComputingDominatorTree,
     /// 正在构造 UI 可直接展示的树节点和 Top retained 列表。
     BuildingRows,
+    /// 正在把完成结果写入 sidecar 索引。
+    WritingIndex,
     /// 分析完成。
     Completed,
 }
@@ -180,6 +213,8 @@ impl HprofAnalysisStage {
     /// 返回面向用户展示的中文阶段名。
     pub(crate) fn label(self) -> &'static str {
         match self {
+            Self::CheckingCache => "检查缓存",
+            Self::LoadingCache => "加载缓存",
             Self::Validating => "校验文件",
             Self::ReadingHeader => "读取文件头",
             Self::ReadingRecords => "解析对象记录",
@@ -188,6 +223,7 @@ impl HprofAnalysisStage {
             Self::BuildingDominatorGraph => "构建引用图",
             Self::ComputingDominatorTree => "计算 Dominator Tree",
             Self::BuildingRows => "整理展示结果",
+            Self::WritingIndex => "写入索引",
             Self::Completed => "完成",
         }
     }
@@ -271,7 +307,7 @@ impl HprofProgress {
 ///
 /// 业务意图：
 /// - header 中的格式标签和 ID 字节数会影响整份 dump 的后续解析，完成后也应在 UI 摘要中展示给用户核对。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct HprofHeader {
     /// 原始格式标签，例如 `JAVA PROFILE 1.0.2`。
     pub(crate) label: String,
@@ -286,7 +322,7 @@ pub(crate) struct HprofHeader {
 /// 业务意图：
 /// - HPROF 记录中的 `instance_size` 不等价于 MAT 展示的 shallow heap；MAT 会按 JVM 对象头、数组头、引用宽度和对象对齐估算。
 /// - 本结构把这些估算参数固化到结果中，UI 可以明确展示当前采用的语义，避免和原始 HPROF 字节长度混淆。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct HprofSizeModel {
     /// 普通对象头大小，单位字节。
     pub(crate) object_header_size: u64,
@@ -347,7 +383,7 @@ impl HprofSizeModel {
 ///
 /// 业务意图：
 /// - UI 展示对象行时需要区分类对象、普通实例、对象数组和基础类型数组，便于用户理解 retained size 来源。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum HprofObjectKind {
     /// Java Class 对象。
     Class,
@@ -382,8 +418,6 @@ pub(crate) struct HprofHeapObject {
     /// 实现原因：
     /// - 该值使用 HotSpot 常见对象布局估算，不再直接等同于 HPROF `instance_size` 或数组元素原始字节数。
     pub(crate) shallow_size: u64,
-    /// 当前对象引用的其它对象 ID。
-    pub(crate) references: Vec<HprofObjectId>,
     /// 对象类型。
     pub(crate) kind: HprofObjectKind,
 }
@@ -437,7 +471,7 @@ enum HprofReferenceStrength {
 ///
 /// 业务意图：
 /// - 默认 dominator tree 不再剪掉这些边以便对齐 MAT；但 UI 仍需要告诉用户结果中有多少 weak/soft/phantom/finalizer referent 参与了对象图。
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct HprofReferenceEdgeStats {
     /// `WeakReference` 或其子类的 referent 边数量。
     pub(crate) weak_like: usize,
@@ -559,6 +593,16 @@ pub(crate) struct HprofObjectGraph {
     /// 业务意图：
     /// - HPROF 引用仍以对象 ID 表达；解析和建图只在需要跳转时查映射，避免所有主流程都围绕 HashMap values 迭代。
     object_indices: FxHashMap<HprofObjectId, usize>,
+    /// 每个对象当前引用段在 `reference_targets` 中的起始偏移。
+    ///
+    /// 业务意图：
+    /// - 大 dump 中绝大多数对象引用数很少，如果每个对象都持有独立 `Vec`，数百万空 Vec 的结构体开销会非常高；
+    ///   这里把所有引用统一放入连续池，按对象下标保存 offset/len，降低首次解析匿名堆峰值。
+    reference_offsets: Vec<usize>,
+    /// 每个对象当前引用段长度。
+    reference_lengths: Vec<usize>,
+    /// 所有对象引用目标 ID 的连续池。
+    reference_targets: Vec<HprofObjectId>,
     /// 类元数据，按类对象 ID 索引。
     pub(crate) classes: FxHashMap<HprofObjectId, HprofClassInfo>,
     /// GC Root 列表。
@@ -607,6 +651,9 @@ impl HprofObjectGraph {
             size_model,
             objects: Vec::new(),
             object_indices: FxHashMap::default(),
+            reference_offsets: Vec::new(),
+            reference_lengths: Vec::new(),
+            reference_targets: Vec::new(),
             classes: FxHashMap::default(),
             gc_roots: Vec::new(),
             edge_count: 0,
@@ -630,25 +677,30 @@ impl HprofObjectGraph {
     ///
     /// 业务意图：
     /// - 真实 dump 理论上不应重复定义对象 ID，但损坏文件可能出现重复；这里按最后一次记录覆盖，并同步维护增量统计。
-    fn insert_object(&mut self, mut object: HprofHeapObject) {
-        normalize_references(&mut object.references);
-        if let Some(index) = self.object_indices.get(&object.id).copied() {
-            let previous = &self.objects[index];
-            self.edge_count = self.edge_count.saturating_sub(previous.references.len());
-            self.total_shallow_size = self
-                .total_shallow_size
-                .saturating_sub(previous.shallow_size);
-            self.edge_count = self.edge_count.saturating_add(object.references.len());
-            self.total_shallow_size = self.total_shallow_size.saturating_add(object.shallow_size);
-            self.objects[index] = object;
-            return;
+    fn insert_object(
+        &mut self,
+        object: HprofHeapObject,
+        mut references: Vec<HprofObjectId>,
+    ) -> Result<(), HprofError> {
+        normalize_references(&mut references);
+        if self.object_indices.contains_key(&object.id) {
+            return Err(HprofError::InvalidFormat(format!(
+                "HPROF 对象重复定义：0x{:x}",
+                object.id
+            )));
         }
 
         let index = self.objects.len();
-        self.edge_count = self.edge_count.saturating_add(object.references.len());
+        let reference_offset = self.reference_targets.len();
+        let reference_len = references.len();
+        self.reference_targets.extend(references);
+        self.reference_offsets.push(reference_offset);
+        self.reference_lengths.push(reference_len);
+        self.edge_count = self.edge_count.saturating_add(reference_len);
         self.total_shallow_size = self.total_shallow_size.saturating_add(object.shallow_size);
         self.object_indices.insert(object.id, index);
         self.objects.push(object);
+        Ok(())
     }
 
     /// 更新已存在对象的 shallow size 和对象引用列表。
@@ -664,15 +716,52 @@ impl HprofObjectGraph {
         normalize_references(&mut references);
         if let Some(index) = self.object_indices.get(&object_id).copied() {
             let previous = &self.objects[index];
-            self.edge_count = self.edge_count.saturating_sub(previous.references.len());
+            self.edge_count = self
+                .edge_count
+                .saturating_sub(self.reference_lengths.get(index).copied().unwrap_or(0));
             self.total_shallow_size = self
                 .total_shallow_size
                 .saturating_sub(previous.shallow_size);
-            self.edge_count = self.edge_count.saturating_add(references.len());
+            let reference_offset = self.reference_targets.len();
+            let reference_len = references.len();
+            self.reference_targets.extend(references);
+            if let Some(offset) = self.reference_offsets.get_mut(index) {
+                *offset = reference_offset;
+            }
+            if let Some(length) = self.reference_lengths.get_mut(index) {
+                *length = reference_len;
+            }
+            self.edge_count = self.edge_count.saturating_add(reference_len);
             self.total_shallow_size = self.total_shallow_size.saturating_add(shallow_size);
             self.objects[index].shallow_size = shallow_size;
-            self.objects[index].references = references;
         }
+    }
+
+    /// 返回指定对象下标的当前引用目标 ID 切片。
+    fn references_for_index(&self, object_index: usize) -> &[HprofObjectId] {
+        let start = self
+            .reference_offsets
+            .get(object_index)
+            .copied()
+            .unwrap_or(0);
+        let len = self
+            .reference_lengths
+            .get(object_index)
+            .copied()
+            .unwrap_or(0);
+        let end = start.saturating_add(len).min(self.reference_targets.len());
+        &self.reference_targets[start..end]
+    }
+
+    /// 释放解析阶段保留的原始对象引用 ID 池。
+    ///
+    /// 业务意图：
+    /// - `build_compact_adjacency` 已把对象引用转换成 `u32` 连续下标；后续 LT、retained 聚合和 UI 结果构造只需要对象摘要，
+    ///   及时丢弃 `u64` 引用池可以避免大 dump 在 dominator 阶段同时保留两份边数据。
+    fn clear_reference_pool(&mut self) {
+        self.reference_offsets = Vec::new();
+        self.reference_lengths = Vec::new();
+        self.reference_targets = Vec::new();
     }
 
     /// 返回对象数量。
@@ -776,7 +865,7 @@ pub(crate) struct HprofDominatorRow {
 ///
 /// 业务意图：
 /// - MAT 的 Thread Details 使用“属性名 / 属性值”表格展示线程对象状态；UI 层只负责渲染，不重新解析对象字段。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct HprofThreadProperty {
     /// 属性展示名。
     pub(crate) name: String,
@@ -788,7 +877,7 @@ pub(crate) struct HprofThreadProperty {
 ///
 /// 业务意图：
 /// - HPROF 的 `STACK_FRAME` 记录分散保存类名、方法名、签名、源文件和行号；结果层将其合成为 UI 可直接显示的栈行。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct HprofThreadStackFrame {
     /// 栈帧所属类名。
     pub(crate) class_name: String,
@@ -808,7 +897,7 @@ pub(crate) struct HprofThreadStackFrame {
 ///
 /// 业务意图：
 /// - 右键菜单打开详情时不能重新读取 5GB 级 dump；所有线程属性和栈信息必须在分析完成结果中以纯数据形式保存。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct HprofThreadDetails {
     /// 线程对象 ID。
     pub(crate) object_id: HprofObjectId,
@@ -828,7 +917,7 @@ pub(crate) struct HprofThreadDetails {
 ///
 /// 业务意图：
 /// - 完成结果可能包含数百万对象，摘要只保存生成 UI 行必须的标量字段；类名和类型文案在可见行生成时再拼接。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct HprofDominatorObjectSummary {
     /// 对象 ID。
     object_id: HprofObjectId,
@@ -846,11 +935,41 @@ struct HprofDominatorObjectSummary {
     direct_child_count: usize,
 }
 
+/// Dominator 对象摘要的存储后端。
+///
+/// 业务意图：
+/// - 首次解析时摘要来自内存构造结果；缓存命中时不应为了展示首屏重新读取全部对象摘要。
+/// - UI 渲染 dominator tree 实际只需要 Top 节点和已展开节点的摘要，因此 sidecar 后端按 summary index 随用随读。
+#[derive(Debug)]
+enum HprofSummaryStorage {
+    /// 首次解析完成后持有的内存摘要。
+    Owned {
+        /// 可达对象摘要，按 summary index 排列。
+        summaries: Vec<HprofDominatorObjectSummary>,
+    },
+    /// sidecar 命中后的懒加载摘要。
+    Sidecar {
+        /// 可达对象摘要数量。
+        count: usize,
+        /// `objects.bin` 的复用读取器。
+        ///
+        /// 业务意图：
+        /// - 缓存命中后 UI 会频繁重绘首屏和展开节点；持有同一个带缓冲的文件读取器可以避免每个可见行都重新 open 文件。
+        /// - 该结果对象只在 UI 线程读取，使用 `RefCell` 是为了在不可变查询方法中进行按需 seek 和小缓存更新。
+        reader: std::cell::RefCell<BufReader<File>>,
+        /// 已读取摘要缓存，避免展开/重绘同一节点时反复 seek。
+        cache: std::cell::RefCell<FxHashMap<usize, HprofDominatorObjectSummary>>,
+        /// 已按对象 ID 查询过的下标缓存；只服务测试/少量查询，不在打开缓存时全量构建。
+        #[cfg(test)]
+        object_index_cache: std::cell::RefCell<FxHashMap<HprofObjectId, usize>>,
+    },
+}
+
 /// HPROF dominator tree 完成结果。
 ///
 /// 业务意图：
 /// - 结果对象供 UI 长时间持有，必须包含摘要、Top retained 入口和按对象 ID 查询子节点所需的数据。
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct HprofDominatorResult {
     /// 原始文件路径。
     pub(crate) file_path: PathBuf,
@@ -884,12 +1003,20 @@ pub(crate) struct HprofDominatorResult {
     pub(crate) unreachable_shallow_size: u64,
     /// 当前结果使用的 MAT 兼容 shallow size 估算模型。
     pub(crate) size_model: HprofSizeModel,
+    /// sidecar 缓存状态说明。
+    ///
+    /// 业务意图：
+    /// - UI 摘要需要明确告诉用户本次是首次解析还是命中磁盘索引，避免“秒开”时误以为没有执行分析。
+    pub(crate) cache_status: Option<String>,
     /// Top retained 根行对象 ID。
     pub(crate) top_object_ids: Vec<HprofObjectId>,
-    /// 可达对象的紧凑摘要。
-    summaries: Vec<HprofDominatorObjectSummary>,
-    /// 对象 ID 到摘要下标的映射。
-    summary_indices: FxHashMap<HprofObjectId, usize>,
+    /// Top retained 根行 summary index。
+    ///
+    /// 业务意图：
+    /// - 可见树渲染只需要 summary index；缓存命中时避免为了 `object_id -> summary_index` 全量建 HashMap。
+    top_summary_indices: Vec<usize>,
+    /// 可达对象摘要存储。
+    summary_storage: HprofSummaryStorage,
     /// 结果展示需要的类名表。
     class_names: FxHashMap<HprofObjectId, String>,
     /// 按线程对象 ID 索引的线程详情。
@@ -910,8 +1037,13 @@ impl HprofDominatorResult {
         expanded_node_ids: &HashSet<HprofObjectId>,
     ) -> Vec<HprofDominatorRow> {
         let mut rows = Vec::new();
-        for object_id in &self.top_object_ids {
-            self.append_visible_row(*object_id, 0, expanded_node_ids, &mut rows);
+        for summary_index in &self.top_summary_indices {
+            self.append_visible_row_by_summary_index(
+                *summary_index,
+                0,
+                expanded_node_ids,
+                &mut rows,
+            );
         }
         rows
     }
@@ -920,12 +1052,14 @@ impl HprofDominatorResult {
     ///
     /// 业务意图：
     /// - 测试和 UI 展开都只需要当前关注的节点；延迟拼接名称可以避免完成阶段为所有对象分配展示字符串。
+    #[cfg(test)]
     pub(crate) fn node_for_object_id(
         &self,
         object_id: HprofObjectId,
     ) -> Option<HprofDominatorNode> {
-        let summary_index = self.summary_indices.get(&object_id).copied()?;
-        self.build_node(&self.summaries[summary_index])
+        let summary_index = self.summary_index_for_object_id(object_id)?;
+        let summary = self.summary_at_index(summary_index)?;
+        self.build_node(&summary)
     }
 
     /// 返回指定对象的线程详情。
@@ -944,24 +1078,25 @@ impl HprofDominatorResult {
         self.thread_details.contains_key(&object_id)
     }
 
-    /// 递归展开单个对象节点。
-    fn append_visible_row(
+    /// 递归展开单个 summary index 节点。
+    fn append_visible_row_by_summary_index(
         &self,
-        object_id: HprofObjectId,
+        summary_index: usize,
         depth: usize,
         expanded_node_ids: &HashSet<HprofObjectId>,
         rows: &mut Vec<HprofDominatorRow>,
     ) {
-        let Some(node) = self.node_for_object_id(object_id) else {
+        let Some(summary) = self.summary_at_index(summary_index) else {
+            return;
+        };
+        let object_id = summary.object_id;
+        let Some(node) = self.build_node(&summary) else {
             return;
         };
         rows.push(HprofDominatorRow { depth, node });
         if !expanded_node_ids.contains(&object_id) {
             return;
         }
-        let Some(summary_index) = self.summary_indices.get(&object_id).copied() else {
-            return;
-        };
         let child_start = self.child_offsets.get(summary_index).copied().unwrap_or(0);
         let child_end = self
             .child_offsets
@@ -969,8 +1104,91 @@ impl HprofDominatorResult {
             .copied()
             .unwrap_or(child_start);
         for child_summary_index in &self.child_summary_indices[child_start..child_end] {
-            let child_id = self.summaries[*child_summary_index].object_id;
-            self.append_visible_row(child_id, depth + 1, expanded_node_ids, rows);
+            self.append_visible_row_by_summary_index(
+                *child_summary_index,
+                depth + 1,
+                expanded_node_ids,
+                rows,
+            );
+        }
+    }
+
+    /// 返回指定 summary index 的对象摘要。
+    ///
+    /// 边界条件：
+    /// - sidecar 缓存可能损坏或被外部删除；这里返回 `None` 让 UI 少展示该行，而不是在渲染阶段 panic。
+    fn summary_at_index(&self, summary_index: usize) -> Option<HprofDominatorObjectSummary> {
+        match &self.summary_storage {
+            HprofSummaryStorage::Owned { summaries } => summaries.get(summary_index).cloned(),
+            HprofSummaryStorage::Sidecar {
+                count,
+                reader,
+                cache,
+                ..
+            } => {
+                if summary_index >= *count {
+                    return None;
+                }
+                if let Some(summary) = cache.borrow().get(&summary_index).cloned() {
+                    return Some(summary);
+                }
+                let summary = hprof_cache::read_object_summary_from_reader(
+                    &mut *reader.borrow_mut(),
+                    summary_index,
+                    *count,
+                )
+                .ok()?;
+                cache.borrow_mut().insert(summary_index, summary.clone());
+                Some(summary)
+            }
+        }
+    }
+
+    /// 返回当前结果中的可达对象摘要数量。
+    fn summary_count(&self) -> usize {
+        match &self.summary_storage {
+            HprofSummaryStorage::Owned { summaries } => summaries.len(),
+            HprofSummaryStorage::Sidecar { count, .. } => *count,
+        }
+    }
+
+    /// 按对象 ID 查找 summary index。
+    ///
+    /// 业务意图：
+    /// - UI 主路径已经使用 summary index 展开树；该方法主要服务测试和少量外部查询。
+    /// - sidecar 命中时不预建全量 HashMap，而是在确实需要按 ID 查询时线性扫描一次并缓存已命中的对象。
+    #[cfg(test)]
+    fn summary_index_for_object_id(&self, object_id: HprofObjectId) -> Option<usize> {
+        match &self.summary_storage {
+            HprofSummaryStorage::Owned { summaries } => summaries
+                .iter()
+                .position(|summary| summary.object_id == object_id),
+            HprofSummaryStorage::Sidecar {
+                count,
+                reader,
+                object_index_cache,
+                ..
+            } => {
+                if let Some(index) = object_index_cache.borrow().get(&object_id).copied() {
+                    return Some(index);
+                }
+                let mut reader = reader.borrow_mut();
+                for summary_index in 0..*count {
+                    let summary = hprof_cache::read_object_summary_from_reader(
+                        &mut *reader,
+                        summary_index,
+                        *count,
+                    )
+                    .ok()?;
+                    object_index_cache
+                        .borrow_mut()
+                        .insert(summary.object_id, summary_index);
+                    if summary.object_id == object_id {
+                        return Some(summary_index);
+                    }
+                }
+                None
+            }
         }
     }
 
@@ -1012,17 +1230,1725 @@ impl HprofDominatorResult {
     }
 }
 
-/// petgraph 图生成后给 LT 算法使用的紧凑邻接表。
+/// HPROF sidecar 缓存读写。
 ///
 /// 业务意图：
-/// - petgraph 保留为可观测图生成阶段；真正 dominator 计算使用连续对象下标，避免再走 petgraph 的 O(V²) simple_fast。
+/// - 大 dump 的 dominator 计算成本很高；完成后把 UI 所需的紧凑结果写到源文件同目录，后续打开可以跳过解析和 LT 计算。
+/// - manifest 使用 JSON 方便人工诊断，主体数据使用稳定手写二进制，避免 serde 对大 Vec 产生额外中间分配。
+mod hprof_cache {
+    use super::*;
+
+    const MANIFEST_FILE: &str = "manifest.json";
+    const OBJECTS_FILE: &str = "objects.bin";
+    const DOMINATOR_FILE: &str = "dominator.bin";
+    const CLASSES_FILE: &str = "classes.bin";
+    const THREADS_FILE: &str = "threads.bin";
+    const STRINGS_FILE: &str = "strings.bin";
+    const EDGES_OFFSETS_FILE: &str = "edges_offsets.bin";
+    const EDGES_TARGETS_FILE: &str = "edges_targets.bin";
+    const ROOT_INDICES_FILE: &str = "root_indices.bin";
+    const MAGIC_OBJECTS: &[u8] = b"LCHP-objects-v3";
+    const MAGIC_DOMINATOR: &[u8] = b"LCHP-dominator-v3";
+    const MAGIC_CLASSES: &[u8] = b"LCHP-classes-v2";
+    const MAGIC_THREADS: &[u8] = b"LCHP-threads-v2";
+    const MAGIC_EMPTY: &[u8] = b"LCHP-empty-v2";
+    const MAX_MAGIC_BYTES: usize = 256;
+    const MAX_STRING_BYTES: usize = 16 * 1024 * 1024;
+    /// `objects.bin` 固定摘要记录长度。
+    ///
+    /// 业务意图：
+    /// - 缓存命中时需要按 summary index 随机读取可见行摘要；固定记录长度可直接 seek，避免第二次打开全量反序列化对象摘要。
+    const OBJECT_SUMMARY_RECORD_BYTES: u64 = 50;
+
+    /// sidecar manifest。
+    ///
+    /// 边界条件：
+    /// - `state` 只有 `complete` 才允许命中；构建中或崩溃残留目录不参与缓存恢复。
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct HprofSidecarManifest {
+        schema_version: u32,
+        mat_semantics_version: u32,
+        logclinic_version: String,
+        state: String,
+        source_file_name: String,
+        source_len: u64,
+        source_modified_millis: u128,
+        head_crc32: u32,
+        tail_crc32: u32,
+        header: HprofHeader,
+        size_model: HprofSizeModel,
+        created_millis: u128,
+    }
+
+    /// 源 dump 快速身份信息。
+    struct SourceIdentity {
+        file_name: String,
+        len: u64,
+        modified_millis: u128,
+        head_crc32: u32,
+        tail_crc32: u32,
+    }
+
+    /// 尝试从 sidecar 缓存恢复结果。
+    pub(super) fn try_load_cached_hprof_result<F>(
+        path: &Path,
+        progress: &mut HprofProgress,
+        progress_reporter: &mut F,
+        cancel_flag: &AtomicBool,
+    ) -> Option<Result<HprofDominatorResult, HprofError>>
+    where
+        F: FnMut(HprofProgress),
+    {
+        progress.stage = HprofAnalysisStage::CheckingCache;
+        progress.message = "正在检查 HPROF sidecar 缓存".to_string();
+        progress.sub_message.clear();
+        progress_reporter(progress.clone());
+
+        let sidecar_dir = sidecar_dir_for_path(path);
+        let manifest_path = sidecar_dir.join(MANIFEST_FILE);
+        if !manifest_path.is_file() {
+            progress.sub_message = "未发现可用 sidecar index，将重新解析".to_string();
+            progress_reporter(progress.clone());
+            return None;
+        }
+
+        let loaded = (|| {
+            check_cancel(cancel_flag)?;
+            let manifest = read_manifest(&manifest_path)?;
+            let identity = source_identity(path)?;
+            let invalid_reason = validate_manifest(path, &manifest, &identity);
+            if let Some(reason) = invalid_reason {
+                progress.sub_message = format!("sidecar index 失效：{reason}");
+                progress_reporter(progress.clone());
+                return Ok(None);
+            }
+            ensure_required_files(&sidecar_dir)?;
+            progress.stage = HprofAnalysisStage::LoadingCache;
+            progress.message = "正在加载 HPROF sidecar index".to_string();
+            progress.total_bytes = sidecar_total_bytes(&sidecar_dir)?;
+            progress.bytes_read = 0;
+            progress.phase_done = 0;
+            progress.phase_total = 1;
+            progress.phase_unit = "文件";
+            progress.sub_message = "准备读取 sidecar index".to_string();
+            progress_reporter(progress.clone());
+            let mut result = read_cached_result(
+                path,
+                &sidecar_dir,
+                &manifest,
+                progress,
+                progress_reporter,
+                cancel_flag,
+            )?;
+            result.cache_status = Some("sidecar index 命中".to_string());
+            Ok(Some(result))
+        })();
+
+        match loaded {
+            Ok(Some(result)) => Some(Ok(result)),
+            Ok(None) => None,
+            Err(HprofError::Canceled) => Some(Err(HprofError::Canceled)),
+            Err(error) => {
+                progress.sub_message = format!("sidecar index 无法读取，将重新解析：{error}");
+                progress_reporter(progress.clone());
+                None
+            }
+        }
+    }
+
+    /// 在大 dump 解析前确认 sidecar 目录可写。
+    pub(super) fn ensure_sidecar_writable(
+        path: &Path,
+        source_len: u64,
+    ) -> Result<bool, HprofError> {
+        let sidecar_dir = sidecar_dir_for_path(path);
+        match std::fs::create_dir_all(&sidecar_dir) {
+            Ok(()) => Ok(true),
+            Err(error) if source_len >= HPROF_SIDECAR_REQUIRED_BYTES => {
+                Err(HprofError::Io(format!(
+                    "无法创建过程索引文件目录 {}：{}",
+                    sidecar_dir.display(),
+                    error
+                )))
+            }
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// 写入完成结果到 sidecar。
+    pub(super) fn write_hprof_sidecar_result<F>(
+        result: &HprofDominatorResult,
+        progress: &mut HprofProgress,
+        progress_reporter: &mut F,
+        cancel_flag: &AtomicBool,
+    ) -> Result<(), HprofError>
+    where
+        F: FnMut(HprofProgress),
+    {
+        let sidecar_dir = sidecar_dir_for_path(&result.file_path);
+        std::fs::create_dir_all(&sidecar_dir).map_err(|error| {
+            HprofError::Io(format!(
+                "无法创建过程索引文件目录 {}：{}",
+                sidecar_dir.display(),
+                error
+            ))
+        })?;
+        let tmp_dir =
+            sidecar_dir.join(format!(".building-{}-{}", std::process::id(), now_millis()));
+        std::fs::create_dir_all(&tmp_dir).map_err(|error| {
+            HprofError::Io(format!(
+                "无法创建过程索引临时目录 {}：{}",
+                tmp_dir.display(),
+                error
+            ))
+        })?;
+
+        let write_result = (|| {
+            let identity = source_identity(&result.file_path)?;
+            let manifest = HprofSidecarManifest {
+                schema_version: HPROF_SIDECAR_SCHEMA_VERSION,
+                mat_semantics_version: HPROF_MAT_SEMANTICS_VERSION,
+                logclinic_version: env!("CARGO_PKG_VERSION").to_string(),
+                state: "complete".to_string(),
+                source_file_name: identity.file_name,
+                source_len: identity.len,
+                source_modified_millis: identity.modified_millis,
+                head_crc32: identity.head_crc32,
+                tail_crc32: identity.tail_crc32,
+                header: result.header.clone(),
+                size_model: result.size_model.clone(),
+                created_millis: now_millis(),
+            };
+            progress.stage = HprofAnalysisStage::WritingIndex;
+            progress.message = "正在写入 HPROF sidecar index".to_string();
+
+            report_cache_write(
+                progress,
+                progress_reporter,
+                0,
+                1,
+                "文件",
+                "准备写入对象摘要",
+            )?;
+            write_objects_file(
+                &tmp_dir.join(OBJECTS_FILE),
+                result,
+                progress,
+                progress_reporter,
+                cancel_flag,
+            )?;
+            check_cancel(cancel_flag)?;
+            report_cache_write(
+                progress,
+                progress_reporter,
+                0,
+                1,
+                "文件",
+                "准备写入 dominator 索引",
+            )?;
+            write_dominator_file(
+                &tmp_dir.join(DOMINATOR_FILE),
+                result,
+                progress,
+                progress_reporter,
+                cancel_flag,
+            )?;
+            check_cancel(cancel_flag)?;
+            report_cache_write(
+                progress,
+                progress_reporter,
+                0,
+                1,
+                "文件",
+                "准备写入类名索引",
+            )?;
+            write_classes_file(
+                &tmp_dir.join(CLASSES_FILE),
+                result,
+                progress,
+                progress_reporter,
+                cancel_flag,
+            )?;
+            check_cancel(cancel_flag)?;
+            report_cache_write(
+                progress,
+                progress_reporter,
+                0,
+                1,
+                "文件",
+                "准备写入线程详情索引",
+            )?;
+            write_threads_file(
+                &tmp_dir.join(THREADS_FILE),
+                result,
+                progress,
+                progress_reporter,
+                cancel_flag,
+            )?;
+            check_cancel(cancel_flag)?;
+            report_cache_write(
+                progress,
+                progress_reporter,
+                0,
+                4,
+                "文件",
+                "写入占位过程文件",
+            )?;
+            write_empty_file(&tmp_dir.join(STRINGS_FILE))?;
+            report_cache_write(
+                progress,
+                progress_reporter,
+                1,
+                4,
+                "文件",
+                "写入 strings.bin",
+            )?;
+            write_empty_file(&tmp_dir.join(EDGES_OFFSETS_FILE))?;
+            report_cache_write(
+                progress,
+                progress_reporter,
+                2,
+                4,
+                "文件",
+                "写入 edges_offsets.bin",
+            )?;
+            write_empty_file(&tmp_dir.join(EDGES_TARGETS_FILE))?;
+            report_cache_write(
+                progress,
+                progress_reporter,
+                3,
+                4,
+                "文件",
+                "写入 edges_targets.bin",
+            )?;
+            write_empty_file(&tmp_dir.join(ROOT_INDICES_FILE))?;
+            check_cancel(cancel_flag)?;
+            report_cache_write(
+                progress,
+                progress_reporter,
+                4,
+                4,
+                "文件",
+                "写入 root_indices.bin",
+            )?;
+            report_cache_write(progress, progress_reporter, 0, 1, "文件", "写入完成标记")?;
+            write_manifest(&tmp_dir.join(MANIFEST_FILE), &manifest)?;
+            publish_tmp_dir(&sidecar_dir, &tmp_dir)
+        })();
+
+        if let Err(error) = write_result {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn report_cache_write<F>(
+        progress: &mut HprofProgress,
+        progress_reporter: &mut F,
+        done: u64,
+        total: u64,
+        unit: &'static str,
+        sub_message: &str,
+    ) -> Result<(), HprofError>
+    where
+        F: FnMut(HprofProgress),
+    {
+        progress.phase_done = done;
+        progress.phase_total = total;
+        progress.phase_unit = unit;
+        progress.sub_message = sub_message.to_string();
+        progress_reporter(progress.clone());
+        Ok(())
+    }
+
+    fn sidecar_dir_for_path(path: &Path) -> PathBuf {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| "dump".to_string());
+        let sidecar_name = format!("{file_name}.logclinic-hprof");
+        path.parent()
+            .map(|parent| parent.join(&sidecar_name))
+            .unwrap_or_else(|| PathBuf::from(sidecar_name))
+    }
+
+    fn read_manifest(path: &Path) -> Result<HprofSidecarManifest, HprofError> {
+        let bytes = std::fs::read(path).map_err(|error| {
+            HprofError::Io(format!(
+                "读取 sidecar manifest {} 失败：{}",
+                path.display(),
+                error
+            ))
+        })?;
+        serde_json::from_slice(&bytes).map_err(|error| {
+            HprofError::InvalidFormat(format!(
+                "sidecar manifest {} 格式损坏：{}",
+                path.display(),
+                error
+            ))
+        })
+    }
+
+    fn write_manifest(path: &Path, manifest: &HprofSidecarManifest) -> Result<(), HprofError> {
+        let bytes = serde_json::to_vec_pretty(manifest).map_err(|error| {
+            HprofError::InvalidFormat(format!("生成 sidecar manifest 失败：{error}"))
+        })?;
+        std::fs::write(path, bytes).map_err(|error| {
+            HprofError::Io(format!(
+                "写入 sidecar manifest {} 失败：{}",
+                path.display(),
+                error
+            ))
+        })
+    }
+
+    fn validate_manifest(
+        path: &Path,
+        manifest: &HprofSidecarManifest,
+        identity: &SourceIdentity,
+    ) -> Option<String> {
+        if manifest.state != "complete" {
+            return Some("索引未完成".to_string());
+        }
+        if manifest.schema_version != HPROF_SIDECAR_SCHEMA_VERSION {
+            return Some("schema version 变化".to_string());
+        }
+        if manifest.mat_semantics_version != HPROF_MAT_SEMANTICS_VERSION {
+            return Some("MAT 兼容语义版本变化".to_string());
+        }
+        if manifest.source_file_name
+            != path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+        {
+            return Some("源文件名变化".to_string());
+        }
+        if manifest.source_len != identity.len {
+            return Some("源文件大小变化".to_string());
+        }
+        if manifest.source_modified_millis != identity.modified_millis {
+            return Some("源文件修改时间变化".to_string());
+        }
+        if manifest.head_crc32 != identity.head_crc32 || manifest.tail_crc32 != identity.tail_crc32
+        {
+            return Some("源文件首尾校验不一致".to_string());
+        }
+        None
+    }
+
+    fn ensure_required_files(sidecar_dir: &Path) -> Result<(), HprofError> {
+        // `objects.bin` 可能是最大的 sidecar 文件，缓存命中时改为可见行懒读取，不计入启动阶段总字节数。
+        for file_name in [
+            DOMINATOR_FILE,
+            CLASSES_FILE,
+            THREADS_FILE,
+            STRINGS_FILE,
+            EDGES_OFFSETS_FILE,
+            EDGES_TARGETS_FILE,
+            ROOT_INDICES_FILE,
+        ] {
+            let path = sidecar_dir.join(file_name);
+            if !path.is_file() {
+                return Err(HprofError::InvalidFormat(format!(
+                    "sidecar index 缺少文件：{}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// 统计本次缓存命中需要读取的 sidecar 主体字节数。
+    ///
+    /// 业务意图：
+    /// - 缓存加载阶段不再读取源 dump；进度条应反映 sidecar index 的读取进度，否则用户会看到 0 / dump 大小长时间不变。
+    fn sidecar_total_bytes(sidecar_dir: &Path) -> Result<u64, HprofError> {
+        let mut total = 0u64;
+        for file_name in [
+            OBJECTS_FILE,
+            DOMINATOR_FILE,
+            CLASSES_FILE,
+            THREADS_FILE,
+            STRINGS_FILE,
+            EDGES_OFFSETS_FILE,
+            EDGES_TARGETS_FILE,
+            ROOT_INDICES_FILE,
+        ] {
+            let path = sidecar_dir.join(file_name);
+            let len = std::fs::metadata(&path)
+                .map_err(|error| {
+                    HprofError::Io(format!(
+                        "读取 sidecar 文件大小 {} 失败：{}",
+                        path.display(),
+                        error
+                    ))
+                })?
+                .len();
+            total = total.saturating_add(len);
+        }
+        Ok(total.max(1))
+    }
+
+    fn publish_tmp_dir(sidecar_dir: &Path, tmp_dir: &Path) -> Result<(), HprofError> {
+        for file_name in [
+            MANIFEST_FILE,
+            OBJECTS_FILE,
+            DOMINATOR_FILE,
+            CLASSES_FILE,
+            THREADS_FILE,
+            STRINGS_FILE,
+            EDGES_OFFSETS_FILE,
+            EDGES_TARGETS_FILE,
+            ROOT_INDICES_FILE,
+        ] {
+            let final_path = sidecar_dir.join(file_name);
+            if final_path.exists() {
+                std::fs::remove_file(&final_path).map_err(|error| {
+                    HprofError::Io(format!(
+                        "清理旧 sidecar 文件 {} 失败：{}",
+                        final_path.display(),
+                        error
+                    ))
+                })?;
+            }
+        }
+        for file_name in [
+            OBJECTS_FILE,
+            DOMINATOR_FILE,
+            CLASSES_FILE,
+            THREADS_FILE,
+            STRINGS_FILE,
+            EDGES_OFFSETS_FILE,
+            EDGES_TARGETS_FILE,
+            ROOT_INDICES_FILE,
+            MANIFEST_FILE,
+        ] {
+            std::fs::rename(tmp_dir.join(file_name), sidecar_dir.join(file_name)).map_err(
+                |error| HprofError::Io(format!("发布 sidecar 文件 {} 失败：{}", file_name, error)),
+            )?;
+        }
+        std::fs::remove_dir(tmp_dir).map_err(|error| {
+            HprofError::Io(format!(
+                "清理 sidecar 临时目录 {} 失败：{}",
+                tmp_dir.display(),
+                error
+            ))
+        })
+    }
+
+    fn source_identity(path: &Path) -> Result<SourceIdentity, HprofError> {
+        let metadata = std::fs::metadata(path).map_err(|error| {
+            HprofError::Io(format!(
+                "读取源 dump 元数据 {} 失败：{}",
+                path.display(),
+                error
+            ))
+        })?;
+        let modified_millis = metadata
+            .modified()
+            .ok()
+            .and_then(system_time_millis)
+            .unwrap_or(0);
+        let (head_crc32, tail_crc32) = file_edge_crc32(path, metadata.len())?;
+        Ok(SourceIdentity {
+            file_name: path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.to_string())
+                .unwrap_or_default(),
+            len: metadata.len(),
+            modified_millis,
+            head_crc32,
+            tail_crc32,
+        })
+    }
+
+    fn file_edge_crc32(path: &Path, len: u64) -> Result<(u32, u32), HprofError> {
+        let mut file = File::open(path).map_err(|error| {
+            HprofError::Io(format!("打开源 dump {} 失败：{}", path.display(), error))
+        })?;
+        let head_len = len.min(HPROF_SIDECAR_CHECKSUM_BYTES);
+        let head_crc32 = crc32_for_reader_slice(&mut file, head_len as usize)?;
+        let tail_len = len.min(HPROF_SIDECAR_CHECKSUM_BYTES);
+        file.seek(SeekFrom::Start(len.saturating_sub(tail_len)))?;
+        let tail_crc32 = crc32_for_reader_slice(&mut file, tail_len as usize)?;
+        Ok((head_crc32, tail_crc32))
+    }
+
+    fn crc32_for_reader_slice(file: &mut File, len: usize) -> Result<u32, HprofError> {
+        let mut hasher = Crc32Hasher::new();
+        let mut remaining = len;
+        let mut buffer = vec![0u8; 64 * 1024];
+        while remaining > 0 {
+            let read_len = remaining.min(buffer.len());
+            let n = file.read(&mut buffer[..read_len])?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buffer[..n]);
+            remaining -= n;
+        }
+        Ok(hasher.finalize())
+    }
+
+    /// 创建带大缓冲的 sidecar 文件写入器。
+    ///
+    /// 业务意图：
+    /// - sidecar 主体文件属于顺序写入场景，使用 32MiB 缓冲可减少大 dump 末尾写索引阶段的小系统调用。
+    fn create_sidecar_writer(path: &Path) -> Result<BufWriter<File>, HprofError> {
+        let file = File::create(path).map_err(|error| {
+            HprofError::Io(format!(
+                "创建 sidecar 文件 {} 失败：{}",
+                path.display(),
+                error
+            ))
+        })?;
+        Ok(BufWriter::with_capacity(
+            HPROF_SIDECAR_WRITER_BUFFER_BYTES,
+            file,
+        ))
+    }
+
+    /// 创建带大缓冲的 sidecar 文件读取器。
+    ///
+    /// 业务意图：
+    /// - 缓存命中路径会按字段顺序读取数百万条对象摘要；如果直接对 `File` 做小块 `read_exact`，第二次打开仍会很慢。
+    ///   使用大缓冲读取可以把大量小读合并成顺序读，明显降低系统调用开销。
+    fn create_sidecar_reader(path: &Path) -> Result<(BufReader<File>, u64), HprofError> {
+        let file = File::open(path).map_err(|error| {
+            HprofError::Io(format!(
+                "打开 sidecar 文件 {} 失败：{}",
+                path.display(),
+                error
+            ))
+        })?;
+        let file_len = file.metadata().map_err(|error| {
+            HprofError::Io(format!(
+                "读取 sidecar 文件元数据 {} 失败：{}",
+                path.display(),
+                error
+            ))
+        })?;
+        Ok((
+            BufReader::with_capacity(HPROF_SIDECAR_WRITER_BUFFER_BYTES, file),
+            file_len.len(),
+        ))
+    }
+
+    /// 刷新 sidecar 文件写入器。
+    fn finish_sidecar_writer(mut writer: BufWriter<File>) -> Result<(), HprofError> {
+        writer.flush()?;
+        Ok(())
+    }
+
+    /// 写入已编码的 sidecar chunk。
+    ///
+    /// 边界条件：
+    /// - chunk 复用同一个 `Vec<u8>`，写完后清空但保留容量，避免数百万对象时反复分配。
+    fn flush_sidecar_chunk<W: Write>(
+        writer: &mut W,
+        chunk: &mut Vec<u8>,
+    ) -> Result<(), HprofError> {
+        if !chunk.is_empty() {
+            writer.write_all(chunk)?;
+            chunk.clear();
+        }
+        Ok(())
+    }
+
+    /// 报告 sidecar 文件内 chunk 处理进度。
+    ///
+    /// 业务意图：
+    /// - sidecar 首次生成和二次打开缓存命中都会按 chunk 处理同一批文件；进度文案必须区分“写入”和“读取”，
+    ///   否则用户在加载缓存时会看到“写入 dominator”这种误导性状态。
+    fn report_sidecar_chunk<F>(
+        progress: &mut HprofProgress,
+        progress_reporter: &mut F,
+        action: &str,
+        file_name: &str,
+        done: usize,
+        total: usize,
+        unit: &'static str,
+    ) -> Result<(), HprofError>
+    where
+        F: FnMut(HprofProgress),
+    {
+        progress.phase_done = done as u64;
+        progress.phase_total = total as u64;
+        progress.phase_unit = unit;
+        progress.sub_message = format!("{action} {file_name} {done} / {total}");
+        progress_reporter(progress.clone());
+        Ok(())
+    }
+
+    /// 报告 sidecar 文件内 chunk 写入进度。
+    fn report_cache_write_chunk<F>(
+        progress: &mut HprofProgress,
+        progress_reporter: &mut F,
+        file_name: &str,
+        done: usize,
+        total: usize,
+        unit: &'static str,
+    ) -> Result<(), HprofError>
+    where
+        F: FnMut(HprofProgress),
+    {
+        report_sidecar_chunk(
+            progress,
+            progress_reporter,
+            "写入",
+            file_name,
+            done,
+            total,
+            unit,
+        )
+    }
+
+    /// 报告 sidecar 文件内 chunk 读取进度。
+    fn report_cache_read_chunk<F>(
+        progress: &mut HprofProgress,
+        progress_reporter: &mut F,
+        file_name: &str,
+        done: usize,
+        total: usize,
+        unit: &'static str,
+    ) -> Result<(), HprofError>
+    where
+        F: FnMut(HprofProgress),
+    {
+        report_sidecar_chunk(
+            progress,
+            progress_reporter,
+            "读取",
+            file_name,
+            done,
+            total,
+            unit,
+        )
+    }
+
+    /// 校验 sidecar 里的长度字段不会触发异常大分配。
+    ///
+    /// 边界条件：
+    /// - sidecar 是过程文件，可能因为崩溃、手工修改或旧版本残留而损坏；任何来自磁盘的 count
+    ///   都必须先和 manifest / 文件大小上限比对，再用于 `Vec::with_capacity`。
+    fn validate_sidecar_count(
+        label: &str,
+        count: usize,
+        max_count: usize,
+    ) -> Result<(), HprofError> {
+        if count > max_count {
+            return Err(HprofError::InvalidFormat(format!(
+                "sidecar {label} 数量异常：{count}，上限 {max_count}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// 校验 sidecar 里的长度字段必须等于预期值。
+    fn validate_sidecar_count_eq(
+        label: &str,
+        count: usize,
+        expected: usize,
+    ) -> Result<(), HprofError> {
+        if count != expected {
+            return Err(HprofError::InvalidFormat(format!(
+                "sidecar {label} 数量不匹配：{count}，预期 {expected}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// 按文件大小估算最多能容纳多少条 8 字节长度记录。
+    fn max_u64_records_for_file(file_len: u64) -> usize {
+        usize::try_from(file_len / 8).unwrap_or(usize::MAX)
+    }
+
+    /// 把“读取完一个 sidecar 文件”计入字节进度。
+    fn finish_cache_file_progress<F>(
+        progress: &mut HprofProgress,
+        progress_reporter: &mut F,
+        file_name: &str,
+        file_len: u64,
+    ) -> Result<(), HprofError>
+    where
+        F: FnMut(HprofProgress),
+    {
+        progress.bytes_read = progress.bytes_read.saturating_add(file_len);
+        progress.phase_done = progress.phase_total;
+        progress.sub_message = format!("读取 {file_name} 完成");
+        progress_reporter(progress.clone());
+        Ok(())
+    }
+
+    fn write_objects_file<F>(
+        path: &Path,
+        result: &HprofDominatorResult,
+        progress: &mut HprofProgress,
+        progress_reporter: &mut F,
+        cancel_flag: &AtomicBool,
+    ) -> Result<(), HprofError>
+    where
+        F: FnMut(HprofProgress),
+    {
+        let summary_count = result.summary_count();
+        let mut writer = create_sidecar_writer(path)?;
+        write_magic(&mut writer, MAGIC_OBJECTS)?;
+        write_len(&mut writer, summary_count)?;
+        report_cache_write_chunk(
+            progress,
+            progress_reporter,
+            OBJECTS_FILE,
+            0,
+            summary_count,
+            "对象",
+        )?;
+        let mut chunk = Vec::with_capacity(HPROF_SIDECAR_RECORD_CHUNK * 48);
+        for chunk_start in (0..summary_count).step_by(HPROF_SIDECAR_RECORD_CHUNK) {
+            check_cancel(cancel_flag)?;
+            let chunk_end = (chunk_start + HPROF_SIDECAR_RECORD_CHUNK).min(summary_count);
+            for summary_index in chunk_start..chunk_end {
+                let Some(summary) = result.summary_at_index(summary_index) else {
+                    return Err(HprofError::InvalidFormat(format!(
+                        "写入 sidecar 时缺少对象摘要：{summary_index}"
+                    )));
+                };
+                write_u64(&mut chunk, summary.object_id)?;
+                write_u64(&mut chunk, summary.class_id)?;
+                write_kind(&mut chunk, &summary.kind)?;
+                write_u64(&mut chunk, summary.shallow_size)?;
+                write_u64(&mut chunk, summary.retained_size)?;
+                write_u32(&mut chunk, summary.retained_percent.to_bits())?;
+                write_len(&mut chunk, summary.direct_child_count)?;
+            }
+            flush_sidecar_chunk(&mut writer, &mut chunk)?;
+            report_cache_write_chunk(
+                progress,
+                progress_reporter,
+                OBJECTS_FILE,
+                chunk_end,
+                summary_count,
+                "对象",
+            )?;
+        }
+        finish_sidecar_writer(writer)
+    }
+
+    /// 打开对象摘要懒加载存储。
+    fn open_object_summary_storage<F>(
+        path: &Path,
+        expected_count: usize,
+        progress: &mut HprofProgress,
+        progress_reporter: &mut F,
+    ) -> Result<HprofSummaryStorage, HprofError>
+    where
+        F: FnMut(HprofProgress),
+    {
+        let (mut file, file_len) = create_sidecar_reader(path)?;
+        read_magic(&mut file, MAGIC_OBJECTS)?;
+        let count = read_len(&mut file)?;
+        validate_sidecar_count_eq("对象摘要", count, expected_count)?;
+        validate_object_summary_file_len(count, file_len)?;
+        progress.phase_done = 1;
+        progress.phase_total = 1;
+        progress.phase_unit = "文件";
+        progress.sub_message = "建立对象摘要懒加载读取器".to_string();
+        progress_reporter(progress.clone());
+        Ok(HprofSummaryStorage::Sidecar {
+            count,
+            reader: std::cell::RefCell::new(file),
+            cache: std::cell::RefCell::new(FxHashMap::default()),
+            #[cfg(test)]
+            object_index_cache: std::cell::RefCell::new(FxHashMap::default()),
+        })
+    }
+
+    /// 从已打开的 `objects.bin` 随机读取单条对象摘要。
+    ///
+    /// 业务意图：
+    /// - 缓存命中时 dominator tree 首屏只需要少量 top row；按固定记录长度 seek 可以避免全量读取数百万对象摘要。
+    /// - 调用方复用同一个 `BufReader<File>`，避免 UI 重绘时为每个可见行重复打开 sidecar 文件。
+    pub(super) fn read_object_summary_from_reader<R: Read + Seek>(
+        reader: &mut R,
+        summary_index: usize,
+        expected_count: usize,
+    ) -> Result<HprofDominatorObjectSummary, HprofError> {
+        if summary_index >= expected_count {
+            return Err(HprofError::InvalidFormat(format!(
+                "sidecar 对象摘要下标越界：{summary_index} / {expected_count}"
+            )));
+        }
+        let header_len = object_summary_data_offset();
+        let offset = header_len
+            .checked_add((summary_index as u64).saturating_mul(OBJECT_SUMMARY_RECORD_BYTES))
+            .ok_or_else(|| HprofError::InvalidFormat("sidecar 对象摘要偏移溢出".to_string()))?;
+        reader.seek(SeekFrom::Start(offset))?;
+        read_object_summary_record(reader)
+    }
+
+    /// 校验 `objects.bin` 是否足以容纳固定长度摘要记录。
+    fn validate_object_summary_file_len(count: usize, file_len: u64) -> Result<(), HprofError> {
+        let expected_len = object_summary_data_offset()
+            .checked_add((count as u64).saturating_mul(OBJECT_SUMMARY_RECORD_BYTES))
+            .ok_or_else(|| HprofError::InvalidFormat("sidecar 对象摘要文件长度溢出".to_string()))?;
+        if file_len < expected_len {
+            return Err(HprofError::InvalidFormat(format!(
+                "sidecar 对象摘要文件截断：{} < {}",
+                file_len, expected_len
+            )));
+        }
+        Ok(())
+    }
+
+    /// 返回 `objects.bin` 固定摘要记录起始偏移。
+    fn object_summary_data_offset() -> u64 {
+        8 + MAGIC_OBJECTS.len() as u64 + 8
+    }
+
+    /// 读取一条固定长度对象摘要记录。
+    fn read_object_summary_record<R: Read>(
+        reader: &mut R,
+    ) -> Result<HprofDominatorObjectSummary, HprofError> {
+        Ok(HprofDominatorObjectSummary {
+            object_id: read_u64(reader)?,
+            class_id: read_u64(reader)?,
+            kind: read_kind(reader)?,
+            shallow_size: read_u64(reader)?,
+            retained_size: read_u64(reader)?,
+            retained_percent: f32::from_bits(read_u32(reader)?),
+            direct_child_count: read_len(reader)?,
+        })
+    }
+
+    fn write_dominator_file<F>(
+        path: &Path,
+        result: &HprofDominatorResult,
+        progress: &mut HprofProgress,
+        progress_reporter: &mut F,
+        cancel_flag: &AtomicBool,
+    ) -> Result<(), HprofError>
+    where
+        F: FnMut(HprofProgress),
+    {
+        let mut writer = create_sidecar_writer(path)?;
+        write_magic(&mut writer, MAGIC_DOMINATOR)?;
+        write_len(&mut writer, result.total_objects)?;
+        write_len(&mut writer, result.total_classes)?;
+        write_len(&mut writer, result.gc_root_count)?;
+        write_len(&mut writer, result.edge_count)?;
+        write_len(&mut writer, result.raw_edge_count)?;
+        write_len(&mut writer, result.reference_edge_stats.weak_like)?;
+        write_len(&mut writer, result.reference_edge_stats.soft_like)?;
+        write_len(&mut writer, result.reference_edge_stats.phantom_like)?;
+        write_len(&mut writer, result.reference_edge_stats.finalizer_like)?;
+        write_len(&mut writer, result.synthetic_class_loader_edge_count)?;
+        write_len(&mut writer, result.synthetic_bootstrap_class_root_count)?;
+        write_u64(&mut writer, result.total_shallow_size)?;
+        write_u64(&mut writer, result.reachable_shallow_size)?;
+        write_len(&mut writer, result.reachable_object_count)?;
+        write_len(&mut writer, result.unreachable_object_count)?;
+        write_u64(&mut writer, result.unreachable_shallow_size)?;
+        write_len(&mut writer, result.top_object_ids.len())?;
+
+        let total_records = 1usize
+            .saturating_add(result.top_object_ids.len())
+            .saturating_add(result.top_summary_indices.len())
+            .saturating_add(result.child_offsets.len())
+            .saturating_add(result.child_summary_indices.len());
+        let mut done = 1usize;
+        report_cache_write_chunk(
+            progress,
+            progress_reporter,
+            DOMINATOR_FILE,
+            done,
+            total_records,
+            "条",
+        )?;
+
+        let mut chunk = Vec::with_capacity(HPROF_SIDECAR_RECORD_CHUNK * 8);
+        for object_ids in result.top_object_ids.chunks(HPROF_SIDECAR_RECORD_CHUNK) {
+            check_cancel(cancel_flag)?;
+            for object_id in object_ids {
+                write_u64(&mut chunk, *object_id)?;
+            }
+            flush_sidecar_chunk(&mut writer, &mut chunk)?;
+            done = done.saturating_add(object_ids.len());
+            report_cache_write_chunk(
+                progress,
+                progress_reporter,
+                DOMINATOR_FILE,
+                done,
+                total_records,
+                "条",
+            )?;
+        }
+
+        write_len(&mut writer, result.top_summary_indices.len())?;
+        for indices in result
+            .top_summary_indices
+            .chunks(HPROF_SIDECAR_RECORD_CHUNK)
+        {
+            check_cancel(cancel_flag)?;
+            for index in indices {
+                write_len(&mut chunk, *index)?;
+            }
+            flush_sidecar_chunk(&mut writer, &mut chunk)?;
+            done = done.saturating_add(indices.len());
+            report_cache_write_chunk(
+                progress,
+                progress_reporter,
+                DOMINATOR_FILE,
+                done,
+                total_records,
+                "条",
+            )?;
+        }
+
+        write_len(&mut writer, result.child_offsets.len())?;
+        for offsets in result.child_offsets.chunks(HPROF_SIDECAR_RECORD_CHUNK) {
+            check_cancel(cancel_flag)?;
+            for offset in offsets {
+                write_len(&mut chunk, *offset)?;
+            }
+            flush_sidecar_chunk(&mut writer, &mut chunk)?;
+            done = done.saturating_add(offsets.len());
+            report_cache_write_chunk(
+                progress,
+                progress_reporter,
+                DOMINATOR_FILE,
+                done,
+                total_records,
+                "条",
+            )?;
+        }
+
+        write_len(&mut writer, result.child_summary_indices.len())?;
+        for indices in result
+            .child_summary_indices
+            .chunks(HPROF_SIDECAR_RECORD_CHUNK)
+        {
+            check_cancel(cancel_flag)?;
+            for index in indices {
+                write_len(&mut chunk, *index)?;
+            }
+            flush_sidecar_chunk(&mut writer, &mut chunk)?;
+            done = done.saturating_add(indices.len());
+            report_cache_write_chunk(
+                progress,
+                progress_reporter,
+                DOMINATOR_FILE,
+                done,
+                total_records,
+                "条",
+            )?;
+        }
+        finish_sidecar_writer(writer)
+    }
+
+    fn read_dominator_file<F>(
+        path: &Path,
+        progress: &mut HprofProgress,
+        progress_reporter: &mut F,
+        cancel_flag: &AtomicBool,
+    ) -> Result<CachedDominatorData, HprofError>
+    where
+        F: FnMut(HprofProgress),
+    {
+        let (mut file, file_len) = create_sidecar_reader(path)?;
+        progress.phase_done = 0;
+        progress.phase_total = 1;
+        progress.phase_unit = "文件";
+        progress.sub_message = "读取 dominator 元数据".to_string();
+        progress_reporter(progress.clone());
+        read_magic(&mut file, MAGIC_DOMINATOR)?;
+        let total_objects = read_len(&mut file)?;
+        let total_classes = read_len(&mut file)?;
+        let gc_root_count = read_len(&mut file)?;
+        let edge_count = read_len(&mut file)?;
+        let raw_edge_count = read_len(&mut file)?;
+        let reference_edge_stats = HprofReferenceEdgeStats {
+            weak_like: read_len(&mut file)?,
+            soft_like: read_len(&mut file)?,
+            phantom_like: read_len(&mut file)?,
+            finalizer_like: read_len(&mut file)?,
+        };
+        let synthetic_class_loader_edge_count = read_len(&mut file)?;
+        let synthetic_bootstrap_class_root_count = read_len(&mut file)?;
+        let total_shallow_size = read_u64(&mut file)?;
+        let reachable_shallow_size = read_u64(&mut file)?;
+        let reachable_object_count = read_len(&mut file)?;
+        let unreachable_object_count = read_len(&mut file)?;
+        let unreachable_shallow_size = read_u64(&mut file)?;
+        // 缓存命中时不会重新扫描源 HPROF，因此摘要计数必须尽早从 dominator 文件恢复。
+        // 这样用户在大 sidecar 读取期间也能看到对象、类、Root、边数，而不是长时间保持 0。
+        progress.object_count = total_objects;
+        progress.class_count = total_classes;
+        progress.gc_root_count = gc_root_count;
+        progress.edge_count = edge_count;
+        progress_reporter(progress.clone());
+        validate_sidecar_count("可达对象", reachable_object_count, total_objects)?;
+        validate_sidecar_count(
+            "不可达对象",
+            unreachable_object_count,
+            total_objects.saturating_sub(reachable_object_count),
+        )?;
+        let max_records_by_file = max_u64_records_for_file(file_len);
+        let top_count = read_len(&mut file)?;
+        validate_sidecar_count(
+            "Top retained",
+            top_count,
+            HPROF_TOP_DOMINATOR_LIMIT.min(max_records_by_file),
+        )?;
+        let mut top_object_ids = Vec::with_capacity(top_count);
+        for index in 0..top_count {
+            check_cancel(cancel_flag)?;
+            top_object_ids.push(read_u64(&mut file)?);
+            let done = index + 1;
+            if should_report_work(done, top_count) {
+                report_cache_read_chunk(
+                    progress,
+                    progress_reporter,
+                    DOMINATOR_FILE,
+                    done,
+                    top_count,
+                    "Top",
+                )?;
+            }
+        }
+        let top_summary_count = read_len(&mut file)?;
+        validate_sidecar_count_eq("Top summary indices", top_summary_count, top_count)?;
+        validate_sidecar_count(
+            "Top summary indices",
+            top_summary_count,
+            reachable_object_count,
+        )?;
+        let mut top_summary_indices = Vec::with_capacity(top_summary_count);
+        for index in 0..top_summary_count {
+            check_cancel(cancel_flag)?;
+            let summary_index = read_len(&mut file)?;
+            validate_sidecar_count(
+                "Top summary index",
+                summary_index,
+                reachable_object_count.saturating_sub(1),
+            )?;
+            top_summary_indices.push(summary_index);
+            let done = index + 1;
+            if should_report_work(done, top_summary_count) {
+                report_cache_read_chunk(
+                    progress,
+                    progress_reporter,
+                    DOMINATOR_FILE,
+                    done,
+                    top_summary_count,
+                    "Top",
+                )?;
+            }
+        }
+        let offset_count = read_len(&mut file)?;
+        let expected_offsets = reachable_object_count.checked_add(1).ok_or_else(|| {
+            HprofError::InvalidFormat("sidecar child offsets 数量溢出".to_string())
+        })?;
+        validate_sidecar_count_eq("child offsets", offset_count, expected_offsets)?;
+        validate_sidecar_count("child offsets", offset_count, max_records_by_file)?;
+        let mut child_offsets = Vec::with_capacity(offset_count);
+        for index in 0..offset_count {
+            check_cancel(cancel_flag)?;
+            child_offsets.push(read_len(&mut file)?);
+            let done = index + 1;
+            if should_report_work(done, offset_count) {
+                report_cache_read_chunk(
+                    progress,
+                    progress_reporter,
+                    DOMINATOR_FILE,
+                    done,
+                    offset_count,
+                    "offset",
+                )?;
+            }
+        }
+        let child_count = read_len(&mut file)?;
+        validate_sidecar_count("child summary indices", child_count, reachable_object_count)?;
+        validate_sidecar_count("child summary indices", child_count, max_records_by_file)?;
+        let mut previous_offset = 0usize;
+        for offset in &child_offsets {
+            if *offset < previous_offset || *offset > child_count {
+                return Err(HprofError::InvalidFormat(format!(
+                    "sidecar child offsets 内容损坏：offset={offset}, child_count={child_count}"
+                )));
+            }
+            previous_offset = *offset;
+        }
+        let mut child_summary_indices = Vec::with_capacity(child_count);
+        for index in 0..child_count {
+            check_cancel(cancel_flag)?;
+            let child_summary_index = read_len(&mut file)?;
+            validate_sidecar_count(
+                "child summary index",
+                child_summary_index,
+                reachable_object_count.saturating_sub(1),
+            )?;
+            child_summary_indices.push(child_summary_index);
+            let done = index + 1;
+            if should_report_work(done, child_count) {
+                report_cache_read_chunk(
+                    progress,
+                    progress_reporter,
+                    DOMINATOR_FILE,
+                    done,
+                    child_count,
+                    "child",
+                )?;
+            }
+        }
+        finish_cache_file_progress(progress, progress_reporter, DOMINATOR_FILE, file_len)?;
+        Ok(CachedDominatorData {
+            total_objects,
+            total_classes,
+            gc_root_count,
+            edge_count,
+            raw_edge_count,
+            reference_edge_stats,
+            synthetic_class_loader_edge_count,
+            synthetic_bootstrap_class_root_count,
+            total_shallow_size,
+            reachable_shallow_size,
+            reachable_object_count,
+            unreachable_object_count,
+            unreachable_shallow_size,
+            top_object_ids,
+            top_summary_indices,
+            child_offsets,
+            child_summary_indices,
+        })
+    }
+
+    struct CachedDominatorData {
+        total_objects: usize,
+        total_classes: usize,
+        gc_root_count: usize,
+        edge_count: usize,
+        raw_edge_count: usize,
+        reference_edge_stats: HprofReferenceEdgeStats,
+        synthetic_class_loader_edge_count: usize,
+        synthetic_bootstrap_class_root_count: usize,
+        total_shallow_size: u64,
+        reachable_shallow_size: u64,
+        reachable_object_count: usize,
+        unreachable_object_count: usize,
+        unreachable_shallow_size: u64,
+        top_object_ids: Vec<HprofObjectId>,
+        top_summary_indices: Vec<usize>,
+        child_offsets: Vec<usize>,
+        child_summary_indices: Vec<usize>,
+    }
+
+    fn write_classes_file<F>(
+        path: &Path,
+        result: &HprofDominatorResult,
+        progress: &mut HprofProgress,
+        progress_reporter: &mut F,
+        cancel_flag: &AtomicBool,
+    ) -> Result<(), HprofError>
+    where
+        F: FnMut(HprofProgress),
+    {
+        let mut writer = create_sidecar_writer(path)?;
+        write_magic(&mut writer, MAGIC_CLASSES)?;
+        write_len(&mut writer, result.class_names.len())?;
+        report_cache_write_chunk(
+            progress,
+            progress_reporter,
+            CLASSES_FILE,
+            0,
+            result.class_names.len(),
+            "类",
+        )?;
+
+        let mut chunk = Vec::with_capacity(HPROF_SIDECAR_RECORD_CHUNK * 64);
+        let mut done = 0usize;
+        for (class_id, name) in &result.class_names {
+            write_u64(&mut chunk, *class_id)?;
+            write_string(&mut chunk, name)?;
+            done = done.saturating_add(1);
+            if done % HPROF_SIDECAR_RECORD_CHUNK == 0 {
+                check_cancel(cancel_flag)?;
+                flush_sidecar_chunk(&mut writer, &mut chunk)?;
+                report_cache_write_chunk(
+                    progress,
+                    progress_reporter,
+                    CLASSES_FILE,
+                    done,
+                    result.class_names.len(),
+                    "类",
+                )?;
+            }
+        }
+        flush_sidecar_chunk(&mut writer, &mut chunk)?;
+        report_cache_write_chunk(
+            progress,
+            progress_reporter,
+            CLASSES_FILE,
+            done,
+            result.class_names.len(),
+            "类",
+        )?;
+        finish_sidecar_writer(writer)
+    }
+
+    fn read_classes_file<F>(
+        path: &Path,
+        max_class_count: usize,
+        progress: &mut HprofProgress,
+        progress_reporter: &mut F,
+        cancel_flag: &AtomicBool,
+    ) -> Result<FxHashMap<HprofObjectId, String>, HprofError>
+    where
+        F: FnMut(HprofProgress),
+    {
+        let (mut file, file_len) = create_sidecar_reader(path)?;
+        read_magic(&mut file, MAGIC_CLASSES)?;
+        let count = read_len(&mut file)?;
+        validate_sidecar_count("类名", count, max_class_count)?;
+        validate_sidecar_count(
+            "类名",
+            count,
+            usize::try_from(file_len / 16).unwrap_or(usize::MAX),
+        )?;
+        progress.phase_done = 0;
+        progress.phase_total = count as u64;
+        progress.phase_unit = "类";
+        progress.sub_message = "读取类名索引".to_string();
+        progress_reporter(progress.clone());
+        let mut class_names = FxHashMap::default();
+        class_names.reserve(count);
+        for index in 0..count {
+            check_cancel(cancel_flag)?;
+            class_names.insert(read_u64(&mut file)?, read_string(&mut file)?);
+            let done = index + 1;
+            if should_report_work(done, count) {
+                report_cache_read_chunk(
+                    progress,
+                    progress_reporter,
+                    CLASSES_FILE,
+                    done,
+                    count,
+                    "类",
+                )?;
+            }
+        }
+        finish_cache_file_progress(progress, progress_reporter, CLASSES_FILE, file_len)?;
+        Ok(class_names)
+    }
+
+    fn write_threads_file<F>(
+        path: &Path,
+        result: &HprofDominatorResult,
+        progress: &mut HprofProgress,
+        progress_reporter: &mut F,
+        cancel_flag: &AtomicBool,
+    ) -> Result<(), HprofError>
+    where
+        F: FnMut(HprofProgress),
+    {
+        let mut writer = create_sidecar_writer(path)?;
+        write_magic(&mut writer, MAGIC_THREADS)?;
+        write_len(&mut writer, result.thread_details.len())?;
+        report_cache_write_chunk(
+            progress,
+            progress_reporter,
+            THREADS_FILE,
+            0,
+            result.thread_details.len(),
+            "线程",
+        )?;
+
+        let mut chunk = Vec::with_capacity(HPROF_SIDECAR_RECORD_CHUNK * 256);
+        let mut done = 0usize;
+        for (object_id, details) in &result.thread_details {
+            write_u64(&mut chunk, *object_id)?;
+            write_u64(&mut chunk, details.object_id)?;
+            write_string(&mut chunk, &details.class_name)?;
+            write_string(&mut chunk, &details.thread_name)?;
+            write_len(&mut chunk, details.properties.len())?;
+            for property in &details.properties {
+                write_string(&mut chunk, &property.name)?;
+                write_string(&mut chunk, &property.value)?;
+            }
+            write_len(&mut chunk, details.stack_frames.len())?;
+            for frame in &details.stack_frames {
+                write_string(&mut chunk, &frame.class_name)?;
+                write_string(&mut chunk, &frame.method_name)?;
+                write_string(&mut chunk, &frame.method_signature)?;
+                write_string(&mut chunk, &frame.source)?;
+                write_i32(&mut chunk, frame.line_number)?;
+                write_string(&mut chunk, &frame.display)?;
+            }
+            write_option_string(&mut chunk, details.stack_message.as_deref())?;
+            done = done.saturating_add(1);
+            if done % HPROF_SIDECAR_RECORD_CHUNK == 0
+                || chunk.len() >= HPROF_SIDECAR_WRITER_BUFFER_BYTES
+            {
+                check_cancel(cancel_flag)?;
+                flush_sidecar_chunk(&mut writer, &mut chunk)?;
+                report_cache_write_chunk(
+                    progress,
+                    progress_reporter,
+                    THREADS_FILE,
+                    done,
+                    result.thread_details.len(),
+                    "线程",
+                )?;
+            }
+        }
+        flush_sidecar_chunk(&mut writer, &mut chunk)?;
+        report_cache_write_chunk(
+            progress,
+            progress_reporter,
+            THREADS_FILE,
+            done,
+            result.thread_details.len(),
+            "线程",
+        )?;
+        finish_sidecar_writer(writer)
+    }
+
+    fn read_threads_file<F>(
+        path: &Path,
+        max_thread_count: usize,
+        progress: &mut HprofProgress,
+        progress_reporter: &mut F,
+        cancel_flag: &AtomicBool,
+    ) -> Result<FxHashMap<HprofObjectId, HprofThreadDetails>, HprofError>
+    where
+        F: FnMut(HprofProgress),
+    {
+        let (mut file, file_len) = create_sidecar_reader(path)?;
+        read_magic(&mut file, MAGIC_THREADS)?;
+        let count = read_len(&mut file)?;
+        validate_sidecar_count("线程详情", count, max_thread_count)?;
+        validate_sidecar_count(
+            "线程详情",
+            count,
+            usize::try_from(file_len / 32).unwrap_or(usize::MAX),
+        )?;
+        progress.phase_done = 0;
+        progress.phase_total = count as u64;
+        progress.phase_unit = "线程";
+        progress.sub_message = "读取线程详情".to_string();
+        progress_reporter(progress.clone());
+        let mut thread_details = FxHashMap::default();
+        thread_details.reserve(count);
+        let max_records_by_file = max_u64_records_for_file(file_len);
+        for index in 0..count {
+            check_cancel(cancel_flag)?;
+            let key = read_u64(&mut file)?;
+            let object_id = read_u64(&mut file)?;
+            let class_name = read_string(&mut file)?;
+            let thread_name = read_string(&mut file)?;
+            let property_count = read_len(&mut file)?;
+            validate_sidecar_count("线程属性", property_count, 128)?;
+            let mut properties = Vec::with_capacity(property_count);
+            for _ in 0..property_count {
+                properties.push(HprofThreadProperty {
+                    name: read_string(&mut file)?,
+                    value: read_string(&mut file)?,
+                });
+            }
+            let frame_count = read_len(&mut file)?;
+            validate_sidecar_count("线程栈帧", frame_count, max_records_by_file)?;
+            let mut stack_frames = Vec::with_capacity(frame_count);
+            for _ in 0..frame_count {
+                stack_frames.push(HprofThreadStackFrame {
+                    class_name: read_string(&mut file)?,
+                    method_name: read_string(&mut file)?,
+                    method_signature: read_string(&mut file)?,
+                    source: read_string(&mut file)?,
+                    line_number: read_i32(&mut file)?,
+                    display: read_string(&mut file)?,
+                });
+            }
+            let stack_message = read_option_string(&mut file)?;
+            thread_details.insert(
+                key,
+                HprofThreadDetails {
+                    object_id,
+                    class_name,
+                    thread_name,
+                    properties,
+                    stack_frames,
+                    stack_message,
+                },
+            );
+            let done = index + 1;
+            if should_report_work(done, count) {
+                report_cache_read_chunk(
+                    progress,
+                    progress_reporter,
+                    THREADS_FILE,
+                    done,
+                    count,
+                    "线程",
+                )?;
+            }
+        }
+        finish_cache_file_progress(progress, progress_reporter, THREADS_FILE, file_len)?;
+        Ok(thread_details)
+    }
+
+    fn read_cached_result<F>(
+        path: &Path,
+        sidecar_dir: &Path,
+        manifest: &HprofSidecarManifest,
+        progress: &mut HprofProgress,
+        progress_reporter: &mut F,
+        cancel_flag: &AtomicBool,
+    ) -> Result<HprofDominatorResult, HprofError>
+    where
+        F: FnMut(HprofProgress),
+    {
+        let dominator_path = sidecar_dir.join(DOMINATOR_FILE);
+        let dominator =
+            read_dominator_file(&dominator_path, progress, progress_reporter, cancel_flag)?;
+        let objects_path = sidecar_dir.join(OBJECTS_FILE);
+        let summary_storage = open_object_summary_storage(
+            &objects_path,
+            dominator.reachable_object_count,
+            progress,
+            progress_reporter,
+        )?;
+        check_cancel(cancel_flag)?;
+        let classes_path = sidecar_dir.join(CLASSES_FILE);
+        let class_names = read_classes_file(
+            &classes_path,
+            dominator.total_classes,
+            progress,
+            progress_reporter,
+            cancel_flag,
+        )?;
+        let threads_path = sidecar_dir.join(THREADS_FILE);
+        let thread_details = read_threads_file(
+            &threads_path,
+            dominator.reachable_object_count,
+            progress,
+            progress_reporter,
+            cancel_flag,
+        )?;
+        Ok(HprofDominatorResult {
+            file_path: path.to_path_buf(),
+            header: manifest.header.clone(),
+            total_objects: dominator.total_objects,
+            total_classes: dominator.total_classes,
+            gc_root_count: dominator.gc_root_count,
+            edge_count: dominator.edge_count,
+            raw_edge_count: dominator.raw_edge_count,
+            reference_edge_stats: dominator.reference_edge_stats,
+            synthetic_class_loader_edge_count: dominator.synthetic_class_loader_edge_count,
+            synthetic_bootstrap_class_root_count: dominator.synthetic_bootstrap_class_root_count,
+            total_shallow_size: dominator.total_shallow_size,
+            reachable_shallow_size: dominator.reachable_shallow_size,
+            reachable_object_count: dominator.reachable_object_count,
+            unreachable_object_count: dominator.unreachable_object_count,
+            unreachable_shallow_size: dominator.unreachable_shallow_size,
+            size_model: manifest.size_model.clone(),
+            cache_status: None,
+            top_object_ids: dominator.top_object_ids,
+            top_summary_indices: dominator.top_summary_indices,
+            summary_storage,
+            class_names,
+            thread_details,
+            child_offsets: dominator.child_offsets,
+            child_summary_indices: dominator.child_summary_indices,
+        })
+    }
+
+    fn write_empty_file(path: &Path) -> Result<(), HprofError> {
+        let mut writer = create_sidecar_writer(path)?;
+        write_magic(&mut writer, MAGIC_EMPTY)?;
+        write_u64(&mut writer, 0)?;
+        finish_sidecar_writer(writer)
+    }
+
+    fn write_magic<W: Write>(writer: &mut W, magic: &[u8]) -> Result<(), HprofError> {
+        write_len(writer, magic.len())?;
+        writer.write_all(magic)?;
+        Ok(())
+    }
+
+    fn read_magic<R: Read>(reader: &mut R, expected: &[u8]) -> Result<(), HprofError> {
+        let len = read_len(reader)?;
+        validate_sidecar_count("magic", len, MAX_MAGIC_BYTES)?;
+        let mut magic = vec![0u8; len];
+        reader.read_exact(&mut magic)?;
+        if magic == expected {
+            Ok(())
+        } else {
+            Err(HprofError::InvalidFormat(
+                "sidecar 二进制文件 magic 不匹配".to_string(),
+            ))
+        }
+    }
+
+    fn write_kind<W: Write>(writer: &mut W, kind: &HprofObjectKind) -> Result<(), HprofError> {
+        match kind {
+            HprofObjectKind::Class => {
+                write_u8(writer, 0)?;
+                write_u32(writer, 0)?;
+                write_u8(writer, 0)
+            }
+            HprofObjectKind::Instance => {
+                write_u8(writer, 1)?;
+                write_u32(writer, 0)?;
+                write_u8(writer, 0)
+            }
+            HprofObjectKind::ObjectArray { length } => {
+                write_u8(writer, 2)?;
+                write_u32(writer, *length)?;
+                write_u8(writer, 0)
+            }
+            HprofObjectKind::PrimitiveArray {
+                element_type,
+                length,
+            } => {
+                write_u8(writer, 3)?;
+                write_u32(writer, *length)?;
+                write_u8(writer, *element_type)
+            }
+        }
+    }
+
+    fn read_kind<R: Read>(reader: &mut R) -> Result<HprofObjectKind, HprofError> {
+        let tag = read_u8(reader)?;
+        let length = read_u32(reader)?;
+        let element_type = read_u8(reader)?;
+        match tag {
+            0 => Ok(HprofObjectKind::Class),
+            1 => Ok(HprofObjectKind::Instance),
+            2 => Ok(HprofObjectKind::ObjectArray { length }),
+            3 => Ok(HprofObjectKind::PrimitiveArray {
+                element_type,
+                length,
+            }),
+            tag => Err(HprofError::InvalidFormat(format!(
+                "未知 sidecar 对象类型：{tag}"
+            ))),
+        }
+    }
+
+    fn write_string<W: Write>(writer: &mut W, value: &str) -> Result<(), HprofError> {
+        write_len(writer, value.len())?;
+        writer.write_all(value.as_bytes())?;
+        Ok(())
+    }
+
+    fn read_string<R: Read>(reader: &mut R) -> Result<String, HprofError> {
+        let len = read_len(reader)?;
+        validate_sidecar_count("字符串字节", len, MAX_STRING_BYTES)?;
+        let mut bytes = vec![0u8; len];
+        reader.read_exact(&mut bytes)?;
+        String::from_utf8(bytes)
+            .map_err(|_| HprofError::InvalidFormat("sidecar 字符串不是有效 UTF-8".to_string()))
+    }
+
+    fn write_option_string<W: Write>(
+        writer: &mut W,
+        value: Option<&str>,
+    ) -> Result<(), HprofError> {
+        match value {
+            Some(value) => {
+                write_u8(writer, 1)?;
+                write_string(writer, value)
+            }
+            None => write_u8(writer, 0),
+        }
+    }
+
+    fn read_option_string<R: Read>(reader: &mut R) -> Result<Option<String>, HprofError> {
+        match read_u8(reader)? {
+            0 => Ok(None),
+            1 => Ok(Some(read_string(reader)?)),
+            tag => Err(HprofError::InvalidFormat(format!(
+                "未知 sidecar Option<String> 标记：{tag}"
+            ))),
+        }
+    }
+
+    fn write_len<W: Write>(writer: &mut W, value: usize) -> Result<(), HprofError> {
+        write_u64(writer, value as u64)
+    }
+
+    fn read_len<R: Read>(reader: &mut R) -> Result<usize, HprofError> {
+        usize::try_from(read_u64(reader)?)
+            .map_err(|_| HprofError::InvalidFormat("sidecar 长度超过当前平台限制".to_string()))
+    }
+
+    fn write_u8<W: Write>(writer: &mut W, value: u8) -> Result<(), HprofError> {
+        writer.write_all(&[value])?;
+        Ok(())
+    }
+
+    fn read_u8<R: Read>(reader: &mut R) -> Result<u8, HprofError> {
+        let mut bytes = [0u8; 1];
+        reader.read_exact(&mut bytes)?;
+        Ok(bytes[0])
+    }
+
+    fn write_u32<W: Write>(writer: &mut W, value: u32) -> Result<(), HprofError> {
+        writer.write_all(&value.to_le_bytes())?;
+        Ok(())
+    }
+
+    fn read_u32<R: Read>(reader: &mut R) -> Result<u32, HprofError> {
+        let mut bytes = [0u8; 4];
+        reader.read_exact(&mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn write_i32<W: Write>(writer: &mut W, value: i32) -> Result<(), HprofError> {
+        writer.write_all(&value.to_le_bytes())?;
+        Ok(())
+    }
+
+    fn read_i32<R: Read>(reader: &mut R) -> Result<i32, HprofError> {
+        let mut bytes = [0u8; 4];
+        reader.read_exact(&mut bytes)?;
+        Ok(i32::from_le_bytes(bytes))
+    }
+
+    fn write_u64<W: Write>(writer: &mut W, value: u64) -> Result<(), HprofError> {
+        writer.write_all(&value.to_le_bytes())?;
+        Ok(())
+    }
+
+    fn read_u64<R: Read>(reader: &mut R) -> Result<u64, HprofError> {
+        let mut bytes = [0u8; 8];
+        reader.read_exact(&mut bytes)?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn now_millis() -> u128 {
+        system_time_millis(SystemTime::now()).unwrap_or(0)
+    }
+
+    fn system_time_millis(time: SystemTime) -> Option<u128> {
+        time.duration_since(UNIX_EPOCH).ok().map(|duration| {
+            u128::from(duration.as_secs()) * 1000 + u128::from(duration.subsec_millis())
+        })
+    }
+}
+
+/// 紧凑引用图，给 LT 算法使用。
+///
+/// 业务意图：
+/// - dominator 计算只需要连续对象下标和出边目标；移除 petgraph 实体图可以避免为同一批节点和边额外复制一份内存。
 struct HprofCompactAdjacency {
     /// 虚拟 Root 指向的 GC Root 对象下标。
-    root_indices: Vec<usize>,
+    root_indices: Vec<HprofNodeId>,
     /// 每个对象出边在 `targets` 中的起始偏移。
-    offsets: Vec<usize>,
+    offsets: Vec<HprofNodeId>,
     /// 所有对象出边目标对象下标。
-    targets: Vec<usize>,
+    targets: Vec<HprofNodeId>,
 }
 
 /// 连续对象下标上的紧凑 dominator 子节点表。
@@ -1116,8 +3042,20 @@ where
     validate_hprof_file_selection(&path)?;
     check_cancel(&cancel_flag)?;
 
+    if let Some(cached_result) = hprof_cache::try_load_cached_hprof_result(
+        &path,
+        &mut progress,
+        &mut progress_reporter,
+        &cancel_flag,
+    ) {
+        return cached_result;
+    }
+
+    let sidecar_writable = hprof_cache::ensure_sidecar_writable(&path, progress.total_bytes)?;
+
     progress.stage = HprofAnalysisStage::ReadingHeader;
     progress.message = "正在读取 HPROF 文件头".to_string();
+    progress.sub_message.clear();
     progress_reporter(progress.clone());
 
     let graph = parse_hprof_object_graph(&path, progress, &mut progress_reporter, &cancel_flag)?;
@@ -1136,11 +3074,11 @@ where
         phase_done: 0,
         phase_total: graph.object_count() as u64,
         phase_unit: "对象",
-        sub_message: "准备构建 petgraph 节点".to_string(),
+        sub_message: "准备构建紧凑图节点".to_string(),
     };
     progress_reporter(progress.clone());
 
-    let result = build_hprof_dominator_result(
+    let mut result = build_hprof_dominator_result(
         &path,
         graph,
         &cancel_flag,
@@ -1154,6 +3092,38 @@ where
             progress_reporter(progress.clone());
         },
     )?;
+
+    if sidecar_writable {
+        hprof_cache::write_hprof_sidecar_result(
+            &result,
+            &mut progress,
+            &mut progress_reporter,
+            &cancel_flag,
+        )?;
+        result.cache_status = Some("sidecar index 已生成".to_string());
+        // 写入 sidecar 后立即按缓存路径重新打开一次结果，释放首次解析阶段构造的全量对象摘要和对象 ID 查询结构。
+        //
+        // 业务意图：
+        // - 首次解析大 dump 仍需要在 LT/result 阶段短暂构造 Owned 结果，但 UI 最终持有的结果应与第二次打开一致，
+        //   只保留 dominator/top/children 等轻量索引，对象摘要按可见行从 sidecar 懒加载。
+        // - 如果刚写出的 sidecar 因外部文件系统问题无法读回，仍返回内存结果，不影响本次分析正确性。
+        if let Some(cached_result) = hprof_cache::try_load_cached_hprof_result(
+            &path,
+            &mut progress,
+            &mut progress_reporter,
+            &cancel_flag,
+        ) {
+            match cached_result {
+                Ok(mut cached_result) => {
+                    cached_result.cache_status =
+                        Some("sidecar index 已生成并切换为懒加载".to_string());
+                    result = cached_result;
+                }
+                Err(HprofError::Canceled) => return Err(HprofError::Canceled),
+                Err(_) => {}
+            }
+        }
+    }
 
     progress.stage = HprofAnalysisStage::Completed;
     progress.message = "HPROF dominator tree 计算完成".to_string();
@@ -1945,13 +3915,15 @@ where
                 instance_fields: field_descriptors,
             },
         );
-        graph.insert_object(HprofHeapObject {
-            id: class_object_id,
-            class_id: class_object_id,
-            shallow_size: 0,
-            references: Vec::new(),
-            kind: HprofObjectKind::Class,
-        });
+        graph.insert_object(
+            HprofHeapObject {
+                id: class_object_id,
+                class_id: class_object_id,
+                shallow_size: 0,
+                kind: HprofObjectKind::Class,
+            },
+            Vec::new(),
+        )?;
         Ok(())
     }
 
@@ -1970,13 +3942,15 @@ where
             data_len,
         });
 
-        self.graph_mut()?.insert_object(HprofHeapObject {
-            id: object_id,
-            class_id,
-            shallow_size: 0,
-            references: Vec::new(),
-            kind: HprofObjectKind::Instance,
-        });
+        self.graph_mut()?.insert_object(
+            HprofHeapObject {
+                id: object_id,
+                class_id,
+                shallow_size: 0,
+                kind: HprofObjectKind::Instance,
+            },
+            Vec::new(),
+        )?;
         Ok(())
     }
 
@@ -1992,13 +3966,15 @@ where
             push_non_zero_reference(&mut references, reference_id);
         }
         let shallow_size = object_array_shallow_size(&self.graph_ref()?.size_model, length);
-        self.graph_mut()?.insert_object(HprofHeapObject {
-            id: array_id,
-            class_id: array_class_id,
-            shallow_size,
+        self.graph_mut()?.insert_object(
+            HprofHeapObject {
+                id: array_id,
+                class_id: array_class_id,
+                shallow_size,
+                kind: HprofObjectKind::ObjectArray { length },
+            },
             references,
-            kind: HprofObjectKind::ObjectArray { length },
-        });
+        )?;
         Ok(())
     }
 
@@ -2035,16 +4011,18 @@ where
             element_type,
             u64::from(length),
         )?;
-        self.graph_mut()?.insert_object(HprofHeapObject {
-            id: array_id,
-            class_id: 0,
-            shallow_size,
-            references: Vec::new(),
-            kind: HprofObjectKind::PrimitiveArray {
-                element_type,
-                length,
+        self.graph_mut()?.insert_object(
+            HprofHeapObject {
+                id: array_id,
+                class_id: 0,
+                shallow_size,
+                kind: HprofObjectKind::PrimitiveArray {
+                    element_type,
+                    length,
+                },
             },
-        });
+            Vec::new(),
+        )?;
         Ok(())
     }
 
@@ -2199,7 +4177,10 @@ where
             };
             let loader_object = &self.graph_ref()?.objects[loader_index];
             let shallow_size = loader_object.shallow_size;
-            let mut references = loader_object.references.clone();
+            let mut references = self
+                .graph_ref()?
+                .references_for_index(loader_index)
+                .to_vec();
             let previous_len = references.len();
             references.extend(class_ids);
             normalize_references(&mut references);
@@ -2659,8 +4640,28 @@ fn should_report_work(done: usize, total: usize) -> bool {
     done == total || done % HPROF_PROGRESS_WORK_INTERVAL == 0
 }
 
-/// 构建 petgraph 图并同步生成 LT 使用的紧凑邻接表。
-fn build_petgraph_and_adjacency<F>(
+/// 把 `usize` 工作下标压缩为 `u32`。
+///
+/// 边界条件：
+/// - `u32::MAX` 保留给无效哨兵，因此对象数、边数和算法编号超过 `u32::MAX - 1` 时明确报错，
+///   避免大 dump 上发生静默截断后生成错误 dominator tree。
+fn hprof_node_id(value: usize, what: &str) -> Result<HprofNodeId, HprofError> {
+    if value >= HPROF_INVALID_NODE as usize {
+        return Err(HprofError::Unsupported(format!(
+            "{what} 超过当前低内存索引上限，暂不支持超过 {} 的 HPROF dump",
+            HPROF_INVALID_NODE - 1
+        )));
+    }
+    Ok(value as HprofNodeId)
+}
+
+/// 将内部 `u32` 节点编号转换为数组下标。
+fn hprof_node_index(value: HprofNodeId) -> usize {
+    value as usize
+}
+
+/// 构建 LT 使用的紧凑邻接表。
+fn build_compact_adjacency<F>(
     graph: &HprofObjectGraph,
     cancel_flag: &AtomicBool,
     reporter: &mut F,
@@ -2669,21 +4670,19 @@ where
     F: FnMut(HprofAnalysisStage, &str, &str, u64, u64, &'static str),
 {
     let object_count = graph.object_count();
-    let mut digraph: DiGraph<HprofObjectId, ()> =
-        DiGraph::with_capacity(object_count.saturating_add(1), graph.edge_count());
-    let mut node_by_object_index = Vec::with_capacity(object_count);
-    let virtual_root_node = digraph.add_node(HPROF_VIRTUAL_ROOT_ID);
+    let _ = hprof_node_id(object_count, "对象数量")?;
+    let _ = hprof_node_id(graph.edge_count(), "引用边数量")?;
 
     for (object_index, object) in graph.objects.iter().enumerate() {
         check_cancel(cancel_flag)?;
-        node_by_object_index.push(digraph.add_node(object.id));
+        let _ = object;
         let done = object_index + 1;
         if should_report_work(done, object_count) {
             report_work_progress(
                 reporter,
                 HprofAnalysisStage::BuildingDominatorGraph,
-                "正在构建 petgraph 引用图",
-                "添加 petgraph 节点",
+                "正在构建紧凑引用图",
+                "添加紧凑图节点",
                 done as u64,
                 object_count as u64,
                 "对象",
@@ -2702,15 +4701,14 @@ where
     for (root_done, root_id) in root_ids.iter().enumerate() {
         check_cancel(cancel_flag)?;
         if let Some(root_index) = graph.object_index(*root_id) {
-            root_indices.push(root_index);
-            digraph.add_edge(virtual_root_node, node_by_object_index[root_index], ());
+            root_indices.push(hprof_node_id(root_index, "GC Root 对象下标")?);
         }
         let done = root_done + 1;
         if should_report_work(done, root_total) {
             report_work_progress(
                 reporter,
                 HprofAnalysisStage::BuildingDominatorGraph,
-                "正在构建 petgraph 引用图",
+                "正在构建紧凑引用图",
                 "添加 GC Root 边",
                 done as u64,
                 root_total as u64,
@@ -2723,20 +4721,18 @@ where
     let mut targets = Vec::with_capacity(graph.edge_count());
     offsets.push(0);
     let mut processed_edges = 0usize;
-    for (object_index, object) in graph.objects.iter().enumerate() {
+    for object_index in 0..graph.objects.len() {
         check_cancel(cancel_flag)?;
-        let from_node = node_by_object_index[object_index];
-        for reference_id in &object.references {
+        for reference_id in graph.references_for_index(object_index) {
             processed_edges = processed_edges.saturating_add(1);
             if let Some(to_index) = graph.object_index(*reference_id) {
-                targets.push(to_index);
-                digraph.add_edge(from_node, node_by_object_index[to_index], ());
+                targets.push(hprof_node_id(to_index, "对象引用目标下标")?);
             }
             if should_report_work(processed_edges, graph.edge_count()) {
                 report_work_progress(
                     reporter,
                     HprofAnalysisStage::BuildingDominatorGraph,
-                    "正在构建 petgraph 引用图",
+                    "正在构建紧凑引用图",
                     "添加对象引用边",
                     processed_edges as u64,
                     graph.edge_count() as u64,
@@ -2744,11 +4740,8 @@ where
                 );
             }
         }
-        offsets.push(targets.len());
+        offsets.push(hprof_node_id(targets.len(), "引用边偏移")?);
     }
-
-    drop(digraph);
-    drop(node_by_object_index);
 
     Ok(HprofCompactAdjacency {
         root_indices,
@@ -2760,7 +4753,7 @@ where
 /// 根据对象图构建 dominator 结果。
 fn build_hprof_dominator_result<F>(
     path: &Path,
-    graph: HprofObjectGraph,
+    mut graph: HprofObjectGraph,
     cancel_flag: &AtomicBool,
     mut stage_reporter: F,
 ) -> Result<HprofDominatorResult, HprofError>
@@ -2771,16 +4764,17 @@ where
     report_work_progress(
         &mut stage_reporter,
         HprofAnalysisStage::BuildingDominatorGraph,
-        "正在构建 petgraph 引用图",
-        "添加 petgraph 节点",
+        "正在构建紧凑引用图",
+        "添加紧凑图节点",
         0,
         graph.object_count() as u64,
         "对象",
     );
-    let adjacency = build_petgraph_and_adjacency(&graph, cancel_flag, &mut stage_reporter)?;
+    let adjacency = build_compact_adjacency(&graph, cancel_flag, &mut stage_reporter)?;
+    graph.clear_reference_pool();
 
     let dominator_indices = compute_lengauer_tarjan_dominators(
-        &adjacency,
+        adjacency,
         graph.object_count(),
         cancel_flag,
         &mut stage_reporter,
@@ -2854,7 +4848,6 @@ where
         .collect::<Vec<_>>();
 
     let mut summaries = Vec::with_capacity(reachable_object_count);
-    let mut summary_indices = FxHashMap::default();
     let mut object_to_summary_index = vec![None; graph.object_count()];
     let mut summary_object_indices = Vec::with_capacity(reachable_object_count);
     for (object_index, object) in graph.objects.iter().enumerate() {
@@ -2868,7 +4861,6 @@ where
             retained_size as f32 * 100.0 / reachable_shallow_size as f32
         };
         let summary_index = summaries.len();
-        summary_indices.insert(object.id, summary_index);
         object_to_summary_index[object_index] = Some(summary_index);
         summary_object_indices.push(object_index);
         summaries.push(HprofDominatorObjectSummary {
@@ -2893,6 +4885,10 @@ where
         }
         child_offsets.push(child_summary_indices.len());
     }
+    let top_summary_indices = top_indices
+        .iter()
+        .filter_map(|object_index| object_to_summary_index[*object_index])
+        .collect::<Vec<_>>();
     let class_names = graph.class_names_for_result();
     let thread_details =
         build_thread_details(&graph, &retained_sizes, &dominator_indices.reachable);
@@ -2914,9 +4910,10 @@ where
         unreachable_object_count,
         unreachable_shallow_size,
         size_model: graph.size_model.clone(),
+        cache_status: None,
         top_object_ids,
-        summaries,
-        summary_indices,
+        top_summary_indices,
+        summary_storage: HprofSummaryStorage::Owned { summaries },
         class_names,
         thread_details,
         child_offsets,
@@ -3237,7 +5234,7 @@ fn stack_frame_source_label(source_file: &str, line_number: i32) -> String {
 
 /// 使用 Lengauer-Tarjan 算法计算对象下标级 immediate dominator。
 fn compute_lengauer_tarjan_dominators<F>(
-    adjacency: &HprofCompactAdjacency,
+    adjacency: HprofCompactAdjacency,
     object_count: usize,
     cancel_flag: &AtomicBool,
     reporter: &mut F,
@@ -3246,6 +5243,7 @@ where
     F: FnMut(HprofAnalysisStage, &str, &str, u64, u64, &'static str),
 {
     let node_count = object_count.saturating_add(1);
+    let _ = hprof_node_id(object_count, "LT 节点数量")?;
     report_work_progress(
         reporter,
         HprofAnalysisStage::ComputingDominatorTree,
@@ -3256,33 +5254,34 @@ where
         "节点",
     );
 
-    let mut dfn = vec![0usize; node_count];
-    let mut vertex = vec![0usize];
-    let mut parent = vec![usize::MAX; node_count];
-    let mut semi = vec![0usize; node_count];
-    let mut stack = vec![(0usize, 0usize)];
+    let mut dfn = vec![0 as HprofNodeId; node_count];
+    let mut vertex = vec![HPROF_INVALID_NODE];
+    let mut parent = vec![HPROF_INVALID_NODE; node_count];
+    let mut semi = vec![0 as HprofNodeId; node_count];
+    let mut stack = vec![(0 as HprofNodeId, 0usize)];
     dfn[0] = 1;
     semi[0] = 1;
     vertex.push(0);
 
     while let Some((node, next_child)) = stack.last_mut() {
-        let child_count = lt_neighbor_count(adjacency, *node);
+        let child_count = lt_neighbor_count(&adjacency, *node);
         if *next_child < child_count {
-            let child = lt_neighbor_at(adjacency, *node, *next_child);
+            let child = lt_neighbor_at(&adjacency, *node, *next_child);
+            let child_index = hprof_node_index(child);
             *next_child += 1;
-            if dfn[child] == 0 {
-                parent[child] = *node;
-                let number = vertex.len();
-                dfn[child] = number;
-                semi[child] = number;
+            if dfn[child_index] == 0 {
+                parent[child_index] = *node;
+                let number = hprof_node_id(vertex.len(), "DFS 编号")?;
+                dfn[child_index] = number;
+                semi[child_index] = number;
                 vertex.push(child);
-                if should_report_work(number, node_count) {
+                if should_report_work(hprof_node_index(number), node_count) {
                     report_work_progress(
                         reporter,
                         HprofAnalysisStage::ComputingDominatorTree,
                         "正在运行 Lengauer-Tarjan dominator 算法",
                         "DFS 编号",
-                        number as u64,
+                        u64::from(number),
                         node_count as u64,
                         "节点",
                     );
@@ -3310,7 +5309,9 @@ where
         "边",
     );
     let (predecessor_offsets, predecessors) =
-        build_lengauer_tarjan_predecessors(adjacency, &dfn, cancel_flag, reporter)?;
+        build_lengauer_tarjan_predecessors(&adjacency, &dfn, cancel_flag, reporter)?;
+    // adjacency 在前驱表构建后不再使用，显式释放 CSR 目标数组，降低 LT 主循环峰值内存。
+    drop(adjacency);
 
     report_work_progress(
         reporter,
@@ -3322,31 +5323,49 @@ where
         "节点",
     );
 
-    let mut ancestor = vec![usize::MAX; node_count];
-    let mut label = (0..node_count).collect::<Vec<_>>();
-    let mut bucket = vec![Vec::<usize>::new(); node_count];
-    let mut idom = vec![usize::MAX; node_count];
+    let mut ancestor = vec![HPROF_INVALID_NODE; node_count];
+    let mut label = (0..node_count)
+        .map(|index| hprof_node_id(index, "LT label 初始化"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut bucket_head = vec![HPROF_INVALID_NODE; node_count];
+    let mut bucket_next = vec![HPROF_INVALID_NODE; node_count];
+    let mut idom = vec![HPROF_INVALID_NODE; node_count];
     let mut eval_path = Vec::new();
 
     for reverse_index in (2..=reachable_node_count).rev() {
         check_cancel(cancel_flag)?;
         let w = vertex[reverse_index];
-        for v in &predecessors[predecessor_offsets[w]..predecessor_offsets[w + 1]] {
+        let w_index = hprof_node_index(w);
+        let predecessor_start = hprof_node_index(predecessor_offsets[w_index]);
+        let predecessor_end = hprof_node_index(predecessor_offsets[w_index + 1]);
+        for v in &predecessors[predecessor_start..predecessor_end] {
             let u = lengauer_tarjan_eval(*v, &mut ancestor, &mut label, &semi, &mut eval_path);
-            if semi[u] < semi[w] {
-                semi[w] = semi[u];
+            let u_index = hprof_node_index(u);
+            if semi[u_index] < semi[w_index] {
+                semi[w_index] = semi[u_index];
             }
         }
 
-        let semi_vertex = vertex[semi[w]];
-        bucket[semi_vertex].push(w);
-        ancestor[w] = parent[w];
+        let semi_vertex = vertex[hprof_node_index(semi[w_index])];
+        bucket_next[w_index] = bucket_head[hprof_node_index(semi_vertex)];
+        bucket_head[hprof_node_index(semi_vertex)] = w;
+        ancestor[w_index] = parent[w_index];
 
-        let parent_w = parent[w];
-        let parent_bucket = std::mem::take(&mut bucket[parent_w]);
-        for v in parent_bucket {
+        let parent_w = parent[w_index];
+        let parent_w_index = hprof_node_index(parent_w);
+        let mut bucket_node = bucket_head[parent_w_index];
+        bucket_head[parent_w_index] = HPROF_INVALID_NODE;
+        while bucket_node != HPROF_INVALID_NODE {
+            let v = bucket_node;
+            let v_index = hprof_node_index(v);
+            bucket_node = bucket_next[v_index];
+            bucket_next[v_index] = HPROF_INVALID_NODE;
             let u = lengauer_tarjan_eval(v, &mut ancestor, &mut label, &semi, &mut eval_path);
-            idom[v] = if semi[u] < semi[v] { u } else { parent_w };
+            idom[v_index] = if semi[hprof_node_index(u)] < semi[v_index] {
+                u
+            } else {
+                parent_w
+            };
         }
 
         let done = reachable_node_count - reverse_index + 1;
@@ -3374,8 +5393,9 @@ where
     );
     for index in 2..=reachable_node_count {
         let w = vertex[index];
-        if idom[w] != vertex[semi[w]] {
-            idom[w] = idom[idom[w]];
+        let w_index = hprof_node_index(w);
+        if idom[w_index] != vertex[hprof_node_index(semi[w_index])] {
+            idom[w_index] = idom[hprof_node_index(idom[w_index])];
         }
         if should_report_work(index - 1, reachable_non_root_count) {
             report_work_progress(
@@ -3391,6 +5411,11 @@ where
         }
     }
     idom[0] = 0;
+    drop(semi);
+    drop(ancestor);
+    drop(label);
+    drop(predecessor_offsets);
+    drop(predecessors);
 
     let mut reachable = vec![false; object_count];
     let mut parent_by_index = vec![None; object_count];
@@ -3400,8 +5425,8 @@ where
             continue;
         }
         reachable[object_index] = true;
-        if idom[node] != 0 && idom[node] != usize::MAX {
-            parent_by_index[object_index] = Some(idom[node] - 1);
+        if idom[node] != 0 && idom[node] != HPROF_INVALID_NODE {
+            parent_by_index[object_index] = Some(hprof_node_index(idom[node] - 1));
         }
     }
 
@@ -3412,32 +5437,36 @@ where
 }
 
 /// 返回 LT 节点的出边数量。
-fn lt_neighbor_count(adjacency: &HprofCompactAdjacency, node: usize) -> usize {
+fn lt_neighbor_count(adjacency: &HprofCompactAdjacency, node: HprofNodeId) -> usize {
     if node == 0 {
         adjacency.root_indices.len()
     } else {
-        let object_index = node - 1;
-        adjacency.offsets[object_index + 1] - adjacency.offsets[object_index]
+        let object_index = hprof_node_index(node - 1);
+        hprof_node_index(adjacency.offsets[object_index + 1] - adjacency.offsets[object_index])
     }
 }
 
 /// 返回 LT 节点的第 `neighbor_index` 个出边目标节点。
-fn lt_neighbor_at(adjacency: &HprofCompactAdjacency, node: usize, neighbor_index: usize) -> usize {
+fn lt_neighbor_at(
+    adjacency: &HprofCompactAdjacency,
+    node: HprofNodeId,
+    neighbor_index: usize,
+) -> HprofNodeId {
     if node == 0 {
         adjacency.root_indices[neighbor_index] + 1
     } else {
-        let object_index = node - 1;
-        adjacency.targets[adjacency.offsets[object_index] + neighbor_index] + 1
+        let object_index = hprof_node_index(node - 1);
+        adjacency.targets[hprof_node_index(adjacency.offsets[object_index]) + neighbor_index] + 1
     }
 }
 
 /// 构建 LT 算法需要的紧凑前驱表。
 fn build_lengauer_tarjan_predecessors<F>(
     adjacency: &HprofCompactAdjacency,
-    dfn: &[usize],
+    dfn: &[HprofNodeId],
     cancel_flag: &AtomicBool,
     reporter: &mut F,
-) -> Result<(Vec<usize>, Vec<usize>), HprofError>
+) -> Result<(Vec<HprofNodeId>, Vec<HprofNodeId>), HprofError>
 where
     F: FnMut(HprofAnalysisStage, &str, &str, u64, u64, &'static str),
 {
@@ -3446,14 +5475,17 @@ where
         .root_indices
         .len()
         .saturating_add(adjacency.targets.len());
-    let mut predecessor_counts = vec![0usize; node_count];
+    let mut predecessor_counts = vec![0 as HprofNodeId; node_count];
     let mut processed_edges = 0usize;
 
     for root_index in &adjacency.root_indices {
         processed_edges = processed_edges.saturating_add(1);
-        let target = root_index + 1;
+        let target = hprof_node_index(root_index + 1);
         if dfn[target] != 0 {
-            predecessor_counts[target] = predecessor_counts[target].saturating_add(1);
+            predecessor_counts[target] =
+                predecessor_counts[target].checked_add(1).ok_or_else(|| {
+                    HprofError::Unsupported("单节点前驱数量超过 u32 上限".to_string())
+                })?;
         }
         if should_report_work(processed_edges, total_edges) {
             report_work_progress(
@@ -3471,13 +5503,16 @@ where
 
     for object_index in 0..adjacency.offsets.len().saturating_sub(1) {
         let from = object_index + 1;
-        for target_index in
-            &adjacency.targets[adjacency.offsets[object_index]..adjacency.offsets[object_index + 1]]
-        {
+        let start = hprof_node_index(adjacency.offsets[object_index]);
+        let end = hprof_node_index(adjacency.offsets[object_index + 1]);
+        for target_index in &adjacency.targets[start..end] {
             processed_edges = processed_edges.saturating_add(1);
-            let target = target_index + 1;
+            let target = hprof_node_index(*target_index + 1);
             if dfn[from] != 0 && dfn[target] != 0 {
-                predecessor_counts[target] = predecessor_counts[target].saturating_add(1);
+                predecessor_counts[target] =
+                    predecessor_counts[target].checked_add(1).ok_or_else(|| {
+                        HprofError::Unsupported("单节点前驱数量超过 u32 上限".to_string())
+                    })?;
             }
             if should_report_work(processed_edges, total_edges) {
                 report_work_progress(
@@ -3495,17 +5530,24 @@ where
     }
 
     let mut offsets = Vec::with_capacity(node_count + 1);
-    offsets.push(0);
+    offsets.push(0 as HprofNodeId);
     for count in &predecessor_counts {
-        offsets.push(offsets.last().copied().unwrap_or(0) + *count);
+        let next = offsets
+            .last()
+            .copied()
+            .unwrap_or(0)
+            .checked_add(*count)
+            .ok_or_else(|| HprofError::Unsupported("前驱表大小超过 u32 上限".to_string()))?;
+        offsets.push(next);
     }
-    let mut predecessors = vec![0usize; offsets.last().copied().unwrap_or(0)];
+    let mut predecessors =
+        vec![0 as HprofNodeId; hprof_node_index(offsets.last().copied().unwrap_or(0))];
     let mut write_offsets = offsets.clone();
 
     for root_index in &adjacency.root_indices {
-        let target = root_index + 1;
+        let target = hprof_node_index(root_index + 1);
         if dfn[target] != 0 {
-            let position = write_offsets[target];
+            let position = hprof_node_index(write_offsets[target]);
             predecessors[position] = 0;
             write_offsets[target] += 1;
         }
@@ -3515,13 +5557,13 @@ where
         if dfn[from] == 0 {
             continue;
         }
-        for target_index in
-            &adjacency.targets[adjacency.offsets[object_index]..adjacency.offsets[object_index + 1]]
-        {
-            let target = target_index + 1;
+        let start = hprof_node_index(adjacency.offsets[object_index]);
+        let end = hprof_node_index(adjacency.offsets[object_index + 1]);
+        for target_index in &adjacency.targets[start..end] {
+            let target = hprof_node_index(*target_index + 1);
             if dfn[target] != 0 {
-                let position = write_offsets[target];
-                predecessors[position] = from;
+                let position = hprof_node_index(write_offsets[target]);
+                predecessors[position] = hprof_node_id(from, "前驱节点下标")?;
                 write_offsets[target] += 1;
             }
         }
@@ -3532,17 +5574,18 @@ where
 
 /// LT eval 操作，使用迭代压缩避免大图递归栈溢出。
 fn lengauer_tarjan_eval(
-    node: usize,
-    ancestor: &mut [usize],
-    label: &mut [usize],
-    semi: &[usize],
-    scratch_path: &mut Vec<usize>,
-) -> usize {
-    if ancestor[node] == usize::MAX {
-        return label[node];
+    node: HprofNodeId,
+    ancestor: &mut [HprofNodeId],
+    label: &mut [HprofNodeId],
+    semi: &[HprofNodeId],
+    scratch_path: &mut Vec<HprofNodeId>,
+) -> HprofNodeId {
+    let node_index = hprof_node_index(node);
+    if ancestor[node_index] == HPROF_INVALID_NODE {
+        return label[node_index];
     }
     lengauer_tarjan_compress(node, ancestor, label, semi, scratch_path);
-    label[node]
+    label[node_index]
 }
 
 /// LT 路径压缩。
@@ -3550,24 +5593,29 @@ fn lengauer_tarjan_eval(
 /// 性能约束：
 /// - 该函数位于 LT 主循环最热路径，会按前驱边调用；scratch 由外层复用，避免每次压缩都分配新的 `Vec`。
 fn lengauer_tarjan_compress(
-    node: usize,
-    ancestor: &mut [usize],
-    label: &mut [usize],
-    semi: &[usize],
-    scratch_path: &mut Vec<usize>,
+    node: HprofNodeId,
+    ancestor: &mut [HprofNodeId],
+    label: &mut [HprofNodeId],
+    semi: &[HprofNodeId],
+    scratch_path: &mut Vec<HprofNodeId>,
 ) {
     scratch_path.clear();
     let mut current = node;
-    while ancestor[current] != usize::MAX && ancestor[ancestor[current]] != usize::MAX {
+    while ancestor[hprof_node_index(current)] != HPROF_INVALID_NODE
+        && ancestor[hprof_node_index(ancestor[hprof_node_index(current)])] != HPROF_INVALID_NODE
+    {
         scratch_path.push(current);
-        current = ancestor[current];
+        current = ancestor[hprof_node_index(current)];
     }
     for item in scratch_path.iter().rev().copied() {
-        let ancestor_item = ancestor[item];
-        if semi[label[ancestor_item]] < semi[label[item]] {
-            label[item] = label[ancestor_item];
+        let item_index = hprof_node_index(item);
+        let ancestor_item = ancestor[item_index];
+        let ancestor_index = hprof_node_index(ancestor_item);
+        if semi[hprof_node_index(label[ancestor_index])] < semi[hprof_node_index(label[item_index])]
+        {
+            label[item_index] = label[ancestor_index];
         }
-        ancestor[item] = ancestor[ancestor_item];
+        ancestor[item_index] = ancestor[ancestor_index];
     }
 }
 
@@ -4105,6 +6153,23 @@ mod tests {
         let path = test_file_path(name, extension);
         fs::write(&path, bytes).expect("测试 HPROF 文件应能写入临时目录");
         path
+    }
+
+    /// 返回测试文件对应的 sidecar 目录。
+    fn test_sidecar_dir(path: &Path) -> PathBuf {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("dump");
+        path.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!("{file_name}.logclinic-hprof"))
+    }
+
+    /// 清理测试文件及其 sidecar 目录。
+    fn cleanup_test_file(path: &Path) {
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(test_sidecar_dir(path));
     }
 
     /// 写入 4 字节 ID 的 HPROF header。
@@ -4973,6 +7038,40 @@ mod tests {
         assert_eq!(object_array_shallow_size(&wide_model8, 2), 32);
     }
 
+    /// 验证重复对象 ID 会被视为损坏 dump，避免 streaming/sidecar 路径出现覆盖语义。
+    #[test]
+    fn 重复对象id会返回格式错误() {
+        let header = HprofHeader {
+            label: "JAVA PROFILE 1.0.2".to_string(),
+            identifier_size: 8,
+            timestamp_millis: 0,
+        };
+        let size_model = HprofSizeModel::mat_compatible(&header, 1024);
+        let mut graph = HprofObjectGraph::new(header, size_model);
+        let object = HprofHeapObject {
+            id: 1,
+            class_id: 100,
+            shallow_size: 8,
+            kind: HprofObjectKind::Instance,
+        };
+        graph
+            .insert_object(object.clone(), Vec::new())
+            .expect("首次插入对象应成功");
+        let error = graph
+            .insert_object(object, Vec::new())
+            .expect_err("重复对象 ID 应被拒绝");
+        assert!(error.to_string().contains("重复定义"));
+    }
+
+    /// 验证低内存索引会拒绝超过 `u32` 哨兵上限的节点数。
+    #[test]
+    fn 低内存节点索引超过上限会返回中文错误() {
+        let error = hprof_node_id(HPROF_INVALID_NODE as usize, "对象数量")
+            .expect_err("u32 哨兵值必须保留给无效节点");
+        assert!(error.to_string().contains("对象数量"));
+        assert!(error.to_string().contains("低内存索引上限"));
+    }
+
     /// 验证大于多个报告阈值的解析进度保持单调增长。
     #[test]
     fn 大量子记录进度单调增长() {
@@ -5001,9 +7100,9 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
-    /// 验证 petgraph 生成和 LT 算法都会输出可展示的细分阶段进度。
+    /// 验证紧凑图生成和 LT 算法都会输出可展示的细分阶段进度。
     #[test]
-    fn 计算阶段会报告petgraph和lt细分进度() {
+    fn 计算阶段会报告紧凑图和lt细分进度() {
         let path = write_test_file(
             "phase-progress",
             "hprof",
@@ -5018,7 +7117,7 @@ mod tests {
         .expect("合成 HPROF 应解析成功");
 
         for expected in [
-            "添加 petgraph 节点",
+            "添加紧凑图节点",
             "添加 GC Root 边",
             "添加对象引用边",
             "DFS 编号",
@@ -5047,6 +7146,116 @@ mod tests {
                 && progress.phase_unit == "节点"
         }));
         let _ = fs::remove_file(path);
+    }
+
+    /// 验证完成结果会写入 sidecar，并且第二次打开可以直接从缓存恢复。
+    #[test]
+    fn sidecar缓存命中会恢复相同dominator结果() {
+        let path = write_test_file("sidecar-cache", "hprof", &minimal_hprof_fixture());
+        cleanup_test_file(&path);
+        fs::write(&path, minimal_hprof_fixture()).expect("测试 HPROF 文件应能重新写入");
+
+        let first =
+            analyze_hprof_dominator_tree(path.clone(), |_| {}, Arc::new(AtomicBool::new(false)))
+                .expect("首次 HPROF 解析应成功");
+        let sidecar_dir = test_sidecar_dir(&path);
+        assert!(sidecar_dir.join("manifest.json").is_file());
+        assert!(sidecar_dir.join("objects.bin").is_file());
+        assert!(sidecar_dir.join("dominator.bin").is_file());
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(sidecar_dir.join("manifest.json")).unwrap())
+                .expect("sidecar manifest 应是合法 JSON");
+        assert_eq!(
+            manifest["schema_version"], HPROF_SIDECAR_SCHEMA_VERSION,
+            "sidecar v3 应让旧缓存按 schema 自动失效"
+        );
+
+        let mut progresses = Vec::new();
+        let second = analyze_hprof_dominator_tree(
+            path.clone(),
+            |progress| progresses.push(progress),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("第二次 HPROF 解析应从 sidecar 恢复");
+
+        assert_eq!(first.total_objects, second.total_objects);
+        assert_eq!(first.reachable_shallow_size, second.reachable_shallow_size);
+        assert_eq!(first.top_object_ids, second.top_object_ids);
+        assert_eq!(second.cache_status.as_deref(), Some("sidecar index 命中"));
+        assert!(
+            progresses
+                .iter()
+                .any(|progress| progress.stage == HprofAnalysisStage::LoadingCache)
+        );
+        assert!(
+            progresses.iter().any(|progress| {
+                progress.stage == HprofAnalysisStage::LoadingCache
+                    && progress.sub_message.contains("对象摘要懒加载")
+                    && progress.phase_unit == "文件"
+                    && progress.phase_total == 1
+            }),
+            "缓存命中路径不应全量读取对象摘要，应只建立可见行懒加载读取器"
+        );
+        assert!(
+            progresses.iter().any(|progress| {
+                progress.stage == HprofAnalysisStage::LoadingCache
+                    && progress.object_count == second.total_objects
+                    && progress.class_count == second.total_classes
+                    && progress.gc_root_count == second.gc_root_count
+                    && progress.edge_count == second.edge_count
+            }),
+            "缓存命中路径应在读取期间恢复摘要计数，避免 UI 长时间显示 0"
+        );
+        assert!(
+            progresses.iter().all(|progress| {
+                progress.stage != HprofAnalysisStage::LoadingCache
+                    || !progress.sub_message.starts_with("写入 ")
+            }),
+            "缓存命中路径只能展示读取进度，不能复用写入 sidecar 的文案"
+        );
+        cleanup_test_file(&path);
+    }
+
+    /// 验证 sidecar 缺少主体文件时会自动忽略旧缓存并重新解析。
+    #[test]
+    fn sidecar缺少文件会重新解析() {
+        let path = write_test_file("sidecar-missing-file", "hprof", &minimal_hprof_fixture());
+        cleanup_test_file(&path);
+        fs::write(&path, minimal_hprof_fixture()).expect("测试 HPROF 文件应能重新写入");
+
+        analyze_hprof_dominator_tree(path.clone(), |_| {}, Arc::new(AtomicBool::new(false)))
+            .expect("首次 HPROF 解析应成功");
+        fs::remove_file(test_sidecar_dir(&path).join("objects.bin"))
+            .expect("测试应能删除 sidecar 主体文件");
+        let result =
+            analyze_hprof_dominator_tree(path.clone(), |_| {}, Arc::new(AtomicBool::new(false)))
+                .expect("缺失 sidecar 文件时应重新解析成功");
+
+        assert_ne!(result.cache_status.as_deref(), Some("sidecar index 命中"));
+        cleanup_test_file(&path);
+    }
+
+    /// 验证损坏 sidecar 的长度字段不会触发异常大分配，而是忽略缓存并重新解析。
+    #[test]
+    fn sidecar损坏长度不会导致异常大分配() {
+        let path = write_test_file("sidecar-corrupt-count", "hprof", &minimal_hprof_fixture());
+        cleanup_test_file(&path);
+        fs::write(&path, minimal_hprof_fixture()).expect("测试 HPROF 文件应能重新写入");
+
+        analyze_hprof_dominator_tree(path.clone(), |_| {}, Arc::new(AtomicBool::new(false)))
+            .expect("首次 HPROF 解析应成功");
+        let objects_path = test_sidecar_dir(&path).join("objects.bin");
+        let mut bytes = fs::read(&objects_path).expect("测试应能读取 objects sidecar");
+        let count_offset = 8 + b"LCHP-objects-v3".len();
+        bytes[count_offset..count_offset + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        fs::write(&objects_path, bytes).expect("测试应能写入损坏 sidecar");
+
+        let result =
+            analyze_hprof_dominator_tree(path.clone(), |_| {}, Arc::new(AtomicBool::new(false)))
+                .expect("损坏 sidecar 应被忽略并重新解析成功");
+
+        assert_ne!(result.cache_status.as_deref(), Some("sidecar index 命中"));
+        cleanup_test_file(&path);
     }
 
     /// 默认忽略的 100MB 合成性能验证入口。
@@ -5092,13 +7301,17 @@ mod tests {
             },
         );
         for (id, class_id, shallow_size, references) in objects {
-            graph.insert_object(HprofHeapObject {
-                id: *id,
-                class_id: *class_id,
-                shallow_size: *shallow_size,
-                references: references.to_vec(),
-                kind: HprofObjectKind::Instance,
-            });
+            graph
+                .insert_object(
+                    HprofHeapObject {
+                        id: *id,
+                        class_id: *class_id,
+                        shallow_size: *shallow_size,
+                        kind: HprofObjectKind::Instance,
+                    },
+                    references.to_vec(),
+                )
+                .expect("测试对象图不应包含重复对象 ID");
         }
         for root in roots {
             graph.gc_roots.push(HprofGcRoot {

@@ -17,12 +17,15 @@ flate2 = "1.1.9"
 gpui = "0.2.2"
 # lucide-icons 提供工具栏和目录树图标字体，避免继续使用难看的手写符号。
 lucide-icons = "1.14.0"
+# crc32fast 用于 HPROF sidecar 缓存的首尾块快速校验，避免为了秒开重新计算全文件哈希。
+crc32fast = "1.4.2"
 # memmap2 用于 HPROF dump 快速只读映射；映射失败时会回退整文件读入内存，保证 Windows/macOS 行为可恢复。
 memmap2 = "0.9.10"
-# petgraph 提供稳定图结构和 dominator 算法，用于 HPROF 对象图的 retained size 精确计算。
-petgraph = "0.8.3"
 # rustc-hash 只用于 HPROF 解析期间的进程内临时 ID 映射，降低数百万对象 HashMap 的 CPU 开销。
 rustc-hash = "2.1.2"
+# serde/serde_json 只用于 HPROF sidecar manifest，二进制索引文件继续使用手写紧凑格式。
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
 # sevenz-rust 只读取 7z 目录元数据，当前不调用任何实际解压到磁盘的接口。
 sevenz-rust = { version = "0.6.1", default-features = false, features = ["bzip2", "zstd"] }
 # tar 用于遍历 tar.gz/tgz 内部条目头部，配合 flate2 实现流式目录树构建。

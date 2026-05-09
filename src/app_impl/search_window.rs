@@ -53,6 +53,7 @@ impl SearchDialogWindowView {
     /// 业务意图：
     /// - 搜索对话框现在是独立窗口，拖动应交给平台窗口系统处理，而不是在主窗口里维护浮层坐标。
     /// - 这样鼠标移动不会再触发主窗口日志行 hover 或选择状态。
+    /// - Windows 隐藏标题栏窗口依赖 `WindowControlArea::Drag` 参与原生命中测试；这里保留显式调用作为其它平台的兜底路径。
     pub(super) fn start_window_drag(&mut self, window: &mut Window, context: &mut Context<Self>) {
         window.start_window_move();
         self.main_view.update(context, |view, context| {
@@ -228,15 +229,25 @@ impl SearchDialogWindowView {
             .px_3()
             .border_b_1()
             .border_color(rgb(palette.border))
-            .cursor_move()
             .child(
                 div()
                     .flex()
+                    .flex_1()
+                    .h_full()
                     .items_center()
                     .gap_2()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(palette.text))
+                    .cursor_move()
+                    .window_control_area(gpui::WindowControlArea::Drag)
+                    // 只把标题文本到关闭按钮左侧的区域作为窗口拖拽区，避免 Windows 原生命中测试把关闭按钮误判成标题栏。
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        context.listener(|view, _event: &MouseDownEvent, window, context| {
+                            view.start_window_drag(window, context);
+                        }),
+                    )
                     .child(MainView::render_lucide_icon(
                         Some(Icon::Search),
                         15.0,
@@ -267,12 +278,6 @@ impl SearchDialogWindowView {
                             view.close_dialog(window, context);
                         }),
                     ),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                context.listener(|view, _event: &MouseDownEvent, window, context| {
-                    view.start_window_drag(window, context);
-                }),
             )
     }
 

@@ -1306,6 +1306,8 @@ mod tests {
                 document: LogTabDocument::InMemory(document),
             },
             scroll_handle: UniformListScrollHandle::new(),
+            paged_viewport_handle: ScrollHandle::new(),
+            paged_scroll: PagedLogScrollState::default(),
             pending_scroll_to_line: None,
             highlighted_search_line: None,
             text_selection: None,
@@ -1313,6 +1315,61 @@ mod tests {
         };
 
         assert_eq!(MainView::log_tab_encoding_selector_label(&tab), "GBK");
+    }
+
+    /// 验证分页日志把超大滚动位置映射为视口内小坐标。
+    ///
+    /// 业务意图：
+    /// - 用户反馈滚到三千多万行后行号出现间隔、正文重叠，本质是完整列表的 `f32` 像素坐标过大。
+    /// - 新分页渲染只保留首个真实行号和小于单行高度的偏移，确保交给布局系统的坐标始终很小。
+    #[test]
+    fn 分页日志深处滚动只产生视口内小偏移() {
+        let target_line = 33_142_000usize;
+        let row_height = f64::from(px(LOG_VIEWER_ROW_HEIGHT));
+        let scroll_top = target_line as f64 * row_height + 7.25;
+
+        let (first_line, fractional_top) =
+            MainView::paged_log_visible_start(scroll_top, target_line + 1_000);
+
+        assert_eq!(first_line, target_line);
+        assert!((7.0..7.5).contains(&fractional_top));
+        assert!(
+            fractional_top < LOG_VIEWER_ROW_HEIGHT,
+            "分页渲染只能把单行内偏移交给 GPUI，不能再传递完整深度坐标"
+        );
+    }
+
+    /// 验证分页日志跳转目标行会夹在合法滚动范围内。
+    ///
+    /// 边界条件：
+    /// - 搜索结果可能指向文件末尾附近；滚动位置必须限制在最大可滚动距离内，否则最后一屏会出现空白。
+    #[test]
+    fn 分页日志跳转行号会限制在最大滚动范围内() {
+        let line_count = 50_000_000usize;
+        let viewport_height = px(880.0);
+        let max_scroll = MainView::paged_log_vertical_max_scroll_px(line_count, viewport_height);
+
+        let scroll_top = MainView::paged_log_scroll_top_for_line(
+            line_count + 10_000,
+            line_count,
+            viewport_height,
+        );
+
+        assert_eq!(scroll_top, max_scroll);
+    }
+
+    /// 验证千万级行号列不会被旧的窄上限裁切。
+    ///
+    /// 业务意图：
+    /// - 用户截图中的 33325038 行属于 8 位行号；如果行号列仍被 64px 上限截断，最左侧数字会显示不全。
+    #[test]
+    fn 千万级日志行号列宽度能容纳完整数字() {
+        let width = MainView::log_viewer_line_number_width(33_325_038);
+
+        assert!(
+            width > 64.0,
+            "8 位行号需要突破旧的 64px 上限，否则左侧高位会被裁切"
+        );
     }
 
     /// 验证日志正文右键另存为按菜单绑定 tab 查找来源。
@@ -1339,6 +1396,8 @@ mod tests {
                     message: "测试加载中".to_string(),
                 },
                 scroll_handle: UniformListScrollHandle::new(),
+                paged_viewport_handle: ScrollHandle::new(),
+                paged_scroll: PagedLogScrollState::default(),
                 pending_scroll_to_line: None,
                 highlighted_search_line: None,
                 text_selection: None,
@@ -1355,6 +1414,8 @@ mod tests {
                     message: "测试加载中".to_string(),
                 },
                 scroll_handle: UniformListScrollHandle::new(),
+                paged_viewport_handle: ScrollHandle::new(),
+                paged_scroll: PagedLogScrollState::default(),
                 pending_scroll_to_line: None,
                 highlighted_search_line: None,
                 text_selection: None,

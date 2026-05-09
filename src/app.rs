@@ -29,8 +29,8 @@ use gpui::{
     EntityInputHandler, ExternalPaths, FontWeight, GlobalElementId, InteractiveElement,
     IntoElement, KeyBinding, KeyDownEvent, Keystroke, LayoutId, ListHorizontalSizingBehavior,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement,
-    PathPromptOptions, Pixels, Point, Render, ScrollHandle, ScrollStrategy, ShapedLine,
-    SharedString, StatefulInteractiveElement, Style, Styled as _, StyledText, TextRun,
+    PathPromptOptions, Pixels, Point, Render, ScrollHandle, ScrollStrategy, ScrollWheelEvent,
+    ShapedLine, SharedString, StatefulInteractiveElement, Style, Styled as _, StyledText, TextRun,
     TitlebarOptions, UTF16Selection, UnderlineStyle, UniformListScrollHandle, Window,
     WindowAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, actions, div, fill,
     point, px, relative, rgb, size, uniform_list,
@@ -886,6 +886,26 @@ const LOG_DOCUMENT_TOOLBAR_HEIGHT: f32 = 36.0;
 /// - 日志正文使用 `uniform_list` 进行虚拟渲染，必须保持每行高度一致，才能在大文件滚动时稳定计算可见区间。
 const LOG_VIEWER_ROW_HEIGHT: f32 = 22.0;
 
+/// 分页日志每帧额外渲染的缓冲行数。
+///
+/// 业务意图：
+/// - 分页模式不再把完整行数交给 GPUI 做绝对像素滚动，而是只渲染视口附近行。
+/// - 缓冲行用于覆盖小幅滚动和首帧视口尺寸尚未回填的情况，避免边缘出现空白。
+const PAGED_LOG_RENDER_BUFFER_ROWS: usize = 8;
+
+/// 分页日志首帧视口高度未知时使用的保守行数。
+///
+/// 边界条件：
+/// - `ScrollHandle::bounds` 需要经过一帧布局才会写入；首帧用固定行数可以先展示内容，下一帧再按真实视口收敛。
+const PAGED_LOG_FALLBACK_VISIBLE_ROWS: usize = 180;
+
+/// 分页日志横向宽度估算的等宽字符比例。
+///
+/// 业务意图：
+/// - 分页模式不能再依赖 `uniform_list` 测量完整最长行，否则会重新引入超大虚拟坐标。
+/// - JetBrains Mono 的常见字符宽度约为字号的六成；这里只用于横向滚动范围估算，真实文本命中仍由 GPUI shaping 计算。
+const PAGED_LOG_MONOSPACE_WIDTH_RATIO: f32 = 0.62;
+
 /// 日志查看器行号列固定宽度。
 ///
 /// 业务意图：
@@ -895,8 +915,9 @@ const LOG_VIEWER_LINE_NUMBER_MIN_WIDTH: f32 = 46.0;
 /// 日志查看器行号列最大宽度。
 ///
 /// 业务意图：
-/// - 大文件行数较多时行号列可以略微变宽，但不能回到上一版过宽导致正文起点过远的问题。
-const LOG_VIEWER_LINE_NUMBER_MAX_WIDTH: f32 = 64.0;
+/// - 超大分页日志可能有数千万行，行号列必须允许 8 位以上数字完整显示，避免左侧高位被裁切。
+/// - 仍保留上限，防止异常索引行数把正文区域完全挤出可视范围。
+const LOG_VIEWER_LINE_NUMBER_MAX_WIDTH: f32 = 128.0;
 
 /// 日志查看器行号单个数字的估算宽度。
 ///
@@ -1557,7 +1578,20 @@ struct OpenLogTab {
     ///
     /// 业务意图：
     /// - 每个 tab 独立保存滚动上下文，切换 tab 时不会把其它文件的滚动位置混进来。
+    /// - 普通内存日志继续把该句柄绑定到 `uniform_list`；分页日志只复用它的横向兼容语义，真实纵向滚动由 `paged_scroll` 保存。
     scroll_handle: UniformListScrollHandle,
+    /// 分页日志正文视口测量句柄。
+    ///
+    /// 业务意图：
+    /// - 分页模式不能再让 GPUI 布局完整行数，因此需要单独跟踪正文视口 bounds，用于滚动条尺寸和鼠标命中坐标换算。
+    /// - 该句柄不承载真实滚动偏移，避免 GPUI 在超大内容高度上使用 `f32` 坐标。
+    paged_viewport_handle: ScrollHandle,
+    /// 分页日志的逻辑滚动位置。
+    ///
+    /// 业务意图：
+    /// - 超大日志的真实滚动距离可能达到数亿像素，必须用 `f64` 保存在应用状态中，渲染时再映射到视口内的小坐标。
+    /// - 普通内存日志不读取该字段；切换编码或重新加载时必须重置。
+    paged_scroll: PagedLogScrollState,
     /// 打开后需要滚动定位的目标行。
     ///
     /// 业务意图：
@@ -1586,6 +1620,19 @@ struct OpenLogTab {
     /// - 鼠标按下确定锚点，后续移动只更新焦点，才能正确支持从下往上或从右往左反向选择。
     /// - 鼠标释放后清空该临时字段，但保留 `text_selection` 供复制和搜索预填使用。
     selection_drag_anchor: Option<LogTextPosition>,
+}
+
+/// 分页日志的逻辑滚动位置。
+///
+/// 业务意图：
+/// - `top_px` 和 `left_px` 都以日志正文内容坐标表示，不直接交给 GPUI 布局系统。
+/// - 渲染时只根据这两个值计算“当前视口附近有哪些真实行号”，从而避开几千万行带来的 `f32` 精度损失。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct PagedLogScrollState {
+    /// 当前视口顶部对应的纵向内容偏移，单位为逻辑像素。
+    top_px: f64,
+    /// 当前视口左侧对应的横向内容偏移，单位为逻辑像素。
+    left_px: f64,
 }
 
 /// 日志正文中的文本位置。
@@ -1665,6 +1712,12 @@ struct LogLineRenderData {
     font_size: f32,
     /// 横向滚动时行号列的反向补偿偏移。
     horizontal_line_number_offset: Pixels,
+    /// 横向滚动时正文内容的局部偏移。
+    ///
+    /// 业务意图：
+    /// - 普通 `uniform_list` 路径由 GPUI 整行平移，正文不需要额外偏移。
+    /// - 分页窗口化路径只在视口内绝对定位行，必须单独平移正文，同时保持行号列固定。
+    horizontal_content_offset: Pixels,
     /// 当前行是否是搜索结果跳转后的目标行。
     search_highlighted: bool,
     /// 是否临时禁用行 hover 样式。
@@ -1744,6 +1797,12 @@ struct LogScrollbarMetrics {
     track_length: Pixels,
     /// 当前轴向可滚动的最大距离。
     max_scroll: Pixels,
+    /// 当前轴向可滚动的最大距离，使用 `f64` 保留超大分页日志的逻辑滚动精度。
+    ///
+    /// 业务意图：
+    /// - 滑块自身仍以 `Pixels` 渲染，但分页日志的真实内容高度可能达到数亿像素。
+    /// - 拖动换算回逻辑滚动位置时使用该字段，避免再次把深处行号压回 `f32` 精度。
+    max_scroll_px: f64,
 }
 
 /// 左侧目录树滚动条正在被拖动时的临时状态。
@@ -4152,6 +4211,8 @@ impl MainView {
                 message: "正在读取日志文件...".to_string(),
             },
             scroll_handle: UniformListScrollHandle::new(),
+            paged_viewport_handle: ScrollHandle::new(),
+            paged_scroll: PagedLogScrollState::default(),
             pending_scroll_to_line: None,
             highlighted_search_line: None,
             text_selection: None,
@@ -4203,10 +4264,35 @@ impl MainView {
     /// 边界条件：
     /// - 只有已打开 tab 才能滚动；如果 tab 仍在加载，调用方应先把行号写入 `pending_scroll_to_line`。
     /// - 行号来自搜索时的解码结果，如果文件在搜索后被外部修改，滚动位置可能不再对应同一内容，这是当前未实现文件监听的已知边界。
-    fn scroll_log_tab_to_line(&self, tab_id: usize, line_index: usize) {
-        if let Some(tab) = self.open_tabs.iter().find(|tab| tab.id == tab_id) {
-            tab.scroll_handle
-                .scroll_to_item_strict(line_index, ScrollStrategy::Center);
+    fn scroll_log_tab_to_line(&mut self, tab_id: usize, line_index: usize) {
+        if let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            match &tab.state {
+                LogTabState::Ready {
+                    document: LogTabDocument::Paged(document),
+                } => {
+                    // 分页日志不再把完整行数交给 GPUI，因此跳转行号时直接更新应用侧的逻辑滚动位置。
+                    // 首帧还没有真实视口高度时使用一屏常见行数估算，下一帧滚动条会按实际 bounds 修正比例。
+                    let viewport_height = tab.paged_viewport_handle.bounds().size.height;
+                    let fallback_height = px(LOG_VIEWER_ROW_HEIGHT * 24.0);
+                    let viewport_height = if viewport_height > px(0.0) {
+                        viewport_height
+                    } else {
+                        fallback_height
+                    };
+                    tab.paged_scroll.top_px = Self::paged_log_scroll_top_for_line(
+                        line_index,
+                        document.line_count(),
+                        viewport_height,
+                    );
+                }
+                LogTabState::Ready {
+                    document: LogTabDocument::InMemory(_),
+                } => {
+                    tab.scroll_handle
+                        .scroll_to_item_strict(line_index, ScrollStrategy::Center);
+                }
+                LogTabState::Loading { .. } | LogTabState::Failed { .. } => {}
+            }
         }
     }
 
@@ -4315,6 +4401,8 @@ impl MainView {
             };
 
             tab.scroll_handle = UniformListScrollHandle::new();
+            tab.paged_viewport_handle = ScrollHandle::new();
+            tab.paged_scroll = PagedLogScrollState::default();
             tab.text_selection = None;
             tab.selection_drag_anchor = None;
             match result {
@@ -4512,6 +4600,8 @@ impl MainView {
             }
 
             tab.scroll_handle = UniformListScrollHandle::new();
+            tab.paged_viewport_handle = ScrollHandle::new();
+            tab.paged_scroll = PagedLogScrollState::default();
             tab.text_selection = None;
             tab.selection_drag_anchor = None;
             match result {
@@ -8150,6 +8240,17 @@ impl MainView {
                 .flex_1()
                 .size_full()
                 .bg(rgb(palette.background))
+                // 单文件模式隐藏了左侧目录树和分割线，但右侧日志正文仍使用自绘滚动条。
+                // 拖动滑块时后续鼠标移动可能落在正文空白处，必须和分栏模式一样由内容容器统一续传和清理拖动状态。
+                .on_mouse_move(context.listener(Self::handle_content_mouse_move))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    context.listener(Self::handle_content_mouse_up),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    context.listener(Self::handle_content_mouse_up),
+                )
                 .child(
                     div()
                         .id("right-log-panel-single-log")

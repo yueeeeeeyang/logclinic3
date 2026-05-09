@@ -739,6 +739,56 @@ impl HprofAnalysisWindowView {
         result: &HprofDominatorResult,
         palette: AppThemePalette,
     ) -> impl IntoElement {
+        let mut metrics = vec![
+            self.render_metric(
+                "总 shallow",
+                format_hprof_bytes(result.total_shallow_size),
+                palette,
+            ),
+            self.render_metric(
+                "可达 shallow",
+                format_hprof_bytes(result.reachable_shallow_size),
+                palette,
+            ),
+            self.render_metric(
+                "可达对象",
+                result.reachable_object_count.to_string(),
+                palette,
+            ),
+            self.render_metric(
+                "不可达对象",
+                result.unreachable_object_count.to_string(),
+                palette,
+            ),
+            self.render_metric(
+                "不可达 shallow",
+                format_hprof_bytes(result.unreachable_shallow_size),
+                palette,
+            ),
+            self.render_metric("GC Root", result.gc_root_count.to_string(), palette),
+            self.render_metric("引用边", result.edge_count.to_string(), palette),
+            self.render_metric("原始引用边", result.raw_edge_count.to_string(), palette),
+            self.render_metric(
+                "Reference referent 边",
+                result.reference_edge_stats.description(),
+                palette,
+            ),
+            self.render_metric(
+                "ClassLoader 合成边",
+                result.synthetic_class_loader_edge_count.to_string(),
+                palette,
+            ),
+            self.render_metric(
+                "Bootstrap 类 Root",
+                result.synthetic_bootstrap_class_root_count.to_string(),
+                palette,
+            ),
+            self.render_metric("size model", result.size_model.description(), palette),
+        ];
+        if let Some(cache_status) = &result.cache_status {
+            metrics.push(self.render_metric("缓存", cache_status.clone(), palette));
+        }
+
         div()
             .flex()
             .flex_col()
@@ -760,52 +810,7 @@ impl HprofAnalysisWindowView {
                         result.file_path.display()
                     )),
             )
-            .child(div().flex().flex_wrap().gap_2().children([
-                self.render_metric(
-                    "总 shallow",
-                    format_hprof_bytes(result.total_shallow_size),
-                    palette,
-                ),
-                self.render_metric(
-                    "可达 shallow",
-                    format_hprof_bytes(result.reachable_shallow_size),
-                    palette,
-                ),
-                self.render_metric(
-                    "可达对象",
-                    result.reachable_object_count.to_string(),
-                    palette,
-                ),
-                self.render_metric(
-                    "不可达对象",
-                    result.unreachable_object_count.to_string(),
-                    palette,
-                ),
-                self.render_metric(
-                    "不可达 shallow",
-                    format_hprof_bytes(result.unreachable_shallow_size),
-                    palette,
-                ),
-                self.render_metric("GC Root", result.gc_root_count.to_string(), palette),
-                self.render_metric("引用边", result.edge_count.to_string(), palette),
-                self.render_metric("原始引用边", result.raw_edge_count.to_string(), palette),
-                self.render_metric(
-                    "Reference referent 边",
-                    result.reference_edge_stats.description(),
-                    palette,
-                ),
-                self.render_metric(
-                    "ClassLoader 合成边",
-                    result.synthetic_class_loader_edge_count.to_string(),
-                    palette,
-                ),
-                self.render_metric(
-                    "Bootstrap 类 Root",
-                    result.synthetic_bootstrap_class_root_count.to_string(),
-                    palette,
-                ),
-                self.render_metric("size model", result.size_model.description(), palette),
-            ]))
+            .child(div().flex().flex_wrap().gap_2().children(metrics))
     }
 
     /// 渲染表头。

@@ -162,6 +162,7 @@ impl MainView {
             track_start,
             track_length,
             max_scroll,
+            max_scroll_px: f64::from(max_scroll),
         })
     }
 
@@ -183,6 +184,7 @@ impl MainView {
             track_start: px(SEARCH_RESULTS_SCROLLBAR_PADDING),
             track_length: px(SEARCH_RESULTS_SCROLLBAR_MIN_THUMB_HEIGHT),
             max_scroll: px(0.0),
+            max_scroll_px: 0.0,
         })
     }
 

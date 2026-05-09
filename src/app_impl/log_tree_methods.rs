@@ -201,6 +201,7 @@ impl MainView {
             track_start,
             track_length,
             max_scroll,
+            max_scroll_px: f64::from(max_scroll),
         })
     }
 
@@ -222,6 +223,7 @@ impl MainView {
             track_start: px(LOG_TREE_SCROLLBAR_PADDING),
             track_length: px(LOG_TREE_SCROLLBAR_MIN_THUMB_HEIGHT),
             max_scroll: px(0.0),
+            max_scroll_px: 0.0,
         })
     }
 
@@ -629,6 +631,20 @@ impl MainView {
             .border_color(rgb(palette.border))
             .bg(rgb(palette.menu))
             .shadow_lg()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    // 菜单覆盖在目录树行之上，按下事件必须在菜单层截止，避免继续冒泡到背后的树行导致误选其它文件。
+                    context.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    // 右键点在菜单上也只应作用于菜单本身，不能重新打开或切换背后的目录树菜单目标。
+                    context.stop_propagation();
+                }),
+            )
             .child(self.render_log_tree_context_menu_item(
                 node_id,
                 fallback_source.clone(),
@@ -693,6 +709,8 @@ impl MainView {
                         window,
                         context,
                     );
+                    // 菜单项命令执行后不允许事件继续落到背后的树行，否则会改变当前选中集合。
+                    context.stop_propagation();
                 }),
             )
     }
