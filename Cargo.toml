@@ -39,3 +39,11 @@ unrar = "0.5.8"
 walkdir = "2.5.0"
 # zip 用于读取 ZIP 中央目录和条目元数据，不读取日志正文。
 zip = "8.6.0"
+
+[patch.crates-io]
+# GPUI 0.2.2 的 Windows release shader 生成逻辑依赖构建脚本宿主也是 Windows；
+# macOS 通过 cargo-xwin 交叉编译时不会生成 `shaders_bytes.rs`，因此本地补丁改为在 Windows 运行时从内嵌 HLSL 源码编译。
+gpui = { path = "vendor/gpui-0.2.2" }
+# unrar_sys 0.5.8 的 build.rs 使用宿主平台 cfg 判断目标平台，macOS 交叉编译 Windows MSVC 时会错误链接 pthread；
+# 本地补丁改为读取 Cargo 注入的目标平台变量，避免污染日志查看器的 Windows x64 打包链路。
+unrar_sys = { path = "vendor/unrar_sys-0.5.8" }

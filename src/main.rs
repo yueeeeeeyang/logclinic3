@@ -1,3 +1,9 @@
+#![cfg_attr(
+    // Windows release 包使用 GUI 子系统，避免 GPUI 桌面程序双击启动时额外出现控制台窗口；debug 保留控制台便于查看启动错误。
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 //! LogClinic 桌面客户端的最小程序入口。
 //!
 //! 业务意图：

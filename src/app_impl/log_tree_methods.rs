@@ -54,7 +54,7 @@ impl MainView {
                     .flex()
                     .items_center()
                     .gap_1()
-                    .text_sm()
+                    .text_size(px(LOG_TREE_FONT_SIZE))
                     .text_color(rgb(palette.text))
                     .child(Self::render_lucide_icon(
                         Some(Icon::FolderTree),
@@ -65,7 +65,7 @@ impl MainView {
             )
             .child(
                 div()
-                    .text_xs()
+                    .text_size(px(LOG_TREE_FONT_SIZE))
                     .text_color(rgb(palette.muted_text))
                     .truncate()
                     .child(summary),
@@ -331,7 +331,7 @@ impl MainView {
             .min_w_0()
             .pl(px(left_padding))
             .pr(px(LOG_TREE_ROW_HORIZONTAL_PADDING))
-            .text_sm()
+            .text_size(px(LOG_TREE_FONT_SIZE))
             .text_color(rgb(if selected {
                 palette.accent
             } else {

@@ -747,6 +747,17 @@ const SPLITTER_OVERLAY_HIT_WIDTH: f32 = SPLITTER_HIT_WIDTH - SPLITTER_VISIBLE_WI
 /// - 当前标题不展示真实绝对路径，避免路径脱敏和窄面板排版规则未定义前暴露过多信息。
 const LOG_TREE_HEADER_HEIGHT: f32 = 34.0;
 
+/// 左侧目录树文本字号。
+///
+/// 业务意图：
+/// - 目录树用于快速扫描文件层级、压缩包成员和错误节点，12px 可以在固定侧栏宽度内提高信息密度。
+/// - 字号独立于右侧日志正文的用户设置，避免用户调大正文后影响目录树和 tab 页签的导航密度。
+///
+/// 边界条件：
+/// - 行高仍由 `LOG_TREE_ROW_HEIGHT` 控制，字号变化不能破坏 `uniform_list` 的等高行假设。
+/// - macOS 和 Windows 字体度量不同，因此使用显式像素字号，避免主题级 `text_sm` 映射差异。
+const LOG_TREE_FONT_SIZE: f32 = 12.0;
+
 /// 左侧目录树每行固定高度。
 ///
 /// 业务意图：
@@ -832,6 +843,17 @@ const LOG_TREE_SCROLLBAR_PADDING: f32 = 3.0;
 /// - tab 栏需要容纳多个已打开日志文件的切换入口，同时不抢占日志正文可视高度。
 /// - 固定高度便于右侧主体区域继续使用等高虚拟列表渲染日志行。
 const LOG_TAB_BAR_HEIGHT: f32 = 34.0;
+
+/// 右侧日志 tab 页签文本字号。
+///
+/// 业务意图：
+/// - tab 页签主要承担多文件导航，12px 可以容纳更多文件名，减少横向滚动频率。
+/// - 该字号只作用于 tab 页签本身，不影响日志正文、编码工具条或右键菜单。
+///
+/// 边界条件：
+/// - tab 高度继续由 `LOG_TAB_BAR_HEIGHT` 决定，避免字号调整引发顶部布局抖动。
+/// - 显式像素字号可以让 macOS 和 Windows 上页签标题接近一致。
+const LOG_TAB_FONT_SIZE: f32 = 12.0;
 
 /// tab 栏两侧滚动箭头按钮宽度。
 ///
@@ -5933,7 +5955,7 @@ impl MainView {
     fn render_log_tree_meta(meta: Option<&str>, palette: AppThemePalette) -> gpui::Div {
         let meta_element = div()
             .flex_none()
-            .text_xs()
+            .text_size(px(LOG_TREE_FONT_SIZE))
             .text_color(rgb(palette.muted_text))
             .child(meta.unwrap_or_default().to_string());
 
@@ -7140,7 +7162,7 @@ impl MainView {
             .border_r_1()
             .border_color(rgb(palette.border))
             .bg(rgb(background))
-            .text_sm()
+            .text_size(px(LOG_TAB_FONT_SIZE))
             .text_color(rgb(if active {
                 palette.text
             } else {
