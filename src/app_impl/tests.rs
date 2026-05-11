@@ -133,6 +133,30 @@ mod tests {
         assert_eq!(decision, MainWindowStartupDecision::DefaultWindowed);
     }
 
+    /// 验证大屏下旧版最大化历史尺寸会被丢弃。
+    ///
+    /// 业务意图：
+    /// - 旧版本可能在最大化关闭时写入接近显示器宽度的历史尺寸；大屏重新启动时应回到 1600x900，而不是继续像最大化。
+    #[test]
+    fn 大屏历史最大化尺寸回退默认窗口化() {
+        let saved_size = test_window_size(2048.0, 1110.0);
+        let decision = decide_main_window_startup(Some(saved_size), Some(2048.0));
+
+        assert_eq!(decision, MainWindowStartupDecision::DefaultWindowed);
+    }
+
+    /// 验证大屏下普通历史尺寸仍会恢复。
+    ///
+    /// 业务意图：
+    /// - 修复最大化残留不能破坏用户手动调整普通窗口大小的行为；明显小于显示器宽度的历史值仍应优先使用。
+    #[test]
+    fn 大屏普通历史尺寸仍会恢复() {
+        let saved_size = test_window_size(1500.0, 820.0);
+        let decision = decide_main_window_startup(Some(saved_size), Some(2048.0));
+
+        assert_eq!(decision, MainWindowStartupDecision::Remembered(saved_size));
+    }
+
     /// 验证用户历史宽高优先于小屏最大化规则。
     ///
     /// 业务意图：

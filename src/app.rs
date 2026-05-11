@@ -129,6 +129,16 @@ const MAIN_WINDOW_HEIGHT: f32 = 900.0;
 /// - 这里使用 GPUI 暴露的显示器逻辑像素，由框架负责处理 macOS Retina 和 Windows 缩放比例差异。
 const SMALL_SCREEN_MAXIMIZED_WIDTH_THRESHOLD: f32 = 1440.0;
 
+/// 历史窗口宽度接近显示器宽度时判定为“最大化残留”的比例阈值。
+///
+/// 业务意图：
+/// - 旧版本会在最大化关闭时保存接近屏幕宽度的窗口尺寸，导致大屏下次启动看起来仍是最大化。
+/// - 只使用宽度判定是因为 macOS 标题栏、菜单栏和 Windows 任务栏会让高度存在平台差异；宽度是更稳定的最大化信号。
+///
+/// 边界条件：
+/// - 阈值保留少量平台装饰误差，避免最大化窗口因为边框、缩放或系统保留区域略小于显示器宽度而漏判。
+const MAXIMIZED_RESTORED_WIDTH_RATIO: f32 = 0.96;
+
 /// 主窗口尺寸偏好文件名。
 ///
 /// 业务意图：
@@ -362,6 +372,31 @@ impl MainWindowSizePreference {
     }
 }
 
+/// 判断历史尺寸是否像旧版本保存下来的最大化窗口宽度。
+///
+/// 业务意图：
+/// - 大屏下无历史尺寸应默认使用 1600x900；如果旧配置保存了最大化宽度，继续尊重它会让窗口看起来仍然最大化。
+/// - 这里只过滤接近当前主显示器宽度的历史值，普通用户手动调整过的窗口尺寸仍继续恢复。
+///
+/// 边界条件：
+/// - 显示器宽度读取失败时不能判断是否最大化残留，保守保留历史尺寸。
+/// - 小屏仍保留“历史尺寸优先”规则，避免用户在小屏上手动调整出的宽窗口被误判为最大化残留。
+fn saved_size_looks_maximized(
+    saved_size: MainWindowSizePreference,
+    primary_display_width: Option<f32>,
+) -> bool {
+    let Some(display_width) = primary_display_width else {
+        return false;
+    };
+    if !display_width.is_finite() || display_width <= 0.0 {
+        return false;
+    }
+    if display_width < SMALL_SCREEN_MAXIMIZED_WIDTH_THRESHOLD {
+        return false;
+    }
+    saved_size.width >= display_width * MAXIMIZED_RESTORED_WIDTH_RATIO
+}
+
 /// 主窗口首次启动时的尺寸策略。
 ///
 /// 业务意图：
@@ -390,7 +425,9 @@ fn decide_main_window_startup(
     primary_display_width: Option<f32>,
 ) -> MainWindowStartupDecision {
     if let Some(saved_size) = saved_size {
-        return MainWindowStartupDecision::Remembered(saved_size);
+        if !saved_size_looks_maximized(saved_size, primary_display_width) {
+            return MainWindowStartupDecision::Remembered(saved_size);
+        }
     }
 
     if primary_display_width.is_some_and(|width| width < SMALL_SCREEN_MAXIMIZED_WIDTH_THRESHOLD) {
@@ -12196,6 +12233,11 @@ pub(crate) fn run() {
                 // 主窗口关闭时只保存宽高，不保存位置或最大化状态。
                 // 保存失败不阻止关闭，避免配置目录权限问题影响日志查看客户端退出。
                 window.on_window_should_close(app, |window, _app| {
+                    if window.is_maximized() || window.is_fullscreen() {
+                        // 最大化和全屏是平台窗口状态，不是用户希望下次以超大普通窗口打开的尺寸。
+                        // 跳过保存可以避免大屏下次启动误用屏幕宽度作为历史窗口宽度。
+                        return true;
+                    }
                     let bounds = window.window_bounds().get_bounds();
                     let width = bounds.size.width / px(1.0);
                     let height = bounds.size.height / px(1.0);
