@@ -87,6 +87,18 @@ mod tests {
         ))
     }
 
+    /// 构造唯一的模型配置测试路径。
+    ///
+    /// 业务意图：
+    /// - 模型配置会保存 API Key 等敏感字段，测试必须使用临时目录，避免污染开发机真实应用配置。
+    fn test_model_configs_file_path(name: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "logclinic3-model-configs-test-{}-{}",
+            std::process::id(),
+            name
+        ))
+    }
+
     /// 构造唯一的另存为测试目录。
     ///
     /// 业务意图：
@@ -806,6 +818,149 @@ mod tests {
             parse_quick_search_keywords("a，b"),
             vec!["a，b".to_string()]
         );
+    }
+
+    /// 验证模型配置缺失和损坏时回退空配置。
+    ///
+    /// 业务意图：
+    /// - 模型配置不是日志查看主流程的必要条件，配置文件缺失或 JSON 损坏不能阻断应用启动或设置窗口打开。
+    #[test]
+    fn 模型配置缺失和损坏返回空配置() {
+        let missing_path = test_model_configs_file_path("missing").join(MODEL_CONFIGS_FILE_NAME);
+        assert_eq!(
+            read_model_configs_preference(&missing_path),
+            ModelConfigs::default()
+        );
+
+        let broken_path = test_model_configs_file_path("broken").join(MODEL_CONFIGS_FILE_NAME);
+        fs::create_dir_all(broken_path.parent().expect("测试路径应包含父目录"))
+            .expect("测试目录应能创建");
+        fs::write(&broken_path, "{broken json").expect("测试损坏 JSON 应能写入");
+        assert_eq!(
+            read_model_configs_preference(&broken_path),
+            ModelConfigs::default()
+        );
+
+        let _ = fs::remove_file(&broken_path);
+        if let Some(parent) = broken_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    /// 验证模型配置 JSON 可以保持多配置和默认 ID 往返。
+    ///
+    /// 业务意图：
+    /// - `model-configs.json` 同时保存列表和默认模型引用，读写必须保持 API Key、Base URL 和默认选择不丢失。
+    #[test]
+    fn 模型配置可以读写往返() {
+        let path = test_model_configs_file_path("roundtrip").join(MODEL_CONFIGS_FILE_NAME);
+        let configs = ModelConfigs {
+            profiles: vec![
+                ModelProfile {
+                    id: "openai".to_string(),
+                    name: "OpenAI".to_string(),
+                    base_url: "https://api.openai.com/v1".to_string(),
+                    api_key: "sk-test".to_string(),
+                    model: "gpt-4.1-mini".to_string(),
+                },
+                ModelProfile {
+                    id: "local".to_string(),
+                    name: "Local".to_string(),
+                    base_url: "http://127.0.0.1:11434/v1".to_string(),
+                    api_key: String::new(),
+                    model: "qwen2.5:7b".to_string(),
+                },
+            ],
+            default_profile_id: Some("local".to_string()),
+        };
+
+        write_model_configs_preference(&path, &configs).expect("模型配置应能写入临时目录");
+        assert_eq!(read_model_configs_preference(&path), configs);
+        let raw = fs::read_to_string(&path).expect("测试配置应能读取原文");
+        assert!(raw.contains('\n'), "pretty JSON 应包含换行，方便手工排查");
+
+        let _ = fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    /// 验证悬空默认模型 ID 会被清空。
+    ///
+    /// 业务意图：
+    /// - 删除默认模型或手工编辑配置后，默认 ID 不能继续指向不存在的配置，否则后续智能功能会引用错误档案。
+    #[test]
+    fn 模型配置悬空默认_id_会清空() {
+        let configs = normalize_model_configs(ModelConfigs {
+            profiles: vec![ModelProfile {
+                id: "exists".to_string(),
+                name: "可用配置".to_string(),
+                base_url: "https://api.example.com/v1".to_string(),
+                api_key: String::new(),
+                model: "demo".to_string(),
+            }],
+            default_profile_id: Some("missing".to_string()),
+        });
+
+        assert_eq!(configs.default_profile_id, None);
+    }
+
+    /// 验证模型配置表单校验规则。
+    ///
+    /// 业务意图：
+    /// - 保存和测试都必须拒绝空名称、空 Base URL、空模型 ID 和非法协议；API Key 可为空以兼容本地服务。
+    #[test]
+    fn 模型配置校验必填字段和_url_协议() {
+        assert!(
+            validate_model_profile_fields("OpenAI", "https://api.openai.com/v1", "gpt").is_ok()
+        );
+        assert!(validate_model_profile_fields("", "https://api.openai.com/v1", "gpt").is_err());
+        assert!(validate_model_profile_fields("OpenAI", "", "gpt").is_err());
+        assert!(
+            validate_model_profile_fields("OpenAI", "ftp://api.example.com/v1", "gpt").is_err()
+        );
+        assert!(validate_model_profile_fields("OpenAI", "http://localhost:11434/v1", "").is_err());
+    }
+
+    /// 验证模型测试请求构造符合 OpenAI Chat Completions 兼容格式。
+    ///
+    /// 业务意图：
+    /// - 测试按钮会产生真实模型调用，URL、鉴权头和请求体必须稳定，避免用户配置正确但测试请求格式错误。
+    #[test]
+    fn 模型测试请求构造稳定() {
+        assert_eq!(
+            model_test_chat_completions_url("https://api.openai.com/v1/").unwrap(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            model_test_authorization_header(" sk-test "),
+            Some("Bearer sk-test".to_string())
+        );
+        assert_eq!(model_test_authorization_header("   "), None);
+
+        let body = model_test_request_body(" gpt-4.1-mini ");
+        assert_eq!(body["model"], "gpt-4.1-mini");
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"], "ping");
+        assert_eq!(body["max_tokens"], 1);
+        assert_eq!(body["stream"], false);
+    }
+
+    /// 验证模型测试响应只接受包含 choices 的 JSON。
+    ///
+    /// 边界条件：
+    /// - HTTP 2xx 但响应不是 Chat Completions 结构时，应提示失败，避免把错误接口误判为可用。
+    #[test]
+    fn 模型测试响应必须包含_choices() {
+        assert!(model_test_response_has_choices(
+            &serde_json::json!({ "choices": [] })
+        ));
+        assert!(!model_test_response_has_choices(
+            &serde_json::json!({ "ok": true })
+        ));
+        assert!(!model_test_response_has_choices(
+            &serde_json::json!({ "choices": {} })
+        ));
     }
 
     /// 验证用户强制主题优先于系统外观。

@@ -1,7 +1,7 @@
 // 设置独立窗口实现。
 //
 // 业务意图：
-// - 该文件集中维护“通用/日志/模型”页签、主题选择、日志显示字号和线程日志分析过滤设置，避免设置 UI 继续堆在应用根文件里。
+// - 该文件集中维护“通用/日志/模型”页签、主题选择、日志显示字号、日志分析过滤、快搜关键字和模型配置设置，避免设置 UI 继续堆在应用根文件里。
 // - 当前作为 `app` 的子模块，通过显式 `pub(super)` 接口更新 `MainView` 的会话状态和持久化配置。
 //
 // 边界条件：
@@ -216,6 +216,61 @@ impl SettingsWindowView {
         focus_handle
     }
 
+    /// 处理模型配置输入框键盘编辑。
+    pub(super) fn handle_model_config_input_key_down(
+        &mut self,
+        kind: ModelConfigInputKind,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.main_view.update(context, |view, context| {
+            view.handle_model_config_input_key_down(kind, event, context);
+        });
+        context.notify();
+    }
+
+    /// 处理模型配置输入框鼠标按下并聚焦对应字段。
+    pub(super) fn handle_model_config_input_mouse_down(
+        &mut self,
+        kind: ModelConfigInputKind,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let focus_handle = self.main_view.update(context, |view, context| {
+            view.start_model_config_input_mouse_selection(kind, event, context);
+            view.model_config_input_focus(kind)
+        });
+        window.focus(&focus_handle);
+        context.notify();
+    }
+
+    /// 拖动扩展模型配置输入框选择范围。
+    pub(super) fn handle_model_config_input_mouse_move(
+        &mut self,
+        kind: ModelConfigInputKind,
+        event: &MouseMoveEvent,
+        context: &mut Context<Self>,
+    ) {
+        self.main_view.update(context, |view, context| {
+            view.update_model_config_input_mouse_selection(kind, event.position, context);
+        });
+        context.notify();
+    }
+
+    /// 结束模型配置输入框鼠标选择。
+    pub(super) fn handle_model_config_input_mouse_up(
+        &mut self,
+        kind: ModelConfigInputKind,
+        context: &mut Context<Self>,
+    ) {
+        self.main_view.update(context, |view, context| {
+            view.finish_model_config_input_mouse_selection(kind, context);
+        });
+        context.notify();
+    }
+
     /// 渲染左侧页签栏。
     fn render_tab_sidebar(
         &self,
@@ -319,7 +374,7 @@ impl SettingsWindowView {
                 palette,
                 context,
             ),
-            SettingsTab::Model => self.render_model_tab(palette),
+            SettingsTab::Model => self.render_model_tab(palette, context),
         }
     }
 
@@ -1066,12 +1121,630 @@ impl SettingsWindowView {
     /// 渲染模型页签。
     ///
     /// 业务意图：
-    /// - 用户要求模型页签先留白，因此这里仅保留空白内容区，不展示占位说明或未完成提示。
-    fn render_model_tab(&self, palette: AppThemePalette) -> gpui::Stateful<gpui::Div> {
+    /// - 模型页提供 OpenAI 兼容模型配置管理，用户可以维护多条配置、测试当前表单并设置默认模型。
+    /// - 列表和表单并排展示，避免多条配置时频繁滚动；窗口较小时外层允许纵向滚动，保证按钮不被裁剪。
+    fn render_model_tab(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let (
+            profiles,
+            default_profile_id,
+            selected_profile_id,
+            form_profile_id,
+            name,
+            base_url,
+            model,
+            api_key_visible,
+            test_status,
+        ) = {
+            let main_view = self.main_view.read(context);
+            (
+                main_view.model_config_profiles.clone(),
+                main_view.model_config_default_profile_id.clone(),
+                main_view.model_config_selected_profile_id.clone(),
+                main_view.model_config_form_profile_id.clone(),
+                main_view.model_config_name_input.text.clone(),
+                main_view.model_config_base_url_input.text.clone(),
+                main_view.model_config_model_input.text.clone(),
+                main_view.model_config_api_key_visible,
+                main_view.model_test_status.clone(),
+            )
+        };
+        let can_save_or_test = validate_model_profile_fields(&name, &base_url, &model).is_ok();
+        let can_test = can_save_or_test && !test_status.is_testing();
+        let can_delete = form_profile_id.is_some();
+        let can_set_default = form_profile_id
+            .as_ref()
+            .is_some_and(|profile_id| default_profile_id.as_ref() != Some(profile_id));
+
         div()
             .id("settings-model-tab")
+            .flex()
+            .flex_col()
             .size_full()
+            .p_4()
+            .overflow_y_scroll()
+            .scrollbar_width(px(6.0))
             .bg(rgb(palette.background))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .mb_3()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(palette.text))
+                            .child(MainView::render_lucide_icon(
+                                Some(Icon::MonitorCog),
+                                16.0,
+                                16.0,
+                                palette.muted_text,
+                            ))
+                            .child("模型设置"),
+                    )
+                    .child(self.render_model_icon_button(
+                        "settings-model-new",
+                        "新增",
+                        Icon::Plus,
+                        true,
+                        false,
+                        palette,
+                        context,
+                        |view, context| view.begin_new_model_profile(context),
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_4()
+                    .min_h(px(390.0))
+                    .child(self.render_model_profile_list(
+                        profiles,
+                        default_profile_id.clone(),
+                        selected_profile_id,
+                        palette,
+                        context,
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(rgb(palette.border))
+                            .bg(rgb(palette.surface))
+                            .p_4()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .mb_4()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(palette.text))
+                                            .child(MainView::render_lucide_icon(
+                                                Some(Icon::Pencil),
+                                                15.0,
+                                                15.0,
+                                                palette.muted_text,
+                                            ))
+                                            .child("配置详情"),
+                                    )
+                                    .when(
+                                        form_profile_id.as_ref().is_some_and(|profile_id| {
+                                            default_profile_id.as_ref() == Some(profile_id)
+                                        }),
+                                        |row| {
+                                            row.child(
+                                                div()
+                                                    .px_2()
+                                                    .py_1()
+                                                    .rounded(px(999.0))
+                                                    .bg(rgb(palette.selected))
+                                                    .text_xs()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(rgb(palette.accent))
+                                                    .child("默认"),
+                                            )
+                                        },
+                                    ),
+                            )
+                            .child(self.render_model_text_field(
+                                ModelConfigInputKind::Name,
+                                "配置名称",
+                                "OpenAI / 本地 vLLM",
+                                false,
+                                palette,
+                                context,
+                            ))
+                            .child(self.render_model_text_field(
+                                ModelConfigInputKind::BaseUrl,
+                                "Base URL",
+                                "https://api.openai.com/v1",
+                                false,
+                                palette,
+                                context,
+                            ))
+                            .child(self.render_model_text_field(
+                                ModelConfigInputKind::ApiKey,
+                                "API Key",
+                                "可为空，兼容本地模型服务",
+                                true,
+                                palette,
+                                context,
+                            ))
+                            .child(self.render_model_text_field(
+                                ModelConfigInputKind::Model,
+                                "模型 ID",
+                                "gpt-4.1-mini / qwen2.5:7b",
+                                false,
+                                palette,
+                                context,
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .mt_2()
+                                    .gap_2()
+                                    .child(self.render_model_icon_button(
+                                        "settings-model-save",
+                                        "保存",
+                                        Icon::Save,
+                                        can_save_or_test,
+                                        true,
+                                        palette,
+                                        context,
+                                        |view, context| view.save_current_model_profile(context),
+                                    ))
+                                    .child(self.render_model_icon_button(
+                                        "settings-model-delete",
+                                        "删除",
+                                        Icon::Trash2,
+                                        can_delete,
+                                        false,
+                                        palette,
+                                        context,
+                                        |view, context| view.delete_current_model_profile(context),
+                                    ))
+                                    .child(self.render_model_icon_button(
+                                        "settings-model-default",
+                                        "设为默认",
+                                        Icon::Check,
+                                        can_set_default,
+                                        false,
+                                        palette,
+                                        context,
+                                        |view, context| {
+                                            view.set_current_model_profile_default(context)
+                                        },
+                                    ))
+                                    .child(self.render_model_icon_button(
+                                        "settings-model-test",
+                                        if test_status.is_testing() {
+                                            "测试中"
+                                        } else {
+                                            "测试模型"
+                                        },
+                                        Icon::TestTube,
+                                        can_test,
+                                        false,
+                                        palette,
+                                        context,
+                                        |view, context| view.start_model_profile_test(context),
+                                    )),
+                            )
+                            .child(self.render_model_test_status(test_status, palette))
+                            .child(
+                                div()
+                                    .mt_2()
+                                    .text_xs()
+                                    .text_color(rgb(palette.muted_text))
+                                    .child(if api_key_visible {
+                                        "API Key 当前明文显示"
+                                    } else {
+                                        "API Key 默认掩码显示，配置保存到应用配置目录"
+                                    }),
+                            ),
+                    ),
+            )
+    }
+
+    /// 渲染模型配置列表。
+    fn render_model_profile_list(
+        &self,
+        profiles: Vec<ModelProfile>,
+        default_profile_id: Option<String>,
+        selected_profile_id: Option<String>,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("settings-model-profile-list")
+            .flex()
+            .flex_col()
+            .w(px(200.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.surface))
+            .p_3()
+            .child(
+                div()
+                    .mb_2()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(palette.muted_text))
+                    .child("已保存配置"),
+            )
+            .when(profiles.is_empty(), |list| {
+                list.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .flex_1()
+                        .min_h(px(240.0))
+                        .text_center()
+                        .text_xs()
+                        .text_color(rgb(palette.muted_text))
+                        .child(MainView::render_lucide_icon(
+                            Some(Icon::MonitorCog),
+                            24.0,
+                            22.0,
+                            palette.muted_text,
+                        ))
+                        .child("暂无模型配置"),
+                )
+            })
+            .children(profiles.into_iter().map(|profile| {
+                self.render_model_profile_list_item(
+                    profile,
+                    default_profile_id.clone(),
+                    selected_profile_id.clone(),
+                    palette,
+                    context,
+                )
+            }))
+    }
+
+    /// 渲染单个模型配置列表项。
+    fn render_model_profile_list_item(
+        &self,
+        profile: ModelProfile,
+        default_profile_id: Option<String>,
+        selected_profile_id: Option<String>,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let profile_id = profile.id.clone();
+        let selected = selected_profile_id.as_ref() == Some(&profile.id);
+        let is_default = default_profile_id.as_ref() == Some(&profile.id);
+        div()
+            .id(SharedString::from(format!(
+                "settings-model-profile-{}",
+                profile.id
+            )))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .w_full()
+            .mb_2()
+            .p_2()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(if selected {
+                palette.accent
+            } else {
+                palette.border
+            }))
+            .bg(rgb(if selected {
+                palette.selected
+            } else {
+                palette.panel
+            }))
+            .cursor_pointer()
+            .hover(move |row| row.bg(rgb(palette.hover)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(if selected {
+                                palette.accent
+                            } else {
+                                palette.text
+                            }))
+                            .overflow_hidden()
+                            .child(profile.name),
+                    )
+                    .when(is_default, |row| {
+                        row.child(
+                            div()
+                                .px_1()
+                                .rounded(px(999.0))
+                                .bg(rgb(palette.selected))
+                                .text_xs()
+                                .text_color(rgb(palette.accent))
+                                .child("默认"),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(palette.muted_text))
+                    .overflow_hidden()
+                    .child(profile.model),
+            )
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, _window, context| {
+                    view.main_view.update(context, |main_view, context| {
+                        main_view.select_model_profile(&profile_id, context);
+                    });
+                    context.notify();
+                }),
+            )
+    }
+
+    /// 渲染模型配置单行字段。
+    fn render_model_text_field(
+        &self,
+        kind: ModelConfigInputKind,
+        label: &'static str,
+        placeholder: &'static str,
+        secret: bool,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let (focus_handle, api_key_visible) = {
+            let main_view = self.main_view.read(context);
+            (
+                main_view.model_config_input_focus(kind),
+                main_view.model_config_api_key_visible,
+            )
+        };
+        div()
+            .id(SharedString::from(format!("settings-model-field-{label}")))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .mb_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(palette.muted_text))
+                            .child(label),
+                    )
+                    .when(secret, |row| {
+                        row.child(self.render_model_api_key_visibility_button(
+                            api_key_visible,
+                            palette,
+                            context,
+                        ))
+                    }),
+            )
+            .child(
+                div()
+                    .relative()
+                    .h(px(SEARCH_INPUT_HEIGHT))
+                    .w_full()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.input))
+                    .track_focus(&focus_handle)
+                    .key_context("model-config-input")
+                    .on_key_down(context.listener(
+                        move |view, event: &KeyDownEvent, window, context| {
+                            view.handle_model_config_input_key_down(kind, event, window, context);
+                        },
+                    ))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        context.listener(move |view, event: &MouseDownEvent, window, context| {
+                            view.handle_model_config_input_mouse_down(kind, event, window, context);
+                        }),
+                    )
+                    .on_mouse_move(context.listener(
+                        move |view, event: &MouseMoveEvent, _window, context| {
+                            view.handle_model_config_input_mouse_move(kind, event, context);
+                        },
+                    ))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        context.listener(move |view, _event: &MouseUpEvent, _window, context| {
+                            view.handle_model_config_input_mouse_up(kind, context);
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        context.listener(move |view, _event: &MouseUpEvent, _window, context| {
+                            view.handle_model_config_input_mouse_up(kind, context);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(10.0))
+                            .right(px(10.0))
+                            .top(px(5.0))
+                            .bottom(px(5.0))
+                            .overflow_hidden()
+                            .text_sm()
+                            .text_color(rgb(palette.text))
+                            .child(ModelConfigInputElement {
+                                view: self.main_view.clone(),
+                                kind,
+                                focus_handle,
+                                placeholder,
+                                palette,
+                            }),
+                    ),
+            )
+    }
+
+    /// 渲染 API Key 显示/隐藏按钮。
+    fn render_model_api_key_visibility_button(
+        &self,
+        api_key_visible: bool,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("settings-model-api-key-visibility")
+            .flex()
+            .items_center()
+            .gap_1()
+            .h(px(24.0))
+            .px_2()
+            .rounded(px(5.0))
+            .text_xs()
+            .text_color(rgb(palette.muted_text))
+            .cursor_pointer()
+            .hover(move |button| button.bg(rgb(palette.hover)))
+            .child(MainView::render_lucide_icon(
+                Some(if api_key_visible {
+                    Icon::EyeOff
+                } else {
+                    Icon::Eye
+                }),
+                13.0,
+                13.0,
+                palette.muted_text,
+            ))
+            .child(if api_key_visible { "隐藏" } else { "显示" })
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, _window, context| {
+                    view.main_view.update(context, |main_view, context| {
+                        main_view.toggle_model_api_key_visibility(context);
+                    });
+                    context.notify();
+                }),
+            )
+    }
+
+    /// 渲染模型页通用按钮。
+    fn render_model_icon_button<F>(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        icon: Icon,
+        enabled: bool,
+        primary: bool,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+        action: F,
+    ) -> gpui::Stateful<gpui::Div>
+    where
+        F: Fn(&mut MainView, &mut Context<MainView>) + 'static,
+    {
+        let text_color = if primary && enabled {
+            palette.on_accent
+        } else if enabled {
+            palette.text
+        } else {
+            palette.muted_text
+        };
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .h(px(28.0))
+            .px_3()
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(if primary && enabled {
+                palette.accent
+            } else {
+                palette.panel
+            }))
+            .text_xs()
+            .text_color(rgb(text_color))
+            .when(enabled, |button| {
+                button.cursor_pointer().hover(move |button| {
+                    button.bg(rgb(if primary {
+                        palette.accent_hover
+                    } else {
+                        palette.hover
+                    }))
+                })
+            })
+            .when(!enabled, |button| button.opacity(0.55))
+            .child(MainView::render_lucide_icon(
+                Some(icon),
+                13.0,
+                13.0,
+                text_color,
+            ))
+            .child(label)
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, _window, context| {
+                    if enabled {
+                        view.main_view.update(context, |main_view, context| {
+                            action(main_view, context);
+                        });
+                        context.notify();
+                    }
+                }),
+            )
+    }
+
+    /// 渲染模型测试状态。
+    fn render_model_test_status(
+        &self,
+        test_status: ModelTestStatus,
+        palette: AppThemePalette,
+    ) -> gpui::Stateful<gpui::Div> {
+        let Some(message) = test_status.message() else {
+            return div().id("settings-model-test-status-empty").h(px(24.0));
+        };
+        let color = match test_status {
+            ModelTestStatus::Success(_) => palette.accent,
+            ModelTestStatus::Failed(_) => palette.error,
+            ModelTestStatus::Testing { .. } | ModelTestStatus::Idle => palette.muted_text,
+        };
+        div()
+            .id("settings-model-test-status")
+            .mt_3()
+            .min_h(px(24.0))
+            .text_xs()
+            .text_color(rgb(color))
+            .child(message.to_string())
     }
 }
 
@@ -1339,6 +2012,218 @@ impl Element for QuickSearchKeywordsInputElement {
         }
         self.view.update(context, |view, _context| {
             view.store_quick_search_keywords_layout(prepaint.line, bounds);
+        });
+    }
+}
+
+/// 模型配置输入框的预绘制结果。
+struct ModelConfigInputPrepaint {
+    /// 当前帧单行字形布局。
+    line: ShapedLine,
+    /// 当前选择范围对应的高亮矩形。
+    selection: Option<PaintQuad>,
+    /// 当前插入光标矩形。
+    cursor: Option<PaintQuad>,
+}
+
+/// 模型配置单行输入元素。
+///
+/// 业务意图：
+/// - 设置-模型页需要四个支持 IME 的自绘输入框，复用快搜单行输入的绘制和平台输入协议方案。
+/// - 元素只负责绘制可见文本、选区和光标；真实字段值、掩码状态和保存逻辑仍由 `MainView` 统一管理。
+struct ModelConfigInputElement {
+    /// 主视图实体，用于读取和写回模型配置输入状态。
+    view: Entity<MainView>,
+    /// 当前字段类型。
+    kind: ModelConfigInputKind,
+    /// 输入区焦点句柄。
+    focus_handle: gpui::FocusHandle,
+    /// 输入为空时显示的占位文案。
+    placeholder: &'static str,
+    /// 当前主题调色板。
+    palette: AppThemePalette,
+}
+
+impl IntoElement for ModelConfigInputElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for ModelConfigInputElement {
+    type RequestLayoutState = ();
+    type PrepaintState = Option<ModelConfigInputPrepaint>;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        context: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.0).into();
+        style.size.height = window.line_height().into();
+        (window.request_layout(style, [], context), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        context: &mut App,
+    ) -> Self::PrepaintState {
+        let (text, display_text, selection_range, marked_range, cursor_visible_by_activity) = {
+            let view = self.view.read(context);
+            let (text, display_text, selection_range, marked_range) =
+                view.model_config_input_text_snapshot(self.kind);
+            (
+                text,
+                display_text,
+                selection_range,
+                marked_range,
+                view.search_text_cursor_visible(),
+            )
+        };
+        let style = window.text_style();
+        let rendered_text = if text.is_empty() {
+            SharedString::from(self.placeholder)
+        } else {
+            SharedString::from(display_text)
+        };
+        let text_color = if text.is_empty() {
+            rgb(self.palette.muted_text).into()
+        } else {
+            style.color
+        };
+        let base_run = TextRun {
+            len: rendered_text.len(),
+            font: style.font(),
+            color: text_color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let runs = if !text.is_empty() {
+            if let Some(marked_range) = marked_range {
+                vec![
+                    TextRun {
+                        len: marked_range.start,
+                        ..base_run.clone()
+                    },
+                    TextRun {
+                        len: marked_range.end.saturating_sub(marked_range.start),
+                        underline: Some(UnderlineStyle {
+                            color: Some(base_run.color),
+                            thickness: px(1.0),
+                            wavy: false,
+                        }),
+                        ..base_run.clone()
+                    },
+                    TextRun {
+                        len: rendered_text.len().saturating_sub(marked_range.end),
+                        ..base_run
+                    },
+                ]
+                .into_iter()
+                .filter(|run| run.len > 0)
+                .collect()
+            } else {
+                vec![base_run]
+            }
+        } else {
+            vec![base_run]
+        };
+
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let line = window
+            .text_system()
+            .shape_line(rendered_text, font_size, &runs, None);
+        let focused = self.focus_handle.is_focused(window);
+        let selection_range = MainView::clamp_search_text_range(&text, selection_range);
+        let has_selection =
+            focused && !text.is_empty() && selection_range.start < selection_range.end;
+        let cursor_index = selection_range.end;
+        let selection = has_selection.then(|| {
+            let mut selection_color = rgb(self.palette.accent);
+            selection_color.a = 0.32;
+            fill(
+                Bounds::from_corners(
+                    point(
+                        bounds.left() + line.x_for_index(selection_range.start),
+                        bounds.top(),
+                    ),
+                    point(
+                        bounds.left() + line.x_for_index(selection_range.end),
+                        bounds.bottom(),
+                    ),
+                ),
+                selection_color,
+            )
+        });
+        let cursor = (focused && !has_selection && cursor_visible_by_activity).then(|| {
+            fill(
+                Bounds::new(
+                    point(bounds.left() + line.x_for_index(cursor_index), bounds.top()),
+                    size(px(1.5), bounds.bottom() - bounds.top()),
+                ),
+                rgb(self.palette.accent),
+            )
+        });
+
+        Some(ModelConfigInputPrepaint {
+            line,
+            selection,
+            cursor,
+        })
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        context: &mut App,
+    ) {
+        window.handle_input(
+            &self.focus_handle,
+            ElementInputHandler::new(bounds, self.view.clone()),
+            context,
+        );
+        let Some(prepaint) = prepaint.take() else {
+            return;
+        };
+        if let Some(selection) = prepaint.selection {
+            window.paint_quad(selection);
+        }
+        prepaint
+            .line
+            .paint(bounds.origin, window.line_height(), window, context)
+            .ok();
+        if let Some(cursor) = prepaint.cursor {
+            window.paint_quad(cursor);
+        }
+        if self.focus_handle.is_focused(window) {
+            window.request_animation_frame();
+        }
+        self.view.update(context, |view, _context| {
+            view.store_model_config_input_layout(self.kind, prepaint.line, bounds);
         });
     }
 }

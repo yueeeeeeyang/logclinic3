@@ -19,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use gpui::prelude::FluentBuilder;
@@ -36,6 +36,7 @@ use gpui::{
     point, px, relative, rgb, size, uniform_list,
 };
 use lucide_icons::{Icon, LUCIDE_FONT_BYTES};
+use serde::{Deserialize, Serialize};
 
 use crate::archive_materializer::{
     cleanup_materialized_file, cleanup_stale_large_log_cache, materialize_source_for_paging,
@@ -162,6 +163,30 @@ const THREAD_ANALYSIS_FILTER_FILE_NAME: &str = "thread-analysis-filter.txt";
 /// - 快搜关键字是用户面向排障场景维护的常用搜索词集合，需要跨应用重启保留。
 /// - 文件保存英文逗号分隔的单行文本，保持可手工编辑，同时避免为一个简单列表引入结构化配置依赖。
 const QUICK_SEARCH_KEYWORDS_FILE_NAME: &str = "quick-search-keywords.txt";
+
+/// 模型配置文件名。
+///
+/// 业务意图：
+/// - 模型配置包含多个 OpenAI 兼容接口档案和默认模型选择，需要跨应用重启恢复。
+/// - 文件使用 JSON 而不是多个文本文件，便于一次性保存列表、默认 ID 和 API Key 等结构化字段。
+///
+/// 安全边界：
+/// - 用户已确认第一版 API Key 明文保存在应用配置目录；UI 默认掩码显示，代码中避免把 Key 写入错误文案。
+const MODEL_CONFIGS_FILE_NAME: &str = "model-configs.json";
+
+/// 测试模型接口的超时时间。
+///
+/// 业务意图：
+/// - 测试按钮只用于快速确认配置是否可用，不能因为网络不可达或本地服务无响应长期占用后台线程。
+/// - 20 秒是需求确认的默认超时，既兼容本地模型冷启动，也能让 UI 尽快反馈失败。
+const MODEL_TEST_TIMEOUT_SECONDS: u64 = 20;
+
+/// OpenAI 兼容 Chat Completions 路径。
+///
+/// 业务意图：
+/// - `base_url` 约定为 API 根路径，例如 `https://api.openai.com/v1`，测试时统一拼接该相对路径。
+/// - 单独定义后测试和真实请求共用一套拼接规则，避免尾斜杠处理不一致。
+const MODEL_TEST_CHAT_COMPLETIONS_PATH: &str = "chat/completions";
 
 /// 快搜默认关键字配置。
 ///
@@ -716,6 +741,11 @@ fn quick_search_keywords_preference_path() -> Option<PathBuf> {
     app_config_dir().map(|dir| dir.join(QUICK_SEARCH_KEYWORDS_FILE_NAME))
 }
 
+/// 获取模型配置文件路径。
+fn model_configs_preference_path() -> Option<PathBuf> {
+    app_config_dir().map(|dir| dir.join(MODEL_CONFIGS_FILE_NAME))
+}
+
 /// 规范化线程日志分析过滤配置文本。
 ///
 /// 业务意图：
@@ -837,6 +867,207 @@ fn save_quick_search_keywords_preference(text: &str) {
     };
     if let Err(error) = write_quick_search_keywords_preference(&path, text) {
         eprintln!("保存快搜关键字配置失败：{}：{}", path.display(), error);
+    }
+}
+
+/// 规范化模型配置文件内容。
+///
+/// 业务意图：
+/// - 配置文件可能被用户手工修改，默认模型 ID 可能指向不存在的档案；读取后统一清理悬空引用，避免 UI 高亮错误。
+/// - 这里不主动裁剪字段内容，保存按钮的校验负责约束新写入内容，读取历史配置时尽量保持用户原文可修复。
+fn normalize_model_configs(mut configs: ModelConfigs) -> ModelConfigs {
+    if configs
+        .default_profile_id
+        .as_ref()
+        .is_some_and(|default_id| {
+            !configs
+                .profiles
+                .iter()
+                .any(|profile| &profile.id == default_id)
+        })
+    {
+        configs.default_profile_id = None;
+    }
+    configs
+}
+
+/// 从指定文件读取模型配置。
+///
+/// 错误处理：
+/// - 文件缺失、读取失败或 JSON 损坏都返回空配置，不能阻断日志查看主流程或设置窗口打开。
+/// - 损坏 JSON 不会自动覆盖原文件，避免用户仍可手工恢复其中的 API Key 和模型信息。
+fn read_model_configs_preference(path: &Path) -> ModelConfigs {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return ModelConfigs::default();
+    };
+    serde_json::from_str::<ModelConfigs>(&raw)
+        .map(normalize_model_configs)
+        .unwrap_or_default()
+}
+
+/// 将模型配置写入指定文件。
+///
+/// 业务意图：
+/// - 模型配置包含列表和默认 ID，使用 pretty JSON 保存，方便用户在配置目录中直接核对。
+fn write_model_configs_preference(path: &Path, configs: &ModelConfigs) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let serialized = serde_json::to_string_pretty(&normalize_model_configs(configs.clone()))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    fs::write(path, format!("{serialized}\n"))
+}
+
+/// 读取模型配置。
+fn load_model_configs_preference() -> ModelConfigs {
+    model_configs_preference_path()
+        .map(|path| read_model_configs_preference(&path))
+        .unwrap_or_default()
+}
+
+/// 保存模型配置。
+///
+/// 错误处理：
+/// - 写入失败不回滚当前 UI 状态，仅输出诊断；这样配置目录权限问题不会让用户丢失当前表单内容。
+fn save_model_configs_preference(configs: &ModelConfigs) {
+    let Some(path) = model_configs_preference_path() else {
+        return;
+    };
+    if let Err(error) = write_model_configs_preference(&path, configs) {
+        eprintln!("保存模型配置失败：{}：{}", path.display(), error);
+    }
+}
+
+/// 校验模型配置表单的必填字段和 URL 协议。
+///
+/// 业务意图：
+/// - 保存和测试都必须使用同一套校验，避免 UI 能保存但不能测试，或测试能发出非法 URL 请求。
+/// - API Key 明确允许为空，以兼容本地 Ollama/vLLM 等不需要 Bearer 鉴权的服务。
+fn validate_model_profile_fields(name: &str, base_url: &str, model: &str) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("配置名称不能为空".to_string());
+    }
+    if base_url.trim().is_empty() {
+        return Err("Base URL 不能为空".to_string());
+    }
+    if model.trim().is_empty() {
+        return Err("模型 ID 不能为空".to_string());
+    }
+    let base_url = base_url.trim();
+    if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+        return Err("Base URL 必须以 http:// 或 https:// 开头".to_string());
+    }
+    Ok(())
+}
+
+/// 拼接模型测试请求 URL。
+///
+/// 边界条件：
+/// - 用户可能在 Base URL 末尾输入一个或多个 `/`，拼接时统一去掉末尾斜杠，避免出现双斜杠路径。
+fn model_test_chat_completions_url(base_url: &str) -> Result<String, String> {
+    let base_url = base_url.trim();
+    if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+        return Err("Base URL 必须以 http:// 或 https:// 开头".to_string());
+    }
+    Ok(format!(
+        "{}/{}",
+        base_url.trim_end_matches('/'),
+        MODEL_TEST_CHAT_COMPLETIONS_PATH
+    ))
+}
+
+/// 构造模型测试请求体。
+///
+/// 业务意图：
+/// - 第一版只支持 OpenAI Chat Completions 兼容接口，固定发送最小 `ping` 请求，降低真实调用成本。
+fn model_test_request_body(model: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model.trim(),
+        "messages": [
+            {
+                "role": "user",
+                "content": "ping"
+            }
+        ],
+        "max_tokens": 1,
+        "stream": false
+    })
+}
+
+/// 返回测试请求需要发送的 Authorization 头。
+///
+/// 业务意图：
+/// - API Key 非空才发送 Bearer header，避免本地模型服务因为无意义空鉴权头拒绝请求。
+fn model_test_authorization_header(api_key: &str) -> Option<String> {
+    let api_key = api_key.trim();
+    (!api_key.is_empty()).then(|| format!("Bearer {api_key}"))
+}
+
+/// 判断模型测试响应是否包含 Chat Completions 的 choices。
+///
+/// 边界条件：
+/// - 只要求 `choices` 是数组，不强制数组非空；部分兼容服务在 `max_tokens=1` 下仍可能返回空内容但格式有效。
+fn model_test_response_has_choices(value: &serde_json::Value) -> bool {
+    value
+        .get("choices")
+        .is_some_and(|choices| choices.is_array())
+}
+
+/// 将 HTTP 错误响应体裁剪成适合 UI 展示的短文本。
+///
+/// 业务意图：
+/// - 兼容服务可能返回很长的 JSON 错误，设置窗口只需要展示可理解的前段原因，避免撑破状态栏。
+fn model_test_http_error_body_snippet(body: &str) -> String {
+    let normalized = body.replace(['\r', '\n'], " ");
+    let trimmed = normalized.trim();
+    if trimmed.chars().count() <= 160 {
+        trimmed.to_string()
+    } else {
+        let snippet: String = trimmed.chars().take(160).collect();
+        format!("{snippet}...")
+    }
+}
+
+/// 执行一次 OpenAI 兼容模型测试请求。
+///
+/// 业务意图：
+/// - 该函数只在后台执行器中调用，使用 blocking client 可以避免把额外异步运行时引入 GPUI 主线程。
+/// - 请求不记录 API Key，也不会把完整请求头写入错误文案，降低明文 Key 暴露风险。
+fn test_openai_compatible_model(profile: ModelProfile) -> Result<String, String> {
+    validate_model_profile_fields(&profile.name, &profile.base_url, &profile.model)?;
+    let url = model_test_chat_completions_url(&profile.base_url)?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(MODEL_TEST_TIMEOUT_SECONDS))
+        .build()
+        .map_err(|error| format!("测试失败：创建 HTTP 客户端失败：{error}"))?;
+
+    let mut request = client
+        .post(url)
+        .json(&model_test_request_body(&profile.model));
+    if let Some(authorization) = model_test_authorization_header(&profile.api_key) {
+        request = request.header(reqwest::header::AUTHORIZATION, authorization);
+    }
+
+    let response = request
+        .send()
+        .map_err(|error| format!("测试失败：请求接口失败：{error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        let snippet = model_test_http_error_body_snippet(&body);
+        if snippet.is_empty() {
+            return Err(format!("测试失败：HTTP 状态码 {status}"));
+        }
+        return Err(format!("测试失败：HTTP 状态码 {status}，{snippet}"));
+    }
+
+    let value = response
+        .json::<serde_json::Value>()
+        .map_err(|error| format!("测试失败：响应 JSON 解析失败：{error}"))?;
+    if model_test_response_has_choices(&value) {
+        Ok("测试成功：模型接口可用".to_string())
+    } else {
+        Err("测试失败：响应 JSON 缺少 choices 字段".to_string())
     }
 }
 
@@ -1351,14 +1582,15 @@ const SEARCH_HISTORY_DROPDOWN_MAX_HEIGHT: f32 = 176.0;
 ///
 /// 业务意图：
 /// - 设置窗口需要容纳左侧页签和右侧统一表单布局；日志页包含多行线程堆栈过滤输入区，因此需要比早期设置窗口更宽。
+/// - 模型页是“配置列表 + 表单 + 四个操作按钮”的两栏布局，宽度不足会导致按钮越过详情卡片边框，因此按该页的最小可用宽度取值。
 /// - 固定宽度可以让独立窗口在 macOS 和 Windows 上保持稳定布局，不受系统字体度量差异影响。
-const SETTINGS_WINDOW_WIDTH: f32 = 760.0;
+const SETTINGS_WINDOW_WIDTH: f32 = 900.0;
 
 /// 设置窗口默认高度。
 ///
 /// 业务意图：
 /// - 日志页需要直接粘贴线程堆栈，较高窗口可以减少输入区滚动，同时保留通用页紧凑布局。
-/// - 模型页签当前按需求留白，因此窗口高度不随页签切换变化，避免用户切换时窗口跳动。
+/// - 模型页签需要容纳配置列表、表单和测试状态；固定高度配合页内滚动，避免不同页签切换时窗口跳动。
 const SETTINGS_WINDOW_HEIGHT: f32 = 520.0;
 
 /// 关于窗口默认宽度。
@@ -2106,6 +2338,145 @@ enum SearchTextInputKind {
     DirectoryTarget,
 }
 
+/// 设置页模型配置表单中的单行输入槽位。
+///
+/// 业务意图：
+/// - “模型”页包含配置名称、Base URL、API Key 和模型 ID 四个自绘输入框，平台 IME 和鼠标命中需要知道当前焦点属于哪个字段。
+/// - 使用枚举集中区分字段，可以复用同一套复制、粘贴、全选、删除和组合文本处理逻辑。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelConfigInputKind {
+    /// 用户可读的配置名称。
+    Name,
+    /// OpenAI 兼容 API 根路径。
+    BaseUrl,
+    /// OpenAI 兼容 API Key，可为空以兼容本地 Ollama/vLLM。
+    ApiKey,
+    /// Chat Completions 请求中的模型 ID。
+    Model,
+}
+
+/// 模型配置单行输入框的可编辑状态。
+///
+/// 业务意图：
+/// - GPUI 当前版本没有现成文本输入控件，设置页每个模型字段都需要保存文本、选区、IME 组合态和鼠标命中布局。
+/// - 该状态只服务当前设置窗口会话；保存时才会转换成 `ModelProfile` 并写入配置文件。
+struct ModelConfigTextFieldState {
+    /// 当前字段文本，使用 UTF-8 保存，平台输入协议回调时再和 UTF-16 范围互转。
+    text: String,
+    /// 当前选择范围，按 UTF-8 字节下标保存，必须始终夹到字符边界。
+    selection_range: Range<usize>,
+    /// 中文等输入法正在组合的文本范围，提交或取消组合时清空。
+    marked_range: Option<Range<usize>>,
+    /// 当前字段焦点句柄，用于 GPUI 平台输入路由和光标绘制判断。
+    focus: gpui::FocusHandle,
+    /// 最近一次绘制的单行字形布局，用于鼠标点击和拖拽反推出字符位置。
+    last_layout: Option<ShapedLine>,
+    /// 最近一次绘制的输入框窗口坐标边界，用于 IME 候选窗口定位。
+    last_bounds: Option<Bounds<Pixels>>,
+    /// 鼠标拖拽选择时的固定锚点，释放鼠标后清空。
+    selection_drag: Option<usize>,
+}
+
+impl ModelConfigTextFieldState {
+    /// 创建一个空模型配置输入状态。
+    fn new(context: &mut Context<MainView>) -> Self {
+        Self {
+            text: String::new(),
+            selection_range: 0..0,
+            marked_range: None,
+            focus: context.focus_handle(),
+            last_layout: None,
+            last_bounds: None,
+            selection_drag: None,
+        }
+    }
+
+    /// 用新文本替换输入框内容并把光标放到末尾。
+    ///
+    /// 业务意图：
+    /// - 切换模型配置或点击新增时，表单字段必须一次性切换到目标配置，不能保留旧选区或 IME 组合状态。
+    fn set_text(&mut self, text: String) {
+        let cursor = text.len();
+        self.text = text;
+        self.selection_range = cursor..cursor;
+        self.marked_range = None;
+        self.selection_drag = None;
+    }
+
+    /// 清空排版缓存。
+    ///
+    /// 边界条件：
+    /// - 字段内容、掩码显示或窗口尺寸变化后，旧布局不再代表当前可见文本；清空后鼠标命中会安全回退到文本末尾。
+    fn clear_layout(&mut self) {
+        self.last_layout = None;
+        self.last_bounds = None;
+    }
+}
+
+/// OpenAI 兼容模型配置文件的单条档案。
+///
+/// 业务意图：
+/// - 每条档案保存一个可命名的 API 端点和模型 ID，用户可以在不同 OpenAI 兼容服务之间切换。
+/// - 字段保持简单字符串，便于 JSON 配置手工排查和后续迁移。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ModelProfile {
+    /// 稳定 ID，用于列表选择和默认模型引用；不直接展示给用户。
+    id: String,
+    /// 用户可读配置名称。
+    name: String,
+    /// OpenAI 兼容 API 根路径，例如 `https://api.openai.com/v1`。
+    base_url: String,
+    /// API Key，允许为空以兼容不需要鉴权的本地服务。
+    api_key: String,
+    /// Chat Completions 请求体中的模型 ID。
+    model: String,
+}
+
+/// 模型配置文件的完整结构。
+///
+/// 业务意图：
+/// - `profiles` 保存多条配置，`default_profile_id` 保存当前默认配置的稳定 ID。
+/// - 删除或读取损坏配置时会通过规范化逻辑清理悬空默认 ID，避免 UI 指向不存在的配置。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct ModelConfigs {
+    /// 已保存的模型配置列表。
+    profiles: Vec<ModelProfile>,
+    /// 当前默认配置 ID；没有默认或默认配置被删除时为 `None`。
+    default_profile_id: Option<String>,
+}
+
+/// 模型测试按钮的 UI 状态。
+///
+/// 业务意图：
+/// - 测试请求在后台执行，状态需要区分空闲、进行中、成功和失败，避免旧请求返回后覆盖新请求结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ModelTestStatus {
+    /// 尚未测试或结果被用户编辑操作清空。
+    Idle,
+    /// 当前正在执行的测试任务 ID。
+    Testing { job_id: usize },
+    /// 最近一次测试成功。
+    Success(String),
+    /// 最近一次测试失败，字符串为用户可见中文原因。
+    Failed(String),
+}
+
+impl ModelTestStatus {
+    /// 返回用户可见状态文案。
+    fn message(&self) -> Option<&str> {
+        match self {
+            Self::Idle => None,
+            Self::Testing { .. } => Some("测试中..."),
+            Self::Success(message) | Self::Failed(message) => Some(message.as_str()),
+        }
+    }
+
+    /// 返回是否处于正在测试状态。
+    fn is_testing(&self) -> bool {
+        matches!(self, Self::Testing { .. })
+    }
+}
+
 /// 线程日志分析过滤输入区中的单行排版缓存。
 ///
 /// 业务意图：
@@ -2123,7 +2494,7 @@ struct ThreadAnalysisFilterLineLayout {
 /// 设置窗口当前激活的页签。
 ///
 /// 业务意图：
-/// - 设置窗口按用户要求拆成“通用”和“模型”两个页签；状态放在主视图中，避免关闭窗口后当前会话选择丢失。
+/// - 设置窗口按用户要求拆成“通用 / 日志 / 模型”页签；状态放在主视图中，避免关闭窗口后当前会话选择丢失。
 /// - 当前页签状态只存在于进程内，不写入配置文件；后续若需要记忆页签，应先定义设置持久化策略。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsTab {
@@ -2131,7 +2502,7 @@ enum SettingsTab {
     General,
     /// 日志设置页签，当前承载线程日志分析过滤配置。
     Log,
-    /// 模型设置页签，当前按需求留白。
+    /// 模型设置页签，当前承载 OpenAI 兼容模型配置管理。
     Model,
 }
 
@@ -3059,6 +3430,66 @@ struct MainView {
     /// - 编辑态内容属于未保存草稿，不能提前影响搜索对话框中的快搜按钮；关闭设置窗口未保存时也需要恢复。
     quick_search_keywords_saved_text_before_edit: Option<String>,
 
+    /// 已保存的模型配置列表。
+    ///
+    /// 业务意图：
+    /// - 设置-模型页允许维护多条 OpenAI 兼容模型档案，列表状态从 `model-configs.json` 加载并在保存、删除、设为默认时落盘。
+    ///
+    /// 边界条件：
+    /// - 配置文件缺失或损坏时为空列表；UI 仍可新增配置，不影响日志查看主流程。
+    model_config_profiles: Vec<ModelProfile>,
+
+    /// 当前默认模型配置 ID。
+    ///
+    /// 业务意图：
+    /// - 默认模型用于后续可能接入的智能诊断入口；当前设置页负责保存并突出显示该选择。
+    ///
+    /// 边界条件：
+    /// - 删除默认配置或读取到悬空 ID 时必须清空，避免指向不存在的配置。
+    model_config_default_profile_id: Option<String>,
+
+    /// 当前在模型配置列表中选中的已保存配置 ID。
+    ///
+    /// 业务意图：
+    /// - 选中列表项会把配置加载到右侧表单；新增未保存配置时该字段为空，防止“删除/设为默认”误作用到旧配置。
+    model_config_selected_profile_id: Option<String>,
+
+    /// 当前表单对应的已保存配置 ID。
+    ///
+    /// 业务意图：
+    /// - 表单允许编辑已保存配置，也允许新增未保存配置；保存时如果该字段为空则创建新 ID，否则覆盖原配置。
+    model_config_form_profile_id: Option<String>,
+
+    /// 模型配置名称输入框状态。
+    model_config_name_input: ModelConfigTextFieldState,
+
+    /// 模型 Base URL 输入框状态。
+    model_config_base_url_input: ModelConfigTextFieldState,
+
+    /// 模型 API Key 输入框状态。
+    ///
+    /// 安全边界：
+    /// - API Key 文本仍明文保存在内存和配置文件中，但 UI 绘制默认使用掩码；复制时只有用户选中该字段才会复制真实文本。
+    model_config_api_key_input: ModelConfigTextFieldState,
+
+    /// 模型 ID 输入框状态。
+    model_config_model_input: ModelConfigTextFieldState,
+
+    /// API Key 是否在 UI 中明文显示。
+    ///
+    /// 业务意图：
+    /// - 默认掩码降低旁观泄露风险；用户点击显示按钮后只影响当前会话绘制，不写入配置。
+    model_config_api_key_visible: bool,
+
+    /// 模型测试请求状态。
+    model_test_status: ModelTestStatus,
+
+    /// 下一个模型测试任务 ID。
+    ///
+    /// 业务意图：
+    /// - 测试请求可能乱序返回，单调递增 ID 用于丢弃旧请求结果，避免用户修改表单后被旧结果覆盖。
+    next_model_test_job_id: usize,
+
     /// 快搜关键字输入区的选择范围，使用 UTF-8 字节下标。
     quick_search_keywords_selection_range: Range<usize>,
 
@@ -3238,6 +3669,29 @@ impl MainView {
     /// - 集中初始化所有首屏 UI 状态，避免在 `main` 的窗口创建回调中散落默认值。
     /// - 左侧栏默认 300px 是用户明确要求，必须从这里作为唯一入口初始化。
     fn new(context: &mut Context<Self>) -> Self {
+        let model_configs = load_model_configs_preference();
+        let selected_model_profile_id = model_configs
+            .profiles
+            .first()
+            .map(|profile| profile.id.clone());
+        let selected_model_profile = selected_model_profile_id.as_ref().and_then(|profile_id| {
+            model_configs
+                .profiles
+                .iter()
+                .find(|profile| &profile.id == profile_id)
+        });
+        let mut model_config_name_input = ModelConfigTextFieldState::new(context);
+        let mut model_config_base_url_input = ModelConfigTextFieldState::new(context);
+        let mut model_config_api_key_input = ModelConfigTextFieldState::new(context);
+        let mut model_config_model_input = ModelConfigTextFieldState::new(context);
+        let model_config_form_profile_id = selected_model_profile.map(|profile| {
+            model_config_name_input.set_text(profile.name.clone());
+            model_config_base_url_input.set_text(profile.base_url.clone());
+            model_config_api_key_input.set_text(profile.api_key.clone());
+            model_config_model_input.set_text(profile.model.clone());
+            profile.id.clone()
+        });
+
         Self {
             left_panel_width: LEFT_PANEL_DEFAULT_WIDTH,
             main_window: None,
@@ -3276,6 +3730,17 @@ impl MainView {
             quick_search_keywords_text: load_quick_search_keywords_preference(),
             quick_search_keywords_is_editing: false,
             quick_search_keywords_saved_text_before_edit: None,
+            model_config_profiles: model_configs.profiles,
+            model_config_default_profile_id: model_configs.default_profile_id,
+            model_config_selected_profile_id: selected_model_profile_id,
+            model_config_form_profile_id,
+            model_config_name_input,
+            model_config_base_url_input,
+            model_config_api_key_input,
+            model_config_model_input,
+            model_config_api_key_visible: false,
+            model_test_status: ModelTestStatus::Idle,
+            next_model_test_job_id: 1,
             quick_search_keywords_selection_range: 0..0,
             quick_search_keywords_marked_range: None,
             quick_search_keywords_focus: context.focus_handle(),
@@ -5227,6 +5692,7 @@ impl MainView {
     fn settings_text_input_focused(&self, window: &Window) -> bool {
         self.thread_analysis_filter_focus.is_focused(window)
             || self.quick_search_keywords_focus.is_focused(window)
+            || self.active_model_config_input_kind(window).is_some()
     }
 
     /// 判断当前焦点是否位于应用内自绘的可编辑文本输入框。
@@ -7369,6 +7835,617 @@ impl MainView {
     /// 返回当前已保存且可用于快搜的关键字列表。
     fn effective_quick_search_keywords(&self) -> Vec<String> {
         parse_quick_search_keywords(self.quick_search_keywords_effective_text())
+    }
+
+    /// 返回当前模型配置持久化结构快照。
+    ///
+    /// 业务意图：
+    /// - 保存、删除和设为默认都通过同一个结构写入 JSON，避免列表和默认 ID 分别落盘导致状态不一致。
+    fn model_configs_snapshot(&self) -> ModelConfigs {
+        normalize_model_configs(ModelConfigs {
+            profiles: self.model_config_profiles.clone(),
+            default_profile_id: self.model_config_default_profile_id.clone(),
+        })
+    }
+
+    /// 返回模型配置输入框状态。
+    fn model_config_input_state(&self, kind: ModelConfigInputKind) -> &ModelConfigTextFieldState {
+        match kind {
+            ModelConfigInputKind::Name => &self.model_config_name_input,
+            ModelConfigInputKind::BaseUrl => &self.model_config_base_url_input,
+            ModelConfigInputKind::ApiKey => &self.model_config_api_key_input,
+            ModelConfigInputKind::Model => &self.model_config_model_input,
+        }
+    }
+
+    /// 返回模型配置输入框可变状态。
+    fn model_config_input_state_mut(
+        &mut self,
+        kind: ModelConfigInputKind,
+    ) -> &mut ModelConfigTextFieldState {
+        match kind {
+            ModelConfigInputKind::Name => &mut self.model_config_name_input,
+            ModelConfigInputKind::BaseUrl => &mut self.model_config_base_url_input,
+            ModelConfigInputKind::ApiKey => &mut self.model_config_api_key_input,
+            ModelConfigInputKind::Model => &mut self.model_config_model_input,
+        }
+    }
+
+    /// 返回模型配置输入框焦点句柄。
+    fn model_config_input_focus(&self, kind: ModelConfigInputKind) -> gpui::FocusHandle {
+        self.model_config_input_state(kind).focus.clone()
+    }
+
+    /// 根据窗口焦点判断当前平台输入应写入哪个模型配置字段。
+    fn active_model_config_input_kind(&self, window: &Window) -> Option<ModelConfigInputKind> {
+        [
+            ModelConfigInputKind::Name,
+            ModelConfigInputKind::BaseUrl,
+            ModelConfigInputKind::ApiKey,
+            ModelConfigInputKind::Model,
+        ]
+        .into_iter()
+        .find(|kind| {
+            self.model_config_input_state(*kind)
+                .focus
+                .is_focused(window)
+        })
+    }
+
+    /// 返回模型配置输入框的可见文本。
+    ///
+    /// 安全边界：
+    /// - API Key 默认使用同等 UTF-8 字节长度的星号掩码，既避免界面明文展示，也让选区和光标索引仍能映射到可见文本。
+    fn model_config_input_display_text(&self, kind: ModelConfigInputKind) -> String {
+        let state = self.model_config_input_state(kind);
+        if kind == ModelConfigInputKind::ApiKey
+            && !self.model_config_api_key_visible
+            && !state.text.is_empty()
+        {
+            "*".repeat(state.text.len())
+        } else {
+            state.text.clone()
+        }
+    }
+
+    /// 读取模型配置输入框绘制快照。
+    fn model_config_input_text_snapshot(
+        &self,
+        kind: ModelConfigInputKind,
+    ) -> (String, String, Range<usize>, Option<Range<usize>>) {
+        let state = self.model_config_input_state(kind);
+        (
+            state.text.clone(),
+            self.model_config_input_display_text(kind),
+            Self::clamp_search_text_range(&state.text, state.selection_range.clone()),
+            state.marked_range.clone(),
+        )
+    }
+
+    /// 保存模型配置输入框最近一次单行排版结果。
+    fn store_model_config_input_layout(
+        &mut self,
+        kind: ModelConfigInputKind,
+        line: ShapedLine,
+        bounds: Bounds<Pixels>,
+    ) {
+        let state = self.model_config_input_state_mut(kind);
+        state.last_layout = Some(line);
+        state.last_bounds = Some(bounds);
+    }
+
+    /// 根据鼠标窗口坐标返回模型配置输入框中的 UTF-8 字节下标。
+    fn model_config_input_index_for_point(
+        &self,
+        kind: ModelConfigInputKind,
+        position: Point<Pixels>,
+    ) -> usize {
+        let state = self.model_config_input_state(kind);
+        let (Some(layout), Some(bounds)) = (state.last_layout.as_ref(), state.last_bounds.as_ref())
+        else {
+            return state.text.len();
+        };
+        if position.y < bounds.top() {
+            return 0;
+        }
+        if position.y > bounds.bottom() {
+            return state.text.len();
+        }
+        layout
+            .closest_index_for_x(position.x - bounds.left())
+            .min(state.text.len())
+    }
+
+    /// 开始模型配置输入框鼠标选择。
+    fn start_model_config_input_mouse_selection(
+        &mut self,
+        kind: ModelConfigInputKind,
+        event: &MouseDownEvent,
+        context: &mut Context<Self>,
+    ) {
+        let index = self.model_config_input_index_for_point(kind, event.position);
+        let state = self.model_config_input_state_mut(kind);
+        state.marked_range = None;
+        match event.click_count {
+            0 | 1 => {
+                if event.modifiers.shift {
+                    state.selection_range.end = index;
+                    state.selection_range =
+                        Self::clamp_search_text_range(&state.text, state.selection_range.clone());
+                } else {
+                    state.selection_range = index..index;
+                }
+                state.selection_drag = Some(state.selection_range.start);
+            }
+            2 => {
+                state.selection_range = Self::search_text_word_range_for_index(&state.text, index);
+                state.selection_drag = None;
+            }
+            _ => {
+                state.selection_range = 0..state.text.len();
+                state.selection_drag = None;
+            }
+        }
+        self.touch_search_text_cursor_activity();
+        context.notify();
+    }
+
+    /// 鼠标拖拽时更新模型配置输入框选区。
+    fn update_model_config_input_mouse_selection(
+        &mut self,
+        kind: ModelConfigInputKind,
+        position: Point<Pixels>,
+        context: &mut Context<Self>,
+    ) {
+        let index = self.model_config_input_index_for_point(kind, position);
+        let state = self.model_config_input_state_mut(kind);
+        let Some(anchor) = state.selection_drag else {
+            return;
+        };
+        state.marked_range = None;
+        state.selection_range = Self::clamp_search_text_range(&state.text, anchor..index);
+        self.touch_search_text_cursor_activity();
+        context.notify();
+    }
+
+    /// 结束模型配置输入框鼠标拖拽选择。
+    fn finish_model_config_input_mouse_selection(
+        &mut self,
+        kind: ModelConfigInputKind,
+        context: &mut Context<Self>,
+    ) {
+        if self
+            .model_config_input_state_mut(kind)
+            .selection_drag
+            .take()
+            .is_some()
+        {
+            context.notify();
+        }
+    }
+
+    /// 返回模型配置输入框当前选中文本。
+    fn selected_model_config_input_text(&self, kind: ModelConfigInputKind) -> Option<String> {
+        let state = self.model_config_input_state(kind);
+        let range = Self::clamp_search_text_range(&state.text, state.selection_range.clone());
+        (range.start < range.end).then(|| state.text[range].to_string())
+    }
+
+    /// 用给定文本替换模型配置输入框当前选区。
+    ///
+    /// 边界条件：
+    /// - 四个字段都是单行输入，粘贴或 IME 提交中的换行会被移除，避免保存 JSON 时出现不可见跨行配置。
+    fn replace_model_config_input_selection(
+        &mut self,
+        kind: ModelConfigInputKind,
+        replacement: &str,
+    ) {
+        let replacement = Self::sanitize_search_input_text(replacement);
+        let state = self.model_config_input_state_mut(kind);
+        let range = state.marked_range.take().unwrap_or_else(|| {
+            Self::clamp_search_text_range(&state.text, state.selection_range.clone())
+        });
+        state.text.replace_range(range.clone(), &replacement);
+        let cursor = range.start + replacement.len();
+        state.selection_range = cursor..cursor;
+        state.clear_layout();
+    }
+
+    /// 处理模型配置单行输入框的基础编辑按键。
+    ///
+    /// 业务意图：
+    /// - 模型设置页字段需要支持复制、粘贴、剪切、全选、删除和方向键，普通字符输入继续交给平台 IME 回调。
+    fn handle_model_config_input_key_down(
+        &mut self,
+        kind: ModelConfigInputKind,
+        event: &KeyDownEvent,
+        context: &mut Context<Self>,
+    ) {
+        if Self::is_paste_keystroke(&event.keystroke) {
+            if let Some(text) = context.read_from_clipboard().and_then(|item| item.text()) {
+                self.replace_model_config_input_selection(kind, &text);
+                self.model_test_status = ModelTestStatus::Idle;
+                self.touch_search_text_cursor_activity();
+                context.notify();
+            }
+            context.stop_propagation();
+            return;
+        }
+
+        if Self::is_copy_keystroke(&event.keystroke) {
+            if let Some(text) = self.selected_model_config_input_text(kind) {
+                context.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            context.stop_propagation();
+            return;
+        }
+
+        if Self::is_cut_keystroke(&event.keystroke) {
+            if let Some(text) = self.selected_model_config_input_text(kind) {
+                context.write_to_clipboard(ClipboardItem::new_string(text));
+                self.replace_model_config_input_selection(kind, "");
+                self.model_test_status = ModelTestStatus::Idle;
+                self.touch_search_text_cursor_activity();
+                context.notify();
+            }
+            context.stop_propagation();
+            return;
+        }
+
+        if Self::is_select_all_keystroke(&event.keystroke) {
+            let state = self.model_config_input_state_mut(kind);
+            state.marked_range = None;
+            state.selection_range = 0..state.text.len();
+            self.touch_search_text_cursor_activity();
+            context.stop_propagation();
+            context.notify();
+            return;
+        }
+
+        match event.keystroke.key.as_str() {
+            "left" => {
+                let state = self.model_config_input_state_mut(kind);
+                state.marked_range = None;
+                if event.keystroke.modifiers.shift {
+                    state.selection_range.end =
+                        Self::previous_search_text_boundary(&state.text, state.selection_range.end);
+                    state.selection_range =
+                        Self::clamp_search_text_range(&state.text, state.selection_range.clone());
+                } else if state.selection_range.start != state.selection_range.end {
+                    state.selection_range =
+                        state.selection_range.start..state.selection_range.start;
+                } else {
+                    let cursor =
+                        Self::previous_search_text_boundary(&state.text, state.selection_range.end);
+                    state.selection_range = cursor..cursor;
+                }
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "right" => {
+                let state = self.model_config_input_state_mut(kind);
+                state.marked_range = None;
+                if event.keystroke.modifiers.shift {
+                    state.selection_range.end =
+                        Self::next_search_text_boundary(&state.text, state.selection_range.end);
+                    state.selection_range =
+                        Self::clamp_search_text_range(&state.text, state.selection_range.clone());
+                } else if state.selection_range.start != state.selection_range.end {
+                    state.selection_range = state.selection_range.end..state.selection_range.end;
+                } else {
+                    let cursor =
+                        Self::next_search_text_boundary(&state.text, state.selection_range.end);
+                    state.selection_range = cursor..cursor;
+                }
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "up" => {
+                let state = self.model_config_input_state_mut(kind);
+                state.marked_range = None;
+                state.selection_range = 0..0;
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "down" => {
+                let state = self.model_config_input_state_mut(kind);
+                state.marked_range = None;
+                let cursor = state.text.len();
+                state.selection_range = cursor..cursor;
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "backspace" => {
+                let should_replace_selection = {
+                    let state = self.model_config_input_state(kind);
+                    state.selection_range.start != state.selection_range.end
+                        || state.marked_range.is_some()
+                };
+                if should_replace_selection {
+                    self.replace_model_config_input_selection(kind, "");
+                } else {
+                    let state = self.model_config_input_state_mut(kind);
+                    if let Some((previous_index, _)) = state.text[..state.selection_range.end]
+                        .char_indices()
+                        .next_back()
+                    {
+                        let cursor = state.selection_range.end;
+                        state.text.replace_range(previous_index..cursor, "");
+                        state.selection_range = previous_index..previous_index;
+                        state.marked_range = None;
+                        state.clear_layout();
+                    }
+                }
+                self.model_test_status = ModelTestStatus::Idle;
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "delete" => {
+                let should_replace_selection = {
+                    let state = self.model_config_input_state(kind);
+                    state.selection_range.start != state.selection_range.end
+                        || state.marked_range.is_some()
+                };
+                if should_replace_selection {
+                    self.replace_model_config_input_selection(kind, "");
+                } else {
+                    let state = self.model_config_input_state_mut(kind);
+                    if let Some((next_index, next_character)) = state.text
+                        [state.selection_range.end..]
+                        .char_indices()
+                        .next()
+                    {
+                        let start = state.selection_range.end + next_index;
+                        let end = start + next_character.len_utf8();
+                        state.text.replace_range(start..end, "");
+                        state.selection_range = start..start;
+                        state.marked_range = None;
+                        state.clear_layout();
+                    }
+                }
+                self.model_test_status = ModelTestStatus::Idle;
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "enter" => {
+                context.stop_propagation();
+            }
+            "escape" => {}
+            _ => {}
+        }
+    }
+
+    /// 清空模型配置表单，进入新增未保存状态。
+    fn clear_model_config_form(&mut self) {
+        self.model_config_selected_profile_id = None;
+        self.model_config_form_profile_id = None;
+        self.model_config_name_input.set_text(String::new());
+        self.model_config_base_url_input.set_text(String::new());
+        self.model_config_api_key_input.set_text(String::new());
+        self.model_config_model_input.set_text(String::new());
+        self.model_config_api_key_visible = false;
+        self.model_test_status = ModelTestStatus::Idle;
+    }
+
+    /// 把已保存模型配置加载到表单。
+    fn load_model_profile_into_form(&mut self, profile: &ModelProfile) {
+        self.model_config_selected_profile_id = Some(profile.id.clone());
+        self.model_config_form_profile_id = Some(profile.id.clone());
+        self.model_config_name_input.set_text(profile.name.clone());
+        self.model_config_base_url_input
+            .set_text(profile.base_url.clone());
+        self.model_config_api_key_input
+            .set_text(profile.api_key.clone());
+        self.model_config_model_input
+            .set_text(profile.model.clone());
+        self.model_config_api_key_visible = false;
+        self.model_test_status = ModelTestStatus::Idle;
+    }
+
+    /// 进入新增模型配置状态。
+    fn begin_new_model_profile(&mut self, context: &mut Context<Self>) {
+        self.clear_model_config_form();
+        context.notify();
+    }
+
+    /// 选择已保存模型配置。
+    fn select_model_profile(&mut self, profile_id: &str, context: &mut Context<Self>) {
+        let Some(profile) = self
+            .model_config_profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+        else {
+            return;
+        };
+        self.load_model_profile_into_form(&profile);
+        context.notify();
+    }
+
+    /// 返回当前表单字段构造的模型配置。
+    fn model_profile_from_form(&self, id: String) -> Result<ModelProfile, String> {
+        let name = self.model_config_name_input.text.trim().to_string();
+        let base_url = self.model_config_base_url_input.text.trim().to_string();
+        let api_key = self.model_config_api_key_input.text.trim().to_string();
+        let model = self.model_config_model_input.text.trim().to_string();
+        validate_model_profile_fields(&name, &base_url, &model)?;
+        Ok(ModelProfile {
+            id,
+            name,
+            base_url,
+            api_key,
+            model,
+        })
+    }
+
+    /// 生成新的模型配置 ID。
+    ///
+    /// 边界条件：
+    /// - 使用系统时间纳秒作为主干，若极端情况下撞到已有 ID，则追加序号直到唯一。
+    fn new_model_profile_id(&self) -> String {
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let mut suffix = 0usize;
+        loop {
+            let candidate = if suffix == 0 {
+                format!("model-profile-{seed}")
+            } else {
+                format!("model-profile-{seed}-{suffix}")
+            };
+            if !self
+                .model_config_profiles
+                .iter()
+                .any(|profile| profile.id == candidate)
+            {
+                return candidate;
+            }
+            suffix += 1;
+        }
+    }
+
+    /// 保存当前模型配置表单。
+    ///
+    /// 业务意图：
+    /// - 已保存配置走覆盖更新，新增配置分配稳定 ID 后追加到列表；保存成功后同步落盘并选中新配置。
+    fn save_current_model_profile(&mut self, context: &mut Context<Self>) {
+        let id = self
+            .model_config_form_profile_id
+            .clone()
+            .unwrap_or_else(|| self.new_model_profile_id());
+        let profile = match self.model_profile_from_form(id) {
+            Ok(profile) => profile,
+            Err(message) => {
+                self.model_test_status = ModelTestStatus::Failed(message);
+                context.notify();
+                return;
+            }
+        };
+
+        if let Some(existing) = self
+            .model_config_profiles
+            .iter_mut()
+            .find(|existing| existing.id == profile.id)
+        {
+            *existing = profile.clone();
+        } else {
+            self.model_config_profiles.push(profile.clone());
+        }
+        self.model_config_form_profile_id = Some(profile.id.clone());
+        self.model_config_selected_profile_id = Some(profile.id.clone());
+        self.model_test_status = ModelTestStatus::Success("模型配置已保存".to_string());
+        save_model_configs_preference(&self.model_configs_snapshot());
+        context.notify();
+    }
+
+    /// 删除当前选中的模型配置。
+    ///
+    /// 边界条件：
+    /// - 未保存的新配置没有 ID，删除时只清空表单。
+    /// - 删除默认配置必须同步清空默认 ID，避免后续功能引用悬空配置。
+    fn delete_current_model_profile(&mut self, context: &mut Context<Self>) {
+        let Some(profile_id) = self.model_config_form_profile_id.clone() else {
+            self.clear_model_config_form();
+            context.notify();
+            return;
+        };
+        self.model_config_profiles
+            .retain(|profile| profile.id != profile_id);
+        if self.model_config_default_profile_id.as_deref() == Some(profile_id.as_str()) {
+            self.model_config_default_profile_id = None;
+        }
+
+        let next_profile = self.model_config_profiles.first().cloned();
+        if let Some(profile) = next_profile {
+            self.load_model_profile_into_form(&profile);
+            self.model_test_status = ModelTestStatus::Success("模型配置已删除".to_string());
+        } else {
+            self.clear_model_config_form();
+            self.model_test_status = ModelTestStatus::Success("模型配置已删除".to_string());
+        }
+        save_model_configs_preference(&self.model_configs_snapshot());
+        context.notify();
+    }
+
+    /// 将当前已保存配置设为默认模型。
+    fn set_current_model_profile_default(&mut self, context: &mut Context<Self>) {
+        let Some(profile_id) = self.model_config_form_profile_id.clone() else {
+            self.model_test_status =
+                ModelTestStatus::Failed("请先保存模型配置，再设为默认".to_string());
+            context.notify();
+            return;
+        };
+        if !self
+            .model_config_profiles
+            .iter()
+            .any(|profile| profile.id == profile_id)
+        {
+            self.model_test_status =
+                ModelTestStatus::Failed("默认模型必须指向已保存配置".to_string());
+            context.notify();
+            return;
+        }
+        self.model_config_default_profile_id = Some(profile_id);
+        self.model_test_status = ModelTestStatus::Success("已设为默认模型".to_string());
+        save_model_configs_preference(&self.model_configs_snapshot());
+        context.notify();
+    }
+
+    /// 切换 API Key 明文/掩码显示。
+    fn toggle_model_api_key_visibility(&mut self, context: &mut Context<Self>) {
+        self.model_config_api_key_visible = !self.model_config_api_key_visible;
+        self.model_config_api_key_input.clear_layout();
+        context.notify();
+    }
+
+    /// 使用当前表单值测试 OpenAI 兼容模型接口。
+    ///
+    /// 业务意图：
+    /// - 测试按钮使用未保存表单值，便于用户粘贴后先验证再决定是否保存。
+    /// - 请求在后台执行，完成时用任务 ID 判断是否仍是最新测试，避免旧结果覆盖新表单状态。
+    fn start_model_profile_test(&mut self, context: &mut Context<Self>) {
+        let id = self
+            .model_config_form_profile_id
+            .clone()
+            .unwrap_or_else(|| "unsaved-model-profile".to_string());
+        let profile = match self.model_profile_from_form(id) {
+            Ok(profile) => profile,
+            Err(message) => {
+                self.model_test_status = ModelTestStatus::Failed(message);
+                context.notify();
+                return;
+            }
+        };
+        let job_id = self.next_model_test_job_id;
+        self.next_model_test_job_id = self.next_model_test_job_id.saturating_add(1);
+        self.model_test_status = ModelTestStatus::Testing { job_id };
+        context.notify();
+
+        context
+            .spawn(async move |view, app| {
+                let result = app
+                    .background_executor()
+                    .spawn(async move { test_openai_compatible_model(profile) })
+                    .await;
+                view.update(app, |view, context| {
+                    if view.model_test_status == (ModelTestStatus::Testing { job_id }) {
+                        view.model_test_status = match result {
+                            Ok(message) => ModelTestStatus::Success(message),
+                            Err(message) => ModelTestStatus::Failed(message),
+                        };
+                        context.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
     }
 
     /// 读取快搜关键字输入区当前文本、选择范围和组合文本范围的快照。
@@ -10132,6 +11209,15 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<String> {
+        if let Some(kind) = self.active_model_config_input_kind(window) {
+            let state = self.model_config_input_state(kind);
+            let range = Self::search_input_range_from_utf16(&state.text, range_utf16);
+            adjusted_range.replace(Self::search_input_range_to_utf16(
+                &state.text,
+                range.clone(),
+            ));
+            return Some(state.text[range].to_string());
+        }
         if self.quick_search_keywords_focus.is_focused(window) {
             let range =
                 Self::search_input_range_from_utf16(&self.quick_search_keywords_text, range_utf16);
@@ -10165,6 +11251,16 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
+        if let Some(kind) = self.active_model_config_input_kind(window) {
+            let state = self.model_config_input_state(kind);
+            return Some(UTF16Selection {
+                range: Self::search_input_range_to_utf16(
+                    &state.text,
+                    state.selection_range.clone(),
+                ),
+                reversed: false,
+            });
+        }
         if self.quick_search_keywords_focus.is_focused(window) {
             return Some(UTF16Selection {
                 range: Self::search_input_range_to_utf16(
@@ -10198,6 +11294,13 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<Range<usize>> {
+        if let Some(kind) = self.active_model_config_input_kind(window) {
+            let state = self.model_config_input_state(kind);
+            return state
+                .marked_range
+                .clone()
+                .map(|range| Self::search_input_range_to_utf16(&state.text, range));
+        }
         if self.quick_search_keywords_focus.is_focused(window) {
             return self
                 .quick_search_keywords_marked_range
@@ -10222,6 +11325,11 @@ impl EntityInputHandler for MainView {
 
     /// 清除输入法组合文本状态。
     fn unmark_text(&mut self, window: &mut Window, context: &mut Context<Self>) {
+        if let Some(kind) = self.active_model_config_input_kind(window) {
+            self.model_config_input_state_mut(kind).marked_range = None;
+            context.notify();
+            return;
+        }
         if self.quick_search_keywords_focus.is_focused(window) {
             self.quick_search_keywords_marked_range = None;
             context.notify();
@@ -10252,6 +11360,24 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
+        if let Some(kind) = self.active_model_config_input_kind(window) {
+            let replacement = Self::sanitize_search_input_text(text);
+            let state = self.model_config_input_state_mut(kind);
+            let range = range_utf16
+                .map(|range| Self::search_input_range_from_utf16(&state.text, range))
+                .or_else(|| state.marked_range.clone())
+                .unwrap_or_else(|| state.selection_range.clone());
+            let range = Self::clamp_search_text_range(&state.text, range);
+            state.text.replace_range(range.clone(), &replacement);
+            let cursor = range.start + replacement.len();
+            state.selection_range = cursor..cursor;
+            state.marked_range = None;
+            state.clear_layout();
+            self.model_test_status = ModelTestStatus::Idle;
+            self.touch_search_text_cursor_activity();
+            context.notify();
+            return;
+        }
         if self.quick_search_keywords_focus.is_focused(window) {
             if !self.quick_search_keywords_is_editing {
                 return;
@@ -10331,6 +11457,38 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
+        if let Some(kind) = self.active_model_config_input_kind(window) {
+            let replacement = Self::sanitize_search_input_text(new_text);
+            let state = self.model_config_input_state_mut(kind);
+            let range = range_utf16
+                .map(|range| Self::search_input_range_from_utf16(&state.text, range))
+                .or_else(|| state.marked_range.clone())
+                .unwrap_or_else(|| state.selection_range.clone());
+            let range = Self::clamp_search_text_range(&state.text, range);
+            state.text.replace_range(range.clone(), &replacement);
+
+            if replacement.is_empty() {
+                state.marked_range = None;
+            } else {
+                state.marked_range = Some(range.start..range.start + replacement.len());
+            }
+
+            let selected_range = new_selected_range_utf16
+                .map(|utf16_range| Self::search_input_range_from_utf16(&replacement, utf16_range))
+                .map(|relative_range| {
+                    range.start + relative_range.start..range.start + relative_range.end
+                })
+                .unwrap_or_else(|| {
+                    let cursor = range.start + replacement.len();
+                    cursor..cursor
+                });
+            state.selection_range = selected_range;
+            state.clear_layout();
+            self.model_test_status = ModelTestStatus::Idle;
+            self.touch_search_text_cursor_activity();
+            context.notify();
+            return;
+        }
         if self.quick_search_keywords_focus.is_focused(window) {
             if !self.quick_search_keywords_is_editing {
                 return;
@@ -10453,6 +11611,23 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        if let Some(kind) = self.active_model_config_input_kind(window) {
+            let state = self.model_config_input_state(kind);
+            let range = Self::search_input_range_from_utf16(&state.text, range_utf16);
+            let Some(layout) = state.last_layout.as_ref() else {
+                return Some(element_bounds);
+            };
+            return Some(Bounds::from_corners(
+                point(
+                    element_bounds.left() + layout.x_for_index(range.start),
+                    element_bounds.top(),
+                ),
+                point(
+                    element_bounds.left() + layout.x_for_index(range.end),
+                    element_bounds.bottom(),
+                ),
+            ));
+        }
         if self.quick_search_keywords_focus.is_focused(window) {
             let range =
                 Self::search_input_range_from_utf16(&self.quick_search_keywords_text, range_utf16);
@@ -10521,6 +11696,14 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<usize> {
+        if let Some(kind) = self.active_model_config_input_kind(window) {
+            let utf8_index = self.model_config_input_index_for_point(kind, point);
+            let state = self.model_config_input_state(kind);
+            return Some(Self::search_input_utf16_offset_from_byte(
+                &state.text,
+                utf8_index,
+            ));
+        }
         if self.quick_search_keywords_focus.is_focused(window) {
             let utf8_index = self.quick_search_keywords_index_for_point(point);
             return Some(Self::search_input_utf16_offset_from_byte(
