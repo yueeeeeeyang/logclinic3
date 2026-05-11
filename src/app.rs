@@ -53,7 +53,7 @@ use crate::log_loader::{
 };
 use crate::paged_document;
 use crate::search::{
-    SearchFileError, SearchOptions, SearchProgress, SearchResultItem, SearchScope,
+    SearchFileError, SearchMatchMode, SearchOptions, SearchProgress, SearchResultItem, SearchScope,
     collect_current_directory_sources, count_query_occurrences, search_lines,
     source_location_label,
 };
@@ -2753,6 +2753,30 @@ enum KeyboardScrollCommand {
     Bottom,
 }
 
+/// 当前会话内的搜索关键字历史项。
+///
+/// 业务意图：
+/// - 普通搜索历史需要同时恢复查询词和匹配模式，避免用户从历史选择正则表达式后仍按普通文本执行。
+/// - 历史只保存在内存中，不写入磁盘，降低日志关键字或敏感正则被持久化的风险。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SearchQueryHistoryItem {
+    /// 用户输入的查询词，已经去掉首尾空白。
+    query: String,
+    /// 查询词对应的匹配模式。
+    match_mode: SearchMatchMode,
+}
+
+impl SearchQueryHistoryItem {
+    /// 构造历史项；空白查询词不会生成历史。
+    fn new(query: &str, match_mode: SearchMatchMode) -> Option<Self> {
+        let query = query.trim();
+        (!query.is_empty()).then(|| Self {
+            query: query.to_string(),
+            match_mode,
+        })
+    }
+}
+
 /// 搜索对话框的交互状态。
 ///
 /// 业务意图：
@@ -2766,7 +2790,7 @@ struct SearchDialogState {
     /// 查询词。
     ///
     /// 业务意图：
-    /// - 当前只支持单行普通文本搜索，输入中的换行会被忽略。
+    /// - 普通搜索支持单行普通文本或正则表达式，输入中的换行会被忽略。
     query: String,
     /// 搜索输入框的当前选择范围，使用 UTF-8 字节下标。
     ///
@@ -2801,6 +2825,12 @@ struct SearchDialogState {
     directory_marked_range: Option<Range<usize>>,
     /// 是否区分大小写。
     case_sensitive: bool,
+    /// 当前普通搜索的匹配模式。
+    ///
+    /// 业务意图：
+    /// - 普通搜索可以切换为正则；快搜不读取该字段，始终按普通文本 OR 执行。
+    /// - 正则模式下 `case_sensitive` 仍保留但 UI 置灰，便于用户切回普通文本时恢复之前选择。
+    match_mode: SearchMatchMode,
     /// 当前关键字在当前激活文件中的出现次数。
     ///
     /// 业务意图：
@@ -2840,6 +2870,11 @@ struct SearchHistoryRecord {
     directory_target: Option<String>,
     /// 本次搜索是否区分大小写。
     case_sensitive: bool,
+    /// 本次搜索的匹配模式。
+    ///
+    /// 业务意图：
+    /// - 结果面板摘要必须准确说明这条记录按普通文本还是正则执行，避免历史记录混淆。
+    match_mode: SearchMatchMode,
     /// 搜索进度终态或当前进度。
     progress: SearchProgress,
     /// 搜索命中结果。
@@ -3529,8 +3564,8 @@ struct MainView {
     /// - 历史只保存在内存中，最多 10 条并按最近使用排序，避免把日志敏感关键字写入配置文件。
     ///
     /// 边界条件：
-    /// - 空白关键字不记录；重复关键字会移动到首位，保证最近使用优先。
-    search_query_history: Vec<String>,
+    /// - 空白关键字不记录；重复的“关键字 + 匹配模式”会移动到首位，保证最近使用优先。
+    search_query_history: Vec<SearchQueryHistoryItem>,
 
     /// 搜索对话框独立窗口句柄。
     ///
@@ -6780,24 +6815,29 @@ impl MainView {
     /// 业务意图：
     /// - 执行搜索后把关键字写入当前会话历史，让下一次没有正文选区时可以自动恢复最近关键字。
     /// - 历史不持久化到配置目录，避免日志关键字涉及业务数据或敏感信息时被长期保存。
-    fn remember_search_query(&mut self, query: &str) {
-        Self::remember_search_query_in_history(&mut self.search_query_history, query);
+    fn remember_search_query(&mut self, query: &str, match_mode: SearchMatchMode) {
+        Self::remember_search_query_in_history(&mut self.search_query_history, query, match_mode);
     }
 
     /// 更新搜索关键字历史集合。
     ///
     /// 边界条件：
     /// - 空白关键字不记录。
-    /// - 重复关键字先移除旧位置再插入首位，保证列表按最近使用排序。
+    /// - 重复的“关键字 + 匹配模式”先移除旧位置再插入首位，保证列表按最近使用排序。
     /// - 超过上限时删除最旧记录，避免会话状态无界增长。
-    fn remember_search_query_in_history(history: &mut Vec<String>, query: &str) {
-        let query = query.trim();
-        if query.is_empty() {
+    fn remember_search_query_in_history(
+        history: &mut Vec<SearchQueryHistoryItem>,
+        query: &str,
+        match_mode: SearchMatchMode,
+    ) {
+        let Some(item) = SearchQueryHistoryItem::new(query, match_mode) else {
             return;
-        }
+        };
 
-        history.retain(|existing| existing != query);
-        history.insert(0, query.to_string());
+        history.retain(|existing| {
+            existing.query != item.query || existing.match_mode != item.match_mode
+        });
+        history.insert(0, item);
         history.truncate(SEARCH_QUERY_HISTORY_LIMIT);
     }
 
@@ -6805,7 +6845,7 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 打开搜索窗口时如果没有日志选区，就使用最近关键字预填，满足用户“显示上一次搜索关键字”的要求。
-    fn last_search_query(&self) -> Option<String> {
+    fn last_search_query(&self) -> Option<SearchQueryHistoryItem> {
         self.search_query_history.first().cloned()
     }
 
@@ -6817,14 +6857,15 @@ impl MainView {
     ///
     /// 边界条件：
     /// - 空白历史项不会由历史管理产生；这里仍做防御性忽略，避免未来调用方传入非法值时清空当前输入。
-    fn apply_search_history_query(dialog: &mut SearchDialogState, query: &str) {
-        let query = query.trim();
+    fn apply_search_history_query(dialog: &mut SearchDialogState, item: &SearchQueryHistoryItem) {
+        let query = item.query.trim();
         if query.is_empty() {
             dialog.query_history_menu_open = false;
             return;
         }
 
         dialog.query = query.to_string();
+        dialog.match_mode = item.match_mode;
         let cursor = dialog.query.len();
         dialog.selection_range = cursor..cursor;
         dialog.marked_range = None;
@@ -6891,13 +6932,23 @@ impl MainView {
         let Some(panel) = self.search_results_panel.as_mut() else {
             return;
         };
-        if let Some(record) = panel
-            .records
-            .iter_mut()
-            .find(|record| record.job_id == job_id)
-        {
+        Self::mark_search_record_canceled_in_records(&mut panel.records, job_id);
+    }
+
+    /// 在记录集合中标记指定搜索任务已取消。
+    ///
+    /// 业务意图：
+    /// - 主窗口和单元测试都需要验证“旧搜索被新操作打断”时记录状态会从“搜索中”切换为“已取消”。
+    /// - 该函数只修改数据，不触发重绘；调用方负责在 UI 上下文中 `notify`。
+    fn mark_search_record_canceled_in_records(
+        records: &mut [SearchHistoryRecord],
+        job_id: usize,
+    ) -> bool {
+        if let Some(record) = records.iter_mut().find(|record| record.job_id == job_id) {
             record.canceled = true;
+            return true;
         }
+        false
     }
 
     /// 在 `MainView` 更新租借结束后打开设置窗口。
@@ -7048,10 +7099,14 @@ impl MainView {
         if self.search_dialog.is_none() {
             let directory_target = self.active_search_directory_label().unwrap_or_default();
             let last_query = self.last_search_query();
-            let query = selected_query
-                .clone()
-                .or_else(|| last_query.clone())
-                .unwrap_or_default();
+            let (query, match_mode) = if let Some(selected_query) = selected_query.clone() {
+                // 正文选区是普通文本片段，预填时默认使用普通文本模式，避免选中内容中的正则元字符改变含义。
+                (selected_query, SearchMatchMode::Literal)
+            } else if let Some(last_query) = last_query.clone() {
+                (last_query.query, last_query.match_mode)
+            } else {
+                (String::new(), SearchMatchMode::Literal)
+            };
             let query_cursor = query.len();
             let directory_cursor = directory_target.len();
             self.search_dialog = Some(SearchDialogState {
@@ -7064,6 +7119,7 @@ impl MainView {
                 directory_selection_range: directory_cursor..directory_cursor,
                 directory_marked_range: None,
                 case_sensitive: false,
+                match_mode,
                 current_file_match_count: None,
                 is_searching: false,
                 progress: SearchProgress::default(),
@@ -7085,13 +7141,15 @@ impl MainView {
             dialog.marked_range = None;
             dialog.query_history_menu_open = false;
             dialog.current_file_match_count = None;
+            dialog.match_mode = SearchMatchMode::Literal;
             dialog.message = "已填入选中文本，按 Enter 或点击搜索".to_string();
         } else if let Some(last_query) = self.last_search_query()
             && let Some(dialog) = self.search_dialog.as_mut()
             && dialog.query.trim().is_empty()
         {
-            let cursor = last_query.len();
-            dialog.query = last_query;
+            let cursor = last_query.query.len();
+            dialog.query = last_query.query;
+            dialog.match_mode = last_query.match_mode;
             dialog.selection_range = cursor..cursor;
             dialog.marked_range = None;
             dialog.query_history_menu_open = false;
@@ -7263,31 +7321,53 @@ impl MainView {
         if let Some(dialog) = self.search_dialog.as_mut() {
             dialog.query_history_menu_open = false;
         }
-        let Some((query, scope, case_sensitive, directory_target, previous_running_job_id)) = ({
+        let Some((
+            query,
+            scope,
+            case_sensitive,
+            match_mode,
+            directory_target,
+            previous_running_job_id,
+        )) = ({
             self.search_dialog.as_ref().map(|dialog| {
                 (
                     dialog.query.trim().to_string(),
                     dialog.scope,
                     dialog.case_sensitive,
+                    dialog.match_mode,
                     dialog.directory_target.trim().to_string(),
                     dialog.is_searching.then_some(dialog.job_id),
                 )
             })
-        }) else {
+        })
+        else {
             return;
         };
-        let options = SearchOptions::single(query.clone(), case_sensitive);
+        let options = SearchOptions::single_with_mode(query.clone(), case_sensitive, match_mode);
         if options.is_empty_query() {
-            self.update_search_dialog_message("请输入要搜索的关键字", context);
+            self.update_search_start_failure_message(
+                previous_running_job_id,
+                "请输入要搜索的关键字",
+                context,
+            );
             return;
         }
-        self.remember_search_query(&query);
+        if let Err(error) = options.validate() {
+            self.update_search_start_failure_message(
+                previous_running_job_id,
+                error.to_string(),
+                context,
+            );
+            return;
+        }
+        self.remember_search_query(&query, match_mode);
 
         self.start_search_job(
             query,
             options,
             scope,
             case_sensitive,
+            match_mode,
             directory_target,
             previous_running_job_id,
             context,
@@ -7303,9 +7383,17 @@ impl MainView {
         if let Some(dialog) = self.search_dialog.as_mut() {
             dialog.query_history_menu_open = false;
         }
+        let previous_running_job_id = self
+            .search_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.is_searching.then_some(dialog.job_id));
         let keywords = self.effective_quick_search_keywords();
         if keywords.is_empty() {
-            self.update_search_dialog_message("请先在设置-日志中配置快搜关键字", context);
+            self.update_search_start_failure_message(
+                previous_running_job_id,
+                "请先在设置-日志中配置快搜关键字",
+                context,
+            );
             return;
         }
         let Some((scope, case_sensitive, directory_target, previous_running_job_id)) = ({
@@ -7328,6 +7416,7 @@ impl MainView {
             options,
             scope,
             case_sensitive,
+            SearchMatchMode::Literal,
             directory_target,
             previous_running_job_id,
             context,
@@ -7344,26 +7433,44 @@ impl MainView {
         options: SearchOptions,
         scope: SearchScope,
         case_sensitive: bool,
+        match_mode: SearchMatchMode,
         directory_target: String,
         previous_running_job_id: Option<usize>,
         context: &mut Context<Self>,
     ) {
         if options.is_empty_query() {
-            self.update_search_dialog_message("请输入要搜索的关键字", context);
+            self.update_search_start_failure_message(
+                previous_running_job_id,
+                "请输入要搜索的关键字",
+                context,
+            );
+            return;
+        }
+        if let Err(error) = options.validate() {
+            self.update_search_start_failure_message(
+                previous_running_job_id,
+                error.to_string(),
+                context,
+            );
             return;
         }
 
         let Some(active_tab_id) = self.active_tab_id else {
-            self.update_search_dialog_message("请先从左侧打开一个日志文件", context);
+            self.update_search_start_failure_message(
+                previous_running_job_id,
+                "请先从左侧打开一个日志文件",
+                context,
+            );
             return;
         };
         let Some(active_tab) = self.open_tabs.iter().find(|tab| tab.id == active_tab_id) else {
-            self.update_search_dialog_message("当前日志 tab 不存在，请重新选择文件", context);
+            self.update_search_start_failure_message(
+                previous_running_job_id,
+                "当前日志 tab 不存在，请重新选择文件",
+                context,
+            );
             return;
         };
-
-        let job_id = self.next_search_job_id;
-        self.next_search_job_id += 1;
 
         let search_target = match scope {
             SearchScope::CurrentFile => match &active_tab.state {
@@ -7372,17 +7479,29 @@ impl MainView {
                     document: document.clone(),
                 },
                 LogTabState::Loading { .. } => {
-                    self.update_search_dialog_message("当前文件仍在加载，完成后再搜索", context);
+                    self.update_search_start_failure_message(
+                        previous_running_job_id,
+                        "当前文件仍在加载，完成后再搜索",
+                        context,
+                    );
                     return;
                 }
                 LogTabState::Failed { .. } => {
-                    self.update_search_dialog_message("当前文件打开失败，无法搜索正文", context);
+                    self.update_search_start_failure_message(
+                        previous_running_job_id,
+                        "当前文件打开失败，无法搜索正文",
+                        context,
+                    );
                     return;
                 }
             },
             SearchScope::CurrentDirectory => {
                 let LogTreeLoadState::Loaded(tree_state) = &self.load_state else {
-                    self.update_search_dialog_message("请先加载日志目录后再搜索当前目录", context);
+                    self.update_search_start_failure_message(
+                        previous_running_job_id,
+                        "请先加载日志目录后再搜索当前目录",
+                        context,
+                    );
                     return;
                 };
                 let sources = if directory_target.is_empty() {
@@ -7394,12 +7513,19 @@ impl MainView {
                     )
                 };
                 if sources.is_empty() {
-                    self.update_search_dialog_message("当前目录中没有可搜索的日志文件", context);
+                    self.update_search_start_failure_message(
+                        previous_running_job_id,
+                        "当前目录中没有可搜索的日志文件",
+                        context,
+                    );
                     return;
                 }
                 SearchTarget::CurrentDirectory { sources }
             }
         };
+
+        let job_id = self.next_search_job_id;
+        self.next_search_job_id += 1;
 
         let total_files = match &search_target {
             SearchTarget::CurrentFile { .. } => 1,
@@ -7418,6 +7544,7 @@ impl MainView {
                 .then(|| directory_target.clone())
                 .filter(|target| !target.is_empty()),
             case_sensitive,
+            match_mode,
             progress: SearchProgress {
                 searched_files: 0,
                 total_files,
@@ -7469,6 +7596,24 @@ impl MainView {
                 self.spawn_current_directory_search(job_id, sources, options, context);
             }
         }
+    }
+
+    /// 处理新搜索启动失败时的旧任务收尾。
+    ///
+    /// 业务意图：
+    /// - 用户可能在上一轮搜索仍运行时按 Enter 发起新搜索；如果新条件校验失败，旧后台回调会因为对话框停止搜索而失效。
+    /// - 这种情况下必须同步把旧结果记录标记为已取消，否则底部面板会长期显示“搜索中”。
+    fn update_search_start_failure_message(
+        &mut self,
+        previous_running_job_id: Option<usize>,
+        message: impl Into<String>,
+        context: &mut Context<Self>,
+    ) {
+        if let Some(job_id) = previous_running_job_id {
+            self.next_search_job_id += 1;
+            self.mark_search_record_canceled(job_id);
+        }
+        self.update_search_dialog_message(message, context);
     }
 
     /// 更新搜索对话框提示文案。
@@ -10387,6 +10532,26 @@ impl MainView {
         }
     }
 
+    /// 设置搜索对话框匹配模式并清理依赖旧条件的临时状态。
+    ///
+    /// 业务意图：
+    /// - “正则”开关会改变同一查询词的解释方式，当前文件计数缓存和历史下拉都必须失效。
+    /// - 正则模式不修改 `case_sensitive` 原值，只让 UI 禁用该开关，方便切回普通文本后恢复用户之前的大小写选择。
+    fn set_search_dialog_match_mode(dialog: &mut SearchDialogState, match_mode: SearchMatchMode) {
+        if dialog.match_mode == match_mode {
+            dialog.query_history_menu_open = false;
+            return;
+        }
+
+        dialog.match_mode = match_mode;
+        dialog.query_history_menu_open = false;
+        dialog.current_file_match_count = None;
+        dialog.message = match match_mode {
+            SearchMatchMode::Literal => "已切换为普通文本搜索".to_string(),
+            SearchMatchMode::Regex => "已切换为正则搜索，大小写由表达式控制".to_string(),
+        };
+    }
+
     /// 统计搜索关键字在当前文件中的出现次数。
     ///
     /// 业务意图：
@@ -10396,9 +10561,18 @@ impl MainView {
         let Some(dialog) = self.search_dialog.as_ref() else {
             return;
         };
-        let options = SearchOptions::single(dialog.query.trim().to_string(), dialog.case_sensitive);
+        let options = SearchOptions::single_with_mode(
+            dialog.query.trim().to_string(),
+            dialog.case_sensitive,
+            dialog.match_mode,
+        );
         if options.is_empty_query() {
             self.update_search_dialog_message("请输入要计数的关键字", context);
+            return;
+        }
+        if let Err(error) = options.validate() {
+            self.clear_search_current_file_match_count();
+            self.update_search_dialog_message(error.to_string(), context);
             return;
         }
         let Some(document) = self.active_log_tab_document() else {

@@ -727,19 +727,47 @@ mod tests {
     fn 搜索关键字历史按最近使用排序并限制数量() {
         let mut history = Vec::new();
         for index in 0..12 {
-            MainView::remember_search_query_in_history(&mut history, &format!("key-{index}"));
+            MainView::remember_search_query_in_history(
+                &mut history,
+                &format!("key-{index}"),
+                SearchMatchMode::Literal,
+            );
         }
 
         assert_eq!(history.len(), SEARCH_QUERY_HISTORY_LIMIT);
-        assert_eq!(history.first().map(String::as_str), Some("key-11"));
-        assert_eq!(history.last().map(String::as_str), Some("key-2"));
+        assert_eq!(
+            history.first().map(|item| item.query.as_str()),
+            Some("key-11")
+        );
+        assert_eq!(
+            history.last().map(|item| item.query.as_str()),
+            Some("key-2")
+        );
 
-        MainView::remember_search_query_in_history(&mut history, "key-5");
+        MainView::remember_search_query_in_history(&mut history, "key-5", SearchMatchMode::Regex);
         assert_eq!(history.len(), SEARCH_QUERY_HISTORY_LIMIT);
-        assert_eq!(history.first().map(String::as_str), Some("key-5"));
-        assert_eq!(history.iter().filter(|query| *query == "key-5").count(), 1);
+        assert_eq!(
+            history.first().map(|item| item.query.as_str()),
+            Some("key-5")
+        );
+        assert_eq!(
+            history.first().map(|item| item.match_mode),
+            Some(SearchMatchMode::Regex)
+        );
+        assert_eq!(
+            history.iter().filter(|item| item.query == "key-5").count(),
+            2
+        );
+        MainView::remember_search_query_in_history(&mut history, "key-5", SearchMatchMode::Regex);
+        assert_eq!(
+            history
+                .iter()
+                .filter(|item| item.query == "key-5" && item.match_mode == SearchMatchMode::Regex)
+                .count(),
+            1
+        );
 
-        MainView::remember_search_query_in_history(&mut history, "   ");
+        MainView::remember_search_query_in_history(&mut history, "   ", SearchMatchMode::Literal);
         assert_eq!(history.len(), SEARCH_QUERY_HISTORY_LIMIT);
     }
 
@@ -759,6 +787,7 @@ mod tests {
             directory_selection_range: 0..0,
             directory_marked_range: None,
             case_sensitive: false,
+            match_mode: SearchMatchMode::Literal,
             current_file_match_count: Some(7),
             is_searching: false,
             progress: SearchProgress::default(),
@@ -766,14 +795,49 @@ mod tests {
             job_id: 0,
         };
 
-        MainView::apply_search_history_query(&mut dialog, "error");
+        let history_item =
+            SearchQueryHistoryItem::new("error", SearchMatchMode::Regex).expect("历史项应有效");
+        MainView::apply_search_history_query(&mut dialog, &history_item);
 
         assert_eq!(dialog.query, "error");
+        assert_eq!(dialog.match_mode, SearchMatchMode::Regex);
         assert_eq!(dialog.selection_range, "error".len().."error".len());
         assert!(dialog.marked_range.is_none());
         assert!(!dialog.query_history_menu_open);
         assert!(dialog.current_file_match_count.is_none());
         assert_eq!(dialog.message, "已选择历史关键字，按 Enter 或点击搜索");
+    }
+
+    /// 验证切换正则模式会清空依赖旧匹配条件的当前文件计数缓存。
+    ///
+    /// 业务意图：
+    /// - 同一个查询词在普通文本和正则模式下含义可能完全不同，旧计数继续展示会误导用户。
+    #[test]
+    fn 切换正则模式会清空当前文件计数缓存() {
+        let mut dialog = SearchDialogState {
+            query: "error|warn".to_string(),
+            selection_range: 0.."error|warn".len(),
+            marked_range: None,
+            query_history_menu_open: true,
+            scope: SearchScope::CurrentFile,
+            directory_target: String::new(),
+            directory_selection_range: 0..0,
+            directory_marked_range: None,
+            case_sensitive: true,
+            match_mode: SearchMatchMode::Literal,
+            current_file_match_count: Some(12),
+            is_searching: false,
+            progress: SearchProgress::default(),
+            message: String::new(),
+            job_id: 0,
+        };
+
+        MainView::set_search_dialog_match_mode(&mut dialog, SearchMatchMode::Regex);
+
+        assert_eq!(dialog.match_mode, SearchMatchMode::Regex);
+        assert!(dialog.current_file_match_count.is_none());
+        assert!(!dialog.query_history_menu_open);
+        assert!(dialog.case_sensitive);
     }
 
     /// 验证停止搜索只取消后台任务，不清空用户输入。
@@ -792,6 +856,7 @@ mod tests {
             directory_selection_range: 0.."monitorThread".len(),
             directory_marked_range: None,
             case_sensitive: true,
+            match_mode: SearchMatchMode::Literal,
             current_file_match_count: Some(3),
             is_searching: true,
             progress: SearchProgress {
@@ -827,6 +892,7 @@ mod tests {
             scope: SearchScope::CurrentDirectory,
             directory_target: Some("logs".to_string()),
             case_sensitive: false,
+            match_mode: SearchMatchMode::Literal,
             progress: SearchProgress {
                 searched_files: 1,
                 total_files: 10,
@@ -840,6 +906,41 @@ mod tests {
         };
 
         assert_eq!(record.state_label(), "已取消");
+    }
+
+    /// 验证新搜索启动失败时可以把上一轮搜索记录切换为取消态。
+    ///
+    /// 业务意图：
+    /// - 用户在搜索运行中按 Enter 发起新搜索时，新条件可能因为无效正则或当前文件状态不满足而失败。
+    /// - 旧后台任务会被对话框状态失效，因此结果面板记录也必须同步变为“已取消”，不能长期显示“搜索中”。
+    #[test]
+    fn 搜索启动失败会取消上一轮搜索记录() {
+        let mut records = vec![SearchHistoryRecord {
+            job_id: 7,
+            query: "error".to_string(),
+            scope: SearchScope::CurrentDirectory,
+            directory_target: Some("logs".to_string()),
+            case_sensitive: false,
+            match_mode: SearchMatchMode::Literal,
+            progress: SearchProgress {
+                searched_files: 1,
+                total_files: 10,
+                matched_lines: 2,
+            },
+            results: Vec::new(),
+            errors: Vec::new(),
+            canceled: false,
+            expanded: true,
+            expanded_file_keys: HashSet::new(),
+        }];
+
+        assert!(MainView::mark_search_record_canceled_in_records(
+            &mut records,
+            7
+        ));
+
+        assert!(records[0].canceled);
+        assert_eq!(records[0].state_label(), "已取消");
     }
 
     /// 验证搜索输入框粘贴会替换当前选区并把光标放到插入文本之后。
@@ -906,6 +1007,7 @@ mod tests {
             directory_selection_range: 0..0,
             directory_marked_range: None,
             case_sensitive: false,
+            match_mode: SearchMatchMode::Literal,
             current_file_match_count: Some(3),
             is_searching: false,
             progress: SearchProgress::default(),

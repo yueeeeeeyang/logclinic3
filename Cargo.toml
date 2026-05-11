@@ -28,6 +28,8 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 # reqwest 只用于设置页“测试模型”的 OpenAI 兼容接口探测；请求放入后台线程并使用 rustls，避免阻塞 UI 或依赖系统 OpenSSL。
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# regex 用于普通搜索窗口的正则模式；语法遵循 Rust regex，避免为日志查找引入额外运行时依赖。
+regex = "1.12.3"
 # sevenz-rust 只读取 7z 目录元数据，当前不调用任何实际解压到磁盘的接口。
 sevenz-rust = { version = "0.6.1", default-features = false, features = ["bzip2", "zstd"] }
 # tar 用于遍历 tar.gz/tgz 内部条目头部，配合 flate2 实现流式目录树构建。

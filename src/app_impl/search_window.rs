@@ -133,9 +133,28 @@ impl SearchDialogWindowView {
     pub(super) fn toggle_case_sensitive(&mut self, context: &mut Context<Self>) {
         self.main_view.update(context, |view, context| {
             if let Some(dialog) = view.search_dialog.as_mut() {
+                if dialog.match_mode == SearchMatchMode::Regex {
+                    dialog.query_history_menu_open = false;
+                    context.notify();
+                    return;
+                }
                 dialog.case_sensitive = !dialog.case_sensitive;
                 dialog.query_history_menu_open = false;
                 dialog.current_file_match_count = None;
+            }
+            context.notify();
+        });
+        context.notify();
+    }
+
+    /// 切换普通搜索匹配模式。
+    ///
+    /// 业务意图：
+    /// - 正则开关只影响普通搜索和当前文件计数，不影响快搜；状态仍保存在主窗口搜索对话框里。
+    pub(super) fn toggle_regex_mode(&mut self, context: &mut Context<Self>) {
+        self.main_view.update(context, |view, context| {
+            if let Some(dialog) = view.search_dialog.as_mut() {
+                MainView::set_search_dialog_match_mode(dialog, dialog.match_mode.toggled());
             }
             context.notify();
         });
@@ -282,13 +301,13 @@ impl SearchDialogWindowView {
     /// - 选择历史项只替换关键字，不立即搜索，让用户仍可调整搜索范围、大小写和目录目标。
     pub(super) fn select_search_history_query(
         &mut self,
-        query: String,
+        item: SearchQueryHistoryItem,
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
         let focus_handle = self.main_view.update(context, |view, context| {
             if let Some(dialog) = view.search_dialog.as_mut() {
-                MainView::apply_search_history_query(dialog, &query);
+                MainView::apply_search_history_query(dialog, &item);
             }
             context.notify();
             view.search_input_focus.clone()
@@ -368,7 +387,7 @@ impl SearchDialogWindowView {
     fn render_search_input(
         &self,
         _dialog: &SearchDialogState,
-        search_query_history: &[String],
+        search_query_history: &[SearchQueryHistoryItem],
         focus_handle: gpui::FocusHandle,
         _window: &Window,
         palette: AppThemePalette,
@@ -499,7 +518,7 @@ impl SearchDialogWindowView {
     /// - 历史最多 10 条；菜单设置最大高度和纵向滚动，避免窗口高度受历史数量影响。
     fn render_search_history_dropdown(
         &self,
-        search_query_history: &[String],
+        search_query_history: &[SearchQueryHistoryItem],
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -542,8 +561,8 @@ impl SearchDialogWindowView {
                 search_query_history
                     .iter()
                     .enumerate()
-                    .map(|(index, query)| {
-                        self.render_search_history_item(index, query, palette, context)
+                    .map(|(index, item)| {
+                        self.render_search_history_item(index, item, palette, context)
                     })
                     .collect::<Vec<_>>(),
             )
@@ -553,11 +572,13 @@ impl SearchDialogWindowView {
     fn render_search_history_item(
         &self,
         index: usize,
-        query: &str,
+        item: &SearchQueryHistoryItem,
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let query = query.to_string();
+        let item = item.clone();
+        let query = item.query.clone();
+        let is_regex = item.match_mode == SearchMatchMode::Regex;
         div()
             .id(SharedString::from(format!(
                 "search-dialog-window-history-item-{index}"
@@ -572,15 +593,28 @@ impl SearchDialogWindowView {
             .hover(move |item| item.bg(rgb(palette.hover)).text_color(rgb(palette.accent)))
             .child(
                 div()
+                    .flex_1()
                     .min_w_0()
                     .truncate()
                     .font_family(LOG_VIEWER_FONT_FAMILY)
                     .child(query.clone()),
             )
+            .when(is_regex, |row| {
+                row.child(
+                    div()
+                        .flex_none()
+                        .ml_2()
+                        .px_1()
+                        .rounded(px(3.0))
+                        .bg(rgb(palette.selected))
+                        .text_color(rgb(palette.accent))
+                        .child("正则"),
+                )
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 context.listener(move |view, _event: &MouseDownEvent, window, context| {
-                    view.select_search_history_query(query.clone(), window, context);
+                    view.select_search_history_query(item.clone(), window, context);
                     context.stop_propagation();
                 }),
             )
@@ -739,30 +773,64 @@ impl SearchDialogWindowView {
             )
     }
 
-    /// 渲染大小写选项。
+    /// 渲染匹配选项。
     fn render_options_row(
         &self,
         case_sensitive: bool,
+        match_mode: SearchMatchMode,
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Div {
-        div().flex().items_center().justify_start().child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .text_xs()
-                .text_color(rgb(palette.muted_text))
-                .id("search-dialog-window-case-sensitive-toggle")
-                .cursor_pointer()
-                .child(MainView::render_checkbox(case_sensitive, palette))
-                .child("区分大小写")
-                .on_click(
-                    context.listener(|view, _event: &ClickEvent, _window, context| {
-                        view.toggle_case_sensitive(context);
-                    }),
-                ),
-        )
+        let regex_enabled = match_mode == SearchMatchMode::Regex;
+        let case_toggle_enabled = !regex_enabled;
+        div()
+            .flex()
+            .items_center()
+            .justify_start()
+            .gap_4()
+            .child(
+                div()
+                    .id("search-dialog-window-case-sensitive-toggle")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(rgb(if case_toggle_enabled {
+                        palette.muted_text
+                    } else {
+                        palette.border
+                    }))
+                    .when(case_toggle_enabled, |toggle| toggle.cursor_pointer())
+                    .when(!case_toggle_enabled, |toggle| toggle.opacity(0.6))
+                    .child(MainView::render_checkbox(case_sensitive, palette))
+                    .child("区分大小写")
+                    .on_click(
+                        context.listener(|view, _event: &ClickEvent, _window, context| {
+                            view.toggle_case_sensitive(context);
+                        }),
+                    ),
+            )
+            .child(
+                div()
+                    .id("search-dialog-window-regex-toggle")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(rgb(if regex_enabled {
+                        palette.accent
+                    } else {
+                        palette.muted_text
+                    }))
+                    .cursor_pointer()
+                    .child(MainView::render_checkbox(regex_enabled, palette))
+                    .child("正则")
+                    .on_click(
+                        context.listener(|view, _event: &ClickEvent, _window, context| {
+                            view.toggle_regex_mode(context);
+                        }),
+                    ),
+            )
     }
 
     /// 渲染搜索窗口右下角操作按钮。
@@ -1031,7 +1099,12 @@ impl Render for SearchDialogWindowView {
                         context,
                     ))
                     .child(self.render_scope_controls(dialog.scope, palette, context))
-                    .child(self.render_options_row(dialog.case_sensitive, palette, context))
+                    .child(self.render_options_row(
+                        dialog.case_sensitive,
+                        dialog.match_mode,
+                        palette,
+                        context,
+                    ))
                     .child(
                         div()
                             .text_xs()

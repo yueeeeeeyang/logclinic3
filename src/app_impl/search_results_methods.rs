@@ -716,10 +716,10 @@ impl MainView {
         record: &SearchHistoryRecord,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let case_label = if record.case_sensitive {
-            "区分大小写"
-        } else {
-            "忽略大小写"
+        let match_label = match record.match_mode {
+            SearchMatchMode::Regex => record.match_mode.label(),
+            SearchMatchMode::Literal if record.case_sensitive => "区分大小写",
+            SearchMatchMode::Literal => "忽略大小写",
         };
         let target_label = record
             .directory_target
@@ -731,7 +731,7 @@ impl MainView {
             "{}{} · {} · {} · {}/{} 文件",
             record.scope.label(),
             target_label,
-            case_label,
+            match_label,
             record.state_label(),
             record.progress.searched_files,
             record.progress.total_files
