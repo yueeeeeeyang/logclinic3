@@ -2,7 +2,7 @@
 //!
 //! 业务意图：
 //! - 该模块承接从历史 `main.rs` 中迁出的主窗口装配、根状态协调和全局事件分发。
-//! - 功能域较大的 UI 代码已经拆到 `app` 目录子模块，由正常 `mod` 边界约束跨域访问。
+//! - 体积较大的 GPUI 壳层代码已经拆到 `app/ui` 目录，由正常 `mod` 边界约束跨域访问。
 //! - 这里仍保留跨域协调逻辑，例如窗口句柄、后台任务回调、主视图状态汇总和全局快捷键。
 //!
 //! 跨平台约束：
@@ -72,93 +72,20 @@ use main_view::MainView;
 
 actions!(logclinic, [OpenSearchDialog]);
 
-/// 设置窗口关于页签功能域。
-mod about_window;
-/// AI 对话页面、持久化和流式请求功能域。
-mod ai_chat;
-/// 主窗口 UI 常量。
-mod constants;
-/// HPROF dump 分析独立窗口功能域。
-mod hprof_analysis;
-/// 主窗口输入、剪贴板和文本选择适配。
-mod input;
-/// 主窗口键盘快捷键和键盘滚动协调。
-mod keyboard;
-/// 日志正文单行渲染与标记辅助。
-mod log_line_render;
-/// 日志正文选区、复制和高亮坐标映射。
-mod log_selection;
-/// 日志 tab 栏和编码菜单渲染。
-mod log_tab_bar;
-/// 日志来源打开、tab 控制和编码重载协调。
-mod log_tab_controller;
-/// 左侧日志目录树功能域。
-mod log_tree_methods;
-/// 日志正文右键菜单协调。
-mod log_viewer_context_menu;
-/// 日志正文查看器和 tab 正文功能域。
-mod log_viewer_methods;
-/// 日志正文滚动条和分页滚动辅助。
-mod log_viewer_scrollbars;
-/// 日志正文文本选择辅助。
-mod log_viewer_selection;
 /// 主窗口根实体和构造功能域。
 mod main_view;
-/// 主窗口导航、工具栏和加载入口协调。
-mod navigation;
-/// 主窗口搜索任务和搜索窗口状态编排。
-mod search_controller;
-/// 搜索窗口自绘输入元素。
-mod search_input_element;
-/// 主窗口搜索结果面板功能域。
-mod search_results_methods;
-/// 搜索独立窗口功能域。
-mod search_window;
-/// 设置页输入状态和表单行为适配。
-mod settings_controller;
-/// 设置窗口通用页签渲染。
-mod settings_general_tab;
-/// 设置窗口日志页签渲染。
-mod settings_log_tab;
-/// 设置页模型配置自绘输入元素。
-mod settings_model_input;
-/// 设置窗口模型页签渲染。
-mod settings_model_tab;
-/// 设置页快搜关键字自绘输入元素。
-mod settings_quick_search_input;
-/// 设置页线程过滤自绘输入元素。
-mod settings_thread_filter_input;
-/// 设置独立窗口功能域。
-mod settings_window;
-/// 主窗口拆分后的纯状态容器。
-mod state;
-/// 日志 tab 右键菜单和 tab 关闭动作。
-mod tab_context_menu;
 /// 应用层纯状态测试。
 #[cfg(test)]
 mod tests;
-/// 线程日志分析独立窗口功能域。
-mod thread_analysis;
-/// 主窗口纯 UI 状态类型。
-mod types;
+/// GPUI 壳层视图、输入和窗口适配模块。
+mod ui;
 /// 主窗口运行时和启动装配功能域。
 mod window_runtime;
-/// 主窗口日志工作区、搜索工作区和页面渲染协调。
-mod workspace;
-/// 主工作区鼠标事件和面板尺寸协调。
-mod workspace_events;
 pub(crate) use window_runtime::run;
 #[cfg(test)]
 pub(crate) use window_runtime::{MainWindowStartupDecision, decide_main_window_startup};
 
-use ai_chat::*;
-use constants::*;
-use hprof_analysis::HprofAnalysisView;
-use search_window::SearchDialogWindowView;
-use settings_window::SettingsWindowView;
-use state::*;
-use thread_analysis::{SearchResultsResizeDrag, SearchTarget, ThreadAnalysisWindowView};
-use types::*;
+use ui::*;
 
 impl Render for MainView {
     /// 渲染主窗口内容。
