@@ -15,10 +15,15 @@ use std::{
     cell::RefCell,
     collections::{BTreeSet, HashMap, HashSet},
     env, fs, io,
+    io::Read,
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, Receiver},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -27,15 +32,16 @@ use gpui::{
     Animation, AnimationExt as _, AnyWindowHandle, App, AppContext, Application, AsyncApp, Bounds,
     ClickEvent, ClipboardItem, Context, DisplayId, Element, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, ExternalPaths, FontWeight, GlobalElementId, InteractiveElement,
-    IntoElement, KeyBinding, KeyDownEvent, Keystroke, LayoutId, ListHorizontalSizingBehavior,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement,
-    PathPromptOptions, Pixels, Point, Render, ScrollHandle, ScrollStrategy, ScrollWheelEvent,
-    ShapedLine, SharedString, StatefulInteractiveElement, Style, Styled as _, StyledText, TextRun,
-    TitlebarOptions, UTF16Selection, UnderlineStyle, UniformListScrollHandle, Window,
-    WindowAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, actions, div, fill,
-    point, px, relative, rgb, size, uniform_list,
+    IntoElement, KeyBinding, KeyDownEvent, Keystroke, LayoutId, ListAlignment,
+    ListHorizontalSizingBehavior, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PaintQuad, ParentElement, PathPromptOptions, Pixels, Point, Render, ScrollHandle,
+    ScrollStrategy, ScrollWheelEvent, ShapedLine, SharedString, StatefulInteractiveElement, Style,
+    Styled as _, StyledText, TextRun, TitlebarOptions, UTF16Selection, UnderlineStyle,
+    UniformListScrollHandle, Window, WindowAppearance, WindowBounds, WindowHandle, WindowKind,
+    WindowOptions, actions, div, fill, list, point, px, relative, rgb, size, uniform_list,
 };
 use lucide_icons::{Icon, LUCIDE_FONT_BYTES};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
 use crate::archive_materializer::{
@@ -182,6 +188,143 @@ const QUICK_SEARCH_KEYWORDS_FILE_NAME: &str = "quick-search-keywords.txt";
 /// 安全边界：
 /// - 用户已确认第一版 API Key 明文保存在应用配置目录；UI 默认掩码显示，代码中避免把 Key 写入错误文案。
 const MODEL_CONFIGS_FILE_NAME: &str = "model-configs.json";
+
+/// AI 对话历史数据库文件名。
+///
+/// 业务意图：
+/// - AI 对话需要保存多会话和完整消息历史，使用单个 SQLite 文件可以在后续扩展搜索、重命名和导出时避免反复迁移零散 JSON。
+/// - 文件仍放在现有应用配置目录下，沿用 macOS/Windows 已确认的配置目录策略。
+const AI_CHAT_DATABASE_FILE_NAME: &str = "ai-chat.db";
+
+/// AI 对话数据库首版 schema 版本。
+///
+/// 业务意图：
+/// - SQLite `PRAGMA user_version` 用于后续迁移判断；首版固定为 1，避免未来新增列时无法区分历史数据库。
+const AI_CHAT_DATABASE_SCHEMA_VERSION: i64 = 1;
+
+/// AI 对话实体 ID 的进程内单调序号。
+///
+/// 业务意图：
+/// - 会话和消息 ID 需要在本地 SQLite 主键中稳定唯一；仅依赖系统时间会受到 Windows、虚拟机或低精度时钟影响。
+/// - 原子序号允许后台和 UI 线程同时生成 ID 时仍保持唯一，`Relaxed` 足够满足“不重复”的原子递增语义。
+static AI_CHAT_ENTITY_ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// AI 对话请求的超时时间。
+///
+/// 业务意图：
+/// - 流式生成可能持续较久，但连接建立、首包和后续读取仍不能无限等待；120 秒兼顾本地大模型和远程服务异常场景。
+const AI_CHAT_REQUEST_TIMEOUT_SECONDS: u64 = 120;
+
+/// AI 对话页左侧会话列表宽度。
+///
+/// UI 约束：
+/// - 固定宽度让消息区和输入区在窗口缩放时保持稳定，避免会话标题变化导致聊天正文横向跳动。
+const AI_CHAT_CONVERSATION_LIST_WIDTH: f32 = 260.0;
+
+/// AI 对话左右两侧顶部栏的统一高度。
+///
+/// UI 约束：
+/// - 历史会话栏和右侧对话窗口共享同一条顶部分隔线，必须使用同一高度避免横线错位。
+const AI_CHAT_TOP_BAR_HEIGHT: f32 = 46.0;
+
+/// AI 对话输入区默认高度。
+///
+/// UI 约束：
+/// - 输入文本区需要平铺底部容器，模型选择和发送按钮作为内部浮层显示，因此高度包含文本编辑空间和底部浮层预留空间。
+const AI_CHAT_INPUT_DEFAULT_HEIGHT: f32 = 132.0;
+
+/// AI 对话输入区允许拖拽到的最小高度。
+///
+/// UI 约束：
+/// - 输入区底部存在模型选择和发送按钮浮层；最小高度必须保证单行文本和浮层不会互相遮挡。
+const AI_CHAT_INPUT_MIN_HEIGHT: f32 = 96.0;
+
+/// AI 对话输入区允许拖拽到的最大绝对高度。
+///
+/// UI 约束：
+/// - 输入区不能无限占用消息流空间，尤其在小屏窗口中必须保留足够消息可视区域。
+const AI_CHAT_INPUT_MAX_HEIGHT: f32 = 360.0;
+
+/// AI 对话输入区最大可占窗口高度比例。
+///
+/// 跨平台约束：
+/// - macOS 和 Windows 标题栏高度由系统管理，比例按 GPUI 视口逻辑像素计算，避免固定值在小屏下压缩消息区。
+const AI_CHAT_INPUT_MAX_VIEWPORT_RATIO: f32 = 0.45;
+
+/// AI 对话输入区高度拖拽条的命中高度。
+///
+/// UI 约束：
+/// - 命中区略高于视觉线条，保证触控板和高 DPI 鼠标更容易抓住；事件会被消费，避免误点到消息区。
+const AI_CHAT_INPUT_RESIZE_HANDLE_HEIGHT: f32 = 8.0;
+
+/// AI 对话输入栏的内边距。
+const AI_CHAT_INPUT_BAR_PADDING: f32 = 16.0;
+
+/// AI 对话模型选择器的固定高度。
+const AI_CHAT_MODEL_SELECTOR_HEIGHT: f32 = 30.0;
+
+/// AI 对话发送按钮的固定高度。
+const AI_CHAT_SEND_BUTTON_HEIGHT: f32 = 34.0;
+
+/// AI 对话输入框内底部浮层的水平内缩。
+const AI_CHAT_INPUT_FLOATING_CONTROLS_HORIZONTAL_INSET: f32 = 10.0;
+
+/// AI 对话输入框内底部浮层的底部内缩。
+const AI_CHAT_INPUT_FLOATING_CONTROLS_BOTTOM_INSET: f32 = 10.0;
+
+/// AI 对话文本输入内容的底部预留空间。
+///
+/// UI 约束：
+/// - 模型选择器和发送按钮悬浮在输入框底部，文本绘制和滚动区域必须预留空间，避免最后一行被浮层遮挡。
+const AI_CHAT_INPUT_CONTENT_BOTTOM_PADDING: f32 =
+    AI_CHAT_INPUT_FLOATING_CONTROLS_BOTTOM_INSET + AI_CHAT_SEND_BUTTON_HEIGHT + 12.0;
+
+/// AI 对话模型菜单相对工作区左侧的偏移。
+const AI_CHAT_MODEL_MENU_LEFT_OFFSET: f32 =
+    AI_CHAT_INPUT_BAR_PADDING + AI_CHAT_INPUT_FLOATING_CONTROLS_HORIZONTAL_INSET;
+
+/// AI 对话模型菜单相对工作区底部的偏移。
+///
+/// UI 约束：
+/// - 模型选择器悬浮在输入框底部，下拉菜单从浮层上方展开，避免遮挡正在输入的底部控件。
+const AI_CHAT_MODEL_MENU_BOTTOM_OFFSET: f32 = AI_CHAT_INPUT_BAR_PADDING
+    + AI_CHAT_INPUT_FLOATING_CONTROLS_BOTTOM_INSET
+    + AI_CHAT_SEND_BUTTON_HEIGHT
+    + 4.0;
+
+/// AI 对话虚拟列表的上下预渲染高度。
+///
+/// 性能约束：
+/// - 聊天消息和历史会话可能持续增长，虚拟列表只渲染可视区域及少量缓冲，避免滚动时为所有历史创建 GPUI 元素。
+const AI_CHAT_VIRTUAL_LIST_OVERDRAW: f32 = 180.0;
+
+/// AI 对话列表滚动条宽度。
+const AI_CHAT_SCROLLBAR_WIDTH: f32 = 6.0;
+
+/// AI 对话列表滚动条最小滑块高度。
+const AI_CHAT_SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 32.0;
+
+/// AI 对话列表滚动条距离容器边缘的内缩。
+const AI_CHAT_SCROLLBAR_PADDING: f32 = 4.0;
+
+/// AI 对话消息之间的垂直间距。
+///
+/// UI 约束：
+/// - 消息列表使用可变高度虚拟列表，间距必须作为消息行内部 padding 参与测量，不能依赖外部 margin。
+const AI_CHAT_MESSAGE_ROW_GAP: f32 = 20.0;
+
+/// AI 对话第一条消息与顶部栏之间的间距。
+///
+/// UI 约束：
+/// - 消息容器本身不再保留上下 padding，避免滚动到顶部/底部时出现遮挡感。
+/// - 首条消息的顶部间距必须放在虚拟列表行内部，确保 `ListState` 测量高度时把这段留白计入滚动范围。
+const AI_CHAT_FIRST_MESSAGE_TOP_GAP: f32 = 24.0;
+
+/// AI 对话多行输入行高。
+const AI_CHAT_INPUT_LINE_HEIGHT: f32 = 20.0;
+
+/// AI 对话消息区默认提示中展示的会话标题截断长度。
+const AI_CHAT_TITLE_MAX_CHARS: usize = 40;
 
 /// 测试模型接口的超时时间。
 ///
@@ -770,6 +913,15 @@ fn model_configs_preference_path() -> Option<PathBuf> {
     app_config_dir().map(|dir| dir.join(MODEL_CONFIGS_FILE_NAME))
 }
 
+/// 获取 AI 对话历史数据库路径。
+///
+/// 跨平台约束：
+/// - 路径沿用 `app_config_dir`，避免 macOS/Windows 分别散落数据库目录判断。
+/// - 非目标平台返回 `None` 时，AI 对话页仍可显示数据库不可用错误，不影响日志查看主流程。
+fn ai_chat_database_path() -> Option<PathBuf> {
+    app_config_dir().map(|dir| dir.join(AI_CHAT_DATABASE_FILE_NAME))
+}
+
 /// 规范化线程日志分析过滤配置文本。
 ///
 /// 业务意图：
@@ -962,6 +1114,390 @@ fn save_model_configs_preference(configs: &ModelConfigs) {
     }
 }
 
+/// 返回当前 Unix epoch 毫秒。
+///
+/// 边界条件：
+/// - 系统时间异常早于 epoch 时回退为 0，避免数据库时间字段写入负数后影响排序。
+fn current_unix_time_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+/// 约束 AI 对话输入区拖拽后的高度。
+///
+/// 业务意图：
+/// - 输入区高度要允许用户临时放大长提示词编辑空间，但不能遮挡发送控件或吞掉主要消息阅读区域。
+///
+/// 边界条件：
+/// - 视口高度异常、极小或非有限时回退到绝对上限，避免平台窗口系统返回临时无效尺寸导致高度计算出 NaN。
+fn clamp_ai_chat_input_height(requested_height: f32, viewport_height: f32) -> f32 {
+    let viewport_cap = if viewport_height.is_finite() && viewport_height > 0.0 {
+        (viewport_height * AI_CHAT_INPUT_MAX_VIEWPORT_RATIO).max(AI_CHAT_INPUT_MIN_HEIGHT)
+    } else {
+        AI_CHAT_INPUT_MAX_HEIGHT
+    };
+    let max_height = AI_CHAT_INPUT_MAX_HEIGHT
+        .min(viewport_cap)
+        .max(AI_CHAT_INPUT_MIN_HEIGHT);
+    requested_height.clamp(AI_CHAT_INPUT_MIN_HEIGHT, max_height)
+}
+
+/// 生成 AI 对话实体 ID。
+///
+/// 业务意图：
+/// - 会话和消息 ID 只需要在本地数据库内稳定唯一；时间戳便于人工排查数据库内容。
+/// - 追加进程内原子序号，避免低精度系统时钟在连续创建用户消息和助手消息时产生相同主键。
+fn new_ai_chat_entity_id(prefix: &str) -> String {
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let sequence = AI_CHAT_ENTITY_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{seed}-{sequence}")
+}
+
+/// 打开并初始化 AI 对话 SQLite 数据库。
+///
+/// 业务意图：
+/// - 所有 AI 对话历史操作统一经过这里打开连接，确保外键、schema 和版本检查在 macOS/Windows 上行为一致。
+fn open_ai_chat_database(path: &Path) -> Result<Connection, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("创建 AI 对话数据库目录失败：{error}"))?;
+    }
+    let connection =
+        Connection::open(path).map_err(|error| format!("打开 AI 对话数据库失败：{error}"))?;
+    initialize_ai_chat_database(&connection)?;
+    Ok(connection)
+}
+
+/// 初始化 AI 对话数据库 schema。
+///
+/// 边界条件：
+/// - `user_version` 大于当前版本时说明数据库来自未来版本，第一版不能安全降级读取，直接返回错误。
+/// - `ON DELETE CASCADE` 保证删除会话时消息同步清理，避免孤儿消息继续参与后续查询。
+fn initialize_ai_chat_database(connection: &Connection) -> Result<(), String> {
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| format!("读取 AI 对话数据库版本失败：{error}"))?;
+    if version > AI_CHAT_DATABASE_SCHEMA_VERSION {
+        return Err(format!(
+            "AI 对话数据库版本 {version} 高于当前支持版本 {AI_CHAT_DATABASE_SCHEMA_VERSION}"
+        ));
+    }
+
+    connection
+        .execute_batch(
+            r#"
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE IF NOT EXISTS conversations (
+                id TEXT PRIMARY KEY NOT NULL,
+                title TEXT NOT NULL,
+                model_profile_id TEXT,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT PRIMARY KEY NOT NULL,
+                conversation_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                status TEXT NOT NULL,
+                error_message TEXT,
+                sequence INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_conversations_updated_at
+                ON conversations(updated_at_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_messages_conversation_sequence
+                ON messages(conversation_id, sequence);
+            "#,
+        )
+        .map_err(|error| format!("初始化 AI 对话数据库失败：{error}"))?;
+
+    if version == 0 {
+        connection
+            .pragma_update(None, "user_version", AI_CHAT_DATABASE_SCHEMA_VERSION)
+            .map_err(|error| format!("写入 AI 对话数据库版本失败：{error}"))?;
+    }
+    Ok(())
+}
+
+/// 加载 AI 对话会话列表。
+///
+/// 业务意图：
+/// - 左侧会话列表按最近更新时间倒序显示，最近使用的对话应优先出现在顶部。
+fn load_ai_chat_conversations(path: &Path) -> Result<Vec<AiChatConversation>, String> {
+    let connection = open_ai_chat_database(path)?;
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT id, title, model_profile_id, created_at_ms, updated_at_ms
+            FROM conversations
+            ORDER BY updated_at_ms DESC, created_at_ms DESC
+            "#,
+        )
+        .map_err(|error| format!("读取 AI 对话会话失败：{error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(AiChatConversation {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                model_profile_id: row.get(2)?,
+                created_at_ms: row.get(3)?,
+                updated_at_ms: row.get(4)?,
+            })
+        })
+        .map_err(|error| format!("读取 AI 对话会话失败：{error}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 AI 对话会话失败：{error}"))
+}
+
+/// 加载指定会话的消息。
+///
+/// 边界条件：
+/// - 如果数据库中存在未知角色或状态，停止加载并显示错误，避免把损坏数据继续发给模型。
+fn load_ai_chat_messages(path: &Path, conversation_id: &str) -> Result<Vec<AiChatMessage>, String> {
+    let connection = open_ai_chat_database(path)?;
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT id, conversation_id, role, content, status, error_message,
+                   sequence, created_at_ms, updated_at_ms
+            FROM messages
+            WHERE conversation_id = ?1
+            ORDER BY sequence ASC, created_at_ms ASC
+            "#,
+        )
+        .map_err(|error| format!("读取 AI 对话消息失败：{error}"))?;
+    let rows = statement
+        .query_map(params![conversation_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+            ))
+        })
+        .map_err(|error| format!("读取 AI 对话消息失败：{error}"))?;
+
+    let mut messages = Vec::new();
+    for row in rows {
+        let (
+            id,
+            conversation_id,
+            role,
+            content,
+            status,
+            error_message,
+            sequence,
+            created_at_ms,
+            updated_at_ms,
+        ) = row.map_err(|error| format!("解析 AI 对话消息失败：{error}"))?;
+        messages.push(AiChatMessage {
+            id,
+            conversation_id,
+            role: AiChatMessageRole::from_str(&role)?,
+            content,
+            status: AiChatMessageStatus::from_str(&status)?,
+            error_message,
+            sequence,
+            created_at_ms,
+            updated_at_ms,
+        });
+    }
+    Ok(messages)
+}
+
+/// 插入 AI 对话会话。
+fn insert_ai_chat_conversation(
+    path: &Path,
+    conversation: &AiChatConversation,
+) -> Result<(), String> {
+    let connection = open_ai_chat_database(path)?;
+    connection
+        .execute(
+            r#"
+            INSERT INTO conversations
+                (id, title, model_profile_id, created_at_ms, updated_at_ms)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![
+                conversation.id,
+                conversation.title,
+                conversation.model_profile_id,
+                conversation.created_at_ms,
+                conversation.updated_at_ms,
+            ],
+        )
+        .map_err(|error| format!("保存 AI 对话会话失败：{error}"))?;
+    Ok(())
+}
+
+/// 更新 AI 对话会话标题、模型配置和更新时间。
+fn update_ai_chat_conversation(
+    path: &Path,
+    conversation: &AiChatConversation,
+) -> Result<(), String> {
+    let connection = open_ai_chat_database(path)?;
+    connection
+        .execute(
+            r#"
+            UPDATE conversations
+            SET title = ?2, model_profile_id = ?3, updated_at_ms = ?4
+            WHERE id = ?1
+            "#,
+            params![
+                conversation.id,
+                conversation.title,
+                conversation.model_profile_id,
+                conversation.updated_at_ms,
+            ],
+        )
+        .map_err(|error| format!("更新 AI 对话会话失败：{error}"))?;
+    Ok(())
+}
+
+/// 删除 AI 对话会话。
+fn delete_ai_chat_conversation(path: &Path, conversation_id: &str) -> Result<(), String> {
+    let connection = open_ai_chat_database(path)?;
+    connection
+        .execute(
+            "DELETE FROM conversations WHERE id = ?1",
+            params![conversation_id],
+        )
+        .map_err(|error| format!("删除 AI 对话会话失败：{error}"))?;
+    Ok(())
+}
+
+/// 插入 AI 对话消息。
+fn insert_ai_chat_message(path: &Path, message: &AiChatMessage) -> Result<(), String> {
+    let connection = open_ai_chat_database(path)?;
+    connection
+        .execute(
+            r#"
+            INSERT INTO messages
+                (id, conversation_id, role, content, status, error_message,
+                 sequence, created_at_ms, updated_at_ms)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                message.id,
+                message.conversation_id,
+                message.role.as_str(),
+                message.content,
+                message.status.as_str(),
+                message.error_message,
+                message.sequence,
+                message.created_at_ms,
+                message.updated_at_ms,
+            ],
+        )
+        .map_err(|error| format!("保存 AI 对话消息失败：{error}"))?;
+    Ok(())
+}
+
+/// 更新 AI 对话消息内容和状态。
+fn update_ai_chat_message(path: &Path, message: &AiChatMessage) -> Result<(), String> {
+    let connection = open_ai_chat_database(path)?;
+    connection
+        .execute(
+            r#"
+            UPDATE messages
+            SET content = ?2, status = ?3, error_message = ?4, updated_at_ms = ?5
+            WHERE id = ?1
+            "#,
+            params![
+                message.id,
+                message.content,
+                message.status.as_str(),
+                message.error_message,
+                message.updated_at_ms,
+            ],
+        )
+        .map_err(|error| format!("更新 AI 对话消息失败：{error}"))?;
+    Ok(())
+}
+
+/// 在内存消息列表中完成一条助手消息，并返回需要落库的消息副本。
+///
+/// 业务意图：
+/// - 正常完成、用户停止、切换会话时的强制停止都必须用同一套状态流转，避免某个分支只取消后台任务但数据库仍停留在 `streaming`。
+/// - 返回 clone 是为了先结束可变借用，再执行 SQLite 写入，避免 UI 状态更新和持久化逻辑互相牵扯。
+fn finish_ai_chat_assistant_message_in_list(
+    messages: &mut [AiChatMessage],
+    message_id: &str,
+    status: AiChatMessageStatus,
+    error_message: Option<String>,
+) -> Option<AiChatMessage> {
+    let message = messages
+        .iter_mut()
+        .find(|message| message.id == message_id)?;
+    message.status = status;
+    message.error_message = error_message;
+    message.updated_at_ms = current_unix_time_millis();
+    Some(message.clone())
+}
+
+/// 返回 AI 对话默认模型配置 ID。
+///
+/// 业务意图：
+/// - 新会话优先使用设置页标记的默认模型；没有默认时使用第一条配置，保证用户只配置一个模型即可直接开始对话。
+fn ai_chat_default_model_profile_id(
+    profiles: &[ModelProfile],
+    default_profile_id: Option<&str>,
+) -> Option<String> {
+    default_profile_id
+        .and_then(|default_id| {
+            profiles
+                .iter()
+                .find(|profile| profile.id == default_id)
+                .map(|profile| profile.id.clone())
+        })
+        .or_else(|| profiles.first().map(|profile| profile.id.clone()))
+}
+
+/// 创建空白 AI 对话会话模型。
+fn new_ai_chat_conversation(model_profile_id: Option<String>) -> AiChatConversation {
+    let now = current_unix_time_millis();
+    AiChatConversation {
+        id: new_ai_chat_entity_id("ai-conversation"),
+        title: "新对话".to_string(),
+        model_profile_id,
+        created_at_ms: now,
+        updated_at_ms: now,
+    }
+}
+
+/// 根据首条用户消息生成会话标题。
+///
+/// 边界条件：
+/// - 标题最多取 40 个字符，并把换行折叠为空格，避免左侧列表因为长提示词或多行文本被撑开。
+fn ai_chat_title_from_user_message(content: &str) -> String {
+    let normalized = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return "新对话".to_string();
+    }
+    let mut title = normalized
+        .chars()
+        .take(AI_CHAT_TITLE_MAX_CHARS)
+        .collect::<String>();
+    if normalized.chars().count() > AI_CHAT_TITLE_MAX_CHARS {
+        title.push_str("...");
+    }
+    title
+}
+
 /// 校验模型配置表单的必填字段和 URL 协议。
 ///
 /// 业务意图：
@@ -1035,6 +1571,226 @@ fn model_test_response_has_choices(value: &serde_json::Value) -> bool {
     value
         .get("choices")
         .is_some_and(|choices| choices.is_array())
+}
+
+/// 构造 AI 对话流式请求体。
+///
+/// 业务意图：
+/// - 第一版只发送用户在 AI 对话页中的消息历史，不自动附加当前日志内容，避免误把本地日志或敏感数据上传给模型服务。
+///
+/// 边界条件：
+/// - 失败的助手消息和正在生成的助手消息不能作为上下文；空内容也不能发送，避免部分兼容接口拒绝请求。
+fn ai_chat_stream_request_body(model: &str, messages: &[AiChatMessage]) -> serde_json::Value {
+    let request_messages = messages
+        .iter()
+        .filter(|message| !message.content.trim().is_empty())
+        .filter(|message| {
+            !(message.role == AiChatMessageRole::Assistant
+                && matches!(
+                    message.status,
+                    AiChatMessageStatus::Failed | AiChatMessageStatus::Streaming
+                ))
+        })
+        .map(|message| {
+            serde_json::json!({
+                "role": message.role.as_str(),
+                "content": message.content,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "model": model.trim(),
+        "messages": request_messages,
+        "stream": true
+    })
+}
+
+/// AI 对话 SSE 解析事件。
+#[derive(Debug, PartialEq, Eq)]
+enum AiChatSseParsedEvent {
+    /// 回复增量文本。
+    Delta(String),
+    /// 服务端结束标记。
+    Done,
+}
+
+/// AI 对话 SSE 增量解析器。
+///
+/// 业务意图：
+/// - `reqwest::blocking::Response` 按字节读取时可能把 UTF-8 字符、SSE 事件或 JSON 对象切在任意边界，解析器必须跨 chunk 保留缓冲。
+struct AiChatSseParser {
+    /// 已经确认是合法 UTF-8 的 SSE 文本缓冲。
+    text_buffer: String,
+    /// 末尾尚未组成完整 UTF-8 字符的字节。
+    pending_bytes: Vec<u8>,
+}
+
+impl AiChatSseParser {
+    /// 创建空解析器。
+    fn new() -> Self {
+        Self {
+            text_buffer: String::new(),
+            pending_bytes: Vec::new(),
+        }
+    }
+
+    /// 推入一段响应字节并返回已完整解析出的 SSE 事件。
+    fn push_bytes(&mut self, bytes: &[u8]) -> Result<Vec<AiChatSseParsedEvent>, String> {
+        self.pending_bytes.extend_from_slice(bytes);
+        loop {
+            match std::str::from_utf8(&self.pending_bytes) {
+                Ok(valid) => {
+                    self.text_buffer.push_str(valid);
+                    self.pending_bytes.clear();
+                    break;
+                }
+                Err(error) if error.error_len().is_none() => {
+                    let valid_up_to = error.valid_up_to();
+                    if valid_up_to > 0 {
+                        let valid = std::str::from_utf8(&self.pending_bytes[..valid_up_to])
+                            .map_err(|utf8_error| {
+                                format!("AI 响应 UTF-8 解析失败：{utf8_error}")
+                            })?;
+                        self.text_buffer.push_str(valid);
+                        self.pending_bytes.drain(..valid_up_to);
+                    }
+                    break;
+                }
+                Err(error) => {
+                    return Err(format!("AI 响应包含非法 UTF-8：{error}"));
+                }
+            }
+        }
+
+        self.text_buffer = self.text_buffer.replace("\r\n", "\n").replace('\r', "\n");
+        let mut parsed = Vec::new();
+        while let Some(separator_index) = self.text_buffer.find("\n\n") {
+            let raw_event = self.text_buffer[..separator_index].to_string();
+            self.text_buffer.drain(..separator_index + 2);
+            if let Some(event) = parse_ai_chat_sse_event(&raw_event)? {
+                parsed.push(event);
+            }
+        }
+        Ok(parsed)
+    }
+}
+
+/// 解析单个 SSE 事件。
+///
+/// 边界条件：
+/// - OpenAI 兼容服务可能发送注释、空事件或不含 `delta.content` 的角色/结束事件；这些事件应忽略而不是报错。
+fn parse_ai_chat_sse_event(raw_event: &str) -> Result<Option<AiChatSseParsedEvent>, String> {
+    let mut data_lines = Vec::new();
+    for line in raw_event.lines() {
+        if let Some(data) = line.strip_prefix("data:") {
+            data_lines.push(data.strip_prefix(' ').unwrap_or(data));
+        }
+    }
+    if data_lines.is_empty() {
+        return Ok(None);
+    }
+    let data = data_lines.join("\n");
+    if data.trim() == "[DONE]" {
+        return Ok(Some(AiChatSseParsedEvent::Done));
+    }
+    let value = serde_json::from_str::<serde_json::Value>(&data)
+        .map_err(|error| format!("AI 响应 SSE JSON 解析失败：{error}"))?;
+    let content = value
+        .get("choices")
+        .and_then(|choices| choices.as_array())
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("delta"))
+        .and_then(|delta| delta.get("content"))
+        .and_then(|content| content.as_str());
+    Ok(content.map(|content| AiChatSseParsedEvent::Delta(content.to_string())))
+}
+
+/// 执行一次 OpenAI 兼容 AI 对话流式请求。
+///
+/// 业务意图：
+/// - 该函数只在后台线程运行，负责 HTTP 和 SSE 字节解析；UI 更新统一通过 `sender` 发回前台，避免跨线程直接触碰 GPUI 状态。
+fn stream_openai_compatible_ai_chat(
+    profile: ModelProfile,
+    messages: Vec<AiChatMessage>,
+    cancel: Arc<AtomicBool>,
+    sender: mpsc::Sender<AiChatStreamEvent>,
+) {
+    let result = (|| -> Result<(), String> {
+        validate_model_profile_fields(&profile.name, &profile.base_url, &profile.model)?;
+        let url = model_test_chat_completions_url(&profile.base_url)?;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(AI_CHAT_REQUEST_TIMEOUT_SECONDS))
+            .build()
+            .map_err(|error| format!("AI 请求失败：创建 HTTP 客户端失败：{error}"))?;
+        let mut request = client
+            .post(url)
+            .json(&ai_chat_stream_request_body(&profile.model, &messages));
+        if let Some(authorization) = model_test_authorization_header(&profile.api_key) {
+            request = request.header(reqwest::header::AUTHORIZATION, authorization);
+        }
+
+        let mut response = request
+            .send()
+            .map_err(|error| format!("AI 请求失败：请求接口失败：{error}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().unwrap_or_default();
+            let snippet = model_test_http_error_body_snippet(&body);
+            if snippet.is_empty() {
+                return Err(format!("AI 请求失败：HTTP 状态码 {status}"));
+            }
+            return Err(format!("AI 请求失败：HTTP 状态码 {status}，{snippet}"));
+        }
+
+        let mut parser = AiChatSseParser::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                let _ = sender.send(AiChatStreamEvent::Stopped);
+                return Ok(());
+            }
+            let read = response
+                .read(&mut buffer)
+                .map_err(|error| format!("AI 响应读取失败：{error}"))?;
+            if read == 0 {
+                let _ = sender.send(AiChatStreamEvent::Done);
+                return Ok(());
+            }
+            for event in parser.push_bytes(&buffer[..read])? {
+                match event {
+                    AiChatSseParsedEvent::Delta(content) => {
+                        if sender.send(AiChatStreamEvent::Delta(content)).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    AiChatSseParsedEvent::Done => {
+                        let _ = sender.send(AiChatStreamEvent::Done);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    })();
+
+    if let Err(message) = result {
+        let _ = sender.send(AiChatStreamEvent::Error(message));
+    }
+}
+
+/// 返回 AI 对话页占位提示。
+///
+/// 业务意图：
+/// - AI 对话入口尚未接入真实请求时仍要把当前阻塞原因说明清楚；没有任何模型配置时，用户应优先去设置页新增模型，而不是看到“请求未接入”的泛化提示。
+///
+/// 边界条件：
+/// - 这里仅判断是否存在已保存配置，不在渲染层重新校验 URL、API Key 或模型 ID；保存入口已经负责字段校验，避免占位页引入额外业务分支。
+fn ai_chat_placeholder_description(model_profiles: &[ModelProfile]) -> &'static str {
+    if model_profiles.is_empty() {
+        "需要至少配置一个模型"
+    } else {
+        "当前版本尚未接入对话请求。"
+    }
 }
 
 /// 将 HTTP 错误响应体裁剪成适合 UI 展示的短文本。
@@ -2549,6 +3305,227 @@ impl ModelTestStatus {
     }
 }
 
+/// AI 对话消息角色。
+///
+/// 业务意图：
+/// - OpenAI Chat Completions 只接受 `user`、`assistant` 等固定角色；内部使用枚举避免数据库或 UI 拼错字符串。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AiChatMessageRole {
+    /// 用户输入的问题或指令。
+    User,
+    /// 模型生成的回复。
+    Assistant,
+}
+
+impl AiChatMessageRole {
+    /// 返回写入数据库和请求体的稳定角色字符串。
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+        }
+    }
+
+    /// 从数据库字符串恢复消息角色。
+    ///
+    /// 错误处理：
+    /// - 数据库可能被用户或旧版本手工修改，未知角色直接返回中文错误，避免错误消息混入上下文发送给模型。
+    fn from_str(raw: &str) -> Result<Self, String> {
+        match raw {
+            "user" => Ok(Self::User),
+            "assistant" => Ok(Self::Assistant),
+            other => Err(format!("AI 对话数据库包含未知消息角色：{other}")),
+        }
+    }
+}
+
+/// AI 对话消息状态。
+///
+/// 业务意图：
+/// - 流式生成期间、完成、停止和失败会影响 UI 文案和下一次请求上下文，必须明确区分。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AiChatMessageStatus {
+    /// 消息已经完整可用。
+    Complete,
+    /// 助手消息正在流式生成。
+    Streaming,
+    /// 用户主动停止生成，内容可能只是部分回复。
+    Stopped,
+    /// 请求失败，`error_message` 保存用户可见原因。
+    Failed,
+}
+
+impl AiChatMessageStatus {
+    /// 返回写入数据库的稳定状态字符串。
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Streaming => "streaming",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// 从数据库字符串恢复消息状态。
+    fn from_str(raw: &str) -> Result<Self, String> {
+        match raw {
+            "complete" => Ok(Self::Complete),
+            "streaming" => Ok(Self::Streaming),
+            "stopped" => Ok(Self::Stopped),
+            "failed" => Ok(Self::Failed),
+            other => Err(format!("AI 对话数据库包含未知消息状态：{other}")),
+        }
+    }
+}
+
+/// AI 对话会话摘要。
+///
+/// 业务意图：
+/// - 左侧会话列表只需要标题、模型配置引用和时间排序，不加载所有消息正文，避免历史较多时切换页面成本过高。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AiChatConversation {
+    /// 会话稳定 ID，作为消息外键和 UI 选中状态。
+    id: String,
+    /// 用户可见标题；第一版由首条用户消息自动生成。
+    title: String,
+    /// 当前会话使用的模型配置 ID；配置被删除时保留原值并在 UI 中提示用户重新选择。
+    model_profile_id: Option<String>,
+    /// 创建时间，Unix epoch 毫秒。
+    created_at_ms: i64,
+    /// 最近更新时间，Unix epoch 毫秒，用于左侧列表排序。
+    updated_at_ms: i64,
+}
+
+/// AI 对话消息。
+///
+/// 业务意图：
+/// - 消息同时服务 UI 展示、SQLite 持久化和下一次 Chat Completions 请求上下文。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AiChatMessage {
+    /// 消息稳定 ID。
+    id: String,
+    /// 所属会话 ID。
+    conversation_id: String,
+    /// 用户或助手角色。
+    role: AiChatMessageRole,
+    /// 消息正文；失败消息可能为空，错误原因放在 `error_message`。
+    content: String,
+    /// 消息生命周期状态。
+    status: AiChatMessageStatus,
+    /// 失败时的用户可见中文错误。
+    error_message: Option<String>,
+    /// 会话内单调递增顺序号，保证跨平台和跨重启排序稳定。
+    sequence: i64,
+    /// 创建时间，Unix epoch 毫秒。
+    created_at_ms: i64,
+    /// 最近更新时间，Unix epoch 毫秒。
+    updated_at_ms: i64,
+}
+
+/// AI 对话页面中的可滚动区域。
+///
+/// 业务意图：
+/// - 左侧历史栏和右侧消息流都使用虚拟列表和自绘滚动条；该枚举让拖动生命周期可以复用同一套计算逻辑。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AiChatScrollArea {
+    /// 左侧历史会话列表。
+    Conversations,
+    /// 右侧当前会话消息流。
+    Messages,
+}
+
+/// AI 对话自绘滚动条拖动状态。
+///
+/// 业务意图：
+/// - 用户拖动滚动条时需要保存鼠标在滑块内部的相对位置，避免按下瞬间滑块跳到鼠标中心。
+#[derive(Clone, Copy, Debug)]
+struct AiChatScrollbarDrag {
+    /// 正在拖动的滚动区域。
+    area: AiChatScrollArea,
+    /// 鼠标按下点到滑块顶部的距离。
+    cursor_offset: Pixels,
+}
+
+/// AI 对话输入区高度拖拽状态。
+///
+/// 业务意图：
+/// - 用户需要根据提示词长度临时放大或缩小输入区；拖动时记录起点和起始高度，保证高度变化与鼠标位移线性一致。
+/// - 高度只保存在当前主视图状态中，不写入配置文件，避免一个临时输入场景影响后续启动默认布局。
+#[derive(Clone, Copy, Debug)]
+struct AiChatInputResizeDrag {
+    /// 鼠标按下时的窗口纵坐标。
+    start_y: Pixels,
+    /// 鼠标按下时的输入区高度。
+    start_height: f32,
+}
+
+/// AI 对话流式后台事件。
+///
+/// 业务意图：
+/// - 后台线程不能直接修改 GPUI 状态，只能把增量内容、结束和错误事件发给前台任务统一处理。
+enum AiChatStreamEvent {
+    /// 收到一段助手回复增量。
+    Delta(String),
+    /// 服务端发送 `[DONE]` 或响应读取到 EOF。
+    Done,
+    /// 用户请求停止后后台循环退出。
+    Stopped,
+    /// 网络、HTTP 或 SSE 解析失败。
+    Error(String),
+}
+
+/// AI 对话正在运行的流式任务。
+///
+/// 业务意图：
+/// - 任务 ID 用于丢弃旧任务事件；停止标记用于让后台读取循环尽快退出；接收器由前台轮询并批量更新 UI。
+struct AiChatStreamingTask {
+    /// 当前任务 ID。
+    job_id: usize,
+    /// 任务所属会话 ID。
+    conversation_id: String,
+    /// 正在写入的助手消息 ID。
+    assistant_message_id: String,
+    /// 后台线程发来的流式事件。
+    receiver: Receiver<AiChatStreamEvent>,
+    /// 用户点击停止时置位。
+    cancel: Arc<AtomicBool>,
+    /// 最近一次持久化到 SQLite 的正文长度，用于减少流式过程中的写库频率。
+    last_persisted_len: usize,
+}
+
+/// AI 对话输入区中的单行排版缓存。
+///
+/// 业务意图：
+/// - 多行输入需要支持鼠标点击、拖拽选择和 IME 候选窗口定位，必须保存每一行的真实字形布局。
+struct AiChatInputLineLayout {
+    /// 当前可视行对应的原始文本 UTF-8 字节范围。
+    byte_range: Range<usize>,
+    /// 当前行的 GPUI 字形布局。
+    line: ShapedLine,
+    /// 当前行在窗口中的绘制边界。
+    bounds: Bounds<Pixels>,
+}
+
+/// AI 对话输入区绘制状态。
+struct AiChatInputPrepaint {
+    /// 当前帧需要绘制的所有文本行。
+    lines: Vec<AiChatInputPaintLine>,
+    /// 当前选择范围对应的高亮矩形。
+    selections: Vec<PaintQuad>,
+    /// 当前光标矩形。
+    cursor: Option<PaintQuad>,
+}
+
+/// AI 对话输入区单行绘制数据。
+struct AiChatInputPaintLine {
+    /// 当前行对应的原始文本范围。
+    byte_range: Range<usize>,
+    /// 当前行边界。
+    bounds: Bounds<Pixels>,
+    /// 已排版的文本行。
+    line: ShapedLine,
+}
+
 /// 线程日志分析过滤输入区中的单行排版缓存。
 ///
 /// 业务意图：
@@ -3758,6 +4735,96 @@ struct MainView {
     /// - 测试请求可能乱序返回，单调递增 ID 用于丢弃旧请求结果，避免用户修改表单后被旧结果覆盖。
     next_model_test_job_id: usize,
 
+    /// AI 对话会话列表。
+    ///
+    /// 业务意图：
+    /// - 左侧会话栏需要展示所有持久化会话摘要，按更新时间倒序排列；消息正文只在切换会话时加载。
+    ai_chat_conversations: Vec<AiChatConversation>,
+
+    /// 当前 AI 对话会话 ID。
+    ///
+    /// 边界条件：
+    /// - 数据库不可用或会话全部删除时为空；右侧工作区显示空态并禁止发送。
+    ai_chat_active_conversation_id: Option<String>,
+
+    /// 当前 AI 对话消息列表。
+    ///
+    /// 业务意图：
+    /// - 该字段只保存当前会话的消息，避免会话很多时主视图长期持有所有正文。
+    ai_chat_messages: Vec<AiChatMessage>,
+
+    /// AI 对话左侧历史会话虚拟列表状态。
+    ///
+    /// 性能约束：
+    /// - 会话很多时只渲染可视范围；新增、删除或重排会话时必须同步该状态的条目数量。
+    ai_chat_conversation_list_state: ListState,
+
+    /// AI 对话右侧消息流虚拟列表状态。
+    ///
+    /// 性能约束：
+    /// - 消息气泡高度会随内容和窗口宽度变化，使用 `ListState` 而不是等高列表，避免长回答滚动时卡顿或被裁切。
+    ai_chat_message_list_state: ListState,
+
+    /// AI 对话列表滚动条拖动状态。
+    ///
+    /// 边界条件：
+    /// - 鼠标释放、切换会话或列表被重建时需要清空，避免旧拖动写入新的列表状态。
+    ai_chat_scrollbar_drag: Option<AiChatScrollbarDrag>,
+
+    /// AI 对话数据库错误。
+    ///
+    /// 错误处理：
+    /// - SQLite 打开、迁移或写入失败不能影响日志查看主流程；错误保存在这里并展示到 AI 页面。
+    ai_chat_database_error: Option<String>,
+
+    /// AI 对话模型选择下拉菜单是否展开。
+    ai_chat_model_menu_open: bool,
+
+    /// AI 对话输入框文本。
+    ///
+    /// 业务意图：
+    /// - 输入框支持多行提示词，按 UTF-8 保存，平台 IME 回调时再与 UTF-16 范围互转。
+    ai_chat_input_text: String,
+
+    /// AI 对话输入框选择范围。
+    ai_chat_input_selection_range: Range<usize>,
+
+    /// AI 对话输入框输入法组合文本范围。
+    ai_chat_input_marked_range: Option<Range<usize>>,
+
+    /// AI 对话输入框焦点句柄。
+    ai_chat_input_focus: gpui::FocusHandle,
+
+    /// AI 对话输入框最近一次绘制的逐行布局。
+    ai_chat_input_last_layouts: Vec<AiChatInputLineLayout>,
+
+    /// AI 对话输入框最近一次整体绘制边界。
+    ai_chat_input_last_bounds: Option<Bounds<Pixels>>,
+
+    /// AI 对话输入框拖拽选择锚点。
+    ai_chat_input_selection_drag: Option<usize>,
+
+    /// AI 对话输入区当前高度。
+    ///
+    /// 业务意图：
+    /// - 用户可以拖拽输入区顶部调整高度；高度仅在当前运行会话中保留，避免临时编辑长提示词后永久改变默认布局。
+    ///
+    /// 边界条件：
+    /// - 赋值必须经过 `clamp_ai_chat_input_height`，防止高度过小遮挡浮层控件或过大挤压消息列表。
+    ai_chat_input_height: f32,
+
+    /// AI 对话输入区高度拖拽状态。
+    ///
+    /// 边界条件：
+    /// - 鼠标释放、离开窗口释放或切换到其它拖拽行为时需要清空，避免后续移动继续修改高度。
+    ai_chat_input_resize_drag: Option<AiChatInputResizeDrag>,
+
+    /// 当前正在进行的 AI 流式任务。
+    ai_chat_streaming_task: Option<AiChatStreamingTask>,
+
+    /// 下一个 AI 流式任务 ID。
+    next_ai_chat_job_id: usize,
+
     /// 快搜关键字输入区的选择范围，使用 UTF-8 字节下标。
     quick_search_keywords_selection_range: Range<usize>,
 
@@ -3959,6 +5026,65 @@ impl MainView {
             model_config_model_input.set_text(profile.model.clone());
             profile.id.clone()
         });
+        let default_ai_model_profile_id = ai_chat_default_model_profile_id(
+            &model_configs.profiles,
+            model_configs.default_profile_id.as_deref(),
+        );
+        let (
+            ai_chat_conversations,
+            ai_chat_active_conversation_id,
+            ai_chat_messages,
+            ai_chat_database_error,
+        ) = if let Some(path) = ai_chat_database_path() {
+            match load_ai_chat_conversations(&path) {
+                Ok(mut conversations) => {
+                    if conversations.is_empty() {
+                        let conversation =
+                            new_ai_chat_conversation(default_ai_model_profile_id.clone());
+                        match insert_ai_chat_conversation(&path, &conversation) {
+                            Ok(()) => {
+                                let active_id = Some(conversation.id.clone());
+                                conversations.push(conversation);
+                                (conversations, active_id, Vec::new(), None)
+                            }
+                            Err(error) => (Vec::new(), None, Vec::new(), Some(error)),
+                        }
+                    } else {
+                        let active_id = conversations
+                            .first()
+                            .map(|conversation| conversation.id.clone());
+                        let messages = active_id
+                            .as_deref()
+                            .map(|conversation_id| load_ai_chat_messages(&path, conversation_id))
+                            .transpose();
+                        match messages {
+                            Ok(messages) => {
+                                (conversations, active_id, messages.unwrap_or_default(), None)
+                            }
+                            Err(error) => (conversations, active_id, Vec::new(), Some(error)),
+                        }
+                    }
+                }
+                Err(error) => (Vec::new(), None, Vec::new(), Some(error)),
+            }
+        } else {
+            (
+                Vec::new(),
+                None,
+                Vec::new(),
+                Some("当前平台没有可用的应用配置目录，无法保存 AI 对话历史".to_string()),
+            )
+        };
+        let ai_chat_conversation_list_state = ListState::new(
+            ai_chat_conversations.len(),
+            ListAlignment::Top,
+            px(AI_CHAT_VIRTUAL_LIST_OVERDRAW),
+        );
+        let ai_chat_message_list_state = ListState::new(
+            ai_chat_messages.len(),
+            ListAlignment::Bottom,
+            px(AI_CHAT_VIRTUAL_LIST_OVERDRAW),
+        );
 
         Self {
             left_panel_width: LEFT_PANEL_DEFAULT_WIDTH,
@@ -4010,6 +5136,25 @@ impl MainView {
             model_config_api_key_visible: false,
             model_test_status: ModelTestStatus::Idle,
             next_model_test_job_id: 1,
+            ai_chat_conversations,
+            ai_chat_active_conversation_id,
+            ai_chat_messages,
+            ai_chat_conversation_list_state,
+            ai_chat_message_list_state,
+            ai_chat_scrollbar_drag: None,
+            ai_chat_database_error,
+            ai_chat_model_menu_open: false,
+            ai_chat_input_text: String::new(),
+            ai_chat_input_selection_range: 0..0,
+            ai_chat_input_marked_range: None,
+            ai_chat_input_focus: context.focus_handle(),
+            ai_chat_input_last_layouts: Vec::new(),
+            ai_chat_input_last_bounds: None,
+            ai_chat_input_selection_drag: None,
+            ai_chat_input_height: AI_CHAT_INPUT_DEFAULT_HEIGHT,
+            ai_chat_input_resize_drag: None,
+            ai_chat_streaming_task: None,
+            next_ai_chat_job_id: 1,
             quick_search_keywords_selection_range: 0..0,
             quick_search_keywords_marked_range: None,
             quick_search_keywords_focus: context.focus_handle(),
@@ -5988,7 +7133,9 @@ impl MainView {
     /// - 线程日志分析过滤框位于设置窗口，但状态保存在 `MainView`，这里统一判断焦点，避免粘贴堆栈时误触发
     ///   “粘贴到搜索框并打开搜索窗口”的只读日志兜底行为。
     fn editable_text_input_focused(&self, window: &Window) -> bool {
-        self.search_text_input_focused(window) || self.settings_text_input_focused(window)
+        self.search_text_input_focused(window)
+            || self.settings_text_input_focused(window)
+            || self.ai_chat_input_focus.is_focused(window)
     }
 
     /// 延迟打开搜索对话框。
@@ -9308,6 +10455,1036 @@ impl MainView {
             .detach();
     }
 
+    /// 返回 AI 对话数据库路径，失败时同步记录错误。
+    fn ai_chat_database_path_or_error(&mut self) -> Option<PathBuf> {
+        let path = ai_chat_database_path();
+        if path.is_none() {
+            self.ai_chat_database_error =
+                Some("当前平台没有可用的应用配置目录，无法保存 AI 对话历史".to_string());
+        }
+        path
+    }
+
+    /// 返回当前 AI 对话会话。
+    fn active_ai_chat_conversation(&self) -> Option<&AiChatConversation> {
+        let active_id = self.ai_chat_active_conversation_id.as_deref()?;
+        self.ai_chat_conversations
+            .iter()
+            .find(|conversation| conversation.id == active_id)
+    }
+
+    /// 返回当前 AI 对话会话的可变引用。
+    fn active_ai_chat_conversation_mut(&mut self) -> Option<&mut AiChatConversation> {
+        let active_id = self.ai_chat_active_conversation_id.as_deref()?;
+        self.ai_chat_conversations
+            .iter_mut()
+            .find(|conversation| conversation.id == active_id)
+    }
+
+    /// 返回当前 AI 对话选择的模型配置 ID。
+    fn active_ai_chat_model_profile_id(&self) -> Option<&str> {
+        self.active_ai_chat_conversation()
+            .and_then(|conversation| conversation.model_profile_id.as_deref())
+    }
+
+    /// 返回当前 AI 对话选择的模型配置。
+    fn active_ai_chat_model_profile(&self) -> Option<ModelProfile> {
+        let profile_id = self.active_ai_chat_model_profile_id()?;
+        self.model_config_profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+    }
+
+    /// 判断 AI 对话当前是否可以发送。
+    fn ai_chat_can_send(&self) -> bool {
+        self.ai_chat_streaming_task.is_none()
+            && self.ai_chat_database_error.is_none()
+            && self.ai_chat_active_conversation_id.is_some()
+            && self.active_ai_chat_model_profile().is_some()
+            && !self.ai_chat_input_text.trim().is_empty()
+    }
+
+    /// 新建 AI 对话会话。
+    ///
+    /// 业务意图：
+    /// - 用户点击“新对话”时立即创建持久化会话，后续输入和模型选择都可以稳定落到该会话 ID。
+    fn create_ai_chat_conversation(&mut self, context: &mut Context<Self>) {
+        let Some(path) = self.ai_chat_database_path_or_error() else {
+            context.notify();
+            return;
+        };
+        let model_profile_id = ai_chat_default_model_profile_id(
+            &self.model_config_profiles,
+            self.model_config_default_profile_id.as_deref(),
+        );
+        let conversation = new_ai_chat_conversation(model_profile_id);
+        match insert_ai_chat_conversation(&path, &conversation) {
+            Ok(()) => {
+                self.ai_chat_conversations.insert(0, conversation.clone());
+                self.ai_chat_active_conversation_id = Some(conversation.id);
+                self.ai_chat_messages.clear();
+                self.ai_chat_input_text.clear();
+                self.ai_chat_input_selection_range = 0..0;
+                self.ai_chat_input_marked_range = None;
+                self.ai_chat_model_menu_open = false;
+                self.ai_chat_database_error = None;
+                self.reset_ai_chat_conversation_list_state();
+                self.reset_ai_chat_message_list_state();
+            }
+            Err(error) => self.ai_chat_database_error = Some(error),
+        }
+        context.notify();
+    }
+
+    /// 选择 AI 对话会话。
+    fn select_ai_chat_conversation(&mut self, conversation_id: &str, context: &mut Context<Self>) {
+        if self.ai_chat_active_conversation_id.as_deref() == Some(conversation_id) {
+            return;
+        }
+        let Some(path) = self.ai_chat_database_path_or_error() else {
+            context.notify();
+            return;
+        };
+        match load_ai_chat_messages(&path, conversation_id) {
+            Ok(messages) => {
+                self.stop_ai_chat_streaming_without_notify();
+                self.ai_chat_active_conversation_id = Some(conversation_id.to_string());
+                self.ai_chat_messages = messages;
+                self.ai_chat_model_menu_open = false;
+                self.ai_chat_database_error = None;
+                self.reset_ai_chat_message_list_state();
+            }
+            Err(error) => self.ai_chat_database_error = Some(error),
+        }
+        context.notify();
+    }
+
+    /// 删除当前 AI 对话会话。
+    ///
+    /// 边界条件：
+    /// - 删除最后一个会话后立即创建一个新的空会话，保证右侧工作区始终有明确落库目标。
+    fn delete_active_ai_chat_conversation(&mut self, context: &mut Context<Self>) {
+        let Some(active_id) = self.ai_chat_active_conversation_id.clone() else {
+            return;
+        };
+        let Some(path) = self.ai_chat_database_path_or_error() else {
+            context.notify();
+            return;
+        };
+        self.stop_ai_chat_streaming_without_notify();
+        match delete_ai_chat_conversation(&path, &active_id) {
+            Ok(()) => {
+                self.ai_chat_conversations
+                    .retain(|conversation| conversation.id != active_id);
+                if self.ai_chat_conversations.is_empty() {
+                    let model_profile_id = ai_chat_default_model_profile_id(
+                        &self.model_config_profiles,
+                        self.model_config_default_profile_id.as_deref(),
+                    );
+                    let conversation = new_ai_chat_conversation(model_profile_id);
+                    match insert_ai_chat_conversation(&path, &conversation) {
+                        Ok(()) => {
+                            self.ai_chat_active_conversation_id = Some(conversation.id.clone());
+                            self.ai_chat_conversations.push(conversation);
+                            self.ai_chat_messages.clear();
+                            self.ai_chat_database_error = None;
+                            self.reset_ai_chat_conversation_list_state();
+                            self.reset_ai_chat_message_list_state();
+                        }
+                        Err(error) => {
+                            self.ai_chat_active_conversation_id = None;
+                            self.ai_chat_messages.clear();
+                            self.ai_chat_database_error = Some(error);
+                            self.reset_ai_chat_conversation_list_state();
+                            self.reset_ai_chat_message_list_state();
+                        }
+                    }
+                } else {
+                    let next_id = self.ai_chat_conversations[0].id.clone();
+                    self.ai_chat_active_conversation_id = Some(next_id.clone());
+                    self.ai_chat_messages =
+                        load_ai_chat_messages(&path, &next_id).unwrap_or_else(|error| {
+                            self.ai_chat_database_error = Some(error);
+                            Vec::new()
+                        });
+                    self.reset_ai_chat_conversation_list_state();
+                    self.reset_ai_chat_message_list_state();
+                }
+            }
+            Err(error) => self.ai_chat_database_error = Some(error),
+        }
+        context.notify();
+    }
+
+    /// 切换 AI 对话模型下拉菜单。
+    fn toggle_ai_chat_model_menu(&mut self, context: &mut Context<Self>) {
+        if self.model_config_profiles.is_empty() {
+            self.ai_chat_model_menu_open = false;
+        } else {
+            self.ai_chat_model_menu_open = !self.ai_chat_model_menu_open;
+        }
+        context.notify();
+    }
+
+    /// 为当前 AI 对话选择模型配置。
+    fn select_ai_chat_model_profile(&mut self, profile_id: &str, context: &mut Context<Self>) {
+        let Some(path) = self.ai_chat_database_path_or_error() else {
+            context.notify();
+            return;
+        };
+        if !self
+            .model_config_profiles
+            .iter()
+            .any(|profile| profile.id == profile_id)
+        {
+            self.ai_chat_database_error = Some("选择的模型配置不存在".to_string());
+            context.notify();
+            return;
+        }
+        let mut updated = None;
+        if let Some(conversation) = self.active_ai_chat_conversation_mut() {
+            conversation.model_profile_id = Some(profile_id.to_string());
+            conversation.updated_at_ms = current_unix_time_millis();
+            updated = Some(conversation.clone());
+        }
+        if let Some(conversation) = updated {
+            match update_ai_chat_conversation(&path, &conversation) {
+                Ok(()) => {
+                    self.ai_chat_database_error = None;
+                    self.sort_ai_chat_conversations();
+                    self.reset_ai_chat_conversation_list_state();
+                }
+                Err(error) => self.ai_chat_database_error = Some(error),
+            }
+        }
+        self.ai_chat_model_menu_open = false;
+        context.notify();
+    }
+
+    /// 根据更新时间重新排序 AI 会话列表。
+    fn sort_ai_chat_conversations(&mut self) {
+        self.ai_chat_conversations.sort_by(|left, right| {
+            right
+                .updated_at_ms
+                .cmp(&left.updated_at_ms)
+                .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
+        });
+    }
+
+    /// 重建 AI 历史会话虚拟列表状态。
+    ///
+    /// 业务意图：
+    /// - 新建、删除或排序会话后，左侧历史栏的虚拟列表条目数和索引内容必须与最新数据一致。
+    fn reset_ai_chat_conversation_list_state(&mut self) {
+        self.ai_chat_conversation_list_state
+            .reset(self.ai_chat_conversations.len());
+        if self
+            .ai_chat_scrollbar_drag
+            .is_some_and(|drag| drag.area == AiChatScrollArea::Conversations)
+        {
+            self.ai_chat_scrollbar_drag = None;
+        }
+    }
+
+    /// 重建 AI 消息虚拟列表状态。
+    ///
+    /// 业务意图：
+    /// - 切换会话、删除会话或重新加载消息时，消息列表的行数和已测量高度都需要失效，避免旧会话的高度缓存影响新会话。
+    fn reset_ai_chat_message_list_state(&mut self) {
+        self.ai_chat_message_list_state
+            .reset(self.ai_chat_messages.len());
+        if self
+            .ai_chat_scrollbar_drag
+            .is_some_and(|drag| drag.area == AiChatScrollArea::Messages)
+        {
+            self.ai_chat_scrollbar_drag = None;
+        }
+    }
+
+    /// 标记单条 AI 消息的虚拟列表高度需要重新测量。
+    ///
+    /// 业务意图：
+    /// - SSE 流式输出会持续改变助手气泡高度，只失效当前消息行可以避免每个增量都重建整个消息列表。
+    fn invalidate_ai_chat_message_row(&mut self, message_id: &str) {
+        let Some(index) = self
+            .ai_chat_messages
+            .iter()
+            .position(|message| message.id == message_id)
+        else {
+            return;
+        };
+        self.ai_chat_message_list_state
+            .splice(index..index.saturating_add(1), 1);
+        self.ai_chat_message_list_state.scroll_to_reveal_item(index);
+    }
+
+    /// 返回 AI 对话指定滚动区域的虚拟列表状态。
+    fn ai_chat_list_state_for_area(&self, area: AiChatScrollArea) -> ListState {
+        match area {
+            AiChatScrollArea::Conversations => self.ai_chat_conversation_list_state.clone(),
+            AiChatScrollArea::Messages => self.ai_chat_message_list_state.clone(),
+        }
+    }
+
+    /// 计算 AI 对话虚拟列表的纵向滚动条布局。
+    ///
+    /// 业务意图：
+    /// - 滚动条直接读取 `ListState` 的视口、高度和偏移，保证滚轮滚动、虚拟渲染和滑块位置使用同一份状态。
+    fn ai_chat_list_scrollbar_metrics(list_state: &ListState) -> Option<LogScrollbarMetrics> {
+        let viewport_bounds = list_state.viewport_bounds();
+        let viewport_height = viewport_bounds.size.height;
+        let max_scroll = list_state.max_offset_for_scrollbar().height;
+        if viewport_height <= px(0.0) || max_scroll <= px(0.0) {
+            return None;
+        }
+
+        let scroll_top =
+            (-list_state.scroll_px_offset_for_scrollbar().y).clamp(px(0.0), max_scroll);
+        let content_height = viewport_height + max_scroll;
+        let track_start = px(AI_CHAT_SCROLLBAR_PADDING);
+        let track_length = (viewport_height - track_start * 2.0).max(px(1.0));
+        let min_thumb_length = px(AI_CHAT_SCROLLBAR_MIN_THUMB_HEIGHT).min(track_length);
+        let thumb_length = (viewport_height * (viewport_height / content_height))
+            .clamp(min_thumb_length, track_length);
+        let movable_length = (track_length - thumb_length).max(px(0.0));
+        let thumb_start = track_start + movable_length * (scroll_top / max_scroll);
+
+        Some(LogScrollbarMetrics {
+            thumb_start,
+            thumb_length,
+            track_start,
+            track_length,
+            max_scroll,
+            max_scroll_px: f64::from(max_scroll),
+        })
+    }
+
+    /// 开始拖动 AI 对话列表滚动条。
+    fn start_ai_chat_scrollbar_drag(&mut self, area: AiChatScrollArea, event: &MouseDownEvent) {
+        let list_state = self.ai_chat_list_state_for_area(area);
+        let Some(metrics) = Self::ai_chat_list_scrollbar_metrics(&list_state) else {
+            return;
+        };
+        if metrics.max_scroll <= px(0.0) {
+            return;
+        }
+        let viewport_top = list_state.viewport_bounds().top();
+        list_state.scrollbar_drag_started();
+        self.ai_chat_scrollbar_drag = Some(AiChatScrollbarDrag {
+            area,
+            cursor_offset: event.position.y - viewport_top - metrics.thumb_start,
+        });
+    }
+
+    /// 根据鼠标移动更新 AI 对话列表滚动条拖动。
+    ///
+    /// 边界条件：
+    /// - 拖动过程中如果列表因为切换会话被重建，或者鼠标已经释放，需要立即清理拖动状态。
+    fn update_ai_chat_scrollbar_drag(
+        &mut self,
+        event: &MouseMoveEvent,
+        context: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.ai_chat_scrollbar_drag else {
+            return;
+        };
+        if !event.dragging() {
+            self.stop_ai_chat_scrollbar_drag(context);
+            return;
+        }
+        let list_state = self.ai_chat_list_state_for_area(drag.area);
+        let Some(metrics) = Self::ai_chat_list_scrollbar_metrics(&list_state) else {
+            self.stop_ai_chat_scrollbar_drag(context);
+            return;
+        };
+        let viewport_top = list_state.viewport_bounds().top();
+        let movable_length = (metrics.track_length - metrics.thumb_length).max(px(0.0));
+        if metrics.max_scroll <= px(0.0) || movable_length <= px(0.0) {
+            return;
+        }
+
+        let requested_thumb_start = event.position.y - viewport_top - drag.cursor_offset;
+        let thumb_start =
+            requested_thumb_start.clamp(metrics.track_start, metrics.track_start + movable_length);
+        let scroll_offset =
+            metrics.max_scroll * ((thumb_start - metrics.track_start) / movable_length);
+        list_state.set_offset_from_scrollbar(point(px(0.0), -scroll_offset));
+        context.notify();
+    }
+
+    /// 结束 AI 对话列表滚动条拖动。
+    fn stop_ai_chat_scrollbar_drag(&mut self, context: &mut Context<Self>) {
+        let Some(drag) = self.ai_chat_scrollbar_drag.take() else {
+            return;
+        };
+        self.ai_chat_list_state_for_area(drag.area)
+            .scrollbar_drag_ended();
+        context.notify();
+    }
+
+    /// 开始拖拽调整 AI 对话输入区高度。
+    ///
+    /// 业务意图：
+    /// - 拖拽条位于输入区顶部，向上拖动扩大输入区，向下拖动缩小输入区，符合底部编辑器面板的常见交互。
+    fn start_ai_chat_input_resize(&mut self, event: &MouseDownEvent) {
+        self.ai_chat_input_resize_drag = Some(AiChatInputResizeDrag {
+            start_y: event.position.y,
+            start_height: self.ai_chat_input_height,
+        });
+        self.ai_chat_input_selection_drag = None;
+        self.ai_chat_scrollbar_drag = None;
+        self.ai_chat_model_menu_open = false;
+    }
+
+    /// 根据鼠标移动更新 AI 对话输入区高度。
+    ///
+    /// 边界条件：
+    /// - 拖拽可能跨过消息区、历史栏或窗口外侧，因此在 AI 页面根节点统一接管鼠标移动。
+    /// - 高度通过窗口视口和固定上下限双重约束，避免小屏下输入区覆盖消息区。
+    fn update_ai_chat_input_resize_drag(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.ai_chat_input_resize_drag else {
+            return;
+        };
+        if !event.dragging() {
+            self.stop_ai_chat_input_resize_drag(context);
+            return;
+        }
+        let viewport_height = f32::from(window.viewport_size().height);
+        let delta = f32::from(drag.start_y - event.position.y);
+        self.ai_chat_input_height =
+            clamp_ai_chat_input_height(drag.start_height + delta, viewport_height);
+        context.notify();
+    }
+
+    /// 结束 AI 对话输入区高度拖拽。
+    fn stop_ai_chat_input_resize_drag(&mut self, context: &mut Context<Self>) {
+        if self.ai_chat_input_resize_drag.take().is_some() {
+            context.notify();
+        }
+    }
+
+    /// 处理 AI 对话页鼠标移动事件。
+    fn handle_ai_chat_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.update_ai_chat_scrollbar_drag(event, context);
+        self.update_ai_chat_input_resize_drag(event, window, context);
+    }
+
+    /// 处理 AI 对话页鼠标释放事件。
+    fn handle_ai_chat_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.stop_ai_chat_scrollbar_drag(context);
+        self.stop_ai_chat_input_resize_drag(context);
+    }
+
+    /// 读取 AI 对话输入区当前文本、选择范围和组合文本范围的快照。
+    fn ai_chat_input_text_snapshot(&self) -> (String, Range<usize>, Option<Range<usize>>) {
+        (
+            self.ai_chat_input_text.clone(),
+            Self::clamp_search_text_range(
+                &self.ai_chat_input_text,
+                self.ai_chat_input_selection_range.clone(),
+            ),
+            self.ai_chat_input_marked_range.clone(),
+        )
+    }
+
+    /// 保存 AI 对话输入区最近一次多行排版结果。
+    fn store_ai_chat_input_text_layouts(
+        &mut self,
+        layouts: Vec<AiChatInputLineLayout>,
+        bounds: Bounds<Pixels>,
+    ) {
+        self.ai_chat_input_last_layouts = layouts;
+        self.ai_chat_input_last_bounds = Some(bounds);
+    }
+
+    /// 返回 AI 对话输入区当前内容需要的可视行数。
+    fn ai_chat_input_visual_line_count(&self) -> usize {
+        Self::thread_analysis_filter_line_ranges(&self.ai_chat_input_text)
+            .len()
+            .max(1)
+    }
+
+    /// 根据窗口坐标返回 AI 对话输入区 UTF-8 字节下标。
+    fn ai_chat_input_index_for_point(&self, position: Point<Pixels>) -> usize {
+        if self.ai_chat_input_text.is_empty() {
+            return 0;
+        }
+        for layout in &self.ai_chat_input_last_layouts {
+            if position.y >= layout.bounds.top() && position.y <= layout.bounds.bottom() {
+                return layout
+                    .byte_range
+                    .start
+                    .saturating_add(
+                        layout
+                            .line
+                            .closest_index_for_x(position.x - layout.bounds.left()),
+                    )
+                    .min(layout.byte_range.end);
+            }
+        }
+        if let Some(bounds) = &self.ai_chat_input_last_bounds
+            && position.y < bounds.top()
+        {
+            return 0;
+        }
+        self.ai_chat_input_text.len()
+    }
+
+    /// 开始 AI 对话输入区鼠标选择。
+    fn start_ai_chat_input_mouse_selection(
+        &mut self,
+        event: &MouseDownEvent,
+        context: &mut Context<Self>,
+    ) {
+        let index = self.ai_chat_input_index_for_point(event.position);
+        self.ai_chat_input_marked_range = None;
+        match event.click_count {
+            0 | 1 => {
+                if event.modifiers.shift {
+                    self.ai_chat_input_selection_range.end = index;
+                    self.ai_chat_input_selection_range = Self::clamp_search_text_range(
+                        &self.ai_chat_input_text,
+                        self.ai_chat_input_selection_range.clone(),
+                    );
+                } else {
+                    self.ai_chat_input_selection_range = index..index;
+                }
+                self.ai_chat_input_selection_drag = Some(self.ai_chat_input_selection_range.start);
+            }
+            2 => {
+                self.ai_chat_input_selection_range =
+                    Self::search_text_word_range_for_index(&self.ai_chat_input_text, index);
+                self.ai_chat_input_selection_drag = None;
+            }
+            _ => {
+                self.ai_chat_input_selection_range = 0..self.ai_chat_input_text.len();
+                self.ai_chat_input_selection_drag = None;
+            }
+        }
+        self.touch_search_text_cursor_activity();
+        context.notify();
+    }
+
+    /// 鼠标拖拽时更新 AI 对话输入区选区终点。
+    fn update_ai_chat_input_mouse_selection(
+        &mut self,
+        position: Point<Pixels>,
+        context: &mut Context<Self>,
+    ) {
+        let Some(anchor) = self.ai_chat_input_selection_drag else {
+            return;
+        };
+        let index = self.ai_chat_input_index_for_point(position);
+        self.ai_chat_input_marked_range = None;
+        self.ai_chat_input_selection_range =
+            Self::clamp_search_text_range(&self.ai_chat_input_text, anchor..index);
+        self.touch_search_text_cursor_activity();
+        context.notify();
+    }
+
+    /// 结束 AI 对话输入区鼠标拖拽选择。
+    fn finish_ai_chat_input_mouse_selection(&mut self, context: &mut Context<Self>) {
+        if self.ai_chat_input_selection_drag.take().is_some() {
+            context.notify();
+        }
+    }
+
+    /// 返回 AI 对话输入区当前选中文本。
+    fn selected_ai_chat_input_text(&self) -> Option<String> {
+        let range = Self::clamp_search_text_range(
+            &self.ai_chat_input_text,
+            self.ai_chat_input_selection_range.clone(),
+        );
+        (range.start < range.end).then(|| self.ai_chat_input_text[range].to_string())
+    }
+
+    /// 用给定文本替换 AI 对话输入区当前选区。
+    fn replace_ai_chat_input_selection(&mut self, replacement: &str) {
+        let replacement = replacement.replace("\r\n", "\n").replace('\r', "\n");
+        let range = self.ai_chat_input_marked_range.take().unwrap_or_else(|| {
+            Self::clamp_search_text_range(
+                &self.ai_chat_input_text,
+                self.ai_chat_input_selection_range.clone(),
+            )
+        });
+        self.ai_chat_input_text
+            .replace_range(range.clone(), &replacement);
+        let cursor = range.start + replacement.len();
+        self.ai_chat_input_selection_range = cursor..cursor;
+    }
+
+    /// 处理 AI 对话输入区按键。
+    ///
+    /// 业务意图：
+    /// - Enter 发送、Shift+Enter 换行；普通字符和中文 IME 提交继续交给平台输入协议，避免手写按键字符破坏输入法。
+    fn handle_ai_chat_input_key_down(&mut self, event: &KeyDownEvent, context: &mut Context<Self>) {
+        if Self::is_paste_keystroke(&event.keystroke) {
+            if let Some(text) = context.read_from_clipboard().and_then(|item| item.text()) {
+                self.replace_ai_chat_input_selection(&text);
+                self.touch_search_text_cursor_activity();
+                context.notify();
+            }
+            context.stop_propagation();
+            return;
+        }
+
+        if Self::is_copy_keystroke(&event.keystroke) {
+            if let Some(text) = self.selected_ai_chat_input_text() {
+                context.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            context.stop_propagation();
+            return;
+        }
+
+        if Self::is_cut_keystroke(&event.keystroke) {
+            if let Some(text) = self.selected_ai_chat_input_text() {
+                context.write_to_clipboard(ClipboardItem::new_string(text));
+                self.replace_ai_chat_input_selection("");
+                self.touch_search_text_cursor_activity();
+                context.notify();
+            }
+            context.stop_propagation();
+            return;
+        }
+
+        if Self::is_select_all_keystroke(&event.keystroke) {
+            self.ai_chat_input_marked_range = None;
+            self.ai_chat_input_selection_range = 0..self.ai_chat_input_text.len();
+            self.touch_search_text_cursor_activity();
+            context.stop_propagation();
+            context.notify();
+            return;
+        }
+
+        match event.keystroke.key.as_str() {
+            "enter" => {
+                if event.keystroke.modifiers.shift {
+                    self.replace_ai_chat_input_selection("\n");
+                    self.touch_search_text_cursor_activity();
+                } else {
+                    self.start_ai_chat_send(context);
+                }
+                context.stop_propagation();
+                context.notify();
+            }
+            "left" => {
+                self.ai_chat_input_marked_range = None;
+                if event.keystroke.modifiers.shift {
+                    self.ai_chat_input_selection_range.end = Self::previous_search_text_boundary(
+                        &self.ai_chat_input_text,
+                        self.ai_chat_input_selection_range.end,
+                    );
+                    self.ai_chat_input_selection_range = Self::clamp_search_text_range(
+                        &self.ai_chat_input_text,
+                        self.ai_chat_input_selection_range.clone(),
+                    );
+                } else if self.ai_chat_input_selection_range.start
+                    != self.ai_chat_input_selection_range.end
+                {
+                    self.ai_chat_input_selection_range = self.ai_chat_input_selection_range.start
+                        ..self.ai_chat_input_selection_range.start;
+                } else {
+                    let cursor = Self::previous_search_text_boundary(
+                        &self.ai_chat_input_text,
+                        self.ai_chat_input_selection_range.end,
+                    );
+                    self.ai_chat_input_selection_range = cursor..cursor;
+                }
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "right" => {
+                self.ai_chat_input_marked_range = None;
+                if event.keystroke.modifiers.shift {
+                    self.ai_chat_input_selection_range.end = Self::next_search_text_boundary(
+                        &self.ai_chat_input_text,
+                        self.ai_chat_input_selection_range.end,
+                    );
+                    self.ai_chat_input_selection_range = Self::clamp_search_text_range(
+                        &self.ai_chat_input_text,
+                        self.ai_chat_input_selection_range.clone(),
+                    );
+                } else if self.ai_chat_input_selection_range.start
+                    != self.ai_chat_input_selection_range.end
+                {
+                    self.ai_chat_input_selection_range = self.ai_chat_input_selection_range.end
+                        ..self.ai_chat_input_selection_range.end;
+                } else {
+                    let cursor = Self::next_search_text_boundary(
+                        &self.ai_chat_input_text,
+                        self.ai_chat_input_selection_range.end,
+                    );
+                    self.ai_chat_input_selection_range = cursor..cursor;
+                }
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "up" => {
+                self.ai_chat_input_marked_range = None;
+                self.ai_chat_input_selection_range = 0..0;
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "down" => {
+                self.ai_chat_input_marked_range = None;
+                let cursor = self.ai_chat_input_text.len();
+                self.ai_chat_input_selection_range = cursor..cursor;
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "backspace" => {
+                if self.ai_chat_input_selection_range.start
+                    != self.ai_chat_input_selection_range.end
+                    || self.ai_chat_input_marked_range.is_some()
+                {
+                    self.replace_ai_chat_input_selection("");
+                } else if let Some((previous_index, _)) = self.ai_chat_input_text
+                    [..self.ai_chat_input_selection_range.end]
+                    .char_indices()
+                    .next_back()
+                {
+                    let cursor = self.ai_chat_input_selection_range.end;
+                    self.ai_chat_input_text
+                        .replace_range(previous_index..cursor, "");
+                    self.ai_chat_input_selection_range = previous_index..previous_index;
+                    self.ai_chat_input_marked_range = None;
+                }
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "delete" => {
+                if self.ai_chat_input_selection_range.start
+                    != self.ai_chat_input_selection_range.end
+                    || self.ai_chat_input_marked_range.is_some()
+                {
+                    self.replace_ai_chat_input_selection("");
+                } else if let Some((next_index, next_character)) = self.ai_chat_input_text
+                    [self.ai_chat_input_selection_range.end..]
+                    .char_indices()
+                    .next()
+                {
+                    let start = self.ai_chat_input_selection_range.end + next_index;
+                    let end = start + next_character.len_utf8();
+                    self.ai_chat_input_text.replace_range(start..end, "");
+                    self.ai_chat_input_selection_range = start..start;
+                    self.ai_chat_input_marked_range = None;
+                }
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "escape" => {}
+            _ => {}
+        }
+    }
+
+    /// 开始发送 AI 对话消息。
+    fn start_ai_chat_send(&mut self, context: &mut Context<Self>) {
+        if !self.ai_chat_can_send() {
+            return;
+        }
+        let Some(path) = self.ai_chat_database_path_or_error() else {
+            context.notify();
+            return;
+        };
+        let Some(conversation_id) = self.ai_chat_active_conversation_id.clone() else {
+            return;
+        };
+        let Some(profile) = self.active_ai_chat_model_profile() else {
+            self.ai_chat_database_error = Some("需要选择一个可用模型配置".to_string());
+            context.notify();
+            return;
+        };
+
+        let content = self.ai_chat_input_text.trim().to_string();
+        let now = current_unix_time_millis();
+        let next_sequence = self
+            .ai_chat_messages
+            .last()
+            .map(|message| message.sequence.saturating_add(1))
+            .unwrap_or(1);
+        let user_message = AiChatMessage {
+            id: new_ai_chat_entity_id("ai-message"),
+            conversation_id: conversation_id.clone(),
+            role: AiChatMessageRole::User,
+            content,
+            status: AiChatMessageStatus::Complete,
+            error_message: None,
+            sequence: next_sequence,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        let assistant_message = AiChatMessage {
+            id: new_ai_chat_entity_id("ai-message"),
+            conversation_id: conversation_id.clone(),
+            role: AiChatMessageRole::Assistant,
+            content: String::new(),
+            status: AiChatMessageStatus::Streaming,
+            error_message: None,
+            sequence: next_sequence.saturating_add(1),
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+
+        if let Err(error) = insert_ai_chat_message(&path, &user_message)
+            .and_then(|_| insert_ai_chat_message(&path, &assistant_message))
+        {
+            self.ai_chat_database_error = Some(error);
+            context.notify();
+            return;
+        }
+
+        let old_message_count = self.ai_chat_messages.len();
+        self.ai_chat_messages.push(user_message.clone());
+        self.ai_chat_messages.push(assistant_message.clone());
+        self.ai_chat_message_list_state
+            .splice(old_message_count..old_message_count, 2);
+        self.ai_chat_message_list_state
+            .scroll_to_reveal_item(self.ai_chat_messages.len().saturating_sub(1));
+        self.ai_chat_input_text.clear();
+        self.ai_chat_input_selection_range = 0..0;
+        self.ai_chat_input_marked_range = None;
+        self.ai_chat_database_error = None;
+
+        let mut conversation_to_update = None;
+        let should_update_title = self
+            .active_ai_chat_conversation()
+            .is_some_and(|conversation| conversation.title == "新对话");
+        if let Some(conversation) = self.active_ai_chat_conversation_mut() {
+            if should_update_title {
+                conversation.title = ai_chat_title_from_user_message(&user_message.content);
+            }
+            conversation.updated_at_ms = now;
+            conversation_to_update = Some(conversation.clone());
+        }
+        if let Some(conversation) = conversation_to_update {
+            if let Err(error) = update_ai_chat_conversation(&path, &conversation) {
+                self.ai_chat_database_error = Some(error);
+            }
+            self.sort_ai_chat_conversations();
+            self.reset_ai_chat_conversation_list_state();
+        }
+
+        let request_messages = self.ai_chat_messages.clone();
+        let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_for_task = cancel.clone();
+        let job_id = self.next_ai_chat_job_id;
+        self.next_ai_chat_job_id = self.next_ai_chat_job_id.saturating_add(1);
+        self.ai_chat_streaming_task = Some(AiChatStreamingTask {
+            job_id,
+            conversation_id,
+            assistant_message_id: assistant_message.id,
+            receiver,
+            cancel,
+            last_persisted_len: 0,
+        });
+
+        context
+            .background_spawn(async move {
+                stream_openai_compatible_ai_chat(
+                    profile,
+                    request_messages,
+                    cancel_for_task,
+                    sender,
+                );
+            })
+            .detach();
+        self.schedule_ai_chat_stream_poll(context);
+        context.notify();
+    }
+
+    /// 停止当前 AI 流式生成。
+    fn stop_ai_chat_streaming(&mut self, context: &mut Context<Self>) {
+        self.finish_ai_chat_streaming_task_immediately(AiChatMessageStatus::Stopped, None);
+        context.notify();
+    }
+
+    /// 停止 AI 流式生成但不触发重绘。
+    fn stop_ai_chat_streaming_without_notify(&mut self) {
+        self.finish_ai_chat_streaming_task_immediately(AiChatMessageStatus::Stopped, None);
+    }
+
+    /// 立即结束当前 AI 流式任务并持久化助手消息状态。
+    ///
+    /// 业务意图：
+    /// - 用户点击停止、切换会话或删除会话时，前台状态必须立即从 `streaming` 变为终态，不能等待后台阻塞读取返回。
+    /// - 后台线程可能稍后才从网络读取中退出；这里先丢弃接收器并设置取消标记，后续旧事件不会再覆盖当前 UI 状态。
+    fn finish_ai_chat_streaming_task_immediately(
+        &mut self,
+        status: AiChatMessageStatus,
+        error_message: Option<String>,
+    ) {
+        let Some(task) = self.ai_chat_streaming_task.take() else {
+            return;
+        };
+        task.cancel.store(true, Ordering::Relaxed);
+        self.finish_ai_chat_assistant_message(&task.assistant_message_id, status, error_message);
+    }
+
+    /// 安排前台轮询 AI 流式事件。
+    fn schedule_ai_chat_stream_poll(&self, context: &mut Context<Self>) {
+        context
+            .spawn(async move |view, app| {
+                loop {
+                    app.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                    let keep_polling = view
+                        .update(app, |view, context| {
+                            view.drain_ai_chat_stream_events(context);
+                            view.ai_chat_streaming_task.is_some()
+                        })
+                        .unwrap_or(false);
+                    if !keep_polling {
+                        break;
+                    }
+                }
+            })
+            .detach();
+    }
+
+    /// 处理后台 AI 流式事件。
+    fn drain_ai_chat_stream_events(&mut self, context: &mut Context<Self>) {
+        loop {
+            let event = match self.ai_chat_streaming_task.as_ref() {
+                Some(task) => match task.receiver.try_recv() {
+                    Ok(event) => event,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => AiChatStreamEvent::Done,
+                },
+                None => break,
+            };
+            self.apply_ai_chat_stream_event(event);
+        }
+        context.notify();
+    }
+
+    /// 应用单个 AI 流式事件。
+    fn apply_ai_chat_stream_event(&mut self, event: AiChatStreamEvent) {
+        let Some(task_snapshot) = self.ai_chat_streaming_task.as_ref().map(|task| {
+            (
+                task.conversation_id.clone(),
+                task.assistant_message_id.clone(),
+                task.job_id,
+            )
+        }) else {
+            return;
+        };
+        let (conversation_id, assistant_message_id, _job_id) = task_snapshot;
+        if self.ai_chat_active_conversation_id.as_deref() != Some(conversation_id.as_str()) {
+            return;
+        }
+
+        match event {
+            AiChatStreamEvent::Delta(delta) => {
+                let mut message_to_persist = None;
+                let mut changed_message_id = None;
+                if let Some(message) = self
+                    .ai_chat_messages
+                    .iter_mut()
+                    .find(|message| message.id == assistant_message_id)
+                {
+                    message.content.push_str(&delta);
+                    message.updated_at_ms = current_unix_time_millis();
+                    changed_message_id = Some(message.id.clone());
+                    if let Some(task) = self.ai_chat_streaming_task.as_mut()
+                        && message
+                            .content
+                            .len()
+                            .saturating_sub(task.last_persisted_len)
+                            >= 512
+                    {
+                        task.last_persisted_len = message.content.len();
+                        message_to_persist = Some(message.clone());
+                    }
+                }
+                if let Some(message) = message_to_persist {
+                    self.persist_ai_chat_message(&message);
+                }
+                if let Some(message_id) = changed_message_id {
+                    self.invalidate_ai_chat_message_row(&message_id);
+                }
+            }
+            AiChatStreamEvent::Done => {
+                self.finish_ai_chat_assistant_message(
+                    &assistant_message_id,
+                    AiChatMessageStatus::Complete,
+                    None,
+                );
+                self.ai_chat_streaming_task = None;
+            }
+            AiChatStreamEvent::Stopped => {
+                self.finish_ai_chat_assistant_message(
+                    &assistant_message_id,
+                    AiChatMessageStatus::Stopped,
+                    None,
+                );
+                self.ai_chat_streaming_task = None;
+            }
+            AiChatStreamEvent::Error(message) => {
+                self.finish_ai_chat_assistant_message(
+                    &assistant_message_id,
+                    AiChatMessageStatus::Failed,
+                    Some(message),
+                );
+                self.ai_chat_streaming_task = None;
+            }
+        }
+    }
+
+    /// 完成、停止或失败 AI 助手消息。
+    fn finish_ai_chat_assistant_message(
+        &mut self,
+        message_id: &str,
+        status: AiChatMessageStatus,
+        error_message: Option<String>,
+    ) {
+        let message_to_persist = finish_ai_chat_assistant_message_in_list(
+            &mut self.ai_chat_messages,
+            message_id,
+            status,
+            error_message,
+        );
+        if let Some(message) = message_to_persist {
+            self.persist_ai_chat_message(&message);
+        }
+        self.invalidate_ai_chat_message_row(message_id);
+    }
+
+    /// 持久化 AI 消息并把错误写回页面状态。
+    fn persist_ai_chat_message(&mut self, message: &AiChatMessage) {
+        let Some(path) = ai_chat_database_path() else {
+            self.ai_chat_database_error =
+                Some("当前平台没有可用的应用配置目录，无法保存 AI 对话历史".to_string());
+            return;
+        };
+        if let Err(error) = update_ai_chat_message(&path, message) {
+            self.ai_chat_database_error = Some(error);
+        }
+    }
+
     /// 读取快搜关键字输入区当前文本、选择范围和组合文本范围的快照。
     fn quick_search_keywords_text_snapshot(&self) -> (String, Range<usize>, Option<Range<usize>>) {
         (
@@ -11796,7 +13973,7 @@ impl MainView {
             MainFeature::HprofAnalysis => {
                 self.render_hprof_analysis_page(context).into_any_element()
             }
-            MainFeature::AiChat => self.render_ai_chat_placeholder().into_any_element(),
+            MainFeature::AiChat => self.render_ai_chat_page(context).into_any_element(),
         }
     }
 
@@ -11884,22 +14061,597 @@ impl MainView {
             .on_click(context.listener(Self::open_hprof_from_toolbar))
     }
 
-    /// 渲染 AI 对话占位页。
+    /// 渲染 AI 对话页。
     ///
     /// 业务意图：
-    /// - 本次需求只要求拆出 AI 对话大功能，不定义真实对话请求、上下文保存、流式输出或错误策略，因此这里只提供静态占位。
-    fn render_ai_chat_placeholder(&self) -> impl IntoElement {
+    /// - AI 对话页提供多会话管理、模型选择、消息显示和流式输入，是日志查看器内的智能排障入口。
+    fn render_ai_chat_page(&self, context: &mut Context<Self>) -> impl IntoElement {
         let palette = self.palette();
         div()
-            .id("ai-chat-placeholder")
+            .id("ai-chat-page")
+            .relative()
+            .flex()
+            .size_full()
+            .bg(rgb(palette.background))
+            .on_mouse_move(context.listener(Self::handle_ai_chat_mouse_move))
+            .on_mouse_up(
+                MouseButton::Left,
+                context.listener(Self::handle_ai_chat_mouse_up),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                context.listener(Self::handle_ai_chat_mouse_up),
+            )
+            .child(self.render_ai_chat_sidebar(palette, context))
+            .child(self.render_ai_chat_workspace(palette, context))
+            .when(self.ai_chat_input_resize_drag.is_some(), |page| {
+                page.child(
+                    div()
+                        .id("ai-chat-input-resize-cursor-overlay")
+                        .absolute()
+                        .left(px(0.0))
+                        .right(px(0.0))
+                        .top(px(0.0))
+                        .bottom(px(0.0))
+                        .cursor_row_resize()
+                        .on_mouse_move(context.listener(Self::handle_ai_chat_mouse_move))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            context.listener(Self::handle_ai_chat_mouse_up),
+                        )
+                        .on_mouse_up_out(
+                            MouseButton::Left,
+                            context.listener(Self::handle_ai_chat_mouse_up),
+                        ),
+                )
+            })
+    }
+
+    /// 渲染 AI 对话左侧会话栏。
+    fn render_ai_chat_sidebar(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("ai-chat-sidebar")
+            .flex()
+            .flex_col()
+            .w(px(AI_CHAT_CONVERSATION_LIST_WIDTH))
+            .h_full()
+            .flex_none()
+            .border_r_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.panel))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .h(px(AI_CHAT_TOP_BAR_HEIGHT))
+                    .px_3()
+                    .border_b_1()
+                    .border_color(rgb(palette.border))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(palette.text))
+                            .child(Self::render_lucide_icon(
+                                Some(Icon::BotMessageSquare),
+                                15.0,
+                                15.0,
+                                palette.muted_text,
+                            ))
+                            .child("AI对话"),
+                    )
+                    .child(
+                        div()
+                            .id("ai-chat-new-conversation")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(28.0))
+                            .h(px(28.0))
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .hover(move |button| button.bg(rgb(palette.hover)))
+                            .child(Self::render_lucide_icon(
+                                Some(Icon::Plus),
+                                15.0,
+                                15.0,
+                                palette.text,
+                            ))
+                            .on_click(context.listener(
+                                |view, _event: &ClickEvent, _window, context| {
+                                    view.create_ai_chat_conversation(context);
+                                },
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .id("ai-chat-conversation-list")
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .id("ai-chat-conversation-list-viewport")
+                            .relative()
+                            .size_full()
+                            .p_2()
+                            .overflow_hidden()
+                            .child(
+                                list(
+                                    self.ai_chat_conversation_list_state.clone(),
+                                    context.processor(
+                                        move |view, index: usize, _window, context| {
+                                            view.render_ai_chat_conversation_item_at_index(
+                                                index, palette, context,
+                                            )
+                                        },
+                                    ),
+                                )
+                                .size_full(),
+                            )
+                            .child(self.render_ai_chat_list_scrollbar(
+                                AiChatScrollArea::Conversations,
+                                &self.ai_chat_conversation_list_state,
+                                palette,
+                                context,
+                            )),
+                    ),
+            )
+    }
+
+    /// 按索引渲染 AI 会话列表项。
+    ///
+    /// 性能约束：
+    /// - 该方法由虚拟列表按可视区间调用，只读取当前索引对应的会话，避免历史很多时一次性创建所有行元素。
+    fn render_ai_chat_conversation_item_at_index(
+        &self,
+        index: usize,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        self.ai_chat_conversations
+            .get(index)
+            .cloned()
+            .map(|conversation| {
+                self.render_ai_chat_conversation_item(&conversation, palette, context)
+                    .into_any_element()
+            })
+            .unwrap_or_else(|| {
+                div()
+                    .id("ai-chat-conversation-missing")
+                    .hidden()
+                    .into_any_element()
+            })
+    }
+
+    /// 渲染单个 AI 会话列表项。
+    fn render_ai_chat_conversation_item(
+        &self,
+        conversation: &AiChatConversation,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let conversation_id = conversation.id.clone();
+        let selected = self.ai_chat_active_conversation_id.as_deref() == Some(&conversation.id);
+        div()
+            .id(SharedString::from(format!(
+                "ai-chat-conversation-{}",
+                conversation.id
+            )))
+            .flex()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .min_w_0()
+            .h(px(36.0))
+            .mb_1()
+            .px_2()
+            .rounded(px(6.0))
+            .bg(rgb(if selected {
+                palette.selected
+            } else {
+                palette.panel
+            }))
+            .text_sm()
+            .text_color(rgb(if selected {
+                palette.accent
+            } else {
+                palette.text
+            }))
+            .cursor_pointer()
+            .hover(move |row| {
+                row.bg(rgb(if selected {
+                    palette.selected
+                } else {
+                    palette.hover
+                }))
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(conversation.title.clone()),
+            )
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, _window, context| {
+                    view.select_ai_chat_conversation(&conversation_id, context);
+                }),
+            )
+    }
+
+    /// 渲染 AI 对话右侧工作区。
+    fn render_ai_chat_workspace(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("ai-chat-workspace")
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(self.render_ai_chat_header(palette, context))
+            .child(self.render_ai_chat_messages(palette, context))
+            .child(self.render_ai_chat_input_bar(palette, context))
+            .when(self.ai_chat_model_menu_open, |workspace| {
+                workspace
+                    .child(self.render_ai_chat_model_menu_dismiss_overlay(context))
+                    .child(self.render_ai_chat_model_menu(palette, context))
+            })
+    }
+
+    /// 渲染 AI 对话顶部栏。
+    fn render_ai_chat_header(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let title = self
+            .active_ai_chat_conversation()
+            .map(|conversation| conversation.title.clone())
+            .unwrap_or_else(|| "AI对话".to_string());
+        div()
+            .id("ai-chat-header")
+            .relative()
+            .flex()
+            .items_center()
+            .justify_between()
+            .h(px(AI_CHAT_TOP_BAR_HEIGHT))
+            .px_4()
+            .border_b_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.background))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(palette.text))
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .id("ai-chat-delete-conversation")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(26.0))
+                            .h(px(26.0))
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .hover(move |button| button.bg(rgb(palette.hover)))
+                            .child(Self::render_lucide_icon(
+                                Some(Icon::Trash2),
+                                14.0,
+                                14.0,
+                                palette.muted_text,
+                            ))
+                            .on_click(context.listener(
+                                |view, _event: &ClickEvent, _window, context| {
+                                    view.delete_active_ai_chat_conversation(context);
+                                },
+                            )),
+                    ),
+            )
+    }
+
+    /// 渲染 AI 对话模型选择器。
+    fn render_ai_chat_model_selector(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let label = self
+            .active_ai_chat_model_profile()
+            .map(|profile| profile.name)
+            .unwrap_or_else(|| "选择模型".to_string());
+        div()
+            .id("ai-chat-model-selector")
+            .flex()
+            .items_center()
+            .gap_1()
+            .h(px(AI_CHAT_MODEL_SELECTOR_HEIGHT))
+            .px_3()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.panel))
+            .text_xs()
+            .text_color(rgb(palette.text))
+            .cursor_pointer()
+            .hover(move |button| button.bg(rgb(palette.hover)))
+            .child(div().max_w(px(180.0)).truncate().child(label))
+            .child(Self::render_lucide_icon(
+                Some(Icon::ChevronDown),
+                13.0,
+                13.0,
+                palette.muted_text,
+            ))
+            .on_click(
+                context.listener(|view, _event: &ClickEvent, _window, context| {
+                    view.toggle_ai_chat_model_menu(context);
+                }),
+            )
+    }
+
+    /// 渲染 AI 对话模型下拉菜单。
+    ///
+    /// UI 约束：
+    /// - 菜单浮在消息区和输入区之上，外壳必须消费左右键事件，避免点击菜单空白处穿透到输入框或消息区域。
+    fn render_ai_chat_model_menu(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("ai-chat-model-menu")
+            .absolute()
+            .left(px(AI_CHAT_MODEL_MENU_LEFT_OFFSET))
+            .bottom(px(AI_CHAT_MODEL_MENU_BOTTOM_OFFSET))
+            .w(px(260.0))
+            .max_h(px(260.0))
+            .overflow_y_scroll()
+            .scrollbar_width(px(6.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.menu))
+            .shadow_lg()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    // 菜单空白区域需要停留在菜单层，不应触发底层输入框聚焦或消息区选择。
+                    context.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    // 右键同样不能穿透到底层聊天区域，避免后续新增右键菜单时出现误触。
+                    context.stop_propagation();
+                }),
+            )
+            .children(
+                self.model_config_profiles
+                    .iter()
+                    .map(|profile| {
+                        let profile_id = profile.id.clone();
+                        let selected =
+                            self.active_ai_chat_model_profile_id() == Some(profile.id.as_str());
+                        div()
+                            .id(SharedString::from(format!("ai-chat-model-{profile_id}")))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .h(px(34.0))
+                            .text_xs()
+                            .text_color(rgb(if selected {
+                                palette.accent
+                            } else {
+                                palette.text
+                            }))
+                            .cursor_pointer()
+                            .hover(move |item| item.bg(rgb(palette.hover)))
+                            .child(Self::render_lucide_icon(
+                                Some(if selected {
+                                    Icon::Check
+                                } else {
+                                    Icon::MonitorCog
+                                }),
+                                13.0,
+                                13.0,
+                                if selected {
+                                    palette.accent
+                                } else {
+                                    palette.muted_text
+                                },
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(format!("{} · {}", profile.name, profile.model)),
+                            )
+                            .on_click(context.listener(
+                                move |view, _event: &ClickEvent, _window, context| {
+                                    view.select_ai_chat_model_profile(&profile_id, context);
+                                    context.stop_propagation();
+                                },
+                            ))
+                    })
+                    .collect::<Vec<_>>(),
+            )
+    }
+
+    /// 渲染 AI 对话模型菜单的关闭遮罩。
+    ///
+    /// 业务意图：
+    /// - 模型菜单打开后，点击菜单外区域应收起菜单，并且这次点击不能继续落到消息区、历史栏或输入框。
+    fn render_ai_chat_model_menu_dismiss_overlay(
+        &self,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("ai-chat-model-menu-dismiss-overlay")
+            .absolute()
+            .left(px(0.0))
+            .right(px(0.0))
+            .top(px(0.0))
+            .bottom(px(0.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|view, _event: &MouseDownEvent, _window, context| {
+                    view.ai_chat_model_menu_open = false;
+                    context.notify();
+                    context.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(|view, _event: &MouseDownEvent, _window, context| {
+                    view.ai_chat_model_menu_open = false;
+                    context.notify();
+                    context.stop_propagation();
+                }),
+            )
+    }
+
+    /// 渲染 AI 对话虚拟列表滚动条。
+    ///
+    /// 业务意图：
+    /// - `ListState` 负责滚轮和虚拟渲染，自绘滚动条负责给用户明确的当前位置提示和拖动入口。
+    /// - 只有内容高度超过视口高度时才显示滚动条，避免少量历史或消息时出现无效控件。
+    fn render_ai_chat_list_scrollbar(
+        &self,
+        area: AiChatScrollArea,
+        list_state: &ListState,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let Some(metrics) = Self::ai_chat_list_scrollbar_metrics(list_state) else {
+            return div()
+                .id(match area {
+                    AiChatScrollArea::Conversations => "ai-chat-conversation-scrollbar-empty",
+                    AiChatScrollArea::Messages => "ai-chat-message-scrollbar-empty",
+                })
+                .hidden();
+        };
+        let element_id = match area {
+            AiChatScrollArea::Conversations => "ai-chat-conversation-scrollbar",
+            AiChatScrollArea::Messages => "ai-chat-message-scrollbar",
+        };
+
+        div()
+            .id(element_id)
+            .absolute()
+            .top(metrics.thumb_start)
+            .right(px(AI_CHAT_SCROLLBAR_PADDING))
+            .w(px(AI_CHAT_SCROLLBAR_WIDTH))
+            .h(metrics.thumb_length)
+            .rounded(px(AI_CHAT_SCROLLBAR_WIDTH / 2.0))
+            .bg(rgb(palette.scrollbar))
+            .cursor_pointer()
+            .hover(move |thumb| thumb.bg(rgb(palette.scrollbar_hover)))
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(move |view, event: &MouseDownEvent, _window, context| {
+                    view.start_ai_chat_scrollbar_drag(area, event);
+                    context.notify();
+                    // 滚动条覆盖在虚拟列表上，按下事件必须在滑块处结束，避免同时触发会话切换或文本选择。
+                    context.stop_propagation();
+                }),
+            )
+    }
+
+    /// 渲染 AI 对话消息区。
+    fn render_ai_chat_messages(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let mut messages = div()
+            .id("ai-chat-messages")
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .overflow_hidden()
+            .bg(rgb(palette.background));
+
+        if self.model_config_profiles.is_empty() {
+            messages = messages.child(self.render_ai_chat_empty_state(
+                ai_chat_placeholder_description(&self.model_config_profiles),
+                palette,
+            ));
+        } else if let Some(error) = &self.ai_chat_database_error {
+            messages = messages.child(self.render_ai_chat_empty_state(error, palette));
+        } else if self.ai_chat_messages.is_empty() {
+            messages = messages
+                .child(self.render_ai_chat_empty_state("输入问题后开始新的 AI 对话", palette));
+        } else {
+            messages = messages.child(
+                div()
+                    .id("ai-chat-message-list-viewport")
+                    .relative()
+                    .size_full()
+                    .px_4()
+                    .overflow_hidden()
+                    .child(
+                        list(
+                            self.ai_chat_message_list_state.clone(),
+                            context.processor(move |view, index: usize, _window, _context| {
+                                view.render_ai_chat_message_at_index(index, palette)
+                            }),
+                        )
+                        .size_full(),
+                    )
+                    .child(self.render_ai_chat_list_scrollbar(
+                        AiChatScrollArea::Messages,
+                        &self.ai_chat_message_list_state,
+                        palette,
+                        context,
+                    )),
+            );
+        }
+        messages
+    }
+
+    /// 渲染 AI 对话空态。
+    fn render_ai_chat_empty_state(
+        &self,
+        message: &str,
+        palette: AppThemePalette,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("ai-chat-empty-state")
             .flex()
             .flex_col()
             .items_center()
             .justify_center()
             .gap_2()
             .size_full()
-            .px_4()
-            .bg(rgb(palette.background))
+            .text_color(rgb(palette.muted_text))
             .child(Self::render_lucide_icon(
                 Some(Icon::BotMessageSquare),
                 34.0,
@@ -11913,11 +14665,352 @@ impl MainView {
                     .text_color(rgb(palette.text))
                     .child("AI对话"),
             )
+            .child(div().text_sm().child(message.to_string()))
+    }
+
+    /// 按索引渲染 AI 消息行。
+    ///
+    /// 性能约束：
+    /// - 该方法只由消息虚拟列表调用，避免历史消息很多时一次性创建所有气泡。
+    fn render_ai_chat_message_at_index(
+        &self,
+        index: usize,
+        palette: AppThemePalette,
+    ) -> gpui::AnyElement {
+        self.ai_chat_messages
+            .get(index)
+            .map(|message| {
+                let top_gap = if index == 0 {
+                    AI_CHAT_FIRST_MESSAGE_TOP_GAP
+                } else {
+                    0.0
+                };
+                self.render_ai_chat_message(message, top_gap, palette)
+                    .into_any_element()
+            })
+            .unwrap_or_else(|| {
+                div()
+                    .id("ai-chat-message-missing")
+                    .hidden()
+                    .into_any_element()
+            })
+    }
+
+    /// 渲染单条 AI 对话消息。
+    fn render_ai_chat_message(
+        &self,
+        message: &AiChatMessage,
+        top_gap: f32,
+        palette: AppThemePalette,
+    ) -> gpui::Stateful<gpui::Div> {
+        let is_user = message.role == AiChatMessageRole::User;
+        let status_text = match message.status {
+            AiChatMessageStatus::Streaming => Some("生成中..."),
+            AiChatMessageStatus::Stopped => Some("已停止"),
+            AiChatMessageStatus::Failed => message.error_message.as_deref().or(Some("请求失败")),
+            AiChatMessageStatus::Complete => None,
+        };
+        div()
+            .id(SharedString::from(format!(
+                "ai-chat-message-{}",
+                message.id
+            )))
+            .flex()
+            .w_full()
+            .min_w_0()
+            .justify_end()
+            .when(!is_user, |row| row.justify_start())
+            .pt(px(top_gap))
+            .pb(px(AI_CHAT_MESSAGE_ROW_GAP))
             .child(
                 div()
-                    .text_sm()
-                    .text_color(rgb(palette.muted_text))
-                    .child("当前版本尚未接入对话请求。"),
+                    .max_w(relative(0.74))
+                    .min_w_0()
+                    .overflow_hidden()
+                    .rounded(px(8.0))
+                    .px_3()
+                    .py_2()
+                    .bg(rgb(if is_user {
+                        palette.selected
+                    } else {
+                        palette.surface
+                    }))
+                    .border_1()
+                    .border_color(rgb(if is_user {
+                        palette.accent
+                    } else {
+                        palette.border
+                    }))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(if is_user {
+                                palette.accent
+                            } else {
+                                palette.muted_text
+                            }))
+                            .child(if is_user { "你" } else { "助手" }),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .w_full()
+                            .min_w_0()
+                            .text_sm()
+                            .line_height(px(21.0))
+                            .whitespace_normal()
+                            .text_color(rgb(palette.text))
+                            .child(if message.content.is_empty() {
+                                status_text.unwrap_or("").to_string()
+                            } else {
+                                message.content.clone()
+                            }),
+                    )
+                    .when(
+                        status_text.is_some() && !message.content.is_empty(),
+                        |bubble| {
+                            bubble.child(
+                                div()
+                                    .mt_1()
+                                    .text_xs()
+                                    .text_color(rgb(
+                                        if message.status == AiChatMessageStatus::Failed {
+                                            palette.error
+                                        } else {
+                                            palette.muted_text
+                                        },
+                                    ))
+                                    .child(status_text.unwrap_or("").to_string()),
+                            )
+                        },
+                    ),
+            )
+    }
+
+    /// 渲染 AI 对话输入栏。
+    fn render_ai_chat_input_bar(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let can_send = self.ai_chat_can_send();
+        let is_streaming = self.ai_chat_streaming_task.is_some();
+        div()
+            .id("ai-chat-input-bar")
+            .relative()
+            .px(px(AI_CHAT_INPUT_BAR_PADDING))
+            .py(px(AI_CHAT_INPUT_BAR_PADDING))
+            .border_t_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.panel))
+            .child(self.render_ai_chat_input_resize_handle(palette, context))
+            .child(self.render_ai_chat_input(can_send, is_streaming, palette, context))
+    }
+
+    /// 渲染 AI 对话输入区高度拖拽条。
+    ///
+    /// UI 约束：
+    /// - 拖拽条覆盖输入栏顶部边缘，只消费鼠标事件，不绘制额外线条，避免和输入栏原有顶部分割线形成双线。
+    fn render_ai_chat_input_resize_handle(
+        &self,
+        _palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("ai-chat-input-resize-handle")
+            .absolute()
+            .top(px(-(AI_CHAT_INPUT_RESIZE_HANDLE_HEIGHT / 2.0)))
+            .left(px(0.0))
+            .right(px(0.0))
+            .h(px(AI_CHAT_INPUT_RESIZE_HANDLE_HEIGHT))
+            .cursor_row_resize()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|view, event: &MouseDownEvent, _window, context| {
+                    view.start_ai_chat_input_resize(event);
+                    context.notify();
+                    context.stop_propagation();
+                }),
+            )
+    }
+
+    /// 渲染 AI 对话多行输入框。
+    fn render_ai_chat_input(
+        &self,
+        can_send: bool,
+        is_streaming: bool,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("ai-chat-input")
+            .relative()
+            .w(relative(1.0))
+            .h(px(self.ai_chat_input_height))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.input))
+            .track_focus(&self.ai_chat_input_focus)
+            .key_context("ai-chat-input")
+            .on_key_down(
+                context.listener(|view, event: &KeyDownEvent, _window, context| {
+                    view.handle_ai_chat_input_key_down(event, context);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|view, event: &MouseDownEvent, window, context| {
+                    view.start_ai_chat_input_mouse_selection(event, context);
+                    window.focus(&view.ai_chat_input_focus);
+                    context.stop_propagation();
+                }),
+            )
+            .on_mouse_move(
+                context.listener(|view, event: &MouseMoveEvent, _window, context| {
+                    view.update_ai_chat_input_mouse_selection(event.position, context);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                context.listener(|view, _event: &MouseUpEvent, _window, context| {
+                    view.finish_ai_chat_input_mouse_selection(context);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                context.listener(|view, _event: &MouseUpEvent, _window, context| {
+                    view.finish_ai_chat_input_mouse_selection(context);
+                }),
+            )
+            .child(
+                div()
+                    .id("ai-chat-input-scroll")
+                    .size_full()
+                    .px_3()
+                    .pt(px(8.0))
+                    .pb(px(AI_CHAT_INPUT_CONTENT_BOTTOM_PADDING))
+                    .overflow_y_scroll()
+                    .scrollbar_width(px(6.0))
+                    .text_size(px(14.0))
+                    .line_height(px(AI_CHAT_INPUT_LINE_HEIGHT))
+                    .text_color(rgb(palette.text))
+                    .child(AiChatInputElement {
+                        view: context.entity(),
+                        focus_handle: self.ai_chat_input_focus.clone(),
+                        placeholder: "输入问题，Enter 发送，Shift+Enter 换行",
+                        palette,
+                    }),
+            )
+            .child(self.render_ai_chat_input_floating_controls(
+                can_send,
+                is_streaming,
+                palette,
+                context,
+            ))
+    }
+
+    /// 渲染 AI 对话输入框底部浮层控件。
+    ///
+    /// UI 约束：
+    /// - 模型选择和发送按钮悬浮在输入区域底部，不能参与输入框外部布局计算，否则会重新挤压文本区高度。
+    /// - 浮层需要消费鼠标按下事件，避免点击按钮时触发底层文本框选区和焦点逻辑。
+    fn render_ai_chat_input_floating_controls(
+        &self,
+        can_send: bool,
+        is_streaming: bool,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("ai-chat-input-floating-controls")
+            .absolute()
+            .left(px(AI_CHAT_INPUT_FLOATING_CONTROLS_HORIZONTAL_INSET))
+            .right(px(AI_CHAT_INPUT_FLOATING_CONTROLS_HORIZONTAL_INSET))
+            .bottom(px(AI_CHAT_INPUT_FLOATING_CONTROLS_BOTTOM_INSET))
+            .flex()
+            .items_center()
+            .justify_between()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    // 浮层控件属于输入框内部，但点击它们不应移动输入光标或开始文本选择。
+                    context.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    // 右键同样停留在浮层，避免未来输入区右键菜单和控件点击互相影响。
+                    context.stop_propagation();
+                }),
+            )
+            .child(self.render_ai_chat_model_selector(palette, context))
+            .child(self.render_ai_chat_send_button(can_send, is_streaming, palette, context))
+    }
+
+    /// 渲染 AI 对话发送或停止按钮。
+    fn render_ai_chat_send_button(
+        &self,
+        can_send: bool,
+        is_streaming: bool,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let enabled = can_send || is_streaming;
+        div()
+            .id("ai-chat-send-button")
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .h(px(34.0))
+            .px_4()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(if enabled {
+                palette.accent
+            } else {
+                palette.border
+            }))
+            .bg(rgb(if enabled {
+                palette.accent
+            } else {
+                palette.panel
+            }))
+            .text_sm()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(if enabled {
+                palette.on_accent
+            } else {
+                palette.muted_text
+            }))
+            .when(enabled, |button| {
+                button
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(rgb(palette.accent_hover)))
+            })
+            .when(!enabled, |button| button.opacity(0.55))
+            .child(Self::render_lucide_icon(
+                Some(if is_streaming { Icon::X } else { Icon::Check }),
+                14.0,
+                14.0,
+                if enabled {
+                    palette.on_accent
+                } else {
+                    palette.muted_text
+                },
+            ))
+            .child(if is_streaming { "停止" } else { "发送" })
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, _window, context| {
+                    if is_streaming {
+                        view.stop_ai_chat_streaming(context);
+                    } else if can_send {
+                        view.start_ai_chat_send(context);
+                    }
+                }),
             )
     }
 
@@ -12243,6 +15336,274 @@ impl MainView {
     }
 }
 
+/// AI 对话多行输入元素。
+///
+/// 业务意图：
+/// - GPUI 0.2.2 没有内建多行文本输入控件；AI 输入必须支持中文 IME、粘贴、选择和光标，因此复用项目内自绘文本区方案。
+/// - 第一版不做自动换行，长提示词横向裁切但完整文本仍保存在状态中并发送给模型。
+struct AiChatInputElement {
+    /// 主视图实体，用于读取和写回 AI 输入状态。
+    view: Entity<MainView>,
+    /// 输入框焦点句柄。
+    focus_handle: gpui::FocusHandle,
+    /// 输入为空时显示的占位文案。
+    placeholder: &'static str,
+    /// 当前主题调色板。
+    palette: AppThemePalette,
+}
+
+impl IntoElement for AiChatInputElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for AiChatInputElement {
+    type RequestLayoutState = ();
+    type PrepaintState = Option<AiChatInputPrepaint>;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        context: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let line_count = self.view.read(context).ai_chat_input_visual_line_count();
+        let mut style = Style::default();
+        style.size.width = relative(1.0).into();
+        style.size.height =
+            px((line_count as f32 * AI_CHAT_INPUT_LINE_HEIGHT).max(AI_CHAT_INPUT_LINE_HEIGHT))
+                .into();
+        (window.request_layout(style, [], context), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        context: &mut App,
+    ) -> Self::PrepaintState {
+        let (text, selection_range, marked_range, cursor_visible_by_activity) = {
+            let view = self.view.read(context);
+            let (text, selection_range, marked_range) = view.ai_chat_input_text_snapshot();
+            (
+                text,
+                selection_range,
+                marked_range,
+                view.search_text_cursor_visible(),
+            )
+        };
+        let focused = self.focus_handle.is_focused(window);
+        let style = window.text_style();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let line_height = px(AI_CHAT_INPUT_LINE_HEIGHT);
+        let line_ranges = MainView::thread_analysis_filter_line_ranges(&text);
+        let display_ranges = if text.is_empty() {
+            vec![0..0]
+        } else {
+            line_ranges
+        };
+
+        let mut lines = Vec::new();
+        let mut selections = Vec::new();
+        let mut cursor = None;
+        let selection_range = MainView::clamp_search_text_range(&text, selection_range);
+        let has_selection = focused && selection_range.start < selection_range.end;
+        let cursor_index = selection_range.end;
+
+        for (line_index, byte_range) in display_ranges.into_iter().enumerate() {
+            let is_placeholder = text.is_empty();
+            let display_text = if is_placeholder {
+                SharedString::from(self.placeholder)
+            } else {
+                SharedString::from(text[byte_range.clone()].to_string())
+            };
+            let text_color = if is_placeholder {
+                rgb(self.palette.muted_text).into()
+            } else {
+                style.color
+            };
+            let base_run = TextRun {
+                len: display_text.len(),
+                font: style.font(),
+                color: text_color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let runs = if !is_placeholder {
+                if let Some(marked_range) = marked_range.clone() {
+                    let local_marked_start = marked_range
+                        .start
+                        .saturating_sub(byte_range.start)
+                        .min(byte_range.len());
+                    let local_marked_end = marked_range
+                        .end
+                        .saturating_sub(byte_range.start)
+                        .min(byte_range.len());
+                    vec![
+                        TextRun {
+                            len: local_marked_start,
+                            ..base_run.clone()
+                        },
+                        TextRun {
+                            len: local_marked_end.saturating_sub(local_marked_start),
+                            underline: Some(UnderlineStyle {
+                                color: Some(base_run.color),
+                                thickness: px(1.0),
+                                wavy: false,
+                            }),
+                            ..base_run.clone()
+                        },
+                        TextRun {
+                            len: display_text.len().saturating_sub(local_marked_end),
+                            ..base_run
+                        },
+                    ]
+                    .into_iter()
+                    .filter(|run| run.len > 0)
+                    .collect()
+                } else {
+                    vec![base_run]
+                }
+            } else {
+                vec![base_run]
+            };
+            let line = window
+                .text_system()
+                .shape_line(display_text, font_size, &runs, None);
+            let line_top = bounds.top() + px(line_index as f32 * AI_CHAT_INPUT_LINE_HEIGHT);
+            let line_bounds = Bounds::new(
+                point(bounds.left(), line_top),
+                size(bounds.right() - bounds.left(), line_height),
+            );
+
+            if has_selection && !is_placeholder {
+                let start = selection_range
+                    .start
+                    .max(byte_range.start)
+                    .min(byte_range.end);
+                let end = selection_range
+                    .end
+                    .max(byte_range.start)
+                    .min(byte_range.end);
+                if start < end {
+                    let mut selection_color = rgb(self.palette.accent);
+                    selection_color.a = 0.32;
+                    selections.push(fill(
+                        Bounds::from_corners(
+                            point(
+                                line_bounds.left() + line.x_for_index(start - byte_range.start),
+                                line_bounds.top(),
+                            ),
+                            point(
+                                line_bounds.left() + line.x_for_index(end - byte_range.start),
+                                line_bounds.bottom(),
+                            ),
+                        ),
+                        selection_color,
+                    ));
+                }
+            }
+
+            if focused
+                && !has_selection
+                && cursor.is_none()
+                && cursor_visible_by_activity
+                && cursor_index >= byte_range.start
+                && cursor_index <= byte_range.end
+            {
+                cursor = Some(fill(
+                    Bounds::new(
+                        point(
+                            line_bounds.left() + line.x_for_index(cursor_index - byte_range.start),
+                            line_bounds.top(),
+                        ),
+                        size(px(1.5), line_bounds.bottom() - line_bounds.top()),
+                    ),
+                    rgb(self.palette.accent),
+                ));
+            }
+
+            lines.push(AiChatInputPaintLine {
+                byte_range,
+                bounds: line_bounds,
+                line,
+            });
+        }
+
+        Some(AiChatInputPrepaint {
+            lines,
+            selections,
+            cursor,
+        })
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        context: &mut App,
+    ) {
+        window.handle_input(
+            &self.focus_handle,
+            ElementInputHandler::new(bounds, self.view.clone()),
+            context,
+        );
+        let Some(prepaint) = prepaint.take() else {
+            return;
+        };
+        for selection in prepaint.selections {
+            window.paint_quad(selection);
+        }
+
+        let mut layouts = Vec::new();
+        for paint_line in prepaint.lines {
+            paint_line
+                .line
+                .paint(
+                    paint_line.bounds.origin,
+                    paint_line.bounds.bottom() - paint_line.bounds.top(),
+                    window,
+                    context,
+                )
+                .ok();
+            layouts.push(AiChatInputLineLayout {
+                byte_range: paint_line.byte_range,
+                line: paint_line.line,
+                bounds: paint_line.bounds,
+            });
+        }
+        if let Some(cursor) = prepaint.cursor {
+            window.paint_quad(cursor);
+        }
+        if self.focus_handle.is_focused(window) {
+            window.request_animation_frame();
+        }
+        self.view.update(context, |view, _context| {
+            view.store_ai_chat_input_text_layouts(layouts, bounds);
+        });
+    }
+}
+
 impl EntityInputHandler for MainView {
     /// 返回指定 UTF-16 范围内的搜索框文本。
     ///
@@ -12264,6 +15625,14 @@ impl EntityInputHandler for MainView {
                 range.clone(),
             ));
             return Some(state.text[range].to_string());
+        }
+        if self.ai_chat_input_focus.is_focused(window) {
+            let range = Self::search_input_range_from_utf16(&self.ai_chat_input_text, range_utf16);
+            adjusted_range.replace(Self::search_input_range_to_utf16(
+                &self.ai_chat_input_text,
+                range.clone(),
+            ));
+            return Some(self.ai_chat_input_text[range].to_string());
         }
         if self.quick_search_keywords_focus.is_focused(window) {
             let range =
@@ -12308,6 +15677,15 @@ impl EntityInputHandler for MainView {
                 reversed: false,
             });
         }
+        if self.ai_chat_input_focus.is_focused(window) {
+            return Some(UTF16Selection {
+                range: Self::search_input_range_to_utf16(
+                    &self.ai_chat_input_text,
+                    self.ai_chat_input_selection_range.clone(),
+                ),
+                reversed: false,
+            });
+        }
         if self.quick_search_keywords_focus.is_focused(window) {
             return Some(UTF16Selection {
                 range: Self::search_input_range_to_utf16(
@@ -12348,6 +15726,12 @@ impl EntityInputHandler for MainView {
                 .clone()
                 .map(|range| Self::search_input_range_to_utf16(&state.text, range));
         }
+        if self.ai_chat_input_focus.is_focused(window) {
+            return self
+                .ai_chat_input_marked_range
+                .clone()
+                .map(|range| Self::search_input_range_to_utf16(&self.ai_chat_input_text, range));
+        }
         if self.quick_search_keywords_focus.is_focused(window) {
             return self
                 .quick_search_keywords_marked_range
@@ -12374,6 +15758,11 @@ impl EntityInputHandler for MainView {
     fn unmark_text(&mut self, window: &mut Window, context: &mut Context<Self>) {
         if let Some(kind) = self.active_model_config_input_kind(window) {
             self.model_config_input_state_mut(kind).marked_range = None;
+            context.notify();
+            return;
+        }
+        if self.ai_chat_input_focus.is_focused(window) {
+            self.ai_chat_input_marked_range = None;
             context.notify();
             return;
         }
@@ -12421,6 +15810,22 @@ impl EntityInputHandler for MainView {
             state.marked_range = None;
             state.clear_layout();
             self.model_test_status = ModelTestStatus::Idle;
+            self.touch_search_text_cursor_activity();
+            context.notify();
+            return;
+        }
+        if self.ai_chat_input_focus.is_focused(window) {
+            let replacement = text.replace("\r\n", "\n").replace('\r', "\n");
+            let range = range_utf16
+                .map(|range| Self::search_input_range_from_utf16(&self.ai_chat_input_text, range))
+                .or_else(|| self.ai_chat_input_marked_range.clone())
+                .unwrap_or_else(|| self.ai_chat_input_selection_range.clone());
+            let range = Self::clamp_search_text_range(&self.ai_chat_input_text, range);
+            self.ai_chat_input_text
+                .replace_range(range.clone(), &replacement);
+            let cursor = range.start + replacement.len();
+            self.ai_chat_input_selection_range = cursor..cursor;
+            self.ai_chat_input_marked_range = None;
             self.touch_search_text_cursor_activity();
             context.notify();
             return;
@@ -12532,6 +15937,37 @@ impl EntityInputHandler for MainView {
             state.selection_range = selected_range;
             state.clear_layout();
             self.model_test_status = ModelTestStatus::Idle;
+            self.touch_search_text_cursor_activity();
+            context.notify();
+            return;
+        }
+        if self.ai_chat_input_focus.is_focused(window) {
+            let replacement = new_text.replace("\r\n", "\n").replace('\r', "\n");
+            let range = range_utf16
+                .map(|range| Self::search_input_range_from_utf16(&self.ai_chat_input_text, range))
+                .or_else(|| self.ai_chat_input_marked_range.clone())
+                .unwrap_or_else(|| self.ai_chat_input_selection_range.clone());
+            let range = Self::clamp_search_text_range(&self.ai_chat_input_text, range);
+            self.ai_chat_input_text
+                .replace_range(range.clone(), &replacement);
+
+            if replacement.is_empty() {
+                self.ai_chat_input_marked_range = None;
+            } else {
+                self.ai_chat_input_marked_range =
+                    Some(range.start..range.start + replacement.len());
+            }
+
+            let selected_range = new_selected_range_utf16
+                .map(|utf16_range| Self::search_input_range_from_utf16(&replacement, utf16_range))
+                .map(|relative_range| {
+                    range.start + relative_range.start..range.start + relative_range.end
+                })
+                .unwrap_or_else(|| {
+                    let cursor = range.start + replacement.len();
+                    cursor..cursor
+                });
+            self.ai_chat_input_selection_range = selected_range;
             self.touch_search_text_cursor_activity();
             context.notify();
             return;
@@ -12675,6 +16111,22 @@ impl EntityInputHandler for MainView {
                 ),
             ));
         }
+        if self.ai_chat_input_focus.is_focused(window) {
+            let range = Self::search_input_range_from_utf16(&self.ai_chat_input_text, range_utf16);
+            let cursor = range.start;
+            for layout in &self.ai_chat_input_last_layouts {
+                if cursor >= layout.byte_range.start && cursor <= layout.byte_range.end {
+                    let x = layout
+                        .line
+                        .x_for_index(cursor.saturating_sub(layout.byte_range.start));
+                    return Some(Bounds::new(
+                        point(layout.bounds.left() + x, layout.bounds.top()),
+                        size(px(1.0), layout.bounds.bottom() - layout.bounds.top()),
+                    ));
+                }
+            }
+            return Some(element_bounds);
+        }
         if self.quick_search_keywords_focus.is_focused(window) {
             let range =
                 Self::search_input_range_from_utf16(&self.quick_search_keywords_text, range_utf16);
@@ -12748,6 +16200,13 @@ impl EntityInputHandler for MainView {
             let state = self.model_config_input_state(kind);
             return Some(Self::search_input_utf16_offset_from_byte(
                 &state.text,
+                utf8_index,
+            ));
+        }
+        if self.ai_chat_input_focus.is_focused(window) {
+            let utf8_index = self.ai_chat_input_index_for_point(point);
+            return Some(Self::search_input_utf16_offset_from_byte(
+                &self.ai_chat_input_text,
                 utf8_index,
             ));
         }

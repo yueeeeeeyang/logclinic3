@@ -28,6 +28,8 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 # reqwest 只用于设置页“测试模型”的 OpenAI 兼容接口探测；请求放入后台线程并使用 rustls，避免阻塞 UI 或依赖系统 OpenSSL。
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# rusqlite 用于 AI 对话历史的本地 SQLite 存储；启用 bundled 以避免 macOS/Windows 依赖系统 SQLite 动态库。
+rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
 # regex 用于普通搜索窗口的正则模式；语法遵循 Rust regex，避免为日志查找引入额外运行时依赖。
 regex = "1.12.3"
 # sevenz-rust 只读取 7z 目录元数据，当前不调用任何实际解压到磁盘的接口。
