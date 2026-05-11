@@ -158,6 +158,49 @@ mod state_tests {
         assert_eq!(decision, MainWindowStartupDecision::Remembered(saved_size));
     }
 
+    /// 验证默认窗口尺寸不会超过当前显示器宽度。
+    ///
+    /// 业务意图：
+    /// - 部分设备逻辑宽度大于小屏阈值 1440px，但仍小于默认窗口宽度 1600px；这时如果不裁剪宽度，
+    ///   系统会把超出屏幕的窗口挤回可见区域，造成启动位置看起来偏右。
+    #[test]
+    fn 中等屏默认窗口尺寸会先裁剪再居中() {
+        let requested_size = test_window_size(1600.0, 900.0);
+        let fitted = fit_main_window_size_to_display(requested_size, Some((1512.0, 982.0)));
+
+        assert_eq!(fitted, test_window_size(1512.0, 900.0));
+    }
+
+    /// 验证历史窗口尺寸过大时也会被限制在显示器内。
+    ///
+    /// 业务意图：
+    /// - 用户可能从外接大屏切回笔记本屏幕；历史尺寸仍应被尊重为“用户偏好”，但不能大到影响初始化居中。
+    #[test]
+    fn 历史窗口尺寸超过显示器时会裁剪() {
+        let saved_size = test_window_size(1800.0, 1100.0);
+        let fitted = fit_main_window_size_to_display(saved_size, Some((1512.0, 982.0)));
+
+        assert_eq!(fitted, test_window_size(1512.0, 982.0));
+    }
+
+    /// 验证显示器尺寸不可用时保留原始窗口尺寸。
+    ///
+    /// 边界条件：
+    /// - 图形环境初始化早期可能无法读取显示器信息；这时不应凭空改写启动尺寸，避免引入新的平台差异。
+    #[test]
+    fn 显示器尺寸不可用时保留请求尺寸() {
+        let requested_size = test_window_size(1600.0, 900.0);
+
+        assert_eq!(
+            fit_main_window_size_to_display(requested_size, None),
+            requested_size
+        );
+        assert_eq!(
+            fit_main_window_size_to_display(requested_size, Some((0.0, 982.0))),
+            requested_size
+        );
+    }
+
     /// 验证用户历史宽高优先于小屏最大化规则。
     ///
     /// 业务意图：

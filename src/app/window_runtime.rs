@@ -76,6 +76,37 @@ pub(crate) fn decide_main_window_startup(
     }
 }
 
+/// 把启动窗口尺寸限制在当前主显示器可见尺寸内。
+///
+/// 业务意图：
+/// - 主窗口默认宽度是 1600px，但部分 macOS/Windows 设备的逻辑宽度介于 1440px 和 1600px 之间，
+///   这类设备不会触发“小屏默认最大化”，如果仍按 1600px 居中，系统可能把超出屏幕的窗口挤回可见区域，导致启动时视觉上偏右。
+/// - 启动前先把普通窗口尺寸限制到显示器尺寸内，再执行居中计算，可以保证首次打开和恢复历史尺寸时窗口中心落在屏幕中心。
+///
+/// 边界条件：
+/// - 只在显示器宽高是有限正数时裁剪；图形环境读取失败或返回异常值时保留原尺寸，由 GPUI 原有默认策略兜底。
+/// - 只裁剪超过屏幕的尺寸，不放大用户保存的小窗口，避免改变用户手动调整过的工作区尺寸偏好。
+pub(crate) fn fit_main_window_size_to_display(
+    requested_size: MainWindowSizePreference,
+    display_size: Option<(f32, f32)>,
+) -> MainWindowSizePreference {
+    let Some((display_width, display_height)) = display_size else {
+        return requested_size;
+    };
+    if !display_width.is_finite()
+        || !display_height.is_finite()
+        || display_width <= 0.0
+        || display_height <= 0.0
+    {
+        return requested_size;
+    }
+
+    MainWindowSizePreference {
+        width: requested_size.width.min(display_width),
+        height: requested_size.height.min(display_height),
+    }
+}
+
 /// 把主窗口启动策略转换成 GPUI 窗口边界。
 ///
 /// 业务意图：
@@ -84,26 +115,27 @@ pub(crate) fn decide_main_window_startup(
 fn main_window_bounds_for_decision(
     decision: MainWindowStartupDecision,
     display_id: Option<DisplayId>,
+    display_size: Option<(f32, f32)>,
     app: &App,
 ) -> WindowBounds {
+    let requested_size = match decision {
+        MainWindowStartupDecision::Remembered(saved_size) => saved_size,
+        MainWindowStartupDecision::DefaultWindowed
+        | MainWindowStartupDecision::DefaultMaximized => MainWindowSizePreference {
+            width: MAIN_WINDOW_WIDTH,
+            height: MAIN_WINDOW_HEIGHT,
+        },
+    };
+    let fitted_size = fit_main_window_size_to_display(requested_size, display_size);
+    let centered_size = size(px(fitted_size.width), px(fitted_size.height));
+
     match decision {
-        MainWindowStartupDecision::Remembered(saved_size) => {
-            WindowBounds::Windowed(Bounds::centered(
-                display_id,
-                size(px(saved_size.width), px(saved_size.height)),
-                app,
-            ))
+        MainWindowStartupDecision::Remembered(_) | MainWindowStartupDecision::DefaultWindowed => {
+            WindowBounds::Windowed(Bounds::centered(display_id, centered_size, app))
         }
-        MainWindowStartupDecision::DefaultWindowed => WindowBounds::Windowed(Bounds::centered(
-            display_id,
-            size(px(MAIN_WINDOW_WIDTH), px(MAIN_WINDOW_HEIGHT)),
-            app,
-        )),
-        MainWindowStartupDecision::DefaultMaximized => WindowBounds::Maximized(Bounds::centered(
-            display_id,
-            size(px(MAIN_WINDOW_WIDTH), px(MAIN_WINDOW_HEIGHT)),
-            app,
-        )),
+        MainWindowStartupDecision::DefaultMaximized => {
+            WindowBounds::Maximized(Bounds::centered(display_id, centered_size, app))
+        }
     }
 }
 
@@ -115,6 +147,18 @@ fn main_window_bounds_for_decision(
 fn primary_display_width(app: &App) -> Option<f32> {
     app.primary_display()
         .map(|display| display.bounds().size.width / px(1.0))
+}
+
+/// 读取当前主显示器的逻辑像素宽高。
+///
+/// 业务意图：
+/// - 主窗口启动居中前需要知道显示器可见尺寸，用于裁剪超过屏幕的默认或历史窗口尺寸。
+/// - 使用 GPUI 逻辑像素，和保存的窗口尺寸单位一致，避免 macOS Retina 或 Windows 缩放下出现物理像素误差。
+fn primary_display_size(app: &App) -> Option<(f32, f32)> {
+    app.primary_display().map(|display| {
+        let size = display.bounds().size;
+        (size.width / px(1.0), size.height / px(1.0))
+    })
 }
 
 /// 读取当前主显示器 ID。
@@ -133,7 +177,12 @@ fn primary_display_id(app: &App) -> Option<DisplayId> {
 fn build_main_window_bounds(app: &App) -> WindowBounds {
     let saved_size = load_main_window_size_preference();
     let decision = decide_main_window_startup(saved_size, primary_display_width(app));
-    main_window_bounds_for_decision(decision, primary_display_id(app), app)
+    main_window_bounds_for_decision(
+        decision,
+        primary_display_id(app),
+        primary_display_size(app),
+        app,
+    )
 }
 
 /// 主窗口运行期状态。

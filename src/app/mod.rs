@@ -83,7 +83,9 @@ mod ui;
 mod window_runtime;
 pub(crate) use window_runtime::run;
 #[cfg(test)]
-pub(crate) use window_runtime::{MainWindowStartupDecision, decide_main_window_startup};
+pub(crate) use window_runtime::{
+    MainWindowStartupDecision, decide_main_window_startup, fit_main_window_size_to_display,
+};
 
 use ui::*;
 
