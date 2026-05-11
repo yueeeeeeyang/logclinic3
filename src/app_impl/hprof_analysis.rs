@@ -926,6 +926,52 @@ impl HprofAnalysisWindowView {
             ))
     }
 
+    /// 渲染线程右键菜单的透明关闭遮罩。
+    ///
+    /// 业务意图：
+    /// - HPROF dominator 表格里的线程行可以打开详情菜单；菜单打开时，菜单外点击应只负责关闭菜单，不能同时展开树节点。
+    fn render_thread_context_menu_dismiss_overlay(
+        &self,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        if self.thread_context_menu.is_none() {
+            return div()
+                .id("hprof-thread-context-menu-dismiss-overlay-empty")
+                .hidden();
+        }
+
+        div()
+            .id("hprof-thread-context-menu-dismiss-overlay")
+            .absolute()
+            .left(px(0.0))
+            .top(px(0.0))
+            .size_full()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    // 遮罩吃掉左键按下，避免底层 dominator 树在菜单关闭前同步处理点击。
+                    context.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(|view, _event: &MouseDownEvent, _window, context| {
+                    // 右键不依赖 click 合成事件；直接关闭旧菜单并截断，避免穿透到其它线程行。
+                    view.thread_context_menu = None;
+                    context.notify();
+                    context.stop_propagation();
+                }),
+            )
+            .on_click(
+                context.listener(|view, _event: &ClickEvent, _window, context| {
+                    view.thread_context_menu = None;
+                    context.notify();
+                    // click 仍然必须在遮罩处结束，避免底层控件收到同一次点击。
+                    context.stop_propagation();
+                }),
+            )
+    }
+
     /// 渲染线程右键菜单。
     fn render_thread_context_menu(
         &self,
@@ -948,6 +994,20 @@ impl HprofAnalysisWindowView {
             .border_color(rgb(palette.border))
             .bg(rgb(palette.menu))
             .shadow_lg()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    // HPROF 线程菜单覆盖在 dominator 表格上，菜单空白区域也不能把事件传回表格行。
+                    context.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    // 菜单层上的右键只应被当前菜单消费，避免底层行重新打开菜单或切换目标线程。
+                    context.stop_propagation();
+                }),
+            )
             .child(
                 div()
                     .id(SharedString::from(format!(
@@ -1082,6 +1142,7 @@ impl Render for HprofAnalysisWindowView {
             .bg(rgb(palette.background))
             .child(self.render_header(palette))
             .child(body)
+            .child(self.render_thread_context_menu_dismiss_overlay(context))
             .child(self.render_thread_context_menu(palette, context))
     }
 }

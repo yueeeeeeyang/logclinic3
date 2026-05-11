@@ -832,6 +832,8 @@ impl ThreadAnalysisWindowView {
                 MouseButton::Left,
                 context.listener(|view, event: &MouseDownEvent, _window, context| {
                     view.start_scrollbar_drag(LogScrollbarAxis::Vertical, event, context);
+                    // 线程分析滚动条覆盖在线程矩阵上，拖动时不能同时触发根节点关闭悬浮气泡。
+                    context.stop_propagation();
                 }),
             )
     }
@@ -869,6 +871,8 @@ impl ThreadAnalysisWindowView {
                 MouseButton::Left,
                 context.listener(|view, event: &MouseDownEvent, _window, context| {
                     view.start_scrollbar_drag(LogScrollbarAxis::Horizontal, event, context);
+                    // 横向滚动条属于独立拖拽控件，按下事件需要在滑块层结束。
+                    context.stop_propagation();
                 }),
             )
     }

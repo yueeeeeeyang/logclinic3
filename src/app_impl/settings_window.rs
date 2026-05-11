@@ -1,11 +1,11 @@
 // 设置独立窗口实现。
 //
 // 业务意图：
-// - 该文件集中维护“通用/模型”页签、主题选择和日志显示字号设置，避免设置 UI 继续堆在应用根文件里。
+// - 该文件集中维护“通用/日志/模型”页签、主题选择、日志显示字号和线程日志分析过滤设置，避免设置 UI 继续堆在应用根文件里。
 // - 当前作为 `app` 的子模块，通过显式 `pub(super)` 接口更新 `MainView` 的会话状态和持久化配置。
 //
 // 边界条件：
-// - 本阶段只做物理拆分，不改变设置项、配置格式、按钮行为或窗口尺寸。
+// - 设置窗口承载会写入应用配置目录的偏好，输入类设置必须显式处理只读、编辑和保存状态，避免误触改变跨会话配置。
 
 use super::*;
 
@@ -128,12 +128,92 @@ impl SettingsWindowView {
         context.notify();
     }
 
-    /// 清空线程日志分析过滤配置。
-    pub(super) fn clear_thread_analysis_filter(&mut self, context: &mut Context<Self>) {
-        self.main_view.update(context, |view, context| {
-            view.clear_thread_analysis_filter_text(context);
+    /// 处理线程日志分析过滤的编辑/保存按钮。
+    ///
+    /// 返回值：
+    /// - 进入编辑态时返回输入区焦点句柄，调用方负责把焦点交给多行输入区。
+    /// - 保存时返回 `None`，避免保存按钮点击后再次抢回只读输入区焦点。
+    pub(super) fn toggle_thread_analysis_filter_editing(
+        &mut self,
+        context: &mut Context<Self>,
+    ) -> Option<gpui::FocusHandle> {
+        let focus_handle = self.main_view.update(context, |view, context| {
+            if view.thread_analysis_filter_is_editing {
+                view.save_thread_analysis_filter_edit(context);
+                None
+            } else {
+                view.begin_thread_analysis_filter_edit(context);
+                Some(view.thread_analysis_filter_focus.clone())
+            }
         });
         context.notify();
+        focus_handle
+    }
+
+    /// 处理快搜关键字输入区键盘编辑。
+    pub(super) fn handle_quick_search_keywords_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.main_view.update(context, |view, context| {
+            view.handle_quick_search_keywords_key_down(event, context);
+        });
+        context.notify();
+    }
+
+    /// 处理快搜关键字输入区鼠标按下。
+    pub(super) fn handle_quick_search_keywords_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let focus_handle = self.main_view.update(context, |view, context| {
+            view.start_quick_search_keywords_mouse_selection(event, context);
+            view.quick_search_keywords_focus.clone()
+        });
+        window.focus(&focus_handle);
+        context.notify();
+    }
+
+    /// 拖动扩展快搜关键字输入区选择范围。
+    pub(super) fn handle_quick_search_keywords_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        context: &mut Context<Self>,
+    ) {
+        self.main_view.update(context, |view, context| {
+            view.update_quick_search_keywords_mouse_selection(event.position, context);
+        });
+        context.notify();
+    }
+
+    /// 结束快搜关键字输入区鼠标选择。
+    pub(super) fn handle_quick_search_keywords_mouse_up(&mut self, context: &mut Context<Self>) {
+        self.main_view.update(context, |view, context| {
+            view.finish_quick_search_keywords_mouse_selection(context);
+        });
+        context.notify();
+    }
+
+    /// 处理快搜关键字配置的编辑/保存按钮。
+    pub(super) fn toggle_quick_search_keywords_editing(
+        &mut self,
+        context: &mut Context<Self>,
+    ) -> Option<gpui::FocusHandle> {
+        let focus_handle = self.main_view.update(context, |view, context| {
+            if view.quick_search_keywords_is_editing {
+                view.save_quick_search_keywords_edit(context);
+                None
+            } else {
+                view.begin_quick_search_keywords_edit(context);
+                Some(view.quick_search_keywords_focus.clone())
+            }
+        });
+        context.notify();
+        focus_handle
     }
 
     /// 渲染左侧页签栏。
@@ -220,7 +300,9 @@ impl SettingsWindowView {
         active_tab: SettingsTab,
         theme: ThemePreference,
         log_viewer_font_size: f32,
-        thread_analysis_filter_text: String,
+        quick_search_keywords_is_editing: bool,
+        quick_search_keywords_focus: gpui::FocusHandle,
+        thread_analysis_filter_is_editing: bool,
         thread_analysis_filter_focus: gpui::FocusHandle,
         palette: AppThemePalette,
         context: &mut Context<Self>,
@@ -230,7 +312,9 @@ impl SettingsWindowView {
                 self.render_general_tab(theme, log_viewer_font_size, palette, context)
             }
             SettingsTab::Log => self.render_log_tab(
-                thread_analysis_filter_text,
+                quick_search_keywords_is_editing,
+                quick_search_keywords_focus,
+                thread_analysis_filter_is_editing,
                 thread_analysis_filter_focus,
                 palette,
                 context,
@@ -565,7 +649,9 @@ impl SettingsWindowView {
     /// - 日志页集中放置影响日志解析、分析和展示的偏好；当前先承载线程日志分析过滤配置。
     fn render_log_tab(
         &self,
-        thread_analysis_filter_text: String,
+        quick_search_keywords_is_editing: bool,
+        quick_search_keywords_focus: gpui::FocusHandle,
+        thread_analysis_filter_is_editing: bool,
         focus_handle: gpui::FocusHandle,
         palette: AppThemePalette,
         context: &mut Context<Self>,
@@ -576,6 +662,10 @@ impl SettingsWindowView {
             .flex_col()
             .size_full()
             .p_4()
+            // 日志页同时承载快搜配置和 300px 的线程过滤输入区，固定窗口高度下必须允许纵向滚动，
+            // 否则底部输入框和保存按钮在 macOS/Windows 的标题栏高度差异下都可能被裁剪。
+            .overflow_y_scroll()
+            .scrollbar_width(px(6.0))
             .bg(rgb(palette.background))
             .child(
                 div()
@@ -594,27 +684,219 @@ impl SettingsWindowView {
                     ))
                     .child("日志设置"),
             )
+            .child(self.render_quick_search_keywords_setting(
+                quick_search_keywords_is_editing,
+                quick_search_keywords_focus,
+                palette,
+                context,
+            ))
             .child(self.render_thread_analysis_filter_setting(
-                thread_analysis_filter_text,
+                thread_analysis_filter_is_editing,
                 focus_handle,
                 palette,
                 context,
             ))
     }
 
-    /// 渲染线程日志分析过滤设置项。
+    /// 渲染快搜关键字配置项。
     ///
     /// 业务意图：
-    /// - 用户可以直接粘贴一个或多个完整线程堆栈，后续线程日志分析会按这些片段过滤无效线程。
-    /// - 输入区使用等宽字体和滚动容器，便于核对 Java 堆栈中的类名、方法名和锁信息。
-    fn render_thread_analysis_filter_setting(
+    /// - 用户维护一组英文逗号分隔的排障关键字，搜索窗口“快搜”按钮会按任一关键字命中生成结果。
+    /// - 配置项默认只读，和线程过滤配置保持一致，降低误修改跨会话搜索偏好的风险。
+    fn render_quick_search_keywords_setting(
         &self,
-        thread_analysis_filter_text: String,
+        quick_search_keywords_is_editing: bool,
         focus_handle: gpui::FocusHandle,
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let has_filter = !thread_analysis_filter_text.trim().is_empty();
+        let input_background = if quick_search_keywords_is_editing {
+            palette.input
+        } else {
+            palette.panel
+        };
+        div()
+            .id("settings-quick-search-keywords")
+            .flex()
+            .flex_col()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.surface))
+            .p_4()
+            .mb_4()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .mb_3()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(MainView::render_lucide_icon(
+                                Some(Icon::Zap),
+                                18.0,
+                                18.0,
+                                palette.muted_text,
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(palette.text))
+                                            .child("快搜关键字配置"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(palette.muted_text))
+                                            .child("英文逗号分隔多个关键字，快搜命中任意关键字"),
+                                    ),
+                            ),
+                    )
+                    .child(self.render_quick_search_keywords_edit_button(
+                        quick_search_keywords_is_editing,
+                        palette,
+                        context,
+                    )),
+            )
+            .child(
+                div()
+                    .id("settings-quick-search-keywords-input")
+                    .relative()
+                    .h(px(SEARCH_INPUT_HEIGHT))
+                    .w_full()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(rgb(if quick_search_keywords_is_editing {
+                        palette.accent
+                    } else {
+                        palette.border
+                    }))
+                    .bg(rgb(input_background))
+                    .track_focus(&focus_handle)
+                    .key_context("quick-search-keywords-input")
+                    .on_key_down(context.listener(Self::handle_quick_search_keywords_key_down))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        context.listener(|view, event: &MouseDownEvent, window, context| {
+                            view.handle_quick_search_keywords_mouse_down(event, window, context);
+                        }),
+                    )
+                    .on_mouse_move(context.listener(
+                        |view, event: &MouseMoveEvent, _window, context| {
+                            view.handle_quick_search_keywords_mouse_move(event, context);
+                        },
+                    ))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        context.listener(|view, _event: &MouseUpEvent, _window, context| {
+                            view.handle_quick_search_keywords_mouse_up(context);
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        context.listener(|view, _event: &MouseUpEvent, _window, context| {
+                            view.handle_quick_search_keywords_mouse_up(context);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .id("settings-quick-search-keywords-text")
+                            .absolute()
+                            .left(px(10.0))
+                            .right(px(10.0))
+                            .top(px(5.0))
+                            .bottom(px(5.0))
+                            .overflow_hidden()
+                            .text_sm()
+                            .text_color(rgb(palette.text))
+                            .child(QuickSearchKeywordsInputElement {
+                                view: self.main_view.clone(),
+                                focus_handle,
+                                editable: quick_search_keywords_is_editing,
+                                placeholder: "ERROR,Exception,Timeout",
+                                palette,
+                            }),
+                    ),
+            )
+    }
+
+    /// 渲染快搜关键字编辑/保存按钮。
+    fn render_quick_search_keywords_edit_button(
+        &self,
+        is_editing: bool,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let (label, icon, text_color, background) = if is_editing {
+            ("保存", Icon::Save, palette.on_accent, palette.accent)
+        } else {
+            ("编辑", Icon::Pencil, palette.text, palette.panel)
+        };
+        div()
+            .id("settings-quick-search-keywords-edit")
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .h(px(28.0))
+            .px_3()
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(background))
+            .text_xs()
+            .text_color(rgb(text_color))
+            .cursor_pointer()
+            .hover(move |button| {
+                button.bg(rgb(if is_editing {
+                    palette.accent_hover
+                } else {
+                    palette.hover
+                }))
+            })
+            .child(MainView::render_lucide_icon(
+                Some(icon),
+                13.0,
+                13.0,
+                text_color,
+            ))
+            .child(label)
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, window, context| {
+                    if let Some(focus_handle) = view.toggle_quick_search_keywords_editing(context) {
+                        window.focus(&focus_handle);
+                    }
+                }),
+            )
+    }
+
+    /// 渲染线程日志分析过滤设置项。
+    ///
+    /// 业务意图：
+    /// - 用户点击编辑后可以粘贴一个或多个完整线程堆栈，保存后的下一次线程日志分析会按这些片段过滤无效线程。
+    /// - 输入区使用等宽字体和滚动容器，便于核对 Java 堆栈中的类名、方法名和锁信息。
+    fn render_thread_analysis_filter_setting(
+        &self,
+        thread_analysis_filter_is_editing: bool,
+        focus_handle: gpui::FocusHandle,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let input_background = if thread_analysis_filter_is_editing {
+            palette.input
+        } else {
+            palette.panel
+        };
         div()
             .id("settings-thread-analysis-filter")
             .flex()
@@ -661,11 +943,11 @@ impl SettingsWindowView {
                                     ),
                             ),
                     )
-                    .child(
-                        self.render_clear_thread_analysis_filter_button(
-                            has_filter, palette, context,
-                        ),
-                    ),
+                    .child(self.render_thread_analysis_filter_edit_button(
+                        thread_analysis_filter_is_editing,
+                        palette,
+                        context,
+                    )),
             )
             .child(
                 div()
@@ -675,8 +957,12 @@ impl SettingsWindowView {
                     .w_full()
                     .rounded(px(6.0))
                     .border_1()
-                    .border_color(rgb(palette.border))
-                    .bg(rgb(palette.input))
+                    .border_color(rgb(if thread_analysis_filter_is_editing {
+                        palette.accent
+                    } else {
+                        palette.border
+                    }))
+                    .bg(rgb(input_background))
                     .track_focus(&focus_handle)
                     .key_context("thread-analysis-filter-input")
                     .on_key_down(context.listener(Self::handle_thread_analysis_filter_key_down))
@@ -718,6 +1004,7 @@ impl SettingsWindowView {
                             .child(ThreadAnalysisFilterTextAreaElement {
                                 view: self.main_view.clone(),
                                 focus_handle,
+                                editable: thread_analysis_filter_is_editing,
                                 placeholder: "粘贴需要过滤的线程堆栈；多段堆栈之间用空行分隔",
                                 palette,
                             }),
@@ -725,41 +1012,52 @@ impl SettingsWindowView {
             )
     }
 
-    /// 渲染线程分析过滤清空按钮。
-    fn render_clear_thread_analysis_filter_button(
+    /// 渲染线程分析过滤编辑/保存按钮。
+    fn render_thread_analysis_filter_edit_button(
         &self,
-        enabled: bool,
+        is_editing: bool,
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        let (label, icon, text_color, background) = if is_editing {
+            ("保存", Icon::Save, palette.on_accent, palette.accent)
+        } else {
+            ("编辑", Icon::Pencil, palette.text, palette.panel)
+        };
         div()
-            .id("settings-thread-analysis-filter-clear")
+            .id("settings-thread-analysis-filter-edit")
             .flex()
             .items_center()
             .justify_center()
+            .gap_1()
             .h(px(28.0))
             .px_3()
             .rounded(px(5.0))
             .border_1()
             .border_color(rgb(palette.border))
-            .bg(rgb(palette.panel))
+            .bg(rgb(background))
             .text_xs()
-            .text_color(rgb(if enabled {
-                palette.text
-            } else {
-                palette.muted_text
-            }))
-            .when(enabled, |button| {
-                button
-                    .cursor_pointer()
-                    .hover(move |button| button.bg(rgb(palette.hover)))
+            .text_color(rgb(text_color))
+            .cursor_pointer()
+            .hover(move |button| {
+                button.bg(rgb(if is_editing {
+                    palette.accent_hover
+                } else {
+                    palette.hover
+                }))
             })
-            .when(!enabled, |button| button.opacity(0.55))
-            .child("清空")
+            .child(MainView::render_lucide_icon(
+                Some(icon),
+                13.0,
+                13.0,
+                text_color,
+            ))
+            .child(label)
             .on_click(
-                context.listener(move |view, _event: &ClickEvent, _window, context| {
-                    if enabled {
-                        view.clear_thread_analysis_filter(context);
+                context.listener(move |view, _event: &ClickEvent, window, context| {
+                    if let Some(focus_handle) = view.toggle_thread_analysis_filter_editing(context)
+                    {
+                        window.focus(&focus_handle);
                     }
                 }),
             )
@@ -787,7 +1085,9 @@ impl Render for SettingsWindowView {
             active_tab,
             theme,
             log_viewer_font_size,
-            thread_analysis_filter_text,
+            quick_search_keywords_is_editing,
+            quick_search_keywords_focus,
+            thread_analysis_filter_is_editing,
             thread_analysis_filter_focus,
             palette,
         ) = {
@@ -796,7 +1096,9 @@ impl Render for SettingsWindowView {
                 main_view.settings_active_tab,
                 main_view.theme_preference,
                 main_view.log_viewer_font_size,
-                main_view.thread_analysis_filter_text.clone(),
+                main_view.quick_search_keywords_is_editing,
+                main_view.quick_search_keywords_focus.clone(),
+                main_view.thread_analysis_filter_is_editing,
                 main_view.thread_analysis_filter_focus.clone(),
                 main_view.palette(),
             )
@@ -818,12 +1120,226 @@ impl Render for SettingsWindowView {
                         active_tab,
                         theme,
                         log_viewer_font_size,
-                        thread_analysis_filter_text,
+                        quick_search_keywords_is_editing,
+                        quick_search_keywords_focus,
+                        thread_analysis_filter_is_editing,
                         thread_analysis_filter_focus,
                         palette,
                         context,
                     )),
             )
+    }
+}
+
+/// 快搜关键字输入框的预绘制结果。
+struct QuickSearchKeywordsInputPrepaint {
+    /// 当前帧单行字形布局。
+    line: ShapedLine,
+    /// 当前选择范围对应的高亮矩形。
+    selection: Option<PaintQuad>,
+    /// 当前插入光标矩形。
+    cursor: Option<PaintQuad>,
+}
+
+/// 快搜关键字单行输入元素。
+///
+/// 业务意图：
+/// - 设置页需要一个支持中文 IME、复制粘贴和精确鼠标选区的单行输入框，GPUI 当前版本没有可直接复用的文本输入控件。
+/// - 元素只负责绘制和注册平台输入协议，真实状态仍保存在 `MainView` 中，便于快搜按钮读取同一份配置。
+struct QuickSearchKeywordsInputElement {
+    /// 主视图实体，用于读取和写回快搜关键字输入状态。
+    view: Entity<MainView>,
+    /// 输入区焦点句柄。
+    focus_handle: gpui::FocusHandle,
+    /// 当前是否允许平台输入法和键盘写入文本。
+    editable: bool,
+    /// 输入为空时显示的占位文案。
+    placeholder: &'static str,
+    /// 当前主题调色板。
+    palette: AppThemePalette,
+}
+
+impl IntoElement for QuickSearchKeywordsInputElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for QuickSearchKeywordsInputElement {
+    type RequestLayoutState = ();
+    type PrepaintState = Option<QuickSearchKeywordsInputPrepaint>;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        context: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.0).into();
+        style.size.height = window.line_height().into();
+        (window.request_layout(style, [], context), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        context: &mut App,
+    ) -> Self::PrepaintState {
+        let (text, selection_range, marked_range, cursor_visible_by_activity) = {
+            let view = self.view.read(context);
+            let (text, selection_range, marked_range) = view.quick_search_keywords_text_snapshot();
+            (
+                text,
+                selection_range,
+                marked_range,
+                view.search_text_cursor_visible(),
+            )
+        };
+        let style = window.text_style();
+        let display_text = if text.is_empty() {
+            SharedString::from(self.placeholder)
+        } else {
+            SharedString::from(text.clone())
+        };
+        let text_color = if text.is_empty() {
+            rgb(self.palette.muted_text).into()
+        } else {
+            style.color
+        };
+        let base_run = TextRun {
+            len: display_text.len(),
+            font: style.font(),
+            color: text_color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let runs = if !text.is_empty() {
+            if let Some(marked_range) = marked_range {
+                vec![
+                    TextRun {
+                        len: marked_range.start,
+                        ..base_run.clone()
+                    },
+                    TextRun {
+                        len: marked_range.end.saturating_sub(marked_range.start),
+                        underline: Some(UnderlineStyle {
+                            color: Some(base_run.color),
+                            thickness: px(1.0),
+                            wavy: false,
+                        }),
+                        ..base_run.clone()
+                    },
+                    TextRun {
+                        len: display_text.len().saturating_sub(marked_range.end),
+                        ..base_run
+                    },
+                ]
+                .into_iter()
+                .filter(|run| run.len > 0)
+                .collect()
+            } else {
+                vec![base_run]
+            }
+        } else {
+            vec![base_run]
+        };
+
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let line = window
+            .text_system()
+            .shape_line(display_text, font_size, &runs, None);
+        let focused = self.focus_handle.is_focused(window);
+        let selection_range = MainView::clamp_search_text_range(&text, selection_range);
+        let has_selection =
+            focused && !text.is_empty() && selection_range.start < selection_range.end;
+        let cursor_index = selection_range.end;
+        let selection = has_selection.then(|| {
+            let mut selection_color = rgb(self.palette.accent);
+            selection_color.a = 0.32;
+            fill(
+                Bounds::from_corners(
+                    point(
+                        bounds.left() + line.x_for_index(selection_range.start),
+                        bounds.top(),
+                    ),
+                    point(
+                        bounds.left() + line.x_for_index(selection_range.end),
+                        bounds.bottom(),
+                    ),
+                ),
+                selection_color,
+            )
+        });
+        let cursor_visible =
+            focused && self.editable && !has_selection && cursor_visible_by_activity;
+        let cursor = cursor_visible.then(|| {
+            fill(
+                Bounds::new(
+                    point(bounds.left() + line.x_for_index(cursor_index), bounds.top()),
+                    size(px(1.5), bounds.bottom() - bounds.top()),
+                ),
+                rgb(self.palette.accent),
+            )
+        });
+
+        Some(QuickSearchKeywordsInputPrepaint {
+            line,
+            selection,
+            cursor,
+        })
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        context: &mut App,
+    ) {
+        window.handle_input(
+            &self.focus_handle,
+            ElementInputHandler::new(bounds, self.view.clone()),
+            context,
+        );
+        let Some(prepaint) = prepaint.take() else {
+            return;
+        };
+        if let Some(selection) = prepaint.selection {
+            window.paint_quad(selection);
+        }
+        prepaint
+            .line
+            .paint(bounds.origin, window.line_height(), window, context)
+            .ok();
+        if let Some(cursor) = prepaint.cursor {
+            window.paint_quad(cursor);
+        }
+        if self.focus_handle.is_focused(window) && self.editable {
+            window.request_animation_frame();
+        }
+        self.view.update(context, |view, _context| {
+            view.store_quick_search_keywords_layout(prepaint.line, bounds);
+        });
     }
 }
 
@@ -860,6 +1376,11 @@ struct ThreadAnalysisFilterTextAreaElement {
     view: Entity<MainView>,
     /// 过滤输入区焦点句柄。
     focus_handle: gpui::FocusHandle,
+    /// 当前是否允许平台输入法和键盘写入文本。
+    ///
+    /// 业务意图：
+    /// - 只读态仍要绘制文本和选区，但不显示插入光标，避免用户误以为内容已经可编辑。
+    editable: bool,
     /// 输入为空时显示的占位文案。
     placeholder: &'static str,
     /// 当前主题调色板。
@@ -1041,6 +1562,7 @@ impl Element for ThreadAnalysisFilterTextAreaElement {
             }
 
             if focused
+                && self.editable
                 && !has_selection
                 && cursor.is_none()
                 && cursor_visible_by_activity
@@ -1115,7 +1637,7 @@ impl Element for ThreadAnalysisFilterTextAreaElement {
         if let Some(cursor) = prepaint.cursor {
             window.paint_quad(cursor);
         }
-        if self.focus_handle.is_focused(window) {
+        if self.focus_handle.is_focused(window) && self.editable {
             window.request_animation_frame();
         }
         self.view.update(context, |view, _context| {

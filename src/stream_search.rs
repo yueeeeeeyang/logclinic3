@@ -6,20 +6,19 @@
 //! - 单次搜索最多收集 50,000 行结果，避免过宽关键字在大日志中生成百万级 UI 行。
 //!
 //! 关键约束：
-//! - 当前搜索仍是单行普通文本搜索，不做正则、跨行或多关键字组合。
+//! - 当前搜索仍是单行普通文本搜索，不做正则或跨行组合；多关键字快搜按“任一关键字命中”处理。
 //! - 不区分大小写时沿用现有 Unicode 小写折叠规则，保证内存模式和分页模式匹配语义一致。
 
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
-    ops::Range,
 };
 
 use crate::{
     line_index::LineIndexEntry,
     log_content::decode_lossy,
     paged_document::PagedLogDocument,
-    search::{SearchOptions, SearchResultItem, source_location_label},
+    search::{SearchOptions, SearchResultItem, find_best_query_range, source_location_label},
 };
 
 /// 单次搜索最多保留的结果行数。
@@ -62,9 +61,7 @@ pub fn search_paged_document(
         let Some(line_text) = read_line_text(&mut file, document, entry) else {
             return Ok(true);
         };
-        if let Some(match_range) =
-            find_query_range(&line_text, &options.query, options.case_sensitive)
-        {
+        if let Some(match_range) = find_best_query_range(&line_text, options) {
             results.push(SearchResultItem {
                 source: source.clone(),
                 source_key: source_key.clone(),
@@ -102,11 +99,15 @@ pub fn count_query_occurrences_paged(
         let Some(line_text) = read_line_text(&mut file, document, entry) else {
             return Ok(true);
         };
-        count = count.saturating_add(count_query_occurrences_in_line(
-            &line_text,
-            &options.query,
-            options.case_sensitive,
-        ));
+        count = count.saturating_add(
+            options
+                .queries
+                .iter()
+                .map(|query| {
+                    count_query_occurrences_in_line(&line_text, query, options.case_sensitive)
+                })
+                .sum::<usize>(),
+        );
         Ok(true)
     });
     count
@@ -127,55 +128,6 @@ fn read_line_text(
     decode_lossy(&bytes, document.encoding)
         .ok()
         .map(|decoded| decoded.text)
-}
-
-/// 在单行文本中查找查询词并返回原始行内的字节范围。
-fn find_query_range(line_text: &str, query: &str, case_sensitive: bool) -> Option<Range<usize>> {
-    if query.is_empty() {
-        return None;
-    }
-
-    if case_sensitive {
-        return line_text
-            .find(query)
-            .map(|start| start..start + query.len());
-    }
-
-    let folded_line = line_text.to_lowercase();
-    let folded_query = query.to_lowercase();
-    let folded_start = folded_line.find(&folded_query)?;
-    let folded_end = folded_start + folded_query.len();
-    folded_range_to_original_range(line_text, &folded_line, folded_start..folded_end)
-}
-
-/// 将小写折叠后的字节范围映射回原始字符串字节范围。
-fn folded_range_to_original_range(
-    original: &str,
-    folded: &str,
-    folded_range: Range<usize>,
-) -> Option<Range<usize>> {
-    let mut folded_char_starts = Vec::new();
-    for (byte_index, _) in folded.char_indices() {
-        folded_char_starts.push(byte_index);
-    }
-    folded_char_starts.push(folded.len());
-
-    let start_char = folded_char_starts
-        .iter()
-        .position(|byte_index| *byte_index == folded_range.start)?;
-    let end_char = folded_char_starts
-        .iter()
-        .position(|byte_index| *byte_index == folded_range.end)?;
-
-    let mut original_char_starts = Vec::new();
-    for (byte_index, _) in original.char_indices() {
-        original_char_starts.push(byte_index);
-    }
-    original_char_starts.push(original.len());
-
-    let start = *original_char_starts.get(start_char)?;
-    let end = *original_char_starts.get(end_char)?;
-    Some(start..end)
 }
 
 /// 统计单行中的普通文本出现次数。

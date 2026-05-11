@@ -5,7 +5,7 @@
 // - 当前作为 `app` 的子模块运行，通过显式 `pub(super)` 接口访问主窗口搜索状态。
 //
 // 边界条件：
-// - 本阶段只做物理拆分，不改变搜索范围、历史记录、快捷键、复制粘贴或搜索结果行为。
+// - 搜索关键字历史只保存在当前会话内；该窗口只提供下拉选择入口，不把关键字持久化到配置目录。
 
 use super::*;
 
@@ -105,6 +105,7 @@ impl SearchDialogWindowView {
                 .flatten();
             if let Some(dialog) = view.search_dialog.as_mut() {
                 dialog.scope = scope;
+                dialog.query_history_menu_open = false;
                 if let Some(target) = default_directory_target
                     && dialog.directory_target.trim().is_empty()
                 {
@@ -133,6 +134,7 @@ impl SearchDialogWindowView {
         self.main_view.update(context, |view, context| {
             if let Some(dialog) = view.search_dialog.as_mut() {
                 dialog.case_sensitive = !dialog.case_sensitive;
+                dialog.query_history_menu_open = false;
                 dialog.current_file_match_count = None;
             }
             context.notify();
@@ -143,6 +145,9 @@ impl SearchDialogWindowView {
     /// 统计当前关键字在当前文件中的出现次数。
     pub(super) fn count_current_file_matches(&mut self, context: &mut Context<Self>) {
         self.main_view.update(context, |view, context| {
+            if let Some(dialog) = view.search_dialog.as_mut() {
+                dialog.query_history_menu_open = false;
+            }
             view.count_search_query_in_current_file(context);
         });
         context.notify();
@@ -152,6 +157,25 @@ impl SearchDialogWindowView {
     pub(super) fn start_search(&mut self, context: &mut Context<Self>) {
         self.main_view.update(context, |view, context| {
             view.start_search(context);
+        });
+        context.notify();
+    }
+
+    /// 启动快搜任务。
+    pub(super) fn start_quick_search(&mut self, context: &mut Context<Self>) {
+        self.main_view.update(context, |view, context| {
+            view.start_quick_search(context);
+        });
+        context.notify();
+    }
+
+    /// 停止当前搜索任务。
+    ///
+    /// 业务意图：
+    /// - 搜索按钮在任务运行中会切换成停止按钮；点击后只中断后台搜索，保留搜索窗口和用户输入。
+    pub(super) fn stop_search(&mut self, context: &mut Context<Self>) {
+        self.main_view.update(context, |view, context| {
+            view.stop_current_search(context);
         });
         context.notify();
     }
@@ -211,6 +235,65 @@ impl SearchDialogWindowView {
         self.main_view.update(context, |view, context| {
             view.finish_search_text_mouse_selection(context);
         });
+        context.notify();
+    }
+
+    /// 切换搜索关键字历史下拉菜单。
+    ///
+    /// 业务意图：
+    /// - 用户可以从最近 10 次搜索关键字中快速恢复查询条件；历史为空时按钮不展开菜单。
+    /// - 展开后焦点仍回到关键字输入框，方便用户选择历史项后继续键盘编辑。
+    pub(super) fn toggle_search_history_menu(
+        &mut self,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let focus_handle = self.main_view.update(context, |view, context| {
+            let has_history = !view.search_query_history.is_empty();
+            if let Some(dialog) = view.search_dialog.as_mut() {
+                dialog.query_history_menu_open = has_history && !dialog.query_history_menu_open;
+            }
+            context.notify();
+            view.search_input_focus.clone()
+        });
+        window.focus(&focus_handle);
+        context.notify();
+    }
+
+    /// 关闭搜索关键字历史下拉菜单。
+    ///
+    /// 业务意图：
+    /// - 点击搜索窗口中除历史按钮和历史项外的区域时，应收起菜单，避免它持续遮挡范围和选项控件。
+    pub(super) fn dismiss_search_history_menu(&mut self, context: &mut Context<Self>) {
+        self.main_view.update(context, |view, context| {
+            if let Some(dialog) = view.search_dialog.as_mut()
+                && dialog.query_history_menu_open
+            {
+                dialog.query_history_menu_open = false;
+                context.notify();
+            }
+        });
+        context.notify();
+    }
+
+    /// 选择一个历史搜索关键字。
+    ///
+    /// 业务意图：
+    /// - 选择历史项只替换关键字，不立即搜索，让用户仍可调整搜索范围、大小写和目录目标。
+    pub(super) fn select_search_history_query(
+        &mut self,
+        query: String,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let focus_handle = self.main_view.update(context, |view, context| {
+            if let Some(dialog) = view.search_dialog.as_mut() {
+                MainView::apply_search_history_query(dialog, &query);
+            }
+            context.notify();
+            view.search_input_focus.clone()
+        });
+        window.focus(&focus_handle);
         context.notify();
     }
 
@@ -285,11 +368,13 @@ impl SearchDialogWindowView {
     fn render_search_input(
         &self,
         _dialog: &SearchDialogState,
+        search_query_history: &[String],
         focus_handle: gpui::FocusHandle,
         _window: &Window,
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        let has_history = !search_query_history.is_empty();
         div()
             .id("search-dialog-window-input")
             .relative()
@@ -335,17 +420,169 @@ impl SearchDialogWindowView {
                     .h_full()
                     .w_full()
                     .min_w_0()
-                    .overflow_hidden()
-                    .line_height(px(20.0))
-                    .text_size(px(14.0))
-                    .text_color(rgb(palette.text))
-                    .child(SearchTextInputElement {
-                        view: self.main_view.clone(),
-                        input_kind: SearchTextInputKind::Query,
-                        focus_handle,
-                        placeholder: "输入搜索关键字",
-                        palette,
-                    }),
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .line_height(px(20.0))
+                            .text_size(px(14.0))
+                            .text_color(rgb(palette.text))
+                            .child(SearchTextInputElement {
+                                view: self.main_view.clone(),
+                                input_kind: SearchTextInputKind::Query,
+                                focus_handle,
+                                placeholder: "输入搜索关键字",
+                                palette,
+                            }),
+                    )
+                    .child(self.render_search_history_button(has_history, palette, context)),
+            )
+    }
+
+    /// 渲染搜索关键字历史下拉按钮。
+    ///
+    /// 业务意图：
+    /// - 按钮使用下拉箭头而不是文字，减少搜索框内占用空间，并符合“选择历史项”的控件语义。
+    fn render_search_history_button(
+        &self,
+        enabled: bool,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("search-dialog-window-history-button")
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(SEARCH_HISTORY_DROPDOWN_BUTTON_WIDTH))
+            .h(px(24.0))
+            .rounded(px(4.0))
+            .text_color(rgb(if enabled {
+                palette.text
+            } else {
+                palette.muted_text
+            }))
+            .when(enabled, |button| {
+                button
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(rgb(palette.hover)))
+            })
+            .when(!enabled, |button| button.opacity(0.45))
+            .child(MainView::render_lucide_icon(
+                Some(Icon::ChevronDown),
+                13.0,
+                13.0,
+                if enabled {
+                    palette.muted_text
+                } else {
+                    palette.border
+                },
+            ))
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(move |view, _event: &MouseDownEvent, window, context| {
+                    if enabled {
+                        view.toggle_search_history_menu(window, context);
+                    }
+                    context.stop_propagation();
+                }),
+            )
+    }
+
+    /// 渲染搜索关键字历史下拉菜单。
+    ///
+    /// 业务意图：
+    /// - 菜单贴在关键字输入框下方，按最近使用顺序展示历史关键字，点击任一项后填入输入框。
+    /// - 历史最多 10 条；菜单设置最大高度和纵向滚动，避免窗口高度受历史数量影响。
+    fn render_search_history_dropdown(
+        &self,
+        search_query_history: &[String],
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let menu_height = (search_query_history.len() as f32 * SEARCH_HISTORY_DROPDOWN_ITEM_HEIGHT
+            + 8.0)
+            .min(SEARCH_HISTORY_DROPDOWN_MAX_HEIGHT);
+
+        div()
+            .id("search-dialog-window-history-menu")
+            .absolute()
+            .left(px(SEARCH_DIALOG_CONTENT_PADDING))
+            .right(px(SEARCH_DIALOG_CONTENT_PADDING))
+            .top(px(SEARCH_DIALOG_CONTENT_PADDING
+                + SEARCH_INPUT_HEIGHT
+                + SEARCH_HISTORY_DROPDOWN_GAP))
+            .h(px(menu_height))
+            .py_1()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.menu))
+            .shadow_lg()
+            .overflow_y_scroll()
+            .scrollbar_width(px(6.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    // 历史菜单是搜索窗口内的浮层，点到滚动区域或内边距时不能冒泡到窗口根节点导致误关闭。
+                    context.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    // 右键同样需要停留在历史菜单层，避免后续新增父级右键行为时形成透传。
+                    context.stop_propagation();
+                }),
+            )
+            .children(
+                search_query_history
+                    .iter()
+                    .enumerate()
+                    .map(|(index, query)| {
+                        self.render_search_history_item(index, query, palette, context)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+    }
+
+    /// 渲染单个搜索关键字历史项。
+    fn render_search_history_item(
+        &self,
+        index: usize,
+        query: &str,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let query = query.to_string();
+        div()
+            .id(SharedString::from(format!(
+                "search-dialog-window-history-item-{index}"
+            )))
+            .flex()
+            .items_center()
+            .h(px(SEARCH_HISTORY_DROPDOWN_ITEM_HEIGHT))
+            .px_2()
+            .text_xs()
+            .text_color(rgb(palette.text))
+            .cursor_pointer()
+            .hover(move |item| item.bg(rgb(palette.hover)).text_color(rgb(palette.accent)))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .font_family(LOG_VIEWER_FONT_FAMILY)
+                    .child(query.clone()),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(move |view, _event: &MouseDownEvent, window, context| {
+                    view.select_search_history_query(query.clone(), window, context);
+                    context.stop_propagation();
+                }),
             )
     }
 
@@ -536,10 +773,30 @@ impl SearchDialogWindowView {
     fn render_action_buttons(
         &self,
         can_search: bool,
+        can_quick_search: bool,
         can_count: bool,
+        is_searching: bool,
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Div {
+        let submit_enabled = is_searching || can_search;
+        let submit_label = if is_searching { "停止" } else { "搜索" };
+        let submit_icon = if is_searching { Icon::X } else { Icon::Search };
+        let submit_background = if submit_enabled {
+            if is_searching {
+                palette.error
+            } else {
+                palette.accent
+            }
+        } else {
+            palette.muted_text
+        };
+        let submit_hover_background = if is_searching {
+            palette.error
+        } else {
+            palette.accent_hover
+        };
+
         div()
             .flex()
             .items_center()
@@ -581,11 +838,59 @@ impl SearchDialogWindowView {
                         },
                     ))
                     .child("计数")
-                    .on_click(
-                        context.listener(|view, _event: &ClickEvent, _window, context| {
-                            view.count_current_file_matches(context);
-                        }),
-                    ),
+                    .on_click(context.listener(
+                        move |view, _event: &ClickEvent, _window, context| {
+                            if can_count {
+                                view.count_current_file_matches(context);
+                            }
+                            context.stop_propagation();
+                        },
+                    )),
+            )
+            .child(
+                div()
+                    .id("search-dialog-window-quick-search")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap_1()
+                    .h(px(28.0))
+                    .px_3()
+                    .rounded(px(5.0))
+                    .text_xs()
+                    .text_color(rgb(if can_quick_search {
+                        palette.accent
+                    } else {
+                        palette.muted_text
+                    }))
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.panel))
+                    .when(can_quick_search, |button| {
+                        button
+                            .cursor_pointer()
+                            .hover(move |button| button.bg(rgb(palette.hover)))
+                    })
+                    .when(!can_quick_search, |button| button.opacity(0.72))
+                    .child(MainView::render_lucide_icon(
+                        Some(Icon::Zap),
+                        12.0,
+                        12.0,
+                        if can_quick_search {
+                            palette.accent
+                        } else {
+                            palette.muted_text
+                        },
+                    ))
+                    .child("快搜")
+                    .on_click(context.listener(
+                        move |view, _event: &ClickEvent, _window, context| {
+                            if can_quick_search {
+                                view.start_quick_search(context);
+                            }
+                            context.stop_propagation();
+                        },
+                    )),
             )
             .child(
                 div()
@@ -599,29 +904,30 @@ impl SearchDialogWindowView {
                     .rounded(px(5.0))
                     .text_xs()
                     .text_color(rgb(palette.on_accent))
-                    .bg(rgb(if can_search {
-                        palette.accent
-                    } else {
-                        palette.muted_text
-                    }))
-                    .when(can_search, |button| {
+                    .bg(rgb(submit_background))
+                    .when(submit_enabled, |button| {
                         button
                             .cursor_pointer()
-                            .hover(move |button| button.bg(rgb(palette.accent_hover)))
+                            .hover(move |button| button.bg(rgb(submit_hover_background)))
                     })
-                    .when(!can_search, |button| button.opacity(0.72))
+                    .when(!submit_enabled, |button| button.opacity(0.72))
                     .child(MainView::render_lucide_icon(
-                        Some(Icon::Search),
+                        Some(submit_icon),
                         12.0,
                         12.0,
                         palette.on_accent,
                     ))
-                    .child("搜索")
-                    .on_click(
-                        context.listener(|view, _event: &ClickEvent, _window, context| {
-                            view.start_search(context);
-                        }),
-                    ),
+                    .child(submit_label)
+                    .on_click(context.listener(
+                        move |view, _event: &ClickEvent, _window, context| {
+                            if is_searching {
+                                view.stop_search(context);
+                            } else if can_search {
+                                view.start_search(context);
+                            }
+                            context.stop_propagation();
+                        },
+                    )),
             )
     }
 }
@@ -633,7 +939,16 @@ impl Render for SearchDialogWindowView {
     /// - 窗口只承载搜索条件、进度和关闭动作；结果仍显示在主窗口底部面板。
     /// - 根节点填满独立窗口，避免在无系统标题栏场景下出现透明或不可点击区域。
     fn render(&mut self, window: &mut Window, context: &mut Context<Self>) -> impl IntoElement {
-        let (dialog, can_search, can_count, search_focus, directory_focus, palette) = {
+        let (
+            dialog,
+            can_search,
+            can_quick_search,
+            can_count,
+            search_query_history,
+            search_focus,
+            directory_focus,
+            palette,
+        ) = {
             let main_view = self.main_view.read(context);
             let Some(dialog) = main_view.search_dialog.clone() else {
                 let palette = main_view.palette();
@@ -645,12 +960,15 @@ impl Render for SearchDialogWindowView {
             (
                 dialog.clone(),
                 main_view.search_can_start(&dialog),
-                main_view.search_can_count_current_file(&dialog),
+                main_view.quick_search_can_start(&dialog),
+                main_view.search_can_count_current_file(&dialog) && !dialog.is_searching,
+                main_view.search_query_history.clone(),
                 main_view.search_input_focus.clone(),
                 main_view.search_directory_focus.clone(),
                 main_view.palette(),
             )
         };
+        let history_menu_open = dialog.query_history_menu_open && !search_query_history.is_empty();
 
         div()
             .id("search-dialog-window")
@@ -662,6 +980,12 @@ impl Render for SearchDialogWindowView {
             .border_color(rgb(palette.border))
             .bg(rgb(palette.background))
             .overflow_hidden()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|view, _event: &MouseDownEvent, _window, context| {
+                    view.dismiss_search_history_menu(context);
+                }),
+            )
             .on_mouse_move(
                 context.listener(|view, event: &MouseMoveEvent, _window, context| {
                     // 输入框拖拽选择一旦从输入框内开始，后续鼠标可能移到标题栏、范围按钮或空白区域。
@@ -684,12 +1008,16 @@ impl Render for SearchDialogWindowView {
             .child(self.render_header(palette, context))
             .child(
                 div()
+                    .relative()
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .p_3()
+                    .px_4()
+                    .pt_4()
+                    .pb_2()
                     .child(self.render_search_input(
                         &dialog,
+                        &search_query_history,
                         search_focus,
                         window,
                         palette,
@@ -713,7 +1041,14 @@ impl Render for SearchDialogWindowView {
                                 palette.muted_text
                             }))
                             .child(dialog.message.clone()),
-                    ),
+                    )
+                    .when(history_menu_open, |content| {
+                        content.child(self.render_search_history_dropdown(
+                            &search_query_history,
+                            palette,
+                            context,
+                        ))
+                    }),
             )
             .child(
                 div()
@@ -721,12 +1056,19 @@ impl Render for SearchDialogWindowView {
                     .flex_col()
                     .flex_1()
                     .justify_end()
-                    // 操作按钮位于搜索窗口右下角，额外增加右侧和底部留白，避免按钮贴近窗口边缘。
-                    // 只调整外层安全边距，不改变按钮尺寸、排列或信息密度。
+                    // 操作按钮位于搜索窗口右下角，底部留白需要大于普通内容间距，避免按钮贴近无标题窗口下边框。
+                    // 这里只调整外层安全边距，不改变按钮尺寸和点击热区，保证已有肌肉记忆不受影响。
                     .px_4()
-                    .pb_4()
-                    .pt_0()
-                    .child(self.render_action_buttons(can_search, can_count, palette, context)),
+                    .pb_5()
+                    .pt_2()
+                    .child(self.render_action_buttons(
+                        can_search,
+                        can_quick_search,
+                        can_count,
+                        dialog.is_searching,
+                        palette,
+                        context,
+                    )),
             )
     }
 }

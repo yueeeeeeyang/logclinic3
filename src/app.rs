@@ -156,6 +156,23 @@ const LOG_VIEWER_FONT_SIZE_FILE_NAME: &str = "log-viewer-font-size.txt";
 /// - 文件保存原始多行文本而不是结构化格式，方便用户直接打开配置文件排查或批量替换。
 const THREAD_ANALYSIS_FILTER_FILE_NAME: &str = "thread-analysis-filter.txt";
 
+/// 快搜关键字配置文件名。
+///
+/// 业务意图：
+/// - 快搜关键字是用户面向排障场景维护的常用搜索词集合，需要跨应用重启保留。
+/// - 文件保存英文逗号分隔的单行文本，保持可手工编辑，同时避免为一个简单列表引入结构化配置依赖。
+const QUICK_SEARCH_KEYWORDS_FILE_NAME: &str = "quick-search-keywords.txt";
+
+/// 快搜默认关键字配置。
+///
+/// 业务意图：
+/// - 首次使用快搜时内置常见导入、导出、转换和水印相关排障词，用户不需要先进入设置维护才能使用快搜。
+///
+/// 边界条件：
+/// - 该默认值只在配置文件不存在时使用；如果用户保存空配置，会写入空文件，后续启动必须尊重用户显式选择。
+/// - 关键字只使用英文逗号分隔，和快搜配置解析规则保持一致。
+const DEFAULT_QUICK_SEARCH_KEYWORDS_TEXT: &str = "excel,import,export,wbi,convertFile,waterMark";
+
 /// 线程日志分析默认过滤配置。
 ///
 /// 业务意图：
@@ -694,6 +711,11 @@ fn thread_analysis_filter_preference_path() -> Option<PathBuf> {
     app_config_dir().map(|dir| dir.join(THREAD_ANALYSIS_FILTER_FILE_NAME))
 }
 
+/// 获取快搜关键字配置文件路径。
+fn quick_search_keywords_preference_path() -> Option<PathBuf> {
+    app_config_dir().map(|dir| dir.join(QUICK_SEARCH_KEYWORDS_FILE_NAME))
+}
+
 /// 规范化线程日志分析过滤配置文本。
 ///
 /// 业务意图：
@@ -750,6 +772,71 @@ fn save_thread_analysis_filter_preference(text: &str) {
             path.display(),
             error
         );
+    }
+}
+
+/// 规范化快搜关键字配置文本。
+///
+/// 业务意图：
+/// - 快搜关键字配置是单行英文逗号分隔文本，平台粘贴或手工编辑时出现换行应被移除，避免保存后解析出跨行不可见字符。
+/// - 这里只处理换行，不替换中文逗号；用户已确认“仅英文逗号”才是分隔符。
+fn normalize_quick_search_keywords_text(text: &str) -> String {
+    text.replace(['\r', '\n'], "")
+}
+
+/// 解析快搜关键字配置。
+///
+/// 业务意图：
+/// - 快搜按多个配置关键字执行 OR 搜索；配置文本只按英文逗号分隔，中文逗号保留为关键字内容。
+/// - 去掉每项首尾空白并丢弃空项，避免连续逗号或末尾逗号生成无意义搜索。
+fn parse_quick_search_keywords(raw: &str) -> Vec<String> {
+    normalize_quick_search_keywords_text(raw)
+        .split(',')
+        .map(str::trim)
+        .filter(|keyword| !keyword.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// 从指定文件读取快搜关键字配置。
+///
+/// 错误处理：
+/// - 配置缺失时使用内置默认关键字，便于首次使用快搜；其它读取失败回退为空文本，避免覆盖用户已有但暂时不可读的配置。
+fn read_quick_search_keywords_preference(path: &Path) -> String {
+    match fs::read_to_string(path) {
+        Ok(raw) => normalize_quick_search_keywords_text(&raw),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            DEFAULT_QUICK_SEARCH_KEYWORDS_TEXT.to_string()
+        }
+        Err(_) => String::new(),
+    }
+}
+
+/// 将快搜关键字配置写入指定文件。
+fn write_quick_search_keywords_preference(path: &Path, text: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, normalize_quick_search_keywords_text(text))
+}
+
+/// 读取快搜关键字配置。
+fn load_quick_search_keywords_preference() -> String {
+    quick_search_keywords_preference_path()
+        .map(|path| read_quick_search_keywords_preference(&path))
+        .unwrap_or_else(|| DEFAULT_QUICK_SEARCH_KEYWORDS_TEXT.to_string())
+}
+
+/// 保存快搜关键字配置。
+///
+/// 错误处理：
+/// - 写入失败不影响当前会话的快搜配置草稿，仅输出开发期诊断，避免配置目录权限问题阻断设置窗口操作。
+fn save_quick_search_keywords_preference(text: &str) {
+    let Some(path) = quick_search_keywords_preference_path() else {
+        return;
+    };
+    if let Err(error) = write_quick_search_keywords_preference(&path, text) {
+        eprintln!("保存快搜关键字配置失败：{}：{}", path.display(), error);
     }
 }
 
@@ -1227,7 +1314,7 @@ const SEARCH_DIALOG_WIDTH: f32 = 430.0;
 ///
 /// 边界条件：
 /// - 该窗口不可调整大小；如果后续增加搜索历史、正则等更多控件，应同步重新定义窗口高度策略。
-const SEARCH_DIALOG_WINDOW_HEIGHT: f32 = 286.0;
+const SEARCH_DIALOG_WINDOW_HEIGHT: f32 = 300.0;
 
 /// 搜索关键字历史记录上限。
 ///
@@ -1235,6 +1322,30 @@ const SEARCH_DIALOG_WINDOW_HEIGHT: f32 = 286.0;
 /// - 搜索窗口再次打开时需要能恢复最近一次关键字，减少重复输入。
 /// - 只保留最近 10 条，避免当前会话内频繁搜索导致状态无限增长；当前不持久化到磁盘，避免隐私规则未定义前保存用户日志关键字。
 const SEARCH_QUERY_HISTORY_LIMIT: usize = 10;
+
+/// 搜索关键字历史下拉按钮宽度。
+///
+/// 业务意图：
+/// - 搜索框右侧需要一个独立、稳定的点击区域展开历史关键字，避免和文本输入区的光标定位互相干扰。
+const SEARCH_HISTORY_DROPDOWN_BUTTON_WIDTH: f32 = 26.0;
+
+/// 搜索关键字历史下拉菜单与搜索框的间距。
+///
+/// 业务意图：
+/// - 菜单贴近搜索框但留出细微间隔，用户能明确它属于关键字输入框而不是下面的范围控件。
+const SEARCH_HISTORY_DROPDOWN_GAP: f32 = 4.0;
+
+/// 搜索关键字历史下拉菜单单项高度。
+///
+/// 业务意图：
+/// - 历史关键字是短文本选择项，固定高度让最多 10 条历史在滚动容器里保持稳定命中区域。
+const SEARCH_HISTORY_DROPDOWN_ITEM_HEIGHT: f32 = 28.0;
+
+/// 搜索关键字历史下拉菜单最大高度。
+///
+/// 业务意图：
+/// - 历史最多保存 10 条，但搜索窗口高度有限；菜单超过该高度后滚动，避免遮住整个窗口内容。
+const SEARCH_HISTORY_DROPDOWN_MAX_HEIGHT: f32 = 176.0;
 
 /// 设置窗口默认宽度。
 ///
@@ -1287,6 +1398,12 @@ const THREAD_ANALYSIS_FILTER_TEXT_LINE_HEIGHT: f32 = 18.0;
 /// 业务意图：
 /// - 搜索框只承载单行查询词，不支持多行输入，因此固定高度可以简化键盘和点击焦点处理。
 const SEARCH_INPUT_HEIGHT: f32 = 30.0;
+
+/// 搜索窗口内容区内边距。
+///
+/// 业务意图：
+/// - 搜索历史下拉菜单作为内容区绝对定位弹层，需要和输入框左、右边缘对齐；该值和搜索窗口内容容器的 `p_3` 保持一致。
+const SEARCH_DIALOG_CONTENT_PADDING: f32 = 16.0;
 
 /// 搜索结果面板默认高度。
 ///
@@ -2049,6 +2166,19 @@ impl SettingsTab {
     }
 }
 
+/// 搜索对话框级键盘命令。
+///
+/// 业务意图：
+/// - `Enter` 和 `Escape` 在搜索窗口里分别代表执行搜索和关闭窗口，但设置窗口也有自绘文本框；
+///   先把这两个控制键归类，便于全局快捷键在焦点位于设置输入框时明确放行。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchDialogControlKey {
+    /// 执行当前搜索条件。
+    Submit,
+    /// 关闭搜索对话框。
+    Close,
+}
+
 /// 搜索对话框的交互状态。
 ///
 /// 业务意图：
@@ -2075,6 +2205,14 @@ struct SearchDialogState {
     /// 边界条件：
     /// - 组合完成后必须清空该范围，否则后续普通输入会错误替换旧组合文本。
     marked_range: Option<Range<usize>>,
+    /// 搜索关键字历史下拉菜单是否展开。
+    ///
+    /// 业务意图：
+    /// - 历史记录本身保存在 `MainView`，展开状态属于当前搜索窗口交互，随搜索窗口关闭一起丢弃。
+    ///
+    /// 边界条件：
+    /// - 当历史为空、用户选择历史项、编辑关键字或开始搜索时都应关闭，避免显示过期选项。
+    query_history_menu_open: bool,
     /// 搜索范围。
     scope: SearchScope,
     /// 当前目录搜索的目标目录文本。
@@ -2882,8 +3020,62 @@ struct MainView {
     /// - 字段保存原始多行文本，便于设置窗口继续展示用户维护的规则；真正匹配前再拆分和去空白。
     ///
     /// 边界条件：
-    /// - 配置文件缺失时加载内置默认过滤堆栈，其它读取失败回退为空字符串；用户编辑后立即尝试写入配置文件，写入失败不影响当前会话分析。
+    /// - 配置文件缺失时加载内置默认过滤堆栈，其它读取失败回退为空字符串；用户在设置页点击保存后再写入配置文件，写入失败不影响当前会话分析。
     thread_analysis_filter_text: String,
+
+    /// 线程日志分析过滤输入区是否处于编辑状态。
+    ///
+    /// 业务意图：
+    /// - 过滤规则默认以内置或已保存内容只读展示，避免用户在查看堆栈时误触键盘、粘贴或输入法提交导致配置被改写。
+    /// - 点击“编辑”后才允许改动文本，点击“保存”后落盘并回到只读状态。
+    thread_analysis_filter_is_editing: bool,
+
+    /// 进入编辑前的线程日志分析过滤配置快照。
+    ///
+    /// 业务意图：
+    /// - 编辑态文本是未保存草稿，不能提前影响线程分析过滤规则；启动分析时如果仍在编辑，继续使用进入编辑前的已保存快照。
+    /// - 设置窗口关闭且未保存时可用该快照恢复只读展示，避免用户误以为临时草稿已经跨会话生效。
+    thread_analysis_filter_saved_text_before_edit: Option<String>,
+
+    /// 快搜关键字配置原文。
+    ///
+    /// 业务意图：
+    /// - 用户在日志设置页维护常用排障关键字，搜索对话框的“快搜”按钮会用该字段的已保存内容生成多关键字 OR 搜索。
+    /// - 字段保存英文逗号分隔的单行原文，便于用户按自己的顺序表达同位置命中的高亮优先级。
+    ///
+    /// 边界条件：
+    /// - 配置文件缺失时加载内置默认关键字，其它读取失败回退为空字符串；用户点击保存后才写入配置文件。
+    quick_search_keywords_text: String,
+
+    /// 快搜关键字输入区是否处于编辑状态。
+    ///
+    /// 业务意图：
+    /// - 和线程日志分析过滤一致，默认只读展示已保存配置，只有点击编辑后才允许键盘、粘贴或 IME 修改。
+    quick_search_keywords_is_editing: bool,
+
+    /// 进入编辑前的快搜关键字配置快照。
+    ///
+    /// 业务意图：
+    /// - 编辑态内容属于未保存草稿，不能提前影响搜索对话框中的快搜按钮；关闭设置窗口未保存时也需要恢复。
+    quick_search_keywords_saved_text_before_edit: Option<String>,
+
+    /// 快搜关键字输入区的选择范围，使用 UTF-8 字节下标。
+    quick_search_keywords_selection_range: Range<usize>,
+
+    /// 快搜关键字输入区的输入法组合文本范围。
+    quick_search_keywords_marked_range: Option<Range<usize>>,
+
+    /// 快搜关键字输入区焦点句柄。
+    quick_search_keywords_focus: gpui::FocusHandle,
+
+    /// 快搜关键字输入区最近一次单行排版结果。
+    quick_search_keywords_last_layout: Option<ShapedLine>,
+
+    /// 快搜关键字输入区最近一次绘制边界。
+    quick_search_keywords_last_bounds: Option<Bounds<Pixels>>,
+
+    /// 快搜关键字输入区拖拽选择锚点。
+    quick_search_keywords_selection_drag: Option<usize>,
 
     /// 线程日志分析过滤输入区的选择范围。
     ///
@@ -3079,6 +3271,17 @@ impl MainView {
             theme_preference: load_theme_preference(),
             log_viewer_font_size: load_log_viewer_font_size_preference(),
             thread_analysis_filter_text: load_thread_analysis_filter_preference(),
+            thread_analysis_filter_is_editing: false,
+            thread_analysis_filter_saved_text_before_edit: None,
+            quick_search_keywords_text: load_quick_search_keywords_preference(),
+            quick_search_keywords_is_editing: false,
+            quick_search_keywords_saved_text_before_edit: None,
+            quick_search_keywords_selection_range: 0..0,
+            quick_search_keywords_marked_range: None,
+            quick_search_keywords_focus: context.focus_handle(),
+            quick_search_keywords_last_layout: None,
+            quick_search_keywords_last_bounds: None,
+            quick_search_keywords_selection_drag: None,
             thread_analysis_filter_selection_range: 0..0,
             thread_analysis_filter_marked_range: None,
             thread_analysis_filter_focus: context.focus_handle(),
@@ -3592,6 +3795,20 @@ impl MainView {
             .border_color(rgb(palette.border))
             .bg(rgb(palette.menu))
             .shadow_lg()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    // 菜单自身覆盖在全屏关闭遮罩之上，空白边距点击不能继续落到遮罩或底层工具栏。
+                    context.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    // 右键点在菜单上只应停留在当前菜单层，避免误触发底层区域的右键处理。
+                    context.stop_propagation();
+                }),
+            )
             .child(self.render_load_source_menu_item(
                 LoadPromptKind::LogFilesOrArchives,
                 Icon::FileArchive,
@@ -3899,7 +4116,7 @@ impl MainView {
         }
         let source_count = sources.len();
         let filter_rules =
-            Self::parse_thread_analysis_filter_rules(&self.thread_analysis_filter_text);
+            Self::parse_thread_analysis_filter_rules(self.thread_analysis_filter_effective_text());
         let main_view = context.entity();
         let main_view_for_loading = main_view.clone();
         let loading_analysis = ThreadAnalysisData {
@@ -4939,7 +5156,8 @@ impl MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) -> bool {
-        if self.editable_text_input_focused(window)
+        let editable_text_input_focused = self.editable_text_input_focused(window);
+        if editable_text_input_focused
             && (Self::is_copy_keystroke(&keystroke) || Self::is_paste_keystroke(&keystroke))
         {
             return false;
@@ -4955,13 +5173,16 @@ impl MainView {
             return true;
         }
 
-        if self.search_dialog.is_some() && keystroke.key == "enter" {
-            self.start_search(context);
-            return true;
-        }
-
-        if self.search_dialog.is_some() && keystroke.key == "escape" {
-            self.close_search_dialog(window, context);
+        if self.search_dialog.is_some()
+            && let Some(control_key) = Self::search_dialog_control_key(&keystroke)
+        {
+            if self.settings_text_input_focused(window) {
+                return false;
+            }
+            match control_key {
+                SearchDialogControlKey::Submit => self.start_search(context),
+                SearchDialogControlKey::Close => self.close_search_dialog(window, context),
+            }
             return true;
         }
 
@@ -4998,6 +5219,16 @@ impl MainView {
         self.search_input_focus.is_focused(window) || self.search_directory_focus.is_focused(window)
     }
 
+    /// 判断焦点是否位于设置窗口内的自绘文本输入框。
+    ///
+    /// 业务意图：
+    /// - 搜索窗口打开时，全局 `Enter`/`Escape` 仍会生效；如果用户正在设置页编辑线程过滤或快搜关键字，
+    ///   这些按键必须优先交给设置输入框，不能误触发搜索或关闭搜索窗口。
+    fn settings_text_input_focused(&self, window: &Window) -> bool {
+        self.thread_analysis_filter_focus.is_focused(window)
+            || self.quick_search_keywords_focus.is_focused(window)
+    }
+
     /// 判断当前焦点是否位于应用内自绘的可编辑文本输入框。
     ///
     /// 业务意图：
@@ -5006,8 +5237,7 @@ impl MainView {
     /// - 线程日志分析过滤框位于设置窗口，但状态保存在 `MainView`，这里统一判断焦点，避免粘贴堆栈时误触发
     ///   “粘贴到搜索框并打开搜索窗口”的只读日志兜底行为。
     fn editable_text_input_focused(&self, window: &Window) -> bool {
-        self.search_text_input_focused(window)
-            || self.thread_analysis_filter_focus.is_focused(window)
+        self.search_text_input_focused(window) || self.settings_text_input_focused(window)
     }
 
     /// 延迟打开搜索对话框。
@@ -5067,6 +5297,18 @@ impl MainView {
             && (keystroke.modifiers.control
                 || keystroke.modifiers.platform
                 || Self::keystroke_matches_control_code(keystroke, CONTROL_X_CODE))
+    }
+
+    /// 判断按键是否是搜索窗口级控制键。
+    ///
+    /// 边界条件：
+    /// - 这里只识别无文本意义的控制键，不处理 `Ctrl+F` 等打开窗口快捷键，也不处理普通字符输入。
+    fn search_dialog_control_key(keystroke: &Keystroke) -> Option<SearchDialogControlKey> {
+        match keystroke.key.as_str() {
+            "enter" => Some(SearchDialogControlKey::Submit),
+            "escape" => Some(SearchDialogControlKey::Close),
+            _ => None,
+        }
     }
 
     /// 判断按键是否匹配指定字母或该字母的 ASCII 控制字符。
@@ -5507,6 +5749,50 @@ impl MainView {
         self.search_query_history.first().cloned()
     }
 
+    /// 把用户选择的历史关键字填入搜索对话框。
+    ///
+    /// 业务意图：
+    /// - 历史下拉菜单只负责选择已有关键字，不立即启动搜索，用户仍可继续编辑范围、大小写和目录目标。
+    /// - 选择后把光标放到关键字末尾，并清除组合文本和当前文件计数缓存，保证后续搜索使用完整新关键字。
+    ///
+    /// 边界条件：
+    /// - 空白历史项不会由历史管理产生；这里仍做防御性忽略，避免未来调用方传入非法值时清空当前输入。
+    fn apply_search_history_query(dialog: &mut SearchDialogState, query: &str) {
+        let query = query.trim();
+        if query.is_empty() {
+            dialog.query_history_menu_open = false;
+            return;
+        }
+
+        dialog.query = query.to_string();
+        let cursor = dialog.query.len();
+        dialog.selection_range = cursor..cursor;
+        dialog.marked_range = None;
+        dialog.query_history_menu_open = false;
+        dialog.current_file_match_count = None;
+        dialog.message = "已选择历史关键字，按 Enter 或点击搜索".to_string();
+    }
+
+    /// 停止搜索对话框当前正在运行的搜索任务，并返回需要标记取消的任务 ID。
+    ///
+    /// 业务意图：
+    /// - 搜索窗口中的“停止”按钮只中断当前后台任务，不关闭窗口，也不清空用户已经输入的关键字和范围。
+    /// - 后台任务可能已经在读取或搜索大文件；这里通过任务 ID 失效和 `is_searching=false` 丢弃后续回调，
+    ///   让 UI 立即恢复可编辑状态，同时保留取消前已经收集到的结果。
+    ///
+    /// 边界条件：
+    /// - 如果当前没有运行中的任务，只关闭历史下拉菜单并返回 `None`，避免重复点击停止按钮错误标记旧记录。
+    fn stop_search_dialog_task(dialog: &mut SearchDialogState) -> Option<usize> {
+        dialog.query_history_menu_open = false;
+        if !dialog.is_searching {
+            return None;
+        }
+
+        dialog.is_searching = false;
+        dialog.message = "搜索已停止，可修改条件后重新搜索".to_string();
+        Some(dialog.job_id)
+    }
+
     /// 从已加载目录树中收集匹配用户目录目标文本的来源。
     ///
     /// 业务意图：
@@ -5583,7 +5869,9 @@ impl MainView {
             {
                 return;
             }
-            main_view.update(app, |view, _| {
+            main_view.update(app, |view, context| {
+                view.discard_thread_analysis_filter_edit(context);
+                view.discard_quick_search_keywords_edit(context);
                 view.settings_window = None;
             });
         }
@@ -5608,6 +5896,8 @@ impl MainView {
         match app.open_window(settings_window_options, move |window, app| {
             window.on_window_should_close(app, move |_, app| {
                 main_view_for_close.update(app, |view, context| {
+                    view.discard_thread_analysis_filter_edit(context);
+                    view.discard_quick_search_keywords_edit(context);
                     view.settings_window = None;
                     view.settings_window_open_pending = false;
                     context.notify();
@@ -5824,6 +6114,7 @@ impl MainView {
                 query,
                 selection_range: query_cursor..query_cursor,
                 marked_range: None,
+                query_history_menu_open: false,
                 scope: SearchScope::CurrentFile,
                 directory_target,
                 directory_selection_range: directory_cursor..directory_cursor,
@@ -5848,6 +6139,7 @@ impl MainView {
             dialog.query = selected_query;
             dialog.selection_range = cursor..cursor;
             dialog.marked_range = None;
+            dialog.query_history_menu_open = false;
             dialog.current_file_match_count = None;
             dialog.message = "已填入选中文本，按 Enter 或点击搜索".to_string();
         } else if let Some(last_query) = self.last_search_query()
@@ -5858,6 +6150,7 @@ impl MainView {
             dialog.query = last_query;
             dialog.selection_range = cursor..cursor;
             dialog.marked_range = None;
+            dialog.query_history_menu_open = false;
             dialog.current_file_match_count = None;
             dialog.message = "已填入上次搜索关键字，按 Enter 或点击搜索".to_string();
         }
@@ -5996,19 +6289,40 @@ impl MainView {
         context.notify();
     }
 
+    /// 停止当前搜索任务但保留搜索窗口。
+    ///
+    /// 业务意图：
+    /// - 用户点击“停止”表示只中断本轮搜索，不应丢失已输入关键字、范围、大小写和目录目标。
+    /// - 通过推进 `next_search_job_id` 并清理 `is_searching`，后续后台回调会被 `is_current_search_job` 丢弃，
+    ///   避免已经取消的任务继续更新进度或在完成时关闭搜索窗口。
+    fn stop_current_search(&mut self, context: &mut Context<Self>) {
+        let canceled_job_id = self
+            .search_dialog
+            .as_mut()
+            .and_then(Self::stop_search_dialog_task);
+        let Some(job_id) = canceled_job_id else {
+            context.notify();
+            return;
+        };
+
+        self.next_search_job_id += 1;
+        self.mark_search_record_canceled(job_id);
+        context.notify();
+    }
+
     /// 启动一次搜索。
     ///
     /// 业务意图：
     /// - 从搜索对话框读取当前查询词、范围和大小写规则，统一分发到当前文件或当前目录搜索。
     /// - 新搜索会保留历史记录，但如果上一轮搜索仍在运行，必须先标记为已取消，避免旧任务回调被丢弃后面板长期显示“搜索中”。
     fn start_search(&mut self, context: &mut Context<Self>) {
-        let Some((options, scope, case_sensitive, directory_target, previous_running_job_id)) = ({
+        if let Some(dialog) = self.search_dialog.as_mut() {
+            dialog.query_history_menu_open = false;
+        }
+        let Some((query, scope, case_sensitive, directory_target, previous_running_job_id)) = ({
             self.search_dialog.as_ref().map(|dialog| {
                 (
-                    SearchOptions {
-                        query: dialog.query.trim().to_string(),
-                        case_sensitive: dialog.case_sensitive,
-                    },
+                    dialog.query.trim().to_string(),
                     dialog.scope,
                     dialog.case_sensitive,
                     dialog.directory_target.trim().to_string(),
@@ -6018,11 +6332,82 @@ impl MainView {
         }) else {
             return;
         };
+        let options = SearchOptions::single(query.clone(), case_sensitive);
         if options.is_empty_query() {
             self.update_search_dialog_message("请输入要搜索的关键字", context);
             return;
         }
-        self.remember_search_query(&options.query);
+        self.remember_search_query(&query);
+
+        self.start_search_job(
+            query,
+            options,
+            scope,
+            case_sensitive,
+            directory_target,
+            previous_running_job_id,
+            context,
+        );
+    }
+
+    /// 启动一次快搜。
+    ///
+    /// 业务意图：
+    /// - 快搜使用“设置-日志”中已保存的英文逗号分隔关键字，按 OR 语义搜索任一关键字命中的行。
+    /// - 快搜复用搜索窗口当前范围、目录目标和大小写选项，但不修改搜索框文本，也不写入普通搜索历史。
+    fn start_quick_search(&mut self, context: &mut Context<Self>) {
+        if let Some(dialog) = self.search_dialog.as_mut() {
+            dialog.query_history_menu_open = false;
+        }
+        let keywords = self.effective_quick_search_keywords();
+        if keywords.is_empty() {
+            self.update_search_dialog_message("请先在设置-日志中配置快搜关键字", context);
+            return;
+        }
+        let Some((scope, case_sensitive, directory_target, previous_running_job_id)) = ({
+            self.search_dialog.as_ref().map(|dialog| {
+                (
+                    dialog.scope,
+                    dialog.case_sensitive,
+                    dialog.directory_target.trim().to_string(),
+                    dialog.is_searching.then_some(dialog.job_id),
+                )
+            })
+        }) else {
+            return;
+        };
+        let record_query = format!("快搜：{}", keywords.join(", "));
+        let options = SearchOptions::any(keywords, case_sensitive);
+
+        self.start_search_job(
+            record_query,
+            options,
+            scope,
+            case_sensitive,
+            directory_target,
+            previous_running_job_id,
+            context,
+        );
+    }
+
+    /// 按给定选项创建搜索任务。
+    ///
+    /// 业务意图：
+    /// - 普通搜索和快搜只在关键字来源和结果记录标题上不同，真正的范围校验、后台任务、进度和结果面板应复用同一条路径。
+    fn start_search_job(
+        &mut self,
+        record_query: String,
+        options: SearchOptions,
+        scope: SearchScope,
+        case_sensitive: bool,
+        directory_target: String,
+        previous_running_job_id: Option<usize>,
+        context: &mut Context<Self>,
+    ) {
+        if options.is_empty_query() {
+            self.update_search_dialog_message("请输入要搜索的关键字", context);
+            return;
+        }
 
         let Some(active_tab_id) = self.active_tab_id else {
             self.update_search_dialog_message("请先从左侧打开一个日志文件", context);
@@ -6083,7 +6468,7 @@ impl MainView {
             .unwrap_or(SEARCH_RESULTS_PANEL_DEFAULT_HEIGHT);
         let new_record = SearchHistoryRecord {
             job_id,
-            query: options.query.clone(),
+            query: record_query,
             scope,
             directory_target: (scope == SearchScope::CurrentDirectory)
                 .then(|| directory_target.clone())
@@ -6201,6 +6586,7 @@ impl MainView {
     /// 业务意图：
     /// - 目录搜索可能涉及多个本地文件或压缩包成员，必须逐文件放到后台读取和解码。
     /// - 每个文件完成后立即回传进度，让搜索对话框显示真实进展，而不是等全部完成才更新。
+    /// - 串行搜索能避免同一压缩包被多个后台任务并发打开和解压，适合日志包内大量成员的常见场景。
     fn spawn_current_directory_search(
         &self,
         job_id: usize,
@@ -6626,9 +7012,11 @@ impl MainView {
         &mut self,
         _event: &MouseDownEvent,
         _window: &mut Window,
-        _context: &mut Context<Self>,
+        context: &mut Context<Self>,
     ) {
         self.is_resizing_splitter = true;
+        // 分栏拖拽条覆盖在左右内容之间，按下后必须截断，避免底层目录树或日志区同步收到鼠标事件。
+        context.stop_propagation();
     }
 
     /// 开始拖动左侧目录树滚动条滑块。
@@ -6956,6 +7344,132 @@ impl MainView {
         Some((text.to_string(), selection_range, marked_range))
     }
 
+    /// 返回当前应参与线程日志分析过滤的已保存文本。
+    ///
+    /// 业务意图：
+    /// - 设置页编辑态中的内容属于草稿，必须等用户点击保存后才影响下一次线程分析。
+    /// - 如果用户一边编辑设置一边从主窗口启动线程分析，这里仍使用进入编辑前的快照，避免半成品堆栈过滤掉真实线程。
+    fn thread_analysis_filter_effective_text(&self) -> &str {
+        self.thread_analysis_filter_saved_text_before_edit
+            .as_deref()
+            .unwrap_or(&self.thread_analysis_filter_text)
+    }
+
+    /// 返回当前应参与快搜的已保存关键字文本。
+    ///
+    /// 业务意图：
+    /// - 设置页编辑态中的快搜关键字属于草稿，必须等用户点击保存后才影响搜索对话框的快搜按钮。
+    /// - 如果用户一边编辑设置一边执行快搜，这里继续使用进入编辑前的快照，避免半成品关键字触发大量无关命中。
+    fn quick_search_keywords_effective_text(&self) -> &str {
+        self.quick_search_keywords_saved_text_before_edit
+            .as_deref()
+            .unwrap_or(&self.quick_search_keywords_text)
+    }
+
+    /// 返回当前已保存且可用于快搜的关键字列表。
+    fn effective_quick_search_keywords(&self) -> Vec<String> {
+        parse_quick_search_keywords(self.quick_search_keywords_effective_text())
+    }
+
+    /// 读取快搜关键字输入区当前文本、选择范围和组合文本范围的快照。
+    fn quick_search_keywords_text_snapshot(&self) -> (String, Range<usize>, Option<Range<usize>>) {
+        (
+            self.quick_search_keywords_text.clone(),
+            Self::clamp_search_text_range(
+                &self.quick_search_keywords_text,
+                self.quick_search_keywords_selection_range.clone(),
+            ),
+            self.quick_search_keywords_marked_range.clone(),
+        )
+    }
+
+    /// 保存快搜关键字输入区最近一次单行排版结果。
+    fn store_quick_search_keywords_layout(&mut self, line: ShapedLine, bounds: Bounds<Pixels>) {
+        self.quick_search_keywords_last_layout = Some(line);
+        self.quick_search_keywords_last_bounds = Some(bounds);
+    }
+
+    /// 根据鼠标窗口坐标返回快搜关键字输入区中的 UTF-8 字节下标。
+    fn quick_search_keywords_index_for_point(&self, position: Point<Pixels>) -> usize {
+        let text = &self.quick_search_keywords_text;
+        let (Some(layout), Some(bounds)) = (
+            self.quick_search_keywords_last_layout.as_ref(),
+            self.quick_search_keywords_last_bounds.as_ref(),
+        ) else {
+            return text.len();
+        };
+        if position.y < bounds.top() {
+            return 0;
+        }
+        if position.y > bounds.bottom() {
+            return text.len();
+        }
+        layout
+            .closest_index_for_x(position.x - bounds.left())
+            .min(text.len())
+    }
+
+    /// 开始快搜关键字输入区的鼠标选择。
+    fn start_quick_search_keywords_mouse_selection(
+        &mut self,
+        event: &MouseDownEvent,
+        context: &mut Context<Self>,
+    ) {
+        let index = self.quick_search_keywords_index_for_point(event.position);
+        self.quick_search_keywords_marked_range = None;
+        match event.click_count {
+            0 | 1 => {
+                if event.modifiers.shift {
+                    self.quick_search_keywords_selection_range.end = index;
+                    self.quick_search_keywords_selection_range = Self::clamp_search_text_range(
+                        &self.quick_search_keywords_text,
+                        self.quick_search_keywords_selection_range.clone(),
+                    );
+                } else {
+                    self.quick_search_keywords_selection_range = index..index;
+                }
+                self.quick_search_keywords_selection_drag =
+                    Some(self.quick_search_keywords_selection_range.start);
+            }
+            2 => {
+                self.quick_search_keywords_selection_range =
+                    Self::search_text_word_range_for_index(&self.quick_search_keywords_text, index);
+                self.quick_search_keywords_selection_drag = None;
+            }
+            _ => {
+                self.quick_search_keywords_selection_range =
+                    0..self.quick_search_keywords_text.len();
+                self.quick_search_keywords_selection_drag = None;
+            }
+        }
+        self.touch_search_text_cursor_activity();
+        context.notify();
+    }
+
+    /// 鼠标拖拽时更新快搜关键字输入区选区终点。
+    fn update_quick_search_keywords_mouse_selection(
+        &mut self,
+        position: Point<Pixels>,
+        context: &mut Context<Self>,
+    ) {
+        let Some(anchor) = self.quick_search_keywords_selection_drag else {
+            return;
+        };
+        let index = self.quick_search_keywords_index_for_point(position);
+        self.quick_search_keywords_marked_range = None;
+        self.quick_search_keywords_selection_range =
+            Self::clamp_search_text_range(&self.quick_search_keywords_text, anchor..index);
+        self.touch_search_text_cursor_activity();
+        context.notify();
+    }
+
+    /// 结束快搜关键字输入区鼠标拖拽选择。
+    fn finish_quick_search_keywords_mouse_selection(&mut self, context: &mut Context<Self>) {
+        if self.quick_search_keywords_selection_drag.take().is_some() {
+            context.notify();
+        }
+    }
+
     /// 读取线程日志分析过滤输入区当前文本、选择范围和组合文本范围的快照。
     ///
     /// 业务意图：
@@ -7109,19 +7623,127 @@ impl MainView {
         self.thread_analysis_filter_text.len()
     }
 
-    /// 清空线程日志分析过滤配置。
+    /// 进入快搜关键字编辑状态。
     ///
     /// 业务意图：
-    /// - 设置页提供明确的恢复入口，用户排查结束后可以一次性取消所有无效线程过滤规则。
-    fn clear_thread_analysis_filter_text(&mut self, context: &mut Context<Self>) {
-        if self.thread_analysis_filter_text.is_empty() {
+    /// - 快搜配置默认只读展示，用户明确点击编辑后才允许修改，避免误触键盘或粘贴导致常用关键字被改写。
+    /// - 光标放到文本末尾，便于用户继续追加英文逗号和新关键字。
+    fn begin_quick_search_keywords_edit(&mut self, context: &mut Context<Self>) {
+        if self.quick_search_keywords_is_editing {
             return;
         }
-        self.thread_analysis_filter_text.clear();
-        self.thread_analysis_filter_selection_range = 0..0;
+        self.quick_search_keywords_saved_text_before_edit =
+            Some(self.quick_search_keywords_text.clone());
+        self.quick_search_keywords_is_editing = true;
+        let cursor = self.quick_search_keywords_text.len();
+        self.quick_search_keywords_selection_range = cursor..cursor;
+        self.quick_search_keywords_marked_range = None;
+        self.quick_search_keywords_selection_drag = None;
+        self.touch_search_text_cursor_activity();
+        context.notify();
+    }
+
+    /// 保存快搜关键字配置并退出编辑状态。
+    ///
+    /// 业务意图：
+    /// - 点击保存后才把单行关键字配置写入配置目录，保证快搜行为只受明确保存过的规则影响。
+    /// - 保存前移除换行但保留中文逗号等其它字符，因为用户已确认只有英文逗号具备分隔语义。
+    fn save_quick_search_keywords_edit(&mut self, context: &mut Context<Self>) {
+        let normalized = normalize_quick_search_keywords_text(&self.quick_search_keywords_text);
+        if normalized != self.quick_search_keywords_text {
+            self.quick_search_keywords_text = normalized;
+        }
+        self.quick_search_keywords_selection_range = Self::clamp_search_text_range(
+            &self.quick_search_keywords_text,
+            self.quick_search_keywords_selection_range.clone(),
+        );
+        self.quick_search_keywords_marked_range = None;
+        self.quick_search_keywords_selection_drag = None;
+        self.quick_search_keywords_is_editing = false;
+        self.quick_search_keywords_saved_text_before_edit = None;
+        save_quick_search_keywords_preference(&self.quick_search_keywords_text);
+        self.touch_search_text_cursor_activity();
+        context.notify();
+    }
+
+    /// 放弃快搜关键字草稿并恢复只读展示。
+    ///
+    /// 业务意图：
+    /// - 设置窗口关闭时如果用户没有点击保存，本次编辑应视为未完成草稿，不能悄悄改变下一次快搜行为。
+    fn discard_quick_search_keywords_edit(&mut self, context: &mut Context<Self>) {
+        if let Some(saved_text) = self.quick_search_keywords_saved_text_before_edit.take() {
+            self.quick_search_keywords_text = saved_text;
+        }
+        self.quick_search_keywords_is_editing = false;
+        self.quick_search_keywords_selection_range = Self::clamp_search_text_range(
+            &self.quick_search_keywords_text,
+            self.quick_search_keywords_selection_range.clone(),
+        );
+        self.quick_search_keywords_marked_range = None;
+        self.quick_search_keywords_selection_drag = None;
+        self.touch_search_text_cursor_activity();
+        context.notify();
+    }
+
+    /// 进入线程日志分析过滤编辑状态。
+    ///
+    /// 业务意图：
+    /// - 设置页默认只读展示过滤堆栈，用户明确点击编辑后才把多行文本框切换为可写，降低误粘贴和输入法误提交风险。
+    /// - 光标放到文本末尾，便于用户继续追加新的过滤堆栈；已有选择和组合文本会被清理，避免从只读态遗留不可见编辑上下文。
+    fn begin_thread_analysis_filter_edit(&mut self, context: &mut Context<Self>) {
+        if self.thread_analysis_filter_is_editing {
+            return;
+        }
+        self.thread_analysis_filter_saved_text_before_edit =
+            Some(self.thread_analysis_filter_text.clone());
+        self.thread_analysis_filter_is_editing = true;
+        let cursor = self.thread_analysis_filter_text.len();
+        self.thread_analysis_filter_selection_range = cursor..cursor;
         self.thread_analysis_filter_marked_range = None;
         self.thread_analysis_filter_selection_drag = None;
+        self.touch_search_text_cursor_activity();
+        context.notify();
+    }
+
+    /// 保存线程日志分析过滤配置并退出编辑状态。
+    ///
+    /// 业务意图：
+    /// - 用户点击保存时才把当前多行文本写入配置文件，符合“默认只读、显式编辑、显式保存”的设置语义。
+    /// - 保存前再次规范化换行，确保从 Windows 粘贴的 CRLF 不会影响后续规则拆分和线程堆栈连续匹配。
+    fn save_thread_analysis_filter_edit(&mut self, context: &mut Context<Self>) {
+        let normalized = normalize_thread_analysis_filter_text(&self.thread_analysis_filter_text);
+        if normalized != self.thread_analysis_filter_text {
+            self.thread_analysis_filter_text = normalized;
+        }
+        self.thread_analysis_filter_selection_range = Self::clamp_search_text_range(
+            &self.thread_analysis_filter_text,
+            self.thread_analysis_filter_selection_range.clone(),
+        );
+        self.thread_analysis_filter_marked_range = None;
+        self.thread_analysis_filter_selection_drag = None;
+        self.thread_analysis_filter_is_editing = false;
+        self.thread_analysis_filter_saved_text_before_edit = None;
         save_thread_analysis_filter_preference(&self.thread_analysis_filter_text);
+        self.touch_search_text_cursor_activity();
+        context.notify();
+    }
+
+    /// 放弃线程日志分析过滤草稿并恢复只读展示。
+    ///
+    /// 业务意图：
+    /// - 设置窗口关闭时如果用户没有点击保存，本次编辑应视为未完成草稿，不能悄悄改变线程分析行为。
+    /// - 恢复进入编辑前的快照，同时清理输入法组合文本和拖拽选择，避免下次打开设置窗口残留编辑态。
+    fn discard_thread_analysis_filter_edit(&mut self, context: &mut Context<Self>) {
+        if let Some(saved_text) = self.thread_analysis_filter_saved_text_before_edit.take() {
+            self.thread_analysis_filter_text = saved_text;
+        }
+        self.thread_analysis_filter_is_editing = false;
+        self.thread_analysis_filter_selection_range = Self::clamp_search_text_range(
+            &self.thread_analysis_filter_text,
+            self.thread_analysis_filter_selection_range.clone(),
+        );
+        self.thread_analysis_filter_marked_range = None;
+        self.thread_analysis_filter_selection_drag = None;
         self.touch_search_text_cursor_activity();
         context.notify();
     }
@@ -7341,6 +7963,9 @@ impl MainView {
                 let text_is_not_empty = !text.is_empty();
                 if text_is_not_empty {
                     if let Some(dialog) = self.search_dialog.as_mut() {
+                        if input_kind == SearchTextInputKind::Query {
+                            dialog.query_history_menu_open = false;
+                        }
                         let (input_text, selection_range, marked_range) =
                             Self::search_text_state_mut(dialog, input_kind);
                         Self::replace_search_text_selection(
@@ -7366,6 +7991,9 @@ impl MainView {
         let Some(dialog) = self.search_dialog.as_mut() else {
             return;
         };
+        if input_kind == SearchTextInputKind::Query {
+            dialog.query_history_menu_open = false;
+        }
         let (text, selection_range, marked_range) = Self::search_text_state_mut(dialog, input_kind);
 
         if Self::is_copy_keystroke(&event.keystroke) {
@@ -7483,10 +8111,226 @@ impl MainView {
         }
     }
 
+    /// 处理快搜关键字输入区的基础编辑按键。
+    ///
+    /// 业务意图：
+    /// - 快搜配置是单行英文逗号分隔文本，默认只读；编辑态才允许粘贴、剪切、删除和普通 IME 提交。
+    /// - 只读态仍允许复制、全选和方向键移动，方便用户核对当前已保存关键字。
+    fn handle_quick_search_keywords_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        context: &mut Context<Self>,
+    ) {
+        if Self::is_paste_keystroke(&event.keystroke) {
+            if self.quick_search_keywords_is_editing {
+                if let Some(text) = context.read_from_clipboard().and_then(|item| item.text()) {
+                    let replacement = Self::sanitize_search_input_text(&text);
+                    if !replacement.is_empty() {
+                        self.replace_quick_search_keywords_selection(&replacement);
+                        self.touch_search_text_cursor_activity();
+                        context.notify();
+                    }
+                }
+            }
+            context.stop_propagation();
+            return;
+        }
+
+        if Self::is_copy_keystroke(&event.keystroke) {
+            if let Some(text) = self.selected_quick_search_keywords_text() {
+                context.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            context.stop_propagation();
+            return;
+        }
+
+        if Self::is_cut_keystroke(&event.keystroke) {
+            if self.quick_search_keywords_is_editing {
+                if let Some(text) = self.selected_quick_search_keywords_text() {
+                    context.write_to_clipboard(ClipboardItem::new_string(text));
+                    self.replace_quick_search_keywords_selection("");
+                    self.touch_search_text_cursor_activity();
+                    context.notify();
+                }
+            }
+            context.stop_propagation();
+            return;
+        }
+
+        if Self::is_select_all_keystroke(&event.keystroke) {
+            self.quick_search_keywords_marked_range = None;
+            self.quick_search_keywords_selection_range = 0..self.quick_search_keywords_text.len();
+            self.touch_search_text_cursor_activity();
+            context.stop_propagation();
+            context.notify();
+            return;
+        }
+
+        match event.keystroke.key.as_str() {
+            "left" => {
+                self.quick_search_keywords_marked_range = None;
+                if event.keystroke.modifiers.shift {
+                    self.quick_search_keywords_selection_range.end =
+                        Self::previous_search_text_boundary(
+                            &self.quick_search_keywords_text,
+                            self.quick_search_keywords_selection_range.end,
+                        );
+                    self.quick_search_keywords_selection_range = Self::clamp_search_text_range(
+                        &self.quick_search_keywords_text,
+                        self.quick_search_keywords_selection_range.clone(),
+                    );
+                } else if self.quick_search_keywords_selection_range.start
+                    != self.quick_search_keywords_selection_range.end
+                {
+                    self.quick_search_keywords_selection_range =
+                        self.quick_search_keywords_selection_range.start
+                            ..self.quick_search_keywords_selection_range.start;
+                } else {
+                    let cursor = Self::previous_search_text_boundary(
+                        &self.quick_search_keywords_text,
+                        self.quick_search_keywords_selection_range.end,
+                    );
+                    self.quick_search_keywords_selection_range = cursor..cursor;
+                }
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "right" => {
+                self.quick_search_keywords_marked_range = None;
+                if event.keystroke.modifiers.shift {
+                    self.quick_search_keywords_selection_range.end =
+                        Self::next_search_text_boundary(
+                            &self.quick_search_keywords_text,
+                            self.quick_search_keywords_selection_range.end,
+                        );
+                    self.quick_search_keywords_selection_range = Self::clamp_search_text_range(
+                        &self.quick_search_keywords_text,
+                        self.quick_search_keywords_selection_range.clone(),
+                    );
+                } else if self.quick_search_keywords_selection_range.start
+                    != self.quick_search_keywords_selection_range.end
+                {
+                    self.quick_search_keywords_selection_range =
+                        self.quick_search_keywords_selection_range.end
+                            ..self.quick_search_keywords_selection_range.end;
+                } else {
+                    let cursor = Self::next_search_text_boundary(
+                        &self.quick_search_keywords_text,
+                        self.quick_search_keywords_selection_range.end,
+                    );
+                    self.quick_search_keywords_selection_range = cursor..cursor;
+                }
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "up" => {
+                self.quick_search_keywords_marked_range = None;
+                self.quick_search_keywords_selection_range = 0..0;
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "down" => {
+                self.quick_search_keywords_marked_range = None;
+                let cursor = self.quick_search_keywords_text.len();
+                self.quick_search_keywords_selection_range = cursor..cursor;
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "backspace" => {
+                if !self.quick_search_keywords_is_editing {
+                    context.stop_propagation();
+                    return;
+                }
+                if self.quick_search_keywords_selection_range.start
+                    != self.quick_search_keywords_selection_range.end
+                    || self.quick_search_keywords_marked_range.is_some()
+                {
+                    self.replace_quick_search_keywords_selection("");
+                } else if let Some((previous_index, _)) = self.quick_search_keywords_text
+                    [..self.quick_search_keywords_selection_range.end]
+                    .char_indices()
+                    .next_back()
+                {
+                    let cursor = self.quick_search_keywords_selection_range.end;
+                    self.quick_search_keywords_text
+                        .replace_range(previous_index..cursor, "");
+                    self.quick_search_keywords_selection_range = previous_index..previous_index;
+                    self.quick_search_keywords_marked_range = None;
+                }
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "delete" => {
+                if !self.quick_search_keywords_is_editing {
+                    context.stop_propagation();
+                    return;
+                }
+                if self.quick_search_keywords_selection_range.start
+                    != self.quick_search_keywords_selection_range.end
+                    || self.quick_search_keywords_marked_range.is_some()
+                {
+                    self.replace_quick_search_keywords_selection("");
+                } else if let Some((next_index, next_character)) = self.quick_search_keywords_text
+                    [self.quick_search_keywords_selection_range.end..]
+                    .char_indices()
+                    .next()
+                {
+                    let start = self.quick_search_keywords_selection_range.end + next_index;
+                    let end = start + next_character.len_utf8();
+                    self.quick_search_keywords_text
+                        .replace_range(start..end, "");
+                    self.quick_search_keywords_selection_range = start..start;
+                    self.quick_search_keywords_marked_range = None;
+                }
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "enter" => {
+                context.stop_propagation();
+            }
+            "escape" => {}
+            _ => {}
+        }
+    }
+
+    /// 返回快搜关键字输入区当前选中文本。
+    fn selected_quick_search_keywords_text(&self) -> Option<String> {
+        let range = Self::clamp_search_text_range(
+            &self.quick_search_keywords_text,
+            self.quick_search_keywords_selection_range.clone(),
+        );
+        (range.start < range.end).then(|| self.quick_search_keywords_text[range].to_string())
+    }
+
+    /// 用给定文本替换快搜关键字输入区当前选区。
+    fn replace_quick_search_keywords_selection(&mut self, replacement: &str) {
+        let replacement = normalize_quick_search_keywords_text(replacement);
+        let range = self
+            .quick_search_keywords_marked_range
+            .take()
+            .unwrap_or_else(|| {
+                Self::clamp_search_text_range(
+                    &self.quick_search_keywords_text,
+                    self.quick_search_keywords_selection_range.clone(),
+                )
+            });
+        self.quick_search_keywords_text
+            .replace_range(range.clone(), &replacement);
+        let cursor = range.start + replacement.len();
+        self.quick_search_keywords_selection_range = cursor..cursor;
+    }
+
     /// 处理线程日志分析过滤多行输入区的基础编辑按键。
     ///
     /// 业务意图：
     /// - 该输入区用于粘贴完整线程堆栈，必须保留换行，并支持复制、剪切、粘贴、删除、全选和回车换行。
+    /// - 设置页默认只读展示过滤规则，因此只有编辑态才允许修改文本；只读态仍允许选中和复制，方便用户核对内置规则。
     /// - 普通字符输入交给 `EntityInputHandler`，这里不处理 `key_char`，从而保留中文 IME 的平台提交路径。
     fn handle_thread_analysis_filter_key_down(
         &mut self,
@@ -7494,14 +8338,15 @@ impl MainView {
         context: &mut Context<Self>,
     ) {
         if Self::is_paste_keystroke(&event.keystroke) {
-            if let Some(text) = context.read_from_clipboard().and_then(|item| item.text()) {
-                let replacement = normalize_thread_analysis_filter_text(&text);
-                self.replace_thread_analysis_filter_selection(&replacement);
-                self.persist_thread_analysis_filter_text();
-                self.touch_search_text_cursor_activity();
-                context.stop_propagation();
-                context.notify();
-                return;
+            if self.thread_analysis_filter_is_editing {
+                if let Some(text) = context.read_from_clipboard().and_then(|item| item.text()) {
+                    let replacement = normalize_thread_analysis_filter_text(&text);
+                    self.replace_thread_analysis_filter_selection(&replacement);
+                    self.touch_search_text_cursor_activity();
+                    context.stop_propagation();
+                    context.notify();
+                    return;
+                }
             }
             context.stop_propagation();
             return;
@@ -7516,12 +8361,13 @@ impl MainView {
         }
 
         if Self::is_cut_keystroke(&event.keystroke) {
-            if let Some(text) = self.selected_thread_analysis_filter_text() {
-                context.write_to_clipboard(ClipboardItem::new_string(text));
-                self.replace_thread_analysis_filter_selection("");
-                self.persist_thread_analysis_filter_text();
-                self.touch_search_text_cursor_activity();
-                context.notify();
+            if self.thread_analysis_filter_is_editing {
+                if let Some(text) = self.selected_thread_analysis_filter_text() {
+                    context.write_to_clipboard(ClipboardItem::new_string(text));
+                    self.replace_thread_analysis_filter_selection("");
+                    self.touch_search_text_cursor_activity();
+                    context.notify();
+                }
             }
             context.stop_propagation();
             return;
@@ -7611,6 +8457,10 @@ impl MainView {
                 context.notify();
             }
             "backspace" => {
+                if !self.thread_analysis_filter_is_editing {
+                    context.stop_propagation();
+                    return;
+                }
                 if self.thread_analysis_filter_selection_range.start
                     != self.thread_analysis_filter_selection_range.end
                     || self.thread_analysis_filter_marked_range.is_some()
@@ -7627,12 +8477,15 @@ impl MainView {
                     self.thread_analysis_filter_selection_range = previous_index..previous_index;
                     self.thread_analysis_filter_marked_range = None;
                 }
-                self.persist_thread_analysis_filter_text();
                 self.touch_search_text_cursor_activity();
                 context.stop_propagation();
                 context.notify();
             }
             "delete" => {
+                if !self.thread_analysis_filter_is_editing {
+                    context.stop_propagation();
+                    return;
+                }
                 if self.thread_analysis_filter_selection_range.start
                     != self.thread_analysis_filter_selection_range.end
                     || self.thread_analysis_filter_marked_range.is_some()
@@ -7650,14 +8503,16 @@ impl MainView {
                     self.thread_analysis_filter_selection_range = start..start;
                     self.thread_analysis_filter_marked_range = None;
                 }
-                self.persist_thread_analysis_filter_text();
                 self.touch_search_text_cursor_activity();
                 context.stop_propagation();
                 context.notify();
             }
             "enter" => {
+                if !self.thread_analysis_filter_is_editing {
+                    context.stop_propagation();
+                    return;
+                }
                 self.replace_thread_analysis_filter_selection("\n");
-                self.persist_thread_analysis_filter_text();
                 self.touch_search_text_cursor_activity();
                 context.stop_propagation();
                 context.notify();
@@ -7695,11 +8550,6 @@ impl MainView {
             .replace_range(range.clone(), &replacement);
         let cursor = range.start + replacement.len();
         self.thread_analysis_filter_selection_range = cursor..cursor;
-    }
-
-    /// 保存线程日志分析过滤输入区当前文本。
-    fn persist_thread_analysis_filter_text(&self) {
-        save_thread_analysis_filter_preference(&self.thread_analysis_filter_text);
     }
 
     /// 返回指定输入槽位的可变文本、选择范围和组合范围。
@@ -7773,6 +8623,7 @@ impl MainView {
         dialog.query = text;
         dialog.selection_range = cursor..cursor;
         dialog.marked_range = None;
+        dialog.query_history_menu_open = false;
         dialog.current_file_match_count = None;
         dialog.message = "已粘贴剪贴板文本，按 Enter 或点击搜索".to_string();
     }
@@ -7937,6 +8788,17 @@ impl MainView {
         !dialog.query.trim().is_empty() && self.active_tab_id.is_some()
     }
 
+    /// 判断快搜按钮是否具备基本启动条件。
+    ///
+    /// 业务意图：
+    /// - 快搜不依赖搜索输入框内容，但必须存在已保存的有效关键字，并且当前不能已有搜索任务运行。
+    /// - 当前 tab 的加载状态仍在启动时给出具体提示，按钮这里只做轻量可用性判断。
+    fn quick_search_can_start(&self, dialog: &SearchDialogState) -> bool {
+        !dialog.is_searching
+            && self.active_tab_id.is_some()
+            && !self.effective_quick_search_keywords().is_empty()
+    }
+
     /// 判断当前文件计数按钮是否可用。
     ///
     /// 业务意图：
@@ -7978,10 +8840,7 @@ impl MainView {
         let Some(dialog) = self.search_dialog.as_ref() else {
             return;
         };
-        let options = SearchOptions {
-            query: dialog.query.trim().to_string(),
-            case_sensitive: dialog.case_sensitive,
-        };
+        let options = SearchOptions::single(dialog.query.trim().to_string(), dialog.case_sensitive);
         if options.is_empty_query() {
             self.update_search_dialog_message("请输入要计数的关键字", context);
             return;
@@ -8148,6 +9007,8 @@ impl MainView {
             .on_click(
                 context.listener(move |view, _event: &ClickEvent, _window, context| {
                     view.scroll_tab_bar(delta, context);
+                    // 滚动箭头是 tab 栏内的独立按钮，不应把 click 继续传递给 tab 容器。
+                    context.stop_propagation();
                 }),
             )
     }
@@ -8270,6 +9131,8 @@ impl MainView {
                     view.tab_context_menu = None;
                     view.encoding_dropdown_menu = None;
                     context.notify();
+                    // 关闭按钮嵌套在 tab 元素中，关闭后不能再让父 tab 收到同一次点击。
+                    context.stop_propagation();
                 }),
             )
     }
@@ -8471,6 +9334,8 @@ impl MainView {
                                     context,
                                 );
                             }
+                            // 编码选择按钮属于状态栏内的独立控件，点击不应继续传给日志正文或外层浮层。
+                            context.stop_propagation();
                         },
                     )),
             )
@@ -8613,6 +9478,20 @@ impl MainView {
             .border_color(rgb(palette.border))
             .bg(rgb(palette.menu))
             .shadow_lg()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    // 下拉菜单包含内边距和选中态空白，菜单壳层需要兜住这些区域的点击。
+                    context.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    // 右键点在菜单上不能穿透到底层日志正文并打开日志右键菜单。
+                    context.stop_propagation();
+                }),
+            )
             .children(menu_items)
     }
 
@@ -8724,6 +9603,20 @@ impl MainView {
             .border_color(rgb(palette.border))
             .bg(rgb(palette.menu))
             .shadow_lg()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    // tab 菜单的上下留白也属于菜单命中区域，必须阻止事件继续触发底层 tab。
+                    context.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    // 菜单上右键不应重新定位底层 tab 的上下文菜单。
+                    context.stop_propagation();
+                }),
+            )
             .child(self.render_tab_context_menu_item(
                 tab_id,
                 TabContextMenuAction::Current,
@@ -9239,6 +10132,15 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<String> {
+        if self.quick_search_keywords_focus.is_focused(window) {
+            let range =
+                Self::search_input_range_from_utf16(&self.quick_search_keywords_text, range_utf16);
+            adjusted_range.replace(Self::search_input_range_to_utf16(
+                &self.quick_search_keywords_text,
+                range.clone(),
+            ));
+            return Some(self.quick_search_keywords_text[range].to_string());
+        }
         if self.thread_analysis_filter_focus.is_focused(window) {
             let range =
                 Self::search_input_range_from_utf16(&self.thread_analysis_filter_text, range_utf16);
@@ -9263,6 +10165,15 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
+        if self.quick_search_keywords_focus.is_focused(window) {
+            return Some(UTF16Selection {
+                range: Self::search_input_range_to_utf16(
+                    &self.quick_search_keywords_text,
+                    self.quick_search_keywords_selection_range.clone(),
+                ),
+                reversed: false,
+            });
+        }
         if self.thread_analysis_filter_focus.is_focused(window) {
             return Some(UTF16Selection {
                 range: Self::search_input_range_to_utf16(
@@ -9287,6 +10198,14 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<Range<usize>> {
+        if self.quick_search_keywords_focus.is_focused(window) {
+            return self
+                .quick_search_keywords_marked_range
+                .clone()
+                .map(|range| {
+                    Self::search_input_range_to_utf16(&self.quick_search_keywords_text, range)
+                });
+        }
         if self.thread_analysis_filter_focus.is_focused(window) {
             return self
                 .thread_analysis_filter_marked_range
@@ -9303,6 +10222,11 @@ impl EntityInputHandler for MainView {
 
     /// 清除输入法组合文本状态。
     fn unmark_text(&mut self, window: &mut Window, context: &mut Context<Self>) {
+        if self.quick_search_keywords_focus.is_focused(window) {
+            self.quick_search_keywords_marked_range = None;
+            context.notify();
+            return;
+        }
         if self.thread_analysis_filter_focus.is_focused(window) {
             self.thread_analysis_filter_marked_range = None;
             context.notify();
@@ -9328,7 +10252,31 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
+        if self.quick_search_keywords_focus.is_focused(window) {
+            if !self.quick_search_keywords_is_editing {
+                return;
+            }
+            let replacement = Self::sanitize_search_input_text(text);
+            let range = range_utf16
+                .map(|range| {
+                    Self::search_input_range_from_utf16(&self.quick_search_keywords_text, range)
+                })
+                .or_else(|| self.quick_search_keywords_marked_range.clone())
+                .unwrap_or_else(|| self.quick_search_keywords_selection_range.clone());
+            let range = Self::clamp_search_text_range(&self.quick_search_keywords_text, range);
+            self.quick_search_keywords_text
+                .replace_range(range.clone(), &replacement);
+            let cursor = range.start + replacement.len();
+            self.quick_search_keywords_selection_range = cursor..cursor;
+            self.quick_search_keywords_marked_range = None;
+            self.touch_search_text_cursor_activity();
+            context.notify();
+            return;
+        }
         if self.thread_analysis_filter_focus.is_focused(window) {
+            if !self.thread_analysis_filter_is_editing {
+                return;
+            }
             let replacement = normalize_thread_analysis_filter_text(text);
             let range = range_utf16
                 .map(|range| {
@@ -9342,7 +10290,6 @@ impl EntityInputHandler for MainView {
             let cursor = range.start + replacement.len();
             self.thread_analysis_filter_selection_range = cursor..cursor;
             self.thread_analysis_filter_marked_range = None;
-            self.persist_thread_analysis_filter_text();
             self.touch_search_text_cursor_activity();
             context.notify();
             return;
@@ -9364,6 +10311,7 @@ impl EntityInputHandler for MainView {
         *selection_range = cursor..cursor;
         *marked_range = None;
         if input_kind == SearchTextInputKind::Query {
+            dialog.query_history_menu_open = false;
             self.clear_search_current_file_match_count();
         }
         self.touch_search_text_cursor_activity();
@@ -9383,7 +10331,46 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
+        if self.quick_search_keywords_focus.is_focused(window) {
+            if !self.quick_search_keywords_is_editing {
+                return;
+            }
+            let replacement = Self::sanitize_search_input_text(new_text);
+            let range = range_utf16
+                .map(|range| {
+                    Self::search_input_range_from_utf16(&self.quick_search_keywords_text, range)
+                })
+                .or_else(|| self.quick_search_keywords_marked_range.clone())
+                .unwrap_or_else(|| self.quick_search_keywords_selection_range.clone());
+            let range = Self::clamp_search_text_range(&self.quick_search_keywords_text, range);
+            self.quick_search_keywords_text
+                .replace_range(range.clone(), &replacement);
+
+            if replacement.is_empty() {
+                self.quick_search_keywords_marked_range = None;
+            } else {
+                self.quick_search_keywords_marked_range =
+                    Some(range.start..range.start + replacement.len());
+            }
+
+            let selected_range = new_selected_range_utf16
+                .map(|utf16_range| Self::search_input_range_from_utf16(&replacement, utf16_range))
+                .map(|relative_range| {
+                    range.start + relative_range.start..range.start + relative_range.end
+                })
+                .unwrap_or_else(|| {
+                    let cursor = range.start + replacement.len();
+                    cursor..cursor
+                });
+            self.quick_search_keywords_selection_range = selected_range;
+            self.touch_search_text_cursor_activity();
+            context.notify();
+            return;
+        }
         if self.thread_analysis_filter_focus.is_focused(window) {
+            if !self.thread_analysis_filter_is_editing {
+                return;
+            }
             let replacement = normalize_thread_analysis_filter_text(new_text);
             let range = range_utf16
                 .map(|range| {
@@ -9412,7 +10399,6 @@ impl EntityInputHandler for MainView {
                     cursor..cursor
                 });
             self.thread_analysis_filter_selection_range = selected_range;
-            self.persist_thread_analysis_filter_text();
             self.touch_search_text_cursor_activity();
             context.notify();
             return;
@@ -9448,6 +10434,7 @@ impl EntityInputHandler for MainView {
             });
         *selection_range = selected_range;
         if input_kind == SearchTextInputKind::Query {
+            dialog.query_history_menu_open = false;
             self.clear_search_current_file_match_count();
         }
         self.touch_search_text_cursor_activity();
@@ -9466,6 +10453,23 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        if self.quick_search_keywords_focus.is_focused(window) {
+            let range =
+                Self::search_input_range_from_utf16(&self.quick_search_keywords_text, range_utf16);
+            let Some(layout) = self.quick_search_keywords_last_layout.as_ref() else {
+                return Some(element_bounds);
+            };
+            return Some(Bounds::from_corners(
+                point(
+                    element_bounds.left() + layout.x_for_index(range.start),
+                    element_bounds.top(),
+                ),
+                point(
+                    element_bounds.left() + layout.x_for_index(range.end),
+                    element_bounds.bottom(),
+                ),
+            ));
+        }
         if self.thread_analysis_filter_focus.is_focused(window) {
             let range =
                 Self::search_input_range_from_utf16(&self.thread_analysis_filter_text, range_utf16);
@@ -9517,6 +10521,13 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<usize> {
+        if self.quick_search_keywords_focus.is_focused(window) {
+            let utf8_index = self.quick_search_keywords_index_for_point(point);
+            return Some(Self::search_input_utf16_offset_from_byte(
+                &self.quick_search_keywords_text,
+                utf8_index,
+            ));
+        }
         if self.thread_analysis_filter_focus.is_focused(window) {
             let utf8_index = self.thread_analysis_filter_index_for_point(point);
             return Some(Self::search_input_utf16_offset_from_byte(

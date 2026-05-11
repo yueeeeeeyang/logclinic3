@@ -21,6 +21,7 @@ impl MainView {
             .bg(rgb(palette.panel))
             .child(self.render_log_tree_header())
             .child(self.render_log_tree_body(context))
+            .child(self.render_log_tree_context_menu_dismiss_overlay(context))
             .child(self.render_log_tree_context_menu(context))
     }
 
@@ -165,6 +166,8 @@ impl MainView {
                 context.listener(|view, event: &MouseDownEvent, _window, context| {
                     view.start_log_tree_scrollbar_drag(event);
                     context.notify();
+                    // 目录树滚动条覆盖在节点列表上，拖动入口必须消费按下事件，避免误选中背后的节点。
+                    context.stop_propagation();
                 }),
             )
     }
@@ -663,6 +666,53 @@ impl MainView {
                 palette,
                 context,
             ))
+    }
+
+    /// 渲染左侧目录树右键菜单的透明关闭遮罩。
+    ///
+    /// 业务意图：
+    /// - 目录树右键菜单打开后，第一次点到菜单外部应只关闭菜单，不能同时选中、展开或打开底层节点。
+    /// - 遮罩放在树内容之上、菜单之下，菜单项仍可点击，菜单外区域则统一消费鼠标事件。
+    pub(super) fn render_log_tree_context_menu_dismiss_overlay(
+        &self,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        if self.log_tree_context_menu.is_none() {
+            return div()
+                .id("log-tree-context-menu-dismiss-overlay-empty")
+                .hidden();
+        }
+
+        div()
+            .id("log-tree-context-menu-dismiss-overlay")
+            .absolute()
+            .left(px(0.0))
+            .top(px(0.0))
+            .size_full()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    // 左键按下先在遮罩层截止，避免底层目录节点在菜单关闭的同一次操作中被误选。
+                    context.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(|view, _event: &MouseDownEvent, _window, context| {
+                    // 右键通常不触发普通 click；这里直接关闭旧菜单并截断，避免穿透到其它节点重新开菜单。
+                    view.log_tree_context_menu = None;
+                    context.notify();
+                    context.stop_propagation();
+                }),
+            )
+            .on_click(
+                context.listener(|view, _event: &ClickEvent, _window, context| {
+                    view.log_tree_context_menu = None;
+                    context.notify();
+                    // click 仍需截断，防止遮罩消失后同一次点击被底层树节点处理。
+                    context.stop_propagation();
+                }),
+            )
     }
 
     /// 渲染左侧目录树右键菜单单项。

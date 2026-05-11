@@ -618,6 +618,8 @@ impl MainView {
                         context,
                     );
                     context.notify();
+                    // 日志滚动条覆盖在正文行上，按下滑块不应同时开始正文文本选择或触发浮层关闭。
+                    context.stop_propagation();
                 }),
             )
     }
@@ -665,6 +667,8 @@ impl MainView {
                         context,
                     );
                     context.notify();
+                    // 横向滚动条同样位于正文上方，拖动入口需要阻断事件继续传递。
+                    context.stop_propagation();
                 }),
             )
     }
@@ -721,6 +725,8 @@ impl MainView {
                         context,
                     );
                     context.notify();
+                    // 分页日志滚动条和普通日志一样覆盖正文区域，避免按下时穿透到日志行。
+                    context.stop_propagation();
                 }),
             )
     }
@@ -765,6 +771,8 @@ impl MainView {
                         context,
                     );
                     context.notify();
+                    // 分页日志横向滚动条启动拖拽后应独占本次鼠标按下事件。
+                    context.stop_propagation();
                 }),
             )
     }

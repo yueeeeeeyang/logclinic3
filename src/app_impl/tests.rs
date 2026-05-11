@@ -75,6 +75,18 @@ mod tests {
         ))
     }
 
+    /// 构造唯一的快搜关键字配置测试路径。
+    ///
+    /// 业务意图：
+    /// - 快搜关键字配置会跨会话保存常用排障词，测试必须使用独立临时目录，避免污染开发机真实设置。
+    fn test_quick_search_keywords_file_path(name: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "logclinic3-quick-search-test-{}-{}",
+            std::process::id(),
+            name
+        ))
+    }
+
     /// 构造唯一的另存为测试目录。
     ///
     /// 业务意图：
@@ -316,6 +328,30 @@ mod tests {
         ));
     }
 
+    /// 验证搜索窗口级控制键只识别 Enter 和 Escape。
+    ///
+    /// 业务意图：
+    /// - 设置窗口内的自绘文本框也会经过应用级快捷键拦截；只有明确属于搜索窗口的控制键才允许触发搜索或关闭窗口。
+    /// - 该纯函数测试锁定按键归类，避免后续扩展快捷键时误把普通编辑键纳入全局搜索控制。
+    #[test]
+    fn 搜索窗口控制键只识别_enter_escape() {
+        let keystroke = |key: &str| Keystroke {
+            modifiers: Default::default(),
+            key: key.to_string(),
+            key_char: None,
+        };
+
+        assert_eq!(
+            MainView::search_dialog_control_key(&keystroke("enter")),
+            Some(SearchDialogControlKey::Submit)
+        );
+        assert_eq!(
+            MainView::search_dialog_control_key(&keystroke("escape")),
+            Some(SearchDialogControlKey::Close)
+        );
+        assert_eq!(MainView::search_dialog_control_key(&keystroke("a")), None);
+    }
+
     /// 验证搜索关键字历史按最近使用排序并限制数量。
     ///
     /// 业务意图：
@@ -339,6 +375,105 @@ mod tests {
 
         MainView::remember_search_query_in_history(&mut history, "   ");
         assert_eq!(history.len(), SEARCH_QUERY_HISTORY_LIMIT);
+    }
+
+    /// 验证选择历史关键字会替换搜索框内容并关闭下拉菜单。
+    ///
+    /// 业务意图：
+    /// - 历史下拉菜单选择项只负责恢复关键字，不立即启动搜索；恢复后光标应位于末尾，当前文件计数缓存必须失效。
+    #[test]
+    fn 搜索历史关键字选择后填入搜索框并关闭菜单() {
+        let mut dialog = SearchDialogState {
+            query: "旧关键字".to_string(),
+            selection_range: 0.."旧关键字".len(),
+            marked_range: Some(0.."旧".len()),
+            query_history_menu_open: true,
+            scope: SearchScope::CurrentFile,
+            directory_target: String::new(),
+            directory_selection_range: 0..0,
+            directory_marked_range: None,
+            case_sensitive: false,
+            current_file_match_count: Some(7),
+            is_searching: false,
+            progress: SearchProgress::default(),
+            message: String::new(),
+            job_id: 0,
+        };
+
+        MainView::apply_search_history_query(&mut dialog, "error");
+
+        assert_eq!(dialog.query, "error");
+        assert_eq!(dialog.selection_range, "error".len().."error".len());
+        assert!(dialog.marked_range.is_none());
+        assert!(!dialog.query_history_menu_open);
+        assert!(dialog.current_file_match_count.is_none());
+        assert_eq!(dialog.message, "已选择历史关键字，按 Enter 或点击搜索");
+    }
+
+    /// 验证停止搜索只取消后台任务，不清空用户输入。
+    ///
+    /// 业务意图：
+    /// - 搜索按钮切换为“停止”后，用户点击应立即让当前任务失效，但搜索窗口仍保留关键字和范围，方便修改后重新搜索。
+    #[test]
+    fn 停止搜索会保留输入并返回任务编号() {
+        let mut dialog = SearchDialogState {
+            query: "Exception".to_string(),
+            selection_range: "Exception".len().."Exception".len(),
+            marked_range: None,
+            query_history_menu_open: true,
+            scope: SearchScope::CurrentDirectory,
+            directory_target: "monitorThread".to_string(),
+            directory_selection_range: 0.."monitorThread".len(),
+            directory_marked_range: None,
+            case_sensitive: true,
+            current_file_match_count: Some(3),
+            is_searching: true,
+            progress: SearchProgress {
+                searched_files: 2,
+                total_files: 10,
+                matched_lines: 6,
+            },
+            message: "正在搜索 2/10 个文件，已命中 6 行".to_string(),
+            job_id: 42,
+        };
+
+        let canceled_job_id = MainView::stop_search_dialog_task(&mut dialog);
+
+        assert_eq!(canceled_job_id, Some(42));
+        assert_eq!(dialog.query, "Exception");
+        assert_eq!(dialog.scope, SearchScope::CurrentDirectory);
+        assert_eq!(dialog.directory_target, "monitorThread");
+        assert!(dialog.case_sensitive);
+        assert!(!dialog.is_searching);
+        assert!(!dialog.query_history_menu_open);
+        assert_eq!(dialog.message, "搜索已停止，可修改条件后重新搜索");
+    }
+
+    /// 验证取消中的搜索记录优先展示取消状态。
+    ///
+    /// 业务意图：
+    /// - 并行目录搜索被停止后，已启动的后台文件任务可能稍后才自然结束；结果面板必须根据取消标记展示“已取消”，不能误显示“搜索中”。
+    #[test]
+    fn 被取消搜索记录优先显示已取消() {
+        let record = SearchHistoryRecord {
+            job_id: 7,
+            query: "error".to_string(),
+            scope: SearchScope::CurrentDirectory,
+            directory_target: Some("logs".to_string()),
+            case_sensitive: false,
+            progress: SearchProgress {
+                searched_files: 1,
+                total_files: 10,
+                matched_lines: 2,
+            },
+            results: Vec::new(),
+            errors: Vec::new(),
+            canceled: true,
+            expanded: true,
+            expanded_file_keys: HashSet::new(),
+        };
+
+        assert_eq!(record.state_label(), "已取消");
     }
 
     /// 验证搜索输入框粘贴会替换当前选区并把光标放到插入文本之后。
@@ -399,6 +534,7 @@ mod tests {
             query: "日志选中文本".to_string(),
             selection_range: "日志选中文本".len().."日志选中文本".len(),
             marked_range: None,
+            query_history_menu_open: false,
             scope: SearchScope::CurrentFile,
             directory_target: String::new(),
             directory_selection_range: 0..0,
@@ -588,6 +724,88 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
+    }
+
+    /// 验证快搜关键字配置缺失时返回内置默认关键字。
+    ///
+    /// 业务意图：
+    /// - 首次使用快搜时应默认覆盖常见导入、导出、转换和水印相关排障词，减少用户进入设置后才能使用的前置步骤。
+    #[test]
+    fn 快搜关键字配置缺失返回默认关键字() {
+        let path =
+            test_quick_search_keywords_file_path("missing").join(QUICK_SEARCH_KEYWORDS_FILE_NAME);
+
+        assert_eq!(
+            read_quick_search_keywords_preference(&path),
+            DEFAULT_QUICK_SEARCH_KEYWORDS_TEXT
+        );
+        assert_eq!(
+            parse_quick_search_keywords(&read_quick_search_keywords_preference(&path)),
+            vec![
+                "excel".to_string(),
+                "import".to_string(),
+                "export".to_string(),
+                "wbi".to_string(),
+                "convertFile".to_string(),
+                "waterMark".to_string(),
+            ]
+        );
+    }
+
+    /// 验证快搜关键字配置空文件会覆盖默认关键字。
+    ///
+    /// 业务意图：
+    /// - 用户保存空配置表示显式禁用默认快搜关键字，后续启动不能悄悄恢复内置值。
+    #[test]
+    fn 快搜关键字配置空文件保留为空文本() {
+        let path =
+            test_quick_search_keywords_file_path("empty").join(QUICK_SEARCH_KEYWORDS_FILE_NAME);
+
+        write_quick_search_keywords_preference(&path, "").expect("快搜关键字配置应能写入空文本");
+        assert_eq!(read_quick_search_keywords_preference(&path), "");
+
+        let _ = fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    /// 验证快搜关键字配置读写保持单行文本。
+    ///
+    /// 业务意图：
+    /// - 设置页输入框是单行配置，读写时需要移除平台换行，保证重启后仍按英文逗号解析。
+    #[test]
+    fn 快搜关键字配置多关键字读写往返并移除换行() {
+        let path =
+            test_quick_search_keywords_file_path("roundtrip").join(QUICK_SEARCH_KEYWORDS_FILE_NAME);
+
+        write_quick_search_keywords_preference(&path, "ERROR, Exception\r\nTimeout")
+            .expect("快搜关键字配置应能写入临时目录");
+        assert_eq!(
+            read_quick_search_keywords_preference(&path),
+            "ERROR, ExceptionTimeout"
+        );
+
+        let _ = fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    /// 验证快搜关键字只按英文逗号拆分。
+    ///
+    /// 业务意图：
+    /// - 用户已确认中文逗号不作为分隔符；连续英文逗号和空白项需要被忽略，避免生成空关键字。
+    #[test]
+    fn 快搜关键字解析只支持英文逗号并忽略空项() {
+        assert_eq!(
+            parse_quick_search_keywords("a,b,, c"),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert_eq!(
+            parse_quick_search_keywords("a，b"),
+            vec!["a，b".to_string()]
+        );
     }
 
     /// 验证用户强制主题优先于系统外观。

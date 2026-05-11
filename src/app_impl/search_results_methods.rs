@@ -42,6 +42,8 @@ impl MainView {
                         f32::from(event.position.y),
                         context,
                     );
+                    // 搜索结果面板本身已经处理右键菜单，事件不能继续冒泡到右侧工作区的其它浮层逻辑。
+                    context.stop_propagation();
                 }),
             )
             .child(self.render_search_results_resizer(context))
@@ -126,6 +128,8 @@ impl MainView {
                 context.listener(|view, event: &MouseDownEvent, _window, context| {
                     view.start_search_results_scrollbar_drag(event, context);
                     context.notify();
+                    // 滚动条是覆盖在结果列表上的拖拽控件，按下事件必须止步于滑块，避免触发列表或浮层关闭逻辑。
+                    context.stop_propagation();
                 }),
             )
     }
@@ -415,6 +419,20 @@ impl MainView {
             .border_color(rgb(palette.border))
             .bg(rgb(palette.menu))
             .shadow_lg()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    // 菜单容器包含上下内边距；点到空白区域时也不能把事件交给下层搜索结果行。
+                    context.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    // 菜单上再次右键只应作用于当前菜单层，避免重新打开或切换底层面板菜单。
+                    context.stop_propagation();
+                }),
+            )
             .child(self.render_search_results_context_menu_item(
                 SearchResultsContextMenuAction::ExpandAll,
                 "展开全部",
@@ -454,6 +472,8 @@ impl MainView {
             .on_click(
                 context.listener(move |view, _event: &ClickEvent, _window, context| {
                     view.handle_search_results_context_menu_action(action, context);
+                    // 菜单项命令执行后不允许 click 继续冒泡，保持与日志正文、目录树菜单一致。
+                    context.stop_propagation();
                 }),
             )
     }
@@ -527,8 +547,10 @@ impl MainView {
             .cursor_row_resize()
             .on_mouse_down(
                 MouseButton::Left,
-                context.listener(|view, event: &MouseDownEvent, _window, _context| {
+                context.listener(|view, event: &MouseDownEvent, _window, context| {
                     view.start_search_results_resize(event);
+                    // 分隔拖拽条覆盖在面板顶部，启动拖拽后不能继续触发面板或日志区的点击处理。
+                    context.stop_propagation();
                 }),
             )
     }
@@ -633,6 +655,8 @@ impl MainView {
                             view.search_results_context_menu = None;
                             view.log_viewer_context_menu = None;
                             context.notify();
+                            // 关闭按钮位于搜索结果标题栏内部，按钮点击不应继续传给标题栏或面板。
+                            context.stop_propagation();
                         }),
                     ),
             )
@@ -1085,6 +1109,25 @@ impl MainView {
             .left(px(0.0))
             .top(px(0.0))
             .size_full()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    // 透明遮罩位于内容之上、菜单之下；先吃掉按下事件，避免底层日志行开始选择或滚动条开始拖动。
+                    context.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(|view, _event: &MouseDownEvent, _window, context| {
+                    // 右键通常不会产生普通 click；这里直接关闭浮层并截断，防止右键穿透到底层重新打开其它菜单。
+                    view.tab_context_menu = None;
+                    view.encoding_dropdown_menu = None;
+                    view.search_results_context_menu = None;
+                    view.log_viewer_context_menu = None;
+                    context.notify();
+                    context.stop_propagation();
+                }),
+            )
             .on_click(
                 context.listener(|view, _event: &ClickEvent, _window, context| {
                     view.tab_context_menu = None;
@@ -1092,6 +1135,8 @@ impl MainView {
                     view.search_results_context_menu = None;
                     view.log_viewer_context_menu = None;
                     context.notify();
+                    // click 也必须在遮罩层截止，避免同一次点击落到遮罩后方的新目标。
+                    context.stop_propagation();
                 }),
             )
     }

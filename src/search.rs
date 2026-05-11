@@ -3,7 +3,7 @@
 //! 业务意图：
 //! - 本模块只处理“在哪些文本行或日志来源中查找查询词”，不直接依赖 GPUI 渲染状态。
 //! - UI 可以把当前已解码文件、同目录文件来源和后台读取错误统一转换成这里的结果模型。
-//! - 当前第一版只支持普通文本搜索，不支持正则和替换，避免在大日志场景中引入未定义的性能与语义边界。
+//! - 当前支持一个或多个普通文本关键字的“任一命中”搜索，不支持正则和替换，避免在大日志场景中引入未定义的性能与语义边界。
 //!
 //! 关键约束：
 //! - 查询词可能包含中文或其它多字节字符，所有命中范围都必须落在 UTF-8 字节边界上。
@@ -43,12 +43,16 @@ impl SearchScope {
 /// 单次搜索使用的匹配选项。
 ///
 /// 业务意图：
+/// - 普通搜索传入单个查询词，快搜传入多个配置关键字，底层统一按“任一关键字命中”处理。
 /// - 查询词保持用户原始输入，是否区分大小写由独立布尔值控制。
 /// - 这里不保存搜索范围，是为了让“搜索哪些文件”和“如何匹配文本”两个规则可以分别测试。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchOptions {
-    /// 用户输入的普通文本查询词。
-    pub query: String,
+    /// 本次搜索使用的普通文本关键字列表。
+    ///
+    /// 边界条件：
+    /// - 普通搜索只有一个关键字；快搜会包含多个关键字。空白关键字在构造时会被丢弃，避免逗号连续出现时生成无意义命中。
+    pub queries: Vec<String>,
     /// 是否区分大小写。
     ///
     /// 边界条件：
@@ -57,12 +61,37 @@ pub struct SearchOptions {
 }
 
 impl SearchOptions {
+    /// 构造普通单关键字搜索选项。
+    pub fn single(query: impl Into<String>, case_sensitive: bool) -> Self {
+        let query = query.into();
+        let queries = (!query.trim().is_empty())
+            .then(|| query)
+            .into_iter()
+            .collect();
+        Self {
+            queries,
+            case_sensitive,
+        }
+    }
+
+    /// 构造任一关键字命中的多关键字搜索选项。
+    pub fn any(queries: impl IntoIterator<Item = String>, case_sensitive: bool) -> Self {
+        Self {
+            queries: queries
+                .into_iter()
+                .map(|query| query.trim().to_string())
+                .filter(|query| !query.is_empty())
+                .collect(),
+            case_sensitive,
+        }
+    }
+
     /// 查询词去掉首尾空白后是否为空。
     ///
     /// 业务意图：
-    /// - 空查询没有业务意义，UI 应阻止启动后台任务并给出提示。
+    /// - 空查询没有业务意义，UI 应阻止启动后台任务并给出提示；快搜配置全为空时同样不能启动。
     pub fn is_empty_query(&self) -> bool {
-        self.query.trim().is_empty()
+        self.queries.is_empty() || self.queries.iter().all(|query| query.trim().is_empty())
     }
 }
 
@@ -124,7 +153,8 @@ pub struct SearchFileError {
 ///
 /// 边界条件：
 /// - 空查询返回空结果，调用方应在 UI 层阻止启动搜索并给出提示。
-/// - 每行只记录第一次命中，第一版结果面板以“命中行”为单位展示，而不是同一行多个片段。
+/// - 每行只记录一个命中，结果面板以“命中行”为单位展示，而不是同一行多个片段。
+/// - 多关键字同时命中同一行时，高亮最靠前的命中；位置相同则按关键字配置顺序优先。
 pub fn search_lines(
     source: &LogFileSource,
     lines: &[String],
@@ -142,16 +172,14 @@ pub fn search_lines(
         .iter()
         .enumerate()
         .filter_map(|(line_index, line_text)| {
-            find_query_range(line_text, &options.query, options.case_sensitive).map(|match_range| {
-                SearchResultItem {
-                    source: source.clone(),
-                    source_key: source_key.clone(),
-                    file_name: file_name.clone(),
-                    location: location.clone(),
-                    line_index,
-                    line_text: line_text.clone(),
-                    match_range,
-                }
+            find_best_query_range(line_text, options).map(|match_range| SearchResultItem {
+                source: source.clone(),
+                source_key: source_key.clone(),
+                file_name: file_name.clone(),
+                location: location.clone(),
+                line_index,
+                line_text: line_text.clone(),
+                match_range,
             })
         })
         .collect()
@@ -175,8 +203,42 @@ pub fn count_query_occurrences(lines: &[String], options: &SearchOptions) -> usi
 
     lines
         .iter()
-        .map(|line| count_query_occurrences_in_line(line, &options.query, options.case_sensitive))
+        .map(|line| {
+            options
+                .queries
+                .iter()
+                .map(|query| count_query_occurrences_in_line(line, query, options.case_sensitive))
+                .sum::<usize>()
+        })
         .sum()
+}
+
+/// 在单行中查找当前搜索选项的最佳命中范围。
+///
+/// 业务意图：
+/// - 快搜按 OR 语义匹配多个关键字，但结果面板仍以“命中行”为单位展示，所以每行只能返回一个高亮范围。
+/// - 选择最靠前的命中能让用户第一眼看到该行最早触发快搜的片段；同位置保留配置顺序，便于用户通过调整配置表达优先级。
+pub(crate) fn find_best_query_range(
+    line_text: &str,
+    options: &SearchOptions,
+) -> Option<std::ops::Range<usize>> {
+    let mut best: Option<(usize, std::ops::Range<usize>)> = None;
+    for (query_index, query) in options.queries.iter().enumerate() {
+        let Some(match_range) = find_query_range(line_text, query, options.case_sensitive) else {
+            continue;
+        };
+        let should_replace = match best.as_ref() {
+            Some((best_index, best_range)) => {
+                match_range.start < best_range.start
+                    || (match_range.start == best_range.start && query_index < *best_index)
+            }
+            None => true,
+        };
+        if should_replace {
+            best = Some((query_index, match_range));
+        }
+    }
+    best.map(|(_, range)| range)
 }
 
 /// 统计单行中的查询词出现次数。
@@ -488,14 +550,7 @@ mod tests {
     fn 普通文本搜索支持不区分大小写() {
         let source = local("/tmp/app/access.log");
         let lines = vec!["INFO started".to_string(), "error failed".to_string()];
-        let results = search_lines(
-            &source,
-            &lines,
-            &SearchOptions {
-                query: "ERROR".to_string(),
-                case_sensitive: false,
-            },
-        );
+        let results = search_lines(&source, &lines, &SearchOptions::single("ERROR", false));
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].line_index, 1);
@@ -507,14 +562,7 @@ mod tests {
     fn 区分大小写搜索只匹配原始大小写() {
         let source = local("/tmp/app/access.log");
         let lines = vec!["error lower".to_string(), "ERROR upper".to_string()];
-        let results = search_lines(
-            &source,
-            &lines,
-            &SearchOptions {
-                query: "ERROR".to_string(),
-                case_sensitive: true,
-            },
-        );
+        let results = search_lines(&source, &lines, &SearchOptions::single("ERROR", true));
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].line_index, 1);
@@ -525,14 +573,7 @@ mod tests {
     fn 中文查询词返回合法_utf8_范围() {
         let source = local("/tmp/app/access.log");
         let lines = vec!["服务启动失败".to_string()];
-        let results = search_lines(
-            &source,
-            &lines,
-            &SearchOptions {
-                query: "启动".to_string(),
-                case_sensitive: false,
-            },
-        );
+        let results = search_lines(&source, &lines, &SearchOptions::single("启动", false));
 
         let range = results[0].match_range.clone();
         assert!(results[0].line_text.is_char_boundary(range.start));
@@ -554,24 +595,65 @@ mod tests {
         ];
 
         assert_eq!(
-            count_query_occurrences(
-                &lines,
-                &SearchOptions {
-                    query: "error".to_string(),
-                    case_sensitive: false,
-                },
-            ),
+            count_query_occurrences(&lines, &SearchOptions::single("error", false),),
             3
         );
         assert_eq!(
-            count_query_occurrences(
-                &lines,
-                &SearchOptions {
-                    query: "error".to_string(),
-                    case_sensitive: true,
-                },
-            ),
+            count_query_occurrences(&lines, &SearchOptions::single("error", true),),
             2
+        );
+    }
+
+    /// 多关键字搜索按任一关键字命中，并且同一行只返回一条结果。
+    #[test]
+    fn 多关键字搜索任一命中且同一行只返回一条结果() {
+        let source = local("/tmp/app/access.log");
+        let lines = vec![
+            "INFO ok".to_string(),
+            "WARN retry then ERROR failed".to_string(),
+            "Timeout waiting".to_string(),
+        ];
+        let results = search_lines(
+            &source,
+            &lines,
+            &SearchOptions::any(vec!["ERROR".to_string(), "Timeout".to_string()], false),
+        );
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].line_index, 1);
+        assert_eq!(
+            &results[0].line_text[results[0].match_range.clone()],
+            "ERROR"
+        );
+        assert_eq!(results[1].line_index, 2);
+    }
+
+    /// 多关键字同时命中一行时高亮最靠前位置；位置相同则保留配置顺序。
+    #[test]
+    fn 多关键字搜索高亮最靠前命中并按配置顺序打破平局() {
+        let source = local("/tmp/app/access.log");
+        let lines = vec![
+            "prefix ERROR Timeout".to_string(),
+            "Exception happens".to_string(),
+        ];
+        let first_results = search_lines(
+            &source,
+            &lines,
+            &SearchOptions::any(vec!["Timeout".to_string(), "ERROR".to_string()], true),
+        );
+        assert_eq!(
+            &first_results[0].line_text[first_results[0].match_range.clone()],
+            "ERROR"
+        );
+
+        let tie_results = search_lines(
+            &source,
+            &lines,
+            &SearchOptions::any(vec!["Exception".to_string(), "Ex".to_string()], true),
+        );
+        assert_eq!(
+            &tie_results[0].line_text[tie_results[0].match_range.clone()],
+            "Exception"
         );
     }
 
