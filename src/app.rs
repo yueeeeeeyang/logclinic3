@@ -2582,7 +2582,7 @@ impl MainFeature {
     /// 返回主功能导航图标。
     fn icon(self) -> Icon {
         match self {
-            Self::LogAnalysis => Icon::Logs,
+            Self::LogAnalysis => Icon::Search,
             Self::HprofAnalysis => Icon::ChartNoAxesCombined,
             Self::AiChat => Icon::BotMessageSquare,
         }
