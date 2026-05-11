@@ -1,12 +1,12 @@
-// HPROF dump 分析独立窗口。
+// HPROF dump 分析视图。
 //
 // 业务意图：
-// - HPROF dominator tree 是独立于日志正文的重型分析视图，应在单独窗口中展示进度和结果，避免遮挡主日志工作区。
-// - 解析任务运行在后台线程，窗口只消费进度快照和最终结果，确保 GPUI 主线程不会被大 dump 解析阻塞。
+// - HPROF dominator tree 是独立于日志正文的重型分析视图，当前嵌入主窗口“HPROF解析”功能页展示进度和结果。
+// - 解析任务运行在后台线程，视图只消费进度快照和最终结果，确保 GPUI 主线程不会被大 dump 解析阻塞。
 //
 // 边界条件：
 // - 用户关闭窗口或点击取消时，只能尽快停止解析循环；第三方 dominator 算法阶段无法细粒度中断，因此在进入前后检查取消状态。
-// - GPUI 文件选择器不能限制扩展名，后缀和 header 校验失败会在本窗口展示中文错误。
+// - GPUI 文件选择器不能限制扩展名，后缀和 header 校验失败会在本视图展示中文错误。
 
 use std::sync::{
     Arc, Mutex,
@@ -62,7 +62,7 @@ const HPROF_THREAD_STACK_ROW_HEIGHT: f32 = 22.0;
 /// HPROF dominator tree 中线程行的右键菜单状态。
 ///
 /// 业务意图：
-/// - 菜单坐标来自 GPUI 鼠标事件，右键菜单作为分析窗口根节点的绝对定位元素渲染，避免依赖平台系统菜单。
+/// - 菜单坐标来自 GPUI 鼠标事件，右键菜单作为分析视图根节点的绝对定位元素渲染，避免依赖平台系统菜单。
 #[derive(Clone, Debug)]
 struct HprofThreadContextMenu {
     /// 线程对象 ID。
@@ -73,11 +73,13 @@ struct HprofThreadContextMenu {
     y: f32,
 }
 
-/// HPROF 分析窗口状态。
+/// HPROF 分析视图状态。
 ///
 /// 业务意图：
-/// - 独立窗口需要同时表达运行中、完成、失败和取消，状态枚举可以让渲染逻辑保持互斥。
-enum HprofAnalysisWindowState {
+/// - 主窗口内嵌页需要同时表达未选择文件、运行中、完成、失败和取消，状态枚举可以让渲染逻辑保持互斥。
+enum HprofAnalysisState {
+    /// 尚未选择 dump 文件。
+    Idle,
     /// 后台任务正在运行。
     Running {
         /// 最近一次进度快照。
@@ -102,13 +104,14 @@ enum HprofAnalysisWindowState {
     },
 }
 
-impl HprofAnalysisWindowState {
-    /// 返回窗口头部展示的状态文案。
+impl HprofAnalysisState {
+    /// 返回头部展示的状态文案。
     ///
     /// 业务意图：
     /// - 失败、取消和完成状态需要在标题栏保持稳定中文文案；集中在纯状态方法里，避免渲染代码和测试各自拼装。
     fn status_label(&self) -> String {
         match self {
+            Self::Idle => "未选择文件".to_string(),
             Self::Running { progress } => progress.stage.label().to_string(),
             Self::Completed { .. } => "完成".to_string(),
             Self::Failed { .. } => "失败".to_string(),
@@ -117,18 +120,18 @@ impl HprofAnalysisWindowState {
     }
 }
 
-/// HPROF 分析独立窗口根视图。
+/// HPROF 分析主窗口内嵌视图。
 ///
 /// 业务意图：
-/// - 该窗口观察主视图主题状态，保证明暗主题切换后 HPROF 分析结果同步刷新。
-/// - 每次选择新 dump 时复用已有窗口，取消旧任务并重置滚动、展开状态和结果。
-pub(super) struct HprofAnalysisWindowView {
+/// - 该视图观察主视图主题状态，保证明暗主题切换后 HPROF 分析结果同步刷新。
+/// - 每次选择新 dump 时复用已有实体，取消旧任务并重置滚动、展开状态和结果。
+pub(super) struct HprofAnalysisView {
     /// 主窗口视图实体。
     main_view: Entity<MainView>,
-    /// 当前分析文件路径。
-    file_path: PathBuf,
-    /// 当前窗口状态。
-    state: HprofAnalysisWindowState,
+    /// 当前分析文件路径；未选择文件时为 `None`，用于渲染 HPROF 页初始空态。
+    file_path: Option<PathBuf>,
+    /// 当前视图状态。
+    state: HprofAnalysisState,
     /// dominator tree 虚拟列表滚动句柄。
     scroll_handle: UniformListScrollHandle,
     /// 当前展开的对象节点 ID。
@@ -151,24 +154,20 @@ pub(super) struct HprofAnalysisWindowView {
     _main_view_subscription: gpui::Subscription,
 }
 
-impl HprofAnalysisWindowView {
-    /// 创建 HPROF 分析窗口并启动解析。
-    pub(super) fn new(
-        main_view: Entity<MainView>,
-        file_path: PathBuf,
-        context: &mut Context<Self>,
-    ) -> Self {
+impl HprofAnalysisView {
+    /// 创建 HPROF 分析视图。
+    ///
+    /// 业务意图：
+    /// - 视图实体会随主窗口功能页存在；创建时不启动后台解析，只有用户在 HPROF 页选择文件后才读取磁盘。
+    pub(super) fn new(main_view: Entity<MainView>, context: &mut Context<Self>) -> Self {
         let observed_main_view = main_view.clone();
         let main_view_subscription = context.observe(&observed_main_view, |_, _, context| {
             context.notify();
         });
-        let initial_progress = HprofProgress::new(Self::file_size_for_progress(&file_path));
-        let mut view = Self {
+        Self {
             main_view,
-            file_path: file_path.clone(),
-            state: HprofAnalysisWindowState::Running {
-                progress: initial_progress,
-            },
+            file_path: None,
+            state: HprofAnalysisState::Idle,
             scroll_handle: UniformListScrollHandle::new(),
             expanded_node_ids: HashSet::new(),
             thread_context_menu: None,
@@ -176,15 +175,13 @@ impl HprofAnalysisWindowView {
             analysis_generation: 0,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             _main_view_subscription: main_view_subscription,
-        };
-        view.start_new_analysis(file_path, context);
-        view
+        }
     }
 
     /// 启动一个新的 HPROF 分析任务。
     ///
     /// 业务意图：
-    /// - 重复点击工具栏并选择新文件时复用同一个窗口；旧任务必须取消，旧展开状态也不能污染新 dump。
+    /// - 重复点击 HPROF 页文件按钮并选择新文件时复用同一个视图；旧任务必须取消，旧展开状态也不能污染新 dump。
     pub(super) fn start_new_analysis(&mut self, file_path: PathBuf, context: &mut Context<Self>) {
         self.cancel_flag.store(true, Ordering::Relaxed);
         self.analysis_generation = self.analysis_generation.saturating_add(1);
@@ -194,8 +191,8 @@ impl HprofAnalysisWindowView {
         let progress_snapshot = Arc::new(Mutex::new(progress.clone()));
         let task_finished = Arc::new(AtomicBool::new(false));
 
-        self.file_path = file_path.clone();
-        self.state = HprofAnalysisWindowState::Running { progress };
+        self.file_path = Some(file_path.clone());
+        self.state = HprofAnalysisState::Running { progress };
         self.scroll_handle = UniformListScrollHandle::new();
         self.expanded_node_ids.clear();
         self.thread_context_menu = None;
@@ -240,7 +237,7 @@ impl HprofAnalysisWindowView {
                                 return false;
                             }
                             if let Some(progress) = progress
-                                && let HprofAnalysisWindowState::Running {
+                                && let HprofAnalysisState::Running {
                                     progress: current_progress,
                                 } = &mut view.state
                             {
@@ -297,13 +294,13 @@ impl HprofAnalysisWindowView {
                     view.expanded_node_ids.clear();
                     view.thread_context_menu = None;
                     view.state = match result {
-                        Ok(result) => HprofAnalysisWindowState::Completed {
+                        Ok(result) => HprofAnalysisState::Completed {
                             result: Arc::new(result),
                         },
-                        Err(HprofError::Canceled) => HprofAnalysisWindowState::Canceled {
+                        Err(HprofError::Canceled) => HprofAnalysisState::Canceled {
                             progress: final_progress,
                         },
-                        Err(error) => HprofAnalysisWindowState::Failed {
+                        Err(error) => HprofAnalysisState::Failed {
                             message: error.to_string(),
                             progress: final_progress,
                         },
@@ -326,13 +323,13 @@ impl HprofAnalysisWindowView {
     fn cancel_analysis(&mut self, context: &mut Context<Self>) {
         self.cancel_flag.store(true, Ordering::Relaxed);
         let progress = match &self.state {
-            HprofAnalysisWindowState::Running { progress } => Some(progress.clone()),
-            HprofAnalysisWindowState::Failed { progress, .. }
-            | HprofAnalysisWindowState::Canceled { progress } => progress.clone(),
-            HprofAnalysisWindowState::Completed { .. } => None,
+            HprofAnalysisState::Running { progress } => Some(progress.clone()),
+            HprofAnalysisState::Failed { progress, .. }
+            | HprofAnalysisState::Canceled { progress } => progress.clone(),
+            HprofAnalysisState::Idle | HprofAnalysisState::Completed { .. } => None,
         };
-        if let HprofAnalysisWindowState::Running { .. } = self.state {
-            self.state = HprofAnalysisWindowState::Canceled { progress };
+        if let HprofAnalysisState::Running { .. } = self.state {
+            self.state = HprofAnalysisState::Canceled { progress };
         }
         context.notify();
     }
@@ -359,7 +356,7 @@ impl HprofAnalysisWindowView {
     ) {
         let is_thread = matches!(
             &self.state,
-            HprofAnalysisWindowState::Completed { result } if result.is_thread_object(object_id)
+            HprofAnalysisState::Completed { result } if result.is_thread_object(object_id)
         );
         self.thread_context_menu = if is_thread {
             Some(HprofThreadContextMenu { object_id, x, y })
@@ -377,7 +374,7 @@ impl HprofAnalysisWindowView {
         context: &mut Context<Self>,
     ) {
         let details = match &self.state {
-            HprofAnalysisWindowState::Completed { result } => {
+            HprofAnalysisState::Completed { result } => {
                 result.thread_details_for_object_id(object_id).cloned()
             }
             _ => None,
@@ -453,9 +450,14 @@ impl HprofAnalysisWindowView {
         }
     }
 
-    /// 渲染窗口头部。
+    /// 渲染视图头部。
     fn render_header(&self, palette: AppThemePalette) -> impl IntoElement {
         let status = self.state.status_label();
+        let file_label = self
+            .file_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "请选择一个 .hprof 或 .bin dump 文件".to_string());
         div()
             .flex()
             .items_center()
@@ -484,7 +486,7 @@ impl HprofAnalysisWindowView {
                             .text_xs()
                             .text_color(rgb(palette.muted_text))
                             .truncate()
-                            .child(self.file_path.display().to_string()),
+                            .child(file_label),
                     ),
             )
             .child(
@@ -493,6 +495,40 @@ impl HprofAnalysisWindowView {
                     .text_xs()
                     .text_color(rgb(palette.muted_text))
                     .child(status),
+            )
+    }
+
+    /// 渲染未选择文件的初始状态。
+    ///
+    /// 业务意图：
+    /// - HPROF 已迁入主窗口大功能页，用户进入该页时不应立即触发磁盘读取；空态只提示下一步选择文件。
+    fn render_idle(&self, palette: AppThemePalette) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .size_full()
+            .px_4()
+            .child(MainView::render_lucide_icon(
+                Some(Icon::ChartNoAxesCombined),
+                34.0,
+                30.0,
+                palette.muted_text,
+            ))
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(palette.text))
+                    .child("请选择 HPROF dump 文件"),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(palette.muted_text))
+                    .child("支持 .hprof 和 .bin，解析会在后台线程执行。"),
             )
     }
 
@@ -1089,26 +1125,27 @@ impl HprofAnalysisWindowView {
     }
 }
 
-impl Drop for HprofAnalysisWindowView {
-    /// 窗口销毁时取消后台任务。
+impl Drop for HprofAnalysisView {
+    /// 视图销毁时取消后台任务。
     fn drop(&mut self) {
         self.cancel_flag.store(true, Ordering::Relaxed);
     }
 }
 
-impl Render for HprofAnalysisWindowView {
-    /// 渲染 HPROF 分析窗口。
+impl Render for HprofAnalysisView {
+    /// 渲染 HPROF 分析视图。
     fn render(&mut self, _window: &mut Window, context: &mut Context<Self>) -> impl IntoElement {
         let palette = self.main_view.read(context).palette();
 
         let body = match &self.state {
-            HprofAnalysisWindowState::Running { progress } => self
+            HprofAnalysisState::Idle => self.render_idle(palette).into_any_element(),
+            HprofAnalysisState::Running { progress } => self
                 .render_running(progress, palette, context)
                 .into_any_element(),
-            HprofAnalysisWindowState::Completed { result } => self
+            HprofAnalysisState::Completed { result } => self
                 .render_completed(Arc::clone(result), palette, context)
                 .into_any_element(),
-            HprofAnalysisWindowState::Failed { message, progress } => self
+            HprofAnalysisState::Failed { message, progress } => self
                 .render_terminal_message(
                     "HPROF 解析失败",
                     message.clone(),
@@ -1116,7 +1153,7 @@ impl Render for HprofAnalysisWindowView {
                     palette,
                 )
                 .into_any_element(),
-            HprofAnalysisWindowState::Canceled { progress } => self
+            HprofAnalysisState::Canceled { progress } => self
                 .render_terminal_message(
                     "HPROF 解析已取消",
                     "当前 dump 的后台解析任务已收到取消信号。".to_string(),
@@ -1434,16 +1471,25 @@ mod tests {
     #[test]
     fn 失败和取消状态文案稳定() {
         let progress = HprofProgress::new(16);
-        let failed = HprofAnalysisWindowState::Failed {
+        let failed = HprofAnalysisState::Failed {
             message: "文件头格式错误".to_string(),
             progress: Some(progress.clone()),
         };
-        let canceled = HprofAnalysisWindowState::Canceled {
+        let canceled = HprofAnalysisState::Canceled {
             progress: Some(progress),
         };
 
         assert_eq!(failed.status_label(), "失败");
         assert_eq!(canceled.status_label(), "已取消");
+    }
+
+    /// 验证 HPROF 初始状态不会进入解析阶段。
+    ///
+    /// 业务意图：
+    /// - HPROF 页迁入主窗口后，用户点击导航只应看到空态；只有选择文件后才允许后台读取 dump。
+    #[test]
+    fn hprof_初始状态保持未选择文件() {
+        assert_eq!(HprofAnalysisState::Idle.status_label(), "未选择文件");
     }
 
     /// 验证线程堆栈行生成会保留线程名，并在缺失栈时给出中文提示。

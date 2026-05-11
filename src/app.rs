@@ -92,7 +92,7 @@ mod tests;
 mod thread_analysis;
 
 use about_window::AboutWindowView;
-use hprof_analysis::HprofAnalysisWindowView;
+use hprof_analysis::HprofAnalysisView;
 use search_window::SearchDialogWindowView;
 use settings_window::SettingsWindowView;
 use thread_analysis::{
@@ -330,18 +330,6 @@ const THREAD_ANALYSIS_POPUP_OFFSET: f32 = 12.0;
 /// 业务意图：
 /// - 气泡贴边会影响阴影和边框识别，保留边距也能减少被系统标题栏或窗口边框裁切的风险。
 const THREAD_ANALYSIS_POPUP_MARGIN: f32 = 8.0;
-
-/// HPROF 分析窗口默认宽度。
-///
-/// 业务意图：
-/// - Dominator tree 需要同时展示对象名、类型、对象 ID、shallow size 和 retained size，因此复用线程分析窗口量级的宽度。
-const HPROF_ANALYSIS_WINDOW_WIDTH: f32 = 1040.0;
-
-/// HPROF 分析窗口默认高度。
-///
-/// 业务意图：
-/// - HPROF Top retained 列表和进度详情都需要足够纵向空间，避免首屏只能看到少量对象行。
-const HPROF_ANALYSIS_WINDOW_HEIGHT: f32 = 720.0;
 
 /// 可持久化的主窗口宽高。
 ///
@@ -1071,16 +1059,64 @@ fn test_openai_compatible_model(profile: ModelProfile) -> Result<String, String>
     }
 }
 
-/// 顶部工具栏的固定高度。
+/// 日志功能页顶部操作栏的固定高度。
 ///
 /// 业务意图：
-/// - 工具栏用于承载当前已经明确的全局入口：加载日志、智能诊断、设置。
-/// - 用户要求工具栏高度和 tab 页签高度一致，因此这里直接复用 `LOG_TAB_BAR_HEIGHT`。
-/// - 统一高度可以让顶部全局工具栏和右侧日志 tab 栏的垂直节奏一致，减少首屏跳变感。
+/// - 根级文字工具栏已经迁移到左侧大导航；日志页仍需要加载日志和搜索入口，因此保留页内操作栏。
+/// - 操作栏高度和 tab 页签高度一致，可以让日志页顶部控件和右侧 tab 栏的垂直节奏一致，减少首屏跳变感。
 ///
 /// 边界条件：
-/// - 当前不实现可换行工具栏；如果后续窗口宽度允许缩小，需要再定义窄宽度下的折叠策略。
+/// - 当前不实现可换行操作栏；如果后续窗口宽度允许缩小，需要再定义窄宽度下的折叠策略。
 const TOOLBAR_HEIGHT: f32 = LOG_TAB_BAR_HEIGHT;
+
+/// 主窗口左侧大导航竖条宽度。
+///
+/// 业务意图：
+/// - 用户要求最左侧固定一个只显示图标的大导航竖条，用于在日志分析、HPROF 解析和 AI 对话之间切换。
+/// - 固定 56px 可以在 macOS 和 Windows 上容纳 40px 命中按钮，同时不明显挤压日志内容区。
+const MAIN_NAV_WIDTH: f32 = 56.0;
+
+/// 主导航按钮固定命中尺寸。
+///
+/// 业务意图：
+/// - 导航按钮只显示图标，命中区域必须比图标更大，保证鼠标点击稳定且 hover 气泡容易触发。
+const MAIN_NAV_BUTTON_SIZE: f32 = 40.0;
+
+/// 主导航图标字号。
+///
+/// 业务意图：
+/// - 20px 图标在 56px 竖条内足够清晰，同时不会显得比日志页操作图标过重。
+const MAIN_NAV_ICON_SIZE: f32 = 20.0;
+
+/// 主导航图标可视宽度。
+///
+/// 业务意图：
+/// - Lucide 图标不同字形的宽度略有差异，固定可视宽度可以让所有入口在竖条中严格居中。
+const MAIN_NAV_ICON_WIDTH: f32 = 20.0;
+
+/// 主导航按钮之间的垂直间距。
+///
+/// 业务意图：
+/// - 顶部三个主功能和底部通用入口都使用同一间距，保持竖向节奏稳定。
+const MAIN_NAV_BUTTON_GAP: f32 = 8.0;
+
+/// 主导航内边距。
+///
+/// 边界条件：
+/// - 顶部和底部都保留同样内缩，避免导航按钮贴住系统标题栏或窗口底边。
+const MAIN_NAV_PADDING: f32 = 8.0;
+
+/// 主导航悬浮气泡宽度。
+///
+/// 业务意图：
+/// - 气泡只展示功能名称，固定宽度可以避免不同中文名称长度导致 hover 时布局抖动。
+const MAIN_NAV_TOOLTIP_WIDTH: f32 = 84.0;
+
+/// 主导航悬浮气泡相对竖条右侧的间距。
+///
+/// 边界条件：
+/// - 气泡需要离开图标命中区一点距离，避免鼠标在图标和气泡之间移动时频繁闪烁。
+const MAIN_NAV_TOOLTIP_GAP: f32 = 8.0;
 
 /// 主界面工具栏按钮的水平内边距。
 ///
@@ -1715,15 +1751,15 @@ const CONTROL_X_CODE: &str = "\u{18}";
 /// - 与复制快捷键保持同一套兼容策略，避免 Windows/macOS 键盘路径出现只在某个平台生效的问题。
 const CONTROL_A_CODE: &str = "\u{1}";
 
-/// 顶部工具栏按钮的声明式配置。
+/// 日志页操作栏按钮的声明式配置。
 ///
 /// 业务意图：
-/// - 将按钮标签和图标绑定在一起，避免渲染代码里出现三组分散的硬编码。
+/// - 将按钮标签和图标绑定在一起，避免日志页操作栏渲染代码里出现分散的硬编码。
 /// - 后续如果按钮需要权限、禁用态或快捷键，可以在这个结构上扩展字段。
 ///
 /// 边界条件：
 /// - 当前只包含静态字符串，所有按钮在进程生命周期内固定不变。
-/// - “加载日志”已绑定真实系统选择器和路径扫描流程；“智能诊断”和“设置”仍等待业务规则明确后接入。
+/// - “加载日志”已绑定真实系统选择器和路径扫描流程；“搜索”复用现有独立搜索窗口逻辑。
 struct ToolbarAction {
     /// 按钮前置图标。
     ///
@@ -1739,14 +1775,11 @@ struct ToolbarAction {
     label: &'static str,
 }
 
-/// 顶部工具栏按钮列表。
+/// 日志页操作栏按钮列表。
 ///
 /// 业务意图：
 /// - “加载日志”使用 `FileText`，表达日志文本文件入口。
-/// - “HPROF解析”使用 `ChartNoAxesCombined`，表达对 JVM heap dump 做对象关系分析。
 /// - “搜索”使用 `Search`，提供鼠标入口打开搜索窗口，避免快捷键异常时用户无法触达搜索能力。
-/// - “智能诊断”使用 `Stethoscope`，表达对日志问题进行诊断和定位，比脑回路图标更贴近按钮语义。
-/// - “设置”使用 `Settings`，表达配置入口；“关于”使用 `Info`，表达产品信息入口。
 ///
 /// 边界条件：
 /// - 当前图标依赖启动时注册的 Lucide 字体；如果字体注册失败，启动阶段会直接暴露错误。
@@ -1756,24 +1789,8 @@ const TOOLBAR_ACTIONS: &[ToolbarAction] = &[
         label: "加载日志",
     },
     ToolbarAction {
-        icon: Icon::ChartNoAxesCombined,
-        label: "HPROF解析",
-    },
-    ToolbarAction {
         icon: Icon::Search,
         label: "搜索",
-    },
-    ToolbarAction {
-        icon: Icon::Stethoscope,
-        label: "智能诊断",
-    },
-    ToolbarAction {
-        icon: Icon::Settings,
-        label: "设置",
-    },
-    ToolbarAction {
-        icon: Icon::Info,
-        label: "关于",
     },
 ];
 
@@ -2491,6 +2508,87 @@ struct ThreadAnalysisFilterLineLayout {
     bounds: Bounds<Pixels>,
 }
 
+/// 主窗口当前展示的大功能页。
+///
+/// 业务意图：
+/// - 主窗口左侧固定大导航只负责在日志分析、HPROF 解析和 AI 对话三个主要工作区之间切换。
+/// - 状态只保存在当前会话，不写入配置文件，避免后续调整默认入口或恢复策略时被旧配置约束。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MainFeature {
+    /// 日志分析页，承载日志加载、目录树、日志 tab、搜索和线程日志分析入口。
+    LogAnalysis,
+    /// HPROF 解析页，承载 heap dump 文件选择、解析进度和 dominator tree 结果。
+    HprofAnalysis,
+    /// AI 对话页，本次只提供占位布局，不发起模型请求。
+    AiChat,
+}
+
+impl Default for MainFeature {
+    /// 默认进入日志分析页。
+    fn default() -> Self {
+        Self::LogAnalysis
+    }
+}
+
+impl MainFeature {
+    /// 返回主功能在左侧大导航中的固定展示顺序。
+    fn all() -> &'static [Self] {
+        &[Self::LogAnalysis, Self::HprofAnalysis, Self::AiChat]
+    }
+
+    /// 返回主功能中文名称。
+    fn label(self) -> &'static str {
+        match self {
+            Self::LogAnalysis => "日志分析",
+            Self::HprofAnalysis => "HPROF解析",
+            Self::AiChat => "AI对话",
+        }
+    }
+
+    /// 返回主功能导航图标。
+    fn icon(self) -> Icon {
+        match self {
+            Self::LogAnalysis => Icon::FileText,
+            Self::HprofAnalysis => Icon::ChartNoAxesCombined,
+            Self::AiChat => Icon::BotMessageSquare,
+        }
+    }
+}
+
+/// 左侧大导航中的可悬浮入口。
+///
+/// 业务意图：
+/// - 导航栏只显示图标，hover 气泡需要知道当前入口名称和纵向位置；设置、关于属于通用入口，不计入主功能状态。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MainNavigationItem {
+    /// 三个主功能页入口。
+    Feature(MainFeature),
+    /// 设置独立窗口入口。
+    Settings,
+    /// 关于独立窗口入口。
+    About,
+}
+
+impl MainNavigationItem {
+    /// 返回导航入口中文名称。
+    fn label(self) -> &'static str {
+        match self {
+            Self::Feature(feature) => feature.label(),
+            Self::Settings => "设置",
+            Self::About => "关于",
+        }
+    }
+
+    /// 返回导航入口图标。
+    fn icon(self) -> Icon {
+        match self {
+            Self::Feature(feature) => feature.icon(),
+            Self::Settings => Icon::Settings,
+            Self::About => Icon::Info,
+        }
+    }
+}
+
 /// 设置窗口当前激活的页签。
 ///
 /// 业务意图：
@@ -3163,6 +3261,20 @@ struct MainView {
     /// - 当前不处理窗口失焦或鼠标释放发生在窗口外的情况，后续如需更强交互再补充捕获策略。
     is_resizing_splitter: bool,
 
+    /// 当前主窗口选中的大功能页。
+    ///
+    /// 业务意图：
+    /// - 左侧固定图标导航需要驱动右侧内容在日志分析、HPROF 解析和 AI 对话之间切换。
+    /// - 默认值为日志分析，保证现有日志查看主流程启动后仍是第一屏。
+    active_main_feature: MainFeature,
+
+    /// 当前鼠标悬浮的左侧导航入口。
+    ///
+    /// 业务意图：
+    /// - 导航栏只显示图标，入口名称通过自绘气泡展示；该字段只保存 hover 期间的临时 UI 状态。
+    /// - 鼠标离开图标后立即清空，避免气泡长期遮挡日志目录树或 HPROF 表格。
+    hovered_navigation_item: Option<MainNavigationItem>,
+
     /// 左侧日志目录树当前的数据状态。
     ///
     /// 业务意图：
@@ -3340,12 +3452,12 @@ struct MainView {
     /// - 句柄只服务当前会话；关闭窗口后由回调清空。
     thread_analysis_window: Option<WindowHandle<ThreadAnalysisWindowView>>,
 
-    /// HPROF dump 分析独立窗口句柄。
+    /// HPROF dump 分析内嵌视图实体。
     ///
     /// 业务意图：
-    /// - HPROF dominator tree 是独立工作视图，重复点击工具栏并选择新文件时复用已有窗口，避免堆叠多个重型分析窗口。
-    /// - 句柄只服务当前会话；关闭窗口后由回调清空，后台任务通过窗口自身的取消标记停止。
-    hprof_analysis_window: Option<WindowHandle<HprofAnalysisWindowView>>,
+    /// - HPROF dominator tree 是独立工作视图，重复选择新文件时复用已有实体，避免丢失当前页布局和后台任务代次控制。
+    /// - 实体只服务当前会话；应用关闭或实体释放时由视图自身取消后台解析任务。
+    hprof_analysis_view: Option<Entity<HprofAnalysisView>>,
 
     /// 设置窗口打开请求是否已经排队到下一帧。
     ///
@@ -3696,6 +3808,8 @@ impl MainView {
             left_panel_width: LEFT_PANEL_DEFAULT_WIDTH,
             main_window: None,
             is_resizing_splitter: false,
+            active_main_feature: MainFeature::default(),
+            hovered_navigation_item: None,
             load_state: LogTreeLoadState::Empty,
             log_tree_scroll_handle: UniformListScrollHandle::new(),
             log_tree_selected_node_ids: HashSet::new(),
@@ -3718,7 +3832,7 @@ impl MainView {
             settings_window: None,
             about_window: None,
             thread_analysis_window: None,
-            hprof_analysis_window: None,
+            hprof_analysis_view: None,
             settings_window_open_pending: false,
             about_window_open_pending: false,
             settings_active_tab: SettingsTab::General,
@@ -3798,19 +3912,198 @@ impl MainView {
         context.notify();
     }
 
-    /// 构建顶部工具栏。
+    /// 渲染主窗口左侧大导航竖条。
     ///
     /// 业务意图：
-    /// - 将全局操作入口集中在窗口顶部，符合日志查看客户端的主要工作流。
-    /// - “加载日志”已经接入真实路径选择和目录树扫描；设置会打开独立设置窗口；诊断仍只保留入口。
+    /// - 左侧导航是主窗口唯一的全局功能入口，顶部三个图标切换大功能，底部两个图标打开设置和关于窗口。
+    /// - 按用户要求导航本体不显示文字；功能名称只在 hover 气泡中显示。
     ///
     /// 边界条件：
-    /// - 工具栏内容固定为单行，超窄窗口下的折叠、隐藏或溢出行为尚未定义。
-    /// - 诊断按钮当前只保留入口，后续实现具体业务时必须补充对应业务规则和错误处理。
-    fn render_toolbar(&self, context: &mut Context<Self>) -> impl IntoElement {
+    /// - 导航宽度固定，不随窗口缩放变化；窄屏时优先保留入口可点击性，再由右侧内容区自行处理可用宽度。
+    fn render_main_navigation(&self, context: &mut Context<Self>) -> impl IntoElement {
+        let palette = self.palette();
+        let main_items = MainFeature::all()
+            .iter()
+            .copied()
+            .map(|feature| {
+                self.render_main_navigation_button(
+                    MainNavigationItem::Feature(feature),
+                    self.active_main_feature == feature,
+                    palette,
+                    context,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        div()
+            .id("main-navigation")
+            .relative()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_between()
+            .w(px(MAIN_NAV_WIDTH))
+            .h_full()
+            .flex_none()
+            .py(px(MAIN_NAV_PADDING))
+            .bg(rgb(palette.panel))
+            .border_r_1()
+            .border_color(rgb(palette.border))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(MAIN_NAV_BUTTON_GAP))
+                    .children(main_items),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(MAIN_NAV_BUTTON_GAP))
+                    .child(self.render_main_navigation_button(
+                        MainNavigationItem::Settings,
+                        false,
+                        palette,
+                        context,
+                    ))
+                    .child(self.render_main_navigation_button(
+                        MainNavigationItem::About,
+                        false,
+                        palette,
+                        context,
+                    )),
+            )
+    }
+
+    /// 渲染左侧大导航中的单个图标按钮。
+    ///
+    /// 业务意图：
+    /// - 按钮本体只渲染图标，hover 状态下把中文名称作为气泡渲染到按钮右侧。
+    /// - 设置和关于不是主功能页，不参与选中态；点击后仍复用现有独立窗口打开逻辑。
+    fn render_main_navigation_button(
+        &self,
+        item: MainNavigationItem,
+        selected: bool,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let hovered = self.hovered_navigation_item == Some(item);
+        let text_color = if selected || hovered {
+            palette.accent
+        } else {
+            palette.muted_text
+        };
+
+        div()
+            .id(SharedString::from(format!("main-nav-{}", item.label())))
+            .relative()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(MAIN_NAV_BUTTON_SIZE))
+            .h(px(MAIN_NAV_BUTTON_SIZE))
+            .rounded(px(8.0))
+            .bg(rgb(if selected {
+                palette.selected
+            } else {
+                palette.panel
+            }))
+            .text_color(rgb(text_color))
+            .cursor_pointer()
+            .hover(move |button| button.bg(rgb(palette.hover)))
+            .active(|button| button.opacity(0.82))
+            .child(Self::render_lucide_icon(
+                Some(item.icon()),
+                MAIN_NAV_ICON_WIDTH,
+                MAIN_NAV_ICON_SIZE,
+                text_color,
+            ))
+            .when(hovered, |button| {
+                button.child(Self::render_main_navigation_tooltip(item.label(), palette))
+            })
+            .on_hover(
+                context.listener(move |view, is_hovered: &bool, _window, context| {
+                    let next_item = (*is_hovered).then_some(item);
+                    if view.hovered_navigation_item != next_item {
+                        view.hovered_navigation_item = next_item;
+                        context.notify();
+                    }
+                }),
+            )
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, window, context| {
+                    match item {
+                        MainNavigationItem::Feature(feature) => {
+                            view.select_main_feature(feature, context);
+                        }
+                        MainNavigationItem::Settings => {
+                            view.schedule_open_settings_window(window, context);
+                        }
+                        MainNavigationItem::About => {
+                            view.schedule_open_about_window(window, context);
+                        }
+                    }
+                    context.stop_propagation();
+                }),
+            )
+    }
+
+    /// 渲染左侧导航 hover 名称气泡。
+    ///
+    /// 业务意图：
+    /// - 主导航只显示图标，为了避免用户猜测图标语义，鼠标悬浮时在右侧显示中文功能名称。
+    fn render_main_navigation_tooltip(
+        label: &'static str,
+        palette: AppThemePalette,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(SharedString::from(format!("main-nav-tooltip-{label}")))
+            .absolute()
+            .left(px(MAIN_NAV_BUTTON_SIZE + MAIN_NAV_TOOLTIP_GAP))
+            .top(px(5.0))
+            .w(px(MAIN_NAV_TOOLTIP_WIDTH))
+            .h(px(30.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.menu))
+            .shadow_lg()
+            .text_xs()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(palette.text))
+            .child(label)
+    }
+
+    /// 切换主窗口大功能页。
+    ///
+    /// 业务意图：
+    /// - 大导航切换时应收起日志页中的临时弹层，避免用户进入 HPROF 或 AI 页后仍看到旧 tab 菜单、编码下拉或搜索结果菜单。
+    fn select_main_feature(&mut self, feature: MainFeature, context: &mut Context<Self>) {
+        self.active_main_feature = feature;
+        self.load_source_menu = None;
+        self.tab_context_menu = None;
+        self.encoding_dropdown_menu = None;
+        self.log_viewer_context_menu = None;
+        self.log_tree_context_menu = None;
+        self.search_results_context_menu = None;
+        context.notify();
+    }
+
+    /// 构建日志分析页顶部操作栏。
+    ///
+    /// 业务意图：
+    /// - 根级文字工具栏已迁移到左侧大导航；日志页仍需要保留“加载日志”和“搜索”两个高频入口。
+    fn render_log_action_bar(&self, context: &mut Context<Self>) -> impl IntoElement {
         let palette = self.palette();
 
         div()
+            .id("log-action-bar")
             .flex()
             .items_center()
             .gap_2()
@@ -3821,11 +4114,7 @@ impl MainView {
             .border_b_1()
             .border_color(rgb(palette.border))
             .child(self.render_load_toolbar_button(context))
-            .child(self.render_hprof_toolbar_button(context))
             .child(self.render_search_toolbar_button(context))
-            .child(Self::render_toolbar_button(&TOOLBAR_ACTIONS[3], palette))
-            .child(self.render_settings_toolbar_button(context))
-            .child(self.render_about_toolbar_button(context))
     }
 
     /// 构建“加载日志”工具栏按钮。
@@ -3866,50 +4155,17 @@ impl MainView {
             .on_click(context.listener(Self::open_log_sources_prompt))
     }
 
-    /// 构建“HPROF解析”工具栏按钮。
-    ///
-    /// 业务意图：
-    /// - HPROF dump 是独立于日志树的诊断入口，按钮放在“加载日志”之后，符合先选普通日志或 dump 再进入分析的排障顺序。
-    /// - 点击后只允许选择单个本地文件；扩展名和 header 校验在后台分析窗口中完成，避免 GPUI 文件选择器能力差异影响逻辑。
-    fn render_hprof_toolbar_button(&self, context: &mut Context<Self>) -> impl IntoElement {
-        let action = &TOOLBAR_ACTIONS[1];
-        let palette = self.palette();
-
-        div()
-            .id(SharedString::from(action.label))
-            .flex()
-            .items_center()
-            .gap_1()
-            .flex_none()
-            .px(px(TOOLBAR_BUTTON_HORIZONTAL_PADDING))
-            .py(px(TOOLBAR_BUTTON_VERTICAL_PADDING))
-            .text_sm()
-            .text_color(rgb(palette.text))
-            .rounded(px(6.0))
-            .cursor_pointer()
-            .hover(move |button| button.text_color(rgb(palette.accent)))
-            .active(|button| button.opacity(0.82))
-            .child(Self::render_lucide_icon(
-                Some(action.icon),
-                TOOLBAR_BUTTON_ICON_WIDTH,
-                TOOLBAR_BUTTON_ICON_SIZE,
-                palette.muted_text,
-            ))
-            .child(action.label)
-            .on_click(context.listener(Self::open_hprof_from_toolbar))
-    }
-
     /// 构建“搜索”工具栏按钮。
     ///
     /// 业务意图：
     /// - 搜索除了快捷键外必须有可见入口，用户在 macOS/Windows 快捷键被系统或输入法拦截时仍能打开搜索窗口。
-    /// - 搜索按钮放在“加载日志”和“智能诊断”之间，符合先加载、再搜索、再诊断的排障流程顺序。
+    /// - 搜索按钮放在日志分析页操作栏内，只作用于当前日志工作区，不污染 HPROF 和 AI 页的占位状态。
     ///
     /// 边界条件：
     /// - 点击按钮来自鼠标事件，不处于 macOS key equivalent 回调栈中，因此可以直接打开或激活独立搜索窗口。
     /// - 如果日志正文已有选区，沿用快捷键入口的预填逻辑，把选中文本写入搜索关键字。
     fn render_search_toolbar_button(&self, context: &mut Context<Self>) -> impl IntoElement {
-        let action = &TOOLBAR_ACTIONS[2];
+        let action = &TOOLBAR_ACTIONS[1];
         let palette = self.palette();
 
         div()
@@ -3936,109 +4192,6 @@ impl MainView {
             .on_click(context.listener(Self::open_search_from_toolbar))
     }
 
-    /// 构建一个顶部工具栏按钮。
-    ///
-    /// 业务意图：
-    /// - 统一工具栏入口的视觉样式，避免后续每个功能入口自行定义按钮外观。
-    /// - 按钮使用“图标 + 中文文字”的文字按钮形态，满足轻量工具栏要求。
-    ///
-    /// 边界条件：
-    /// - 当前仅用于“智能诊断”占位入口；点击后不改变状态、不访问文件、不请求网络。
-    /// - `id` 使用按钮标签生成，当前三个标签唯一；后续如果允许重复入口，需要改为稳定枚举 ID。
-    fn render_toolbar_button(action: &ToolbarAction, palette: AppThemePalette) -> impl IntoElement {
-        div()
-            .id(SharedString::from(action.label))
-            .flex()
-            .items_center()
-            .gap_1()
-            .flex_none()
-            .px(px(TOOLBAR_BUTTON_HORIZONTAL_PADDING))
-            .py(px(TOOLBAR_BUTTON_VERTICAL_PADDING))
-            .text_sm()
-            .text_color(rgb(palette.text))
-            .rounded(px(6.0))
-            .cursor_pointer()
-            .hover(move |button| button.text_color(rgb(palette.accent)))
-            .active(|button| button.opacity(0.82))
-            .child(Self::render_lucide_icon(
-                Some(action.icon),
-                TOOLBAR_BUTTON_ICON_WIDTH,
-                TOOLBAR_BUTTON_ICON_SIZE,
-                palette.muted_text,
-            ))
-            .child(action.label)
-            .on_click(|_event, _window, _context| {
-                // 智能诊断当前只要求保留入口，具体业务动作尚未定义。
-                // 后续实现时应按 AGENTS.md 先确认权限、数据边界和验收标准，再绑定真实处理逻辑。
-            })
-    }
-
-    /// 构建“设置”工具栏按钮。
-    ///
-    /// 业务意图：
-    /// - 设置入口现在有真实独立窗口，重复点击应激活已有窗口，避免用户打开多个配置窗口后状态不一致。
-    /// - 视觉样式保持和其它工具栏按钮一致，避免设置入口因为已接入功能而破坏顶部工具栏节奏。
-    fn render_settings_toolbar_button(&self, context: &mut Context<Self>) -> impl IntoElement {
-        let action = &TOOLBAR_ACTIONS[4];
-        let palette = self.palette();
-
-        div()
-            .id(SharedString::from(action.label))
-            .flex()
-            .items_center()
-            .gap_1()
-            .flex_none()
-            .px(px(TOOLBAR_BUTTON_HORIZONTAL_PADDING))
-            .py(px(TOOLBAR_BUTTON_VERTICAL_PADDING))
-            .text_sm()
-            .text_color(rgb(palette.text))
-            .rounded(px(6.0))
-            .cursor_pointer()
-            .hover(move |button| button.text_color(rgb(palette.accent)))
-            .active(|button| button.opacity(0.82))
-            .child(Self::render_lucide_icon(
-                Some(action.icon),
-                TOOLBAR_BUTTON_ICON_WIDTH,
-                TOOLBAR_BUTTON_ICON_SIZE,
-                palette.muted_text,
-            ))
-            .child(action.label)
-            .on_click(context.listener(Self::open_settings_from_toolbar))
-    }
-
-    /// 构建“关于”工具栏按钮。
-    ///
-    /// 业务意图：
-    /// - 关于入口放在设置按钮之后，用于查看软件名称、版本、作者和特色功能，不影响日志查看主流程。
-    /// - 重复点击应激活已有关于窗口，避免用户打开多个内容相同的窗口。
-    fn render_about_toolbar_button(&self, context: &mut Context<Self>) -> impl IntoElement {
-        let action = &TOOLBAR_ACTIONS[5];
-        let palette = self.palette();
-
-        div()
-            .id(SharedString::from(action.label))
-            .flex()
-            .items_center()
-            .gap_1()
-            .flex_none()
-            .px(px(TOOLBAR_BUTTON_HORIZONTAL_PADDING))
-            .py(px(TOOLBAR_BUTTON_VERTICAL_PADDING))
-            .text_sm()
-            .text_color(rgb(palette.text))
-            .rounded(px(6.0))
-            .cursor_pointer()
-            .hover(move |button| button.text_color(rgb(palette.accent)))
-            .active(|button| button.opacity(0.82))
-            .child(Self::render_lucide_icon(
-                Some(action.icon),
-                TOOLBAR_BUTTON_ICON_WIDTH,
-                TOOLBAR_BUTTON_ICON_SIZE,
-                palette.muted_text,
-            ))
-            .child(action.label)
-            .on_click(context.listener(Self::open_about_from_toolbar))
-    }
-
     /// 打开日志来源选择器。
     ///
     /// 业务意图：
@@ -4058,11 +4211,11 @@ impl MainView {
         }
     }
 
-    /// 从工具栏打开 HPROF 文件选择器。
+    /// 从 HPROF 页打开 HPROF 文件选择器。
     ///
     /// 业务意图：
     /// - HPROF 分析只接受单个 dump 文件，不依赖当前日志树状态，也不会清空已经加载的日志工作区。
-    /// - 选择器本身无法过滤 `.hprof/.bin`，因此这里只负责拿到路径，真正校验由分析窗口后台任务执行并展示错误。
+    /// - 选择器本身无法过滤 `.hprof/.bin`，因此这里只负责拿到路径，真正校验由 HPROF 页后台任务执行并展示错误。
     fn open_hprof_from_toolbar(
         &mut self,
         _event: &ClickEvent,
@@ -4085,33 +4238,6 @@ impl MainView {
         context: &mut Context<Self>,
     ) {
         self.schedule_open_search_dialog(window, context);
-    }
-
-    /// 从工具栏按钮打开设置窗口。
-    ///
-    /// 业务意图：
-    /// - 设置窗口会持有并观察 `MainView`，因此和搜索窗口一样延后到当前主视图更新结束后再创建。
-    /// - 这样可以避免在按钮点击的状态更新栈中同时读取同一个 `MainView`。
-    fn open_settings_from_toolbar(
-        &mut self,
-        _event: &ClickEvent,
-        window: &mut Window,
-        context: &mut Context<Self>,
-    ) {
-        self.schedule_open_settings_window(window, context);
-    }
-
-    /// 从工具栏按钮打开关于窗口。
-    ///
-    /// 业务意图：
-    /// - 关于窗口会持有并观察 `MainView`，因此和设置窗口一样延后到当前主视图更新结束后再创建。
-    fn open_about_from_toolbar(
-        &mut self,
-        _event: &ClickEvent,
-        window: &mut Window,
-        context: &mut Context<Self>,
-    ) {
-        self.schedule_open_about_window(window, context);
     }
 
     /// 打开 HPROF 文件选择器，并在确认后打开分析窗口。
@@ -4142,11 +4268,7 @@ impl MainView {
                 };
 
                 app.update(move |app| {
-                    Self::open_hprof_analysis_window_after_main_update(
-                        main_view,
-                        selected_path,
-                        app,
-                    );
+                    Self::open_hprof_analysis_page_after_main_update(main_view, selected_path, app);
                 })
                 .ok();
             })
@@ -6466,94 +6588,56 @@ impl MainView {
         }
     }
 
-    /// 在 `MainView` 更新租借结束后打开 HPROF 分析窗口。
+    /// 在 `MainView` 更新租借结束后切换到 HPROF 页并启动解析。
     ///
     /// 业务意图：
-    /// - HPROF 分析窗口会观察主视图主题，因此窗口创建必须发生在当前主视图更新闭包之外，避免重入读取同一实体。
-    /// - 如果已有 HPROF 分析窗口仍有效，直接复用窗口并启动新文件分析；窗口内部会取消旧后台任务。
+    /// - HPROF 解析已经迁入主窗口大功能页，选择文件后应切到该页并复用内嵌分析实体。
+    /// - 分析实体观察主视图主题，因此创建实体必须发生在主视图更新闭包内，并在实体内部启动后台解析。
     ///
     /// 边界条件：
-    /// - 创建失败时只清理窗口句柄，不影响主日志查看工作区。
-    fn open_hprof_analysis_window_after_main_update(
+    /// - 重复选择新文件时复用旧实体，旧后台任务由 `HprofAnalysisView::start_new_analysis` 通过取消标记和代次保护停止或丢弃结果。
+    fn open_hprof_analysis_page_after_main_update(
         main_view: Entity<MainView>,
         file_path: PathBuf,
         app: &mut App,
     ) {
-        let existing_hprof_window = main_view.update(app, |view, context| {
+        main_view.update(app, |view, context| {
+            view.active_main_feature = MainFeature::HprofAnalysis;
             view.tab_context_menu = None;
             view.encoding_dropdown_menu = None;
             view.search_results_context_menu = None;
             view.log_viewer_context_menu = None;
+            view.log_tree_context_menu = None;
+            view.load_source_menu = None;
+
+            let hprof_view = if let Some(hprof_view) = view.hprof_analysis_view.clone() {
+                hprof_view
+            } else {
+                let main_view_for_hprof = context.entity();
+                let hprof_view =
+                    context.new(|context| HprofAnalysisView::new(main_view_for_hprof, context));
+                view.hprof_analysis_view = Some(hprof_view.clone());
+                hprof_view
+            };
+            hprof_view.update(context, |hprof_view, context| {
+                hprof_view.start_new_analysis(file_path, context);
+            });
             context.notify();
-            view.hprof_analysis_window
         });
+    }
 
-        if let Some(hprof_window) = existing_hprof_window {
-            let file_path_for_existing = file_path.clone();
-            if hprof_window
-                .update(app, |window_view, window, context| {
-                    window_view.start_new_analysis(file_path_for_existing, context);
-                    window.activate_window();
-                })
-                .is_ok()
-            {
-                return;
-            }
-            main_view.update(app, |view, _| {
-                view.hprof_analysis_window = None;
-            });
+    /// 返回 HPROF 页的内嵌分析视图，如果尚未创建则创建空态视图。
+    ///
+    /// 业务意图：
+    /// - 用户第一次点击 HPROF 导航时应看到主窗口内的空态页，而不是打开独立窗口或立即读取磁盘。
+    fn hprof_analysis_view(&mut self, context: &mut Context<Self>) -> Entity<HprofAnalysisView> {
+        if let Some(hprof_view) = self.hprof_analysis_view.clone() {
+            return hprof_view;
         }
-
-        let main_view_for_window = main_view.clone();
-        let main_view_for_close = main_view.clone();
-        let file_path_for_window = file_path.clone();
-        let hprof_window_options = WindowOptions {
-            titlebar: Some(TitlebarOptions {
-                title: Some("HPROF 解析".into()),
-                ..Default::default()
-            }),
-            window_bounds: Some(WindowBounds::centered(
-                size(
-                    px(HPROF_ANALYSIS_WINDOW_WIDTH),
-                    px(HPROF_ANALYSIS_WINDOW_HEIGHT),
-                ),
-                app,
-            )),
-            is_resizable: true,
-            is_minimizable: true,
-            window_min_size: Some(size(px(720.0), px(420.0))),
-            ..Default::default()
-        };
-
-        match app.open_window(hprof_window_options, move |window, app| {
-            window.on_window_should_close(app, move |_, app| {
-                main_view_for_close.update(app, |view, context| {
-                    view.hprof_analysis_window = None;
-                    context.notify();
-                });
-                true
-            });
-            app.new(|context| {
-                HprofAnalysisWindowView::new(
-                    main_view_for_window,
-                    file_path_for_window.clone(),
-                    context,
-                )
-            })
-        }) {
-            Ok(hprof_window) => {
-                main_view.update(app, |view, context| {
-                    view.hprof_analysis_window = Some(hprof_window);
-                    context.notify();
-                });
-            }
-            Err(_error) => {
-                main_view.update(app, |view, context| {
-                    view.hprof_analysis_window = None;
-                    context.notify();
-                });
-            }
-        }
+        let main_view = context.entity();
+        let hprof_view = context.new(|context| HprofAnalysisView::new(main_view, context));
+        self.hprof_analysis_view = Some(hprof_view.clone());
+        hprof_view
     }
 
     /// 准备搜索对话框状态。
@@ -7627,10 +7711,9 @@ impl MainView {
             return;
         }
 
-        self.left_panel_width = Self::clamp_left_panel_width(
-            f32::from(event.position.x),
-            f32::from(window.bounds().size.width),
-        );
+        let log_page_x = (f32::from(event.position.x) - MAIN_NAV_WIDTH).max(0.0);
+        let log_page_width = (f32::from(window.bounds().size.width) - MAIN_NAV_WIDTH).max(0.0);
+        self.left_panel_width = Self::clamp_left_panel_width(log_page_x, log_page_width);
         context.notify();
     }
 
@@ -7702,7 +7785,7 @@ impl MainView {
                 Icon::FileText,
                 palette.muted_text,
                 "请先加载日志".to_string(),
-                "点击左上角“加载日志”，选择日志文件、目录或压缩包。".to_string(),
+                "点击日志页顶部“加载日志”，选择日志文件、目录或压缩包。".to_string(),
             ),
             LogTreeLoadState::Failed { message } => (
                 Icon::FileX,
@@ -10896,6 +10979,142 @@ impl MainView {
         }
     }
 
+    /// 渲染当前大功能页内容。
+    ///
+    /// 业务意图：
+    /// - 左侧主导航只负责切换功能，右侧区域按当前功能渲染完整工作区。
+    /// - 日志分析保留现有目录树和日志正文；HPROF 解析嵌入可复用分析实体；AI 对话本次只展示占位空态。
+    fn render_main_feature_page(&mut self, context: &mut Context<Self>) -> gpui::AnyElement {
+        match self.active_main_feature {
+            MainFeature::LogAnalysis => self.render_log_analysis_page(context).into_any_element(),
+            MainFeature::HprofAnalysis => {
+                self.render_hprof_analysis_page(context).into_any_element()
+            }
+            MainFeature::AiChat => self.render_ai_chat_placeholder().into_any_element(),
+        }
+    }
+
+    /// 渲染日志分析大功能页。
+    ///
+    /// 业务意图：
+    /// - 根级顶部工具栏已移除，日志页内部保留“加载日志”和“搜索”操作栏，下面继续使用原有左右分栏日志工作区。
+    fn render_log_analysis_page(&self, context: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("log-analysis-page")
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(self.render_log_action_bar(context))
+            .child(self.render_content(context))
+    }
+
+    /// 渲染 HPROF 解析大功能页。
+    ///
+    /// 业务意图：
+    /// - HPROF 入口从独立窗口迁入主窗口，页顶部提供文件选择按钮，下面直接嵌入解析视图的空态、进度或结果。
+    fn render_hprof_analysis_page(&mut self, context: &mut Context<Self>) -> impl IntoElement {
+        let hprof_view = self.hprof_analysis_view(context);
+        div()
+            .id("hprof-analysis-page")
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(rgb(self.palette().background))
+            .child(self.render_hprof_action_bar(context))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .child(hprof_view),
+            )
+    }
+
+    /// 渲染 HPROF 页顶部操作栏。
+    fn render_hprof_action_bar(&self, context: &mut Context<Self>) -> impl IntoElement {
+        let palette = self.palette();
+        div()
+            .id("hprof-action-bar")
+            .flex()
+            .items_center()
+            .h(px(TOOLBAR_HEIGHT))
+            .pl(px(LOG_TREE_ROW_HORIZONTAL_PADDING))
+            .pr_4()
+            .bg(rgb(palette.panel))
+            .border_b_1()
+            .border_color(rgb(palette.border))
+            .child(self.render_hprof_select_file_button(context))
+    }
+
+    /// 渲染 HPROF 文件选择按钮。
+    ///
+    /// 业务意图：
+    /// - HPROF 页内选择文件后复用当前内嵌分析视图启动后台解析，不再打开新的分析窗口。
+    fn render_hprof_select_file_button(&self, context: &mut Context<Self>) -> impl IntoElement {
+        let palette = self.palette();
+        div()
+            .id("hprof-select-file-button")
+            .flex()
+            .items_center()
+            .gap_1()
+            .flex_none()
+            .pl(px(0.0))
+            .pr(px(TOOLBAR_BUTTON_HORIZONTAL_PADDING))
+            .py(px(TOOLBAR_BUTTON_VERTICAL_PADDING))
+            .text_sm()
+            .text_color(rgb(palette.text))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .hover(move |button| button.text_color(rgb(palette.accent)))
+            .active(|button| button.opacity(0.82))
+            .child(Self::render_lucide_icon(
+                Some(Icon::ChartNoAxesCombined),
+                TOOLBAR_BUTTON_ICON_WIDTH,
+                TOOLBAR_BUTTON_ICON_SIZE,
+                palette.muted_text,
+            ))
+            .child("选择 HPROF 文件")
+            .on_click(context.listener(Self::open_hprof_from_toolbar))
+    }
+
+    /// 渲染 AI 对话占位页。
+    ///
+    /// 业务意图：
+    /// - 本次需求只要求拆出 AI 对话大功能，不定义真实对话请求、上下文保存、流式输出或错误策略，因此这里只提供静态占位。
+    fn render_ai_chat_placeholder(&self) -> impl IntoElement {
+        let palette = self.palette();
+        div()
+            .id("ai-chat-placeholder")
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .size_full()
+            .px_4()
+            .bg(rgb(palette.background))
+            .child(Self::render_lucide_icon(
+                Some(Icon::BotMessageSquare),
+                34.0,
+                30.0,
+                palette.muted_text,
+            ))
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(palette.text))
+                    .child("AI对话"),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(palette.muted_text))
+                    .child("当前版本尚未接入对话请求。"),
+            )
+    }
+
     /// 渲染左右分栏内容区域。
     ///
     /// 业务意图：
@@ -10998,17 +11217,39 @@ impl MainView {
         )
     }
 
-    /// 返回右侧日志工作区相对窗口内容区左侧的横向偏移。
+    /// 返回右侧日志工作区相对主窗口左侧的横向偏移。
     ///
     /// 业务意图：
     /// - 右键菜单和编码下拉菜单由窗口坐标转换到右侧面板局部坐标，必须和当前布局是否隐藏左侧树保持一致。
-    /// - 单日志模式没有左侧树和分割线，偏移为 0；多文件模式仍扣除左侧树宽度和分割线宽度。
+    /// - 主窗口最左侧现在固定 56px 大导航，因此所有日志页内部弹层都必须先扣除导航宽度。
+    /// - 单日志模式没有左侧树和分割线，只扣除导航宽度；多文件模式继续额外扣除左侧树宽度和分割线宽度。
     fn right_panel_left_offset(&self) -> f32 {
-        if self.should_hide_log_tree_panel() {
-            0.0
+        Self::right_panel_left_offset_for_layout(
+            self.should_hide_log_tree_panel(),
+            self.left_panel_width,
+        )
+    }
+
+    /// 按布局状态计算右侧日志工作区相对主窗口左侧的横向偏移。
+    ///
+    /// 业务意图：
+    /// - 将坐标规则拆成纯函数，便于测试固定导航竖条加入后各类日志弹层不会整体向左错位。
+    fn right_panel_left_offset_for_layout(hide_log_tree_panel: bool, left_panel_width: f32) -> f32 {
+        if hide_log_tree_panel {
+            MAIN_NAV_WIDTH
         } else {
-            self.left_panel_width + SPLITTER_VISIBLE_WIDTH
+            MAIN_NAV_WIDTH + left_panel_width + SPLITTER_VISIBLE_WIDTH
         }
+    }
+
+    /// 计算左侧目录树右键菜单在目录树面板内的横坐标。
+    ///
+    /// 业务意图：
+    /// - 鼠标事件使用主窗口坐标，而菜单渲染在目录树面板内部；固定大导航宽度必须在进入面板坐标前扣除。
+    fn log_tree_context_menu_x(window_x: f32, left_panel_width: f32) -> f32 {
+        (window_x - MAIN_NAV_WIDTH)
+            .max(0.0)
+            .clamp(0.0, left_panel_width - LOG_TREE_CONTEXT_MENU_WIDTH)
     }
 
     /// 渲染左右两栏之间的可拖动分割线。
@@ -11730,15 +11971,14 @@ impl Render for MainView {
     /// 渲染主窗口内容。
     ///
     /// 实现原因：
-    /// - 顶部工具栏提供全局入口，内容区提供左右分栏和左侧日志目录树。
-    /// - 右侧主内容区仍不放占位文案，避免用户误以为日志正文、诊断或设置功能已经完成。
+    /// - 左侧固定大导航提供全局入口，右侧根据当前主功能显示日志分析、HPROF 解析或 AI 对话占位页。
+    /// - 日志加载拖拽仍挂在根节点，用户从任意功能页拖入日志时都会切回日志分析页并复用原加载流程。
     fn render(&mut self, _window: &mut Window, context: &mut Context<Self>) -> impl IntoElement {
         let palette = self.palette();
 
         div()
             .relative()
             .flex()
-            .flex_col()
             .size_full()
             .bg(rgb(palette.background))
             .track_focus(&self.root_focus_handle)
@@ -11763,6 +12003,7 @@ impl Render for MainView {
                 context.listener(|view, external_paths: &ExternalPaths, _window, context| {
                     // GPUI 会把系统文件拖放转成 `ExternalPaths`；这里只取真实文件系统路径，
                     // 目录、普通文件和压缩包的具体解释仍交给加载模块统一处理。
+                    view.active_main_feature = MainFeature::LogAnalysis;
                     view.start_log_source_load(
                         external_paths.paths().to_vec(),
                         "正在加载拖入的日志".to_string(),
@@ -11770,8 +12011,19 @@ impl Render for MainView {
                     );
                 }),
             )
-            .child(self.render_toolbar(context))
-            .child(self.render_content(context))
+            .child(self.render_main_navigation(context))
+            .child(
+                div()
+                    .id("main-feature-page")
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .bg(rgb(palette.background))
+                    .child(self.render_main_feature_page(context)),
+            )
             .child(self.render_load_source_menu_dismiss_overlay(context))
             .child(self.render_load_source_menu(context))
             .child(self.render_save_overwrite_confirm_dialog(context))

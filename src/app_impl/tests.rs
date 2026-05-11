@@ -280,6 +280,82 @@ mod tests {
         }
     }
 
+    /// 验证主窗口大功能导航的名称和图标稳定。
+    ///
+    /// 业务意图：
+    /// - 左侧大导航只显示图标，hover 气泡依赖 `label()` 返回中文名称；图标和名称错配会直接影响用户识别功能入口。
+    #[test]
+    fn 主功能导航名称和图标稳定() {
+        assert_eq!(MainFeature::all().len(), 3);
+        assert_eq!(MainFeature::LogAnalysis.label(), "日志分析");
+        assert_eq!(
+            char::from(MainFeature::LogAnalysis.icon()),
+            char::from(Icon::FileText)
+        );
+        assert_eq!(MainFeature::HprofAnalysis.label(), "HPROF解析");
+        assert_eq!(
+            char::from(MainFeature::HprofAnalysis.icon()),
+            char::from(Icon::ChartNoAxesCombined)
+        );
+        assert_eq!(MainFeature::AiChat.label(), "AI对话");
+        assert_eq!(
+            char::from(MainFeature::AiChat.icon()),
+            char::from(Icon::BotMessageSquare)
+        );
+        assert_eq!(MainNavigationItem::Settings.label(), "设置");
+        assert_eq!(
+            char::from(MainNavigationItem::Settings.icon()),
+            char::from(Icon::Settings)
+        );
+        assert_eq!(MainNavigationItem::About.label(), "关于");
+        assert_eq!(
+            char::from(MainNavigationItem::About.icon()),
+            char::from(Icon::Info)
+        );
+    }
+
+    /// 验证主窗口默认进入日志分析功能页。
+    ///
+    /// 业务意图：
+    /// - 新增大导航后不能改变既有启动体验；用户打开应用后仍应先看到日志加载和分析工作区。
+    #[test]
+    fn 主窗口默认功能是日志分析() {
+        assert_eq!(MainFeature::default(), MainFeature::LogAnalysis);
+    }
+
+    /// 验证日志页右侧弹层坐标会扣除固定大导航宽度。
+    ///
+    /// 业务意图：
+    /// - tab 菜单、编码下拉、日志正文菜单和搜索结果菜单都依赖右侧面板局部坐标；新增 56px 导航后必须整体右移补偿。
+    #[test]
+    fn 日志右侧面板偏移包含主导航宽度() {
+        assert_eq!(
+            MainView::right_panel_left_offset_for_layout(true, LEFT_PANEL_DEFAULT_WIDTH),
+            MAIN_NAV_WIDTH
+        );
+        assert_eq!(
+            MainView::right_panel_left_offset_for_layout(false, 300.0),
+            MAIN_NAV_WIDTH + 300.0 + SPLITTER_VISIBLE_WIDTH
+        );
+    }
+
+    /// 验证日志目录树右键菜单坐标会扣除固定大导航宽度。
+    ///
+    /// 边界条件：
+    /// - 鼠标在导航区或目录树左缘附近右键时，菜单横坐标不能变成负数；靠近目录树右边缘时仍要限制在面板内。
+    #[test]
+    fn 日志目录树菜单横坐标包含主导航宽度() {
+        assert_eq!(MainView::log_tree_context_menu_x(24.0, 300.0), 0.0);
+        assert_eq!(
+            MainView::log_tree_context_menu_x(MAIN_NAV_WIDTH + 80.0, 300.0),
+            80.0
+        );
+        assert_eq!(
+            MainView::log_tree_context_menu_x(MAIN_NAV_WIDTH + 280.0, 300.0),
+            300.0 - LOG_TREE_CONTEXT_MENU_WIDTH
+        );
+    }
+
     /// 验证搜索输入框双击选择连续非空白片段。
     ///
     /// 业务意图：

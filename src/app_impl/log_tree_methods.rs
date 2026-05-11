@@ -576,6 +576,7 @@ impl MainView {
     /// 业务意图：
     /// - 右键已选中文件时保留当前多选集合；右键未选中行时先把该行切换为唯一选择。
     /// - 菜单命令随后统一作用于当前选择中的可读取文件，目录和错误节点会被自动忽略。
+    /// - 鼠标事件坐标来自主窗口，左侧固定大导航不属于目录树面板，定位菜单时必须先扣除导航宽度。
     pub(super) fn open_log_tree_context_menu(
         &mut self,
         node_id: usize,
@@ -597,7 +598,7 @@ impl MainView {
         self.log_tree_context_menu = Some(LogTreeContextMenu {
             node_id,
             source,
-            x: window_x.clamp(0.0, self.left_panel_width - LOG_TREE_CONTEXT_MENU_WIDTH),
+            x: Self::log_tree_context_menu_x(window_x, self.left_panel_width),
             y: (window_y - TOOLBAR_HEIGHT).max(0.0),
         });
         self.tab_context_menu = None;
