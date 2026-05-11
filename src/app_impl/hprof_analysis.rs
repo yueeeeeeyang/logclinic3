@@ -67,9 +67,15 @@ const HPROF_THREAD_STACK_ROW_HEIGHT: f32 = 22.0;
 struct HprofThreadContextMenu {
     /// 线程对象 ID。
     object_id: HprofObjectId,
-    /// 菜单左上角窗口坐标。
+    /// 菜单左上角在 HPROF 分析视图内的局部横坐标。
+    ///
+    /// 业务意图：
+    /// - GPUI 鼠标事件给出窗口坐标，但菜单作为 HPROF 内嵌视图的绝对定位子元素渲染，必须先扣除左侧大导航宽度。
     x: f32,
-    /// 菜单左上角窗口坐标。
+    /// 菜单左上角在 HPROF 分析视图内的局部纵坐标。
+    ///
+    /// 业务意图：
+    /// - HPROF 页顶部还有文件选择操作栏，菜单纵坐标需要扣除这段高度，否则会显示在右键点下方较远的位置。
     y: f32,
 }
 
@@ -340,23 +346,40 @@ impl HprofAnalysisView {
     ///
     /// 业务意图：
     /// - 只有完成状态下、且对象确认为线程对象时才显示菜单；非线程对象右键不会展示无效命令。
+    /// - 鼠标事件坐标来自主窗口内容区，右键菜单渲染在 HPROF 内嵌视图内，因此必须转换为视图局部坐标。
     fn open_thread_context_menu(
         &mut self,
         object_id: HprofObjectId,
-        x: f32,
-        y: f32,
+        window_x: f32,
+        window_y: f32,
         context: &mut Context<Self>,
     ) {
         let is_thread = matches!(
             &self.state,
             HprofAnalysisState::Completed { result } if result.is_thread_object(object_id)
         );
+        let (x, y) = Self::thread_context_menu_position(window_x, window_y);
         self.thread_context_menu = if is_thread {
             Some(HprofThreadContextMenu { object_id, x, y })
         } else {
             None
         };
         context.notify();
+    }
+
+    /// 将窗口内容坐标转换为 HPROF 视图内的右键菜单坐标。
+    ///
+    /// 业务意图：
+    /// - HPROF 视图嵌在“左侧大导航 + 顶部 HPROF 操作栏”之后；菜单如果直接使用窗口坐标，会相对右键点整体向右、向下偏移。
+    /// - 这里集中转换，避免行右键、后续表格菜单或测试各自硬编码偏移。
+    ///
+    /// 边界条件：
+    /// - 如果事件来自导航区或操作栏上方，坐标会压到 0，避免异常输入导致菜单渲染到负坐标区域。
+    fn thread_context_menu_position(window_x: f32, window_y: f32) -> (f32, f32) {
+        (
+            (window_x - MAIN_NAV_WIDTH).max(0.0),
+            (window_y - TOOLBAR_HEIGHT).max(0.0),
+        )
     }
 
     /// 根据右键菜单选择打开线程详情。
@@ -1419,6 +1442,25 @@ mod tests {
             HprofAnalysisView::initial_state(),
             HprofAnalysisState::Idle
         ));
+    }
+
+    /// 验证 HPROF 线程右键菜单坐标会转换为内嵌视图局部坐标。
+    ///
+    /// 业务意图：
+    /// - HPROF 分析结果现在嵌在主窗口右侧，窗口坐标包含左侧大导航和顶部文件选择操作栏；菜单必须扣除这些偏移后才会贴近右键位置。
+    #[test]
+    fn hprof_线程菜单坐标扣除主导航和操作栏() {
+        assert_eq!(
+            HprofAnalysisView::thread_context_menu_position(
+                MAIN_NAV_WIDTH + 120.0,
+                TOOLBAR_HEIGHT + 80.0
+            ),
+            (120.0, 80.0)
+        );
+        assert_eq!(
+            HprofAnalysisView::thread_context_menu_position(20.0, 10.0),
+            (0.0, 0.0)
+        );
     }
 
     /// 验证线程堆栈行生成会保留线程名，并在缺失栈时给出中文提示。
