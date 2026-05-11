@@ -80,6 +80,62 @@ impl SettingsWindowView {
         context.notify();
     }
 
+    /// 处理线程日志分析过滤输入区键盘编辑。
+    pub(super) fn handle_thread_analysis_filter_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.main_view.update(context, |view, context| {
+            view.handle_thread_analysis_filter_key_down(event, context);
+        });
+        context.notify();
+    }
+
+    /// 处理线程日志分析过滤输入区鼠标按下。
+    pub(super) fn handle_thread_analysis_filter_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let focus_handle = self.main_view.update(context, |view, context| {
+            view.start_thread_analysis_filter_mouse_selection(event, context);
+            view.thread_analysis_filter_focus.clone()
+        });
+        window.focus(&focus_handle);
+        context.notify();
+    }
+
+    /// 拖动扩展线程日志分析过滤输入区的选择范围。
+    pub(super) fn handle_thread_analysis_filter_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        context: &mut Context<Self>,
+    ) {
+        self.main_view.update(context, |view, context| {
+            view.update_thread_analysis_filter_mouse_selection(event.position, context);
+        });
+        context.notify();
+    }
+
+    /// 结束线程日志分析过滤输入区鼠标选择。
+    pub(super) fn handle_thread_analysis_filter_mouse_up(&mut self, context: &mut Context<Self>) {
+        self.main_view.update(context, |view, context| {
+            view.finish_thread_analysis_filter_mouse_selection(context);
+        });
+        context.notify();
+    }
+
+    /// 清空线程日志分析过滤配置。
+    pub(super) fn clear_thread_analysis_filter(&mut self, context: &mut Context<Self>) {
+        self.main_view.update(context, |view, context| {
+            view.clear_thread_analysis_filter_text(context);
+        });
+        context.notify();
+    }
+
     /// 渲染左侧页签栏。
     fn render_tab_sidebar(
         &self,
@@ -164,6 +220,8 @@ impl SettingsWindowView {
         active_tab: SettingsTab,
         theme: ThemePreference,
         log_viewer_font_size: f32,
+        thread_analysis_filter_text: String,
+        thread_analysis_filter_focus: gpui::FocusHandle,
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -171,6 +229,12 @@ impl SettingsWindowView {
             SettingsTab::General => {
                 self.render_general_tab(theme, log_viewer_font_size, palette, context)
             }
+            SettingsTab::Log => self.render_log_tab(
+                thread_analysis_filter_text,
+                thread_analysis_filter_focus,
+                palette,
+                context,
+            ),
             SettingsTab::Model => self.render_model_tab(palette),
         }
     }
@@ -495,6 +559,212 @@ impl SettingsWindowView {
             )
     }
 
+    /// 渲染日志页签。
+    ///
+    /// 业务意图：
+    /// - 日志页集中放置影响日志解析、分析和展示的偏好；当前先承载线程日志分析过滤配置。
+    fn render_log_tab(
+        &self,
+        thread_analysis_filter_text: String,
+        focus_handle: gpui::FocusHandle,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("settings-log-tab")
+            .flex()
+            .flex_col()
+            .size_full()
+            .p_4()
+            .bg(rgb(palette.background))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .mb_3()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(palette.text))
+                    .child(MainView::render_lucide_icon(
+                        Some(Icon::FileText),
+                        16.0,
+                        16.0,
+                        palette.muted_text,
+                    ))
+                    .child("日志设置"),
+            )
+            .child(self.render_thread_analysis_filter_setting(
+                thread_analysis_filter_text,
+                focus_handle,
+                palette,
+                context,
+            ))
+    }
+
+    /// 渲染线程日志分析过滤设置项。
+    ///
+    /// 业务意图：
+    /// - 用户可以直接粘贴一个或多个完整线程堆栈，后续线程日志分析会按这些片段过滤无效线程。
+    /// - 输入区使用等宽字体和滚动容器，便于核对 Java 堆栈中的类名、方法名和锁信息。
+    fn render_thread_analysis_filter_setting(
+        &self,
+        thread_analysis_filter_text: String,
+        focus_handle: gpui::FocusHandle,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let has_filter = !thread_analysis_filter_text.trim().is_empty();
+        div()
+            .id("settings-thread-analysis-filter")
+            .flex()
+            .flex_col()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.surface))
+            .p_4()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .mb_3()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(MainView::render_lucide_icon(
+                                Some(Icon::ListFilter),
+                                18.0,
+                                18.0,
+                                palette.muted_text,
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(palette.text))
+                                            .child("线程日志分析过滤"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(palette.muted_text))
+                                            .child("空行分隔多段堆栈，命中连续片段的线程不会显示"),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        self.render_clear_thread_analysis_filter_button(
+                            has_filter, palette, context,
+                        ),
+                    ),
+            )
+            .child(
+                div()
+                    .id("settings-thread-analysis-filter-input")
+                    .relative()
+                    .h(px(THREAD_ANALYSIS_FILTER_TEXTAREA_HEIGHT))
+                    .w_full()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.input))
+                    .track_focus(&focus_handle)
+                    .key_context("thread-analysis-filter-input")
+                    .on_key_down(context.listener(Self::handle_thread_analysis_filter_key_down))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        context.listener(|view, event: &MouseDownEvent, window, context| {
+                            view.handle_thread_analysis_filter_mouse_down(event, window, context);
+                        }),
+                    )
+                    .on_mouse_move(context.listener(
+                        |view, event: &MouseMoveEvent, _window, context| {
+                            view.handle_thread_analysis_filter_mouse_move(event, context);
+                        },
+                    ))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        context.listener(|view, _event: &MouseUpEvent, _window, context| {
+                            view.handle_thread_analysis_filter_mouse_up(context);
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        context.listener(|view, _event: &MouseUpEvent, _window, context| {
+                            view.handle_thread_analysis_filter_mouse_up(context);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .id("settings-thread-analysis-filter-scroll")
+                            .size_full()
+                            .px_2()
+                            .py_2()
+                            .overflow_y_scroll()
+                            .scrollbar_width(px(6.0))
+                            .text_size(px(12.0))
+                            .line_height(px(THREAD_ANALYSIS_FILTER_TEXT_LINE_HEIGHT))
+                            .text_color(rgb(palette.text))
+                            .font_family(LOG_VIEWER_FONT_FAMILY)
+                            .child(ThreadAnalysisFilterTextAreaElement {
+                                view: self.main_view.clone(),
+                                focus_handle,
+                                placeholder: "粘贴需要过滤的线程堆栈；多段堆栈之间用空行分隔",
+                                palette,
+                            }),
+                    ),
+            )
+    }
+
+    /// 渲染线程分析过滤清空按钮。
+    fn render_clear_thread_analysis_filter_button(
+        &self,
+        enabled: bool,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("settings-thread-analysis-filter-clear")
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(28.0))
+            .px_3()
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.panel))
+            .text_xs()
+            .text_color(rgb(if enabled {
+                palette.text
+            } else {
+                palette.muted_text
+            }))
+            .when(enabled, |button| {
+                button
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(rgb(palette.hover)))
+            })
+            .when(!enabled, |button| button.opacity(0.55))
+            .child("清空")
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, _window, context| {
+                    if enabled {
+                        view.clear_thread_analysis_filter(context);
+                    }
+                }),
+            )
+    }
+
     /// 渲染模型页签。
     ///
     /// 业务意图：
@@ -513,12 +783,21 @@ impl Render for SettingsWindowView {
     /// 业务意图：
     /// - 设置窗口内容由左侧页签和右侧内容组成，根节点填满独立窗口，避免系统标题栏下方出现未绘制区域。
     fn render(&mut self, _window: &mut Window, context: &mut Context<Self>) -> impl IntoElement {
-        let (active_tab, theme, log_viewer_font_size, palette) = {
+        let (
+            active_tab,
+            theme,
+            log_viewer_font_size,
+            thread_analysis_filter_text,
+            thread_analysis_filter_focus,
+            palette,
+        ) = {
             let main_view = self.main_view.read(context);
             (
                 main_view.settings_active_tab,
                 main_view.theme_preference,
                 main_view.log_viewer_font_size,
+                main_view.thread_analysis_filter_text.clone(),
+                main_view.thread_analysis_filter_focus.clone(),
                 main_view.palette(),
             )
         };
@@ -539,9 +818,308 @@ impl Render for SettingsWindowView {
                         active_tab,
                         theme,
                         log_viewer_font_size,
+                        thread_analysis_filter_text,
+                        thread_analysis_filter_focus,
                         palette,
                         context,
                     )),
             )
+    }
+}
+
+/// 线程日志分析过滤输入区单行绘制状态。
+struct ThreadAnalysisFilterTextPaintLine {
+    /// 当前行对应的原始文本 UTF-8 字节范围。
+    byte_range: Range<usize>,
+    /// 当前行绘制边界。
+    bounds: Bounds<Pixels>,
+    /// 当前行字形布局。
+    line: ShapedLine,
+}
+
+/// 线程日志分析过滤输入区绘制状态。
+struct ThreadAnalysisFilterTextAreaPrepaint {
+    /// 当前帧需要绘制的所有文本行。
+    lines: Vec<ThreadAnalysisFilterTextPaintLine>,
+    /// 当前选择范围对应的高亮矩形。
+    selections: Vec<PaintQuad>,
+    /// 当前光标矩形。
+    cursor: Option<PaintQuad>,
+}
+
+/// 线程日志分析过滤多行输入元素。
+///
+/// 业务意图：
+/// - GPUI 0.2.2 没有现成多行文本框；该元素复用搜索输入框的自定义元素方案，注册平台输入协议并手动绘制文本、选区和光标。
+/// - 输入内容可能是完整 Java 堆栈，必须保留换行并使用等宽字体，方便用户核对过滤片段。
+///
+/// 边界条件：
+/// - 当前不做自动换行，长堆栈行横向超出时由输入区裁切；过滤匹配仍使用完整原文，不受显示裁切影响。
+struct ThreadAnalysisFilterTextAreaElement {
+    /// 主视图实体，用于读取和写回过滤输入状态。
+    view: Entity<MainView>,
+    /// 过滤输入区焦点句柄。
+    focus_handle: gpui::FocusHandle,
+    /// 输入为空时显示的占位文案。
+    placeholder: &'static str,
+    /// 当前主题调色板。
+    palette: AppThemePalette,
+}
+
+impl IntoElement for ThreadAnalysisFilterTextAreaElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for ThreadAnalysisFilterTextAreaElement {
+    type RequestLayoutState = ();
+    type PrepaintState = Option<ThreadAnalysisFilterTextAreaPrepaint>;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        context: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let line_count = self
+            .view
+            .read(context)
+            .thread_analysis_filter_visual_line_count();
+        let mut style = Style::default();
+        style.size.width = relative(1.0).into();
+        style.size.height = px(
+            (line_count as f32 * THREAD_ANALYSIS_FILTER_TEXT_LINE_HEIGHT)
+                .max(THREAD_ANALYSIS_FILTER_TEXT_LINE_HEIGHT),
+        )
+        .into();
+        (window.request_layout(style, [], context), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        context: &mut App,
+    ) -> Self::PrepaintState {
+        let (text, selection_range, marked_range, cursor_visible_by_activity) = {
+            let view = self.view.read(context);
+            let (text, selection_range, marked_range) = view.thread_analysis_filter_text_snapshot();
+            (
+                text,
+                selection_range,
+                marked_range,
+                view.search_text_cursor_visible(),
+            )
+        };
+        let focused = self.focus_handle.is_focused(window);
+        let style = window.text_style();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let line_height = px(THREAD_ANALYSIS_FILTER_TEXT_LINE_HEIGHT);
+        let line_ranges = MainView::thread_analysis_filter_line_ranges(&text);
+        let display_ranges = if text.is_empty() {
+            vec![0..0]
+        } else {
+            line_ranges
+        };
+
+        let mut lines = Vec::new();
+        let mut selections = Vec::new();
+        let mut cursor = None;
+        let selection_range = MainView::clamp_search_text_range(&text, selection_range);
+        let has_selection = focused && selection_range.start < selection_range.end;
+        let cursor_index = selection_range.end;
+
+        for (line_index, byte_range) in display_ranges.into_iter().enumerate() {
+            let is_placeholder = text.is_empty();
+            let display_text = if is_placeholder {
+                SharedString::from(self.placeholder)
+            } else {
+                SharedString::from(text[byte_range.clone()].to_string())
+            };
+            let text_color = if is_placeholder {
+                rgb(self.palette.muted_text).into()
+            } else {
+                style.color
+            };
+            let base_run = TextRun {
+                len: display_text.len(),
+                font: style.font(),
+                color: text_color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let runs = if !is_placeholder {
+                if let Some(marked_range) = marked_range.clone() {
+                    let local_marked_start = marked_range
+                        .start
+                        .saturating_sub(byte_range.start)
+                        .min(byte_range.len());
+                    let local_marked_end = marked_range
+                        .end
+                        .saturating_sub(byte_range.start)
+                        .min(byte_range.len());
+                    vec![
+                        TextRun {
+                            len: local_marked_start,
+                            ..base_run.clone()
+                        },
+                        TextRun {
+                            len: local_marked_end.saturating_sub(local_marked_start),
+                            underline: Some(UnderlineStyle {
+                                color: Some(base_run.color),
+                                thickness: px(1.0),
+                                wavy: false,
+                            }),
+                            ..base_run.clone()
+                        },
+                        TextRun {
+                            len: display_text.len().saturating_sub(local_marked_end),
+                            ..base_run
+                        },
+                    ]
+                    .into_iter()
+                    .filter(|run| run.len > 0)
+                    .collect()
+                } else {
+                    vec![base_run]
+                }
+            } else {
+                vec![base_run]
+            };
+            let line = window
+                .text_system()
+                .shape_line(display_text, font_size, &runs, None);
+            let line_top =
+                bounds.top() + px(line_index as f32 * THREAD_ANALYSIS_FILTER_TEXT_LINE_HEIGHT);
+            let line_bounds = Bounds::new(
+                point(bounds.left(), line_top),
+                size(bounds.right() - bounds.left(), line_height),
+            );
+
+            if has_selection && !is_placeholder {
+                let start = selection_range
+                    .start
+                    .max(byte_range.start)
+                    .min(byte_range.end);
+                let end = selection_range
+                    .end
+                    .max(byte_range.start)
+                    .min(byte_range.end);
+                if start < end {
+                    let mut selection_color = rgb(self.palette.accent);
+                    selection_color.a = 0.32;
+                    selections.push(fill(
+                        Bounds::from_corners(
+                            point(
+                                line_bounds.left() + line.x_for_index(start - byte_range.start),
+                                line_bounds.top(),
+                            ),
+                            point(
+                                line_bounds.left() + line.x_for_index(end - byte_range.start),
+                                line_bounds.bottom(),
+                            ),
+                        ),
+                        selection_color,
+                    ));
+                }
+            }
+
+            if focused
+                && !has_selection
+                && cursor.is_none()
+                && cursor_visible_by_activity
+                && cursor_index >= byte_range.start
+                && cursor_index <= byte_range.end
+            {
+                cursor = Some(fill(
+                    Bounds::new(
+                        point(
+                            line_bounds.left() + line.x_for_index(cursor_index - byte_range.start),
+                            line_bounds.top(),
+                        ),
+                        size(px(1.5), line_bounds.bottom() - line_bounds.top()),
+                    ),
+                    rgb(self.palette.accent),
+                ));
+            }
+
+            lines.push(ThreadAnalysisFilterTextPaintLine {
+                byte_range,
+                bounds: line_bounds,
+                line,
+            });
+        }
+
+        Some(ThreadAnalysisFilterTextAreaPrepaint {
+            lines,
+            selections,
+            cursor,
+        })
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        context: &mut App,
+    ) {
+        window.handle_input(
+            &self.focus_handle,
+            ElementInputHandler::new(bounds, self.view.clone()),
+            context,
+        );
+        let Some(prepaint) = prepaint.take() else {
+            return;
+        };
+        for selection in prepaint.selections {
+            window.paint_quad(selection);
+        }
+
+        let mut layouts = Vec::new();
+        for paint_line in prepaint.lines {
+            paint_line
+                .line
+                .paint(
+                    paint_line.bounds.origin,
+                    paint_line.bounds.bottom() - paint_line.bounds.top(),
+                    window,
+                    context,
+                )
+                .ok();
+            layouts.push(ThreadAnalysisFilterLineLayout {
+                byte_range: paint_line.byte_range,
+                line: paint_line.line,
+                bounds: paint_line.bounds,
+            });
+        }
+        if let Some(cursor) = prepaint.cursor {
+            window.paint_quad(cursor);
+        }
+        if self.focus_handle.is_focused(window) {
+            window.request_animation_frame();
+        }
+        self.view.update(context, |view, _context| {
+            view.store_thread_analysis_filter_text_layouts(layouts, bounds);
+        });
     }
 }

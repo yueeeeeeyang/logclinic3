@@ -28,7 +28,7 @@ pub(super) struct ThreadAnalysisData {
     /// 线程名到每个快照详情的矩阵。
     ///
     /// 业务意图：
-    /// - 单个色块既要展示状态，也要支持单击查看线程片段、双击回到主窗口定位原始日志行。
+    /// - 单个色块既要展示状态，也要支持悬浮查看线程片段、单击回到主窗口定位原始日志行。
     /// - 因此矩阵保存可定位的单元详情，而不是只保存颜色所需的状态枚举。
     pub(super) matrix: Vec<Vec<Option<Arc<ThreadTimelineCell>>>>,
 }
@@ -49,7 +49,7 @@ pub(super) struct ThreadSnapshot {
     /// 当前快照所属日志来源。
     ///
     /// 业务意图：
-    /// - 双击分析色块需要在主窗口打开对应本地文件或压缩包成员，因此必须保留真实来源，不能只保留展示名。
+    /// - 单击分析色块需要在主窗口打开对应本地文件或压缩包成员，因此必须保留真实来源，不能只保留展示名。
     pub(super) source: LogFileSource,
     /// 当前快照内识别出的线程状态。
     pub(super) threads: Vec<ThreadStateSample>,
@@ -71,13 +71,18 @@ pub(super) struct ThreadStateSample {
     /// 线程头在解码后日志中的零基行号。
     ///
     /// 业务意图：
-    /// - 双击色块回主窗口时需要跳转到线程头，而不是只打开文件或跳到状态行。
+    /// - 单击色块回主窗口时需要跳转到线程头，而不是只打开文件或跳到状态行。
     pub(super) line_index: usize,
     /// 线程头开始的前 5 行日志预览。
     ///
     /// 边界条件：
     /// - 文件末尾不足 5 行时只保留实际存在的行；预览只用于悬浮气泡，不参与状态分析。
     pub(super) preview_lines: Vec<String>,
+    /// 线程头开始直到下一个线程头或下一个快照前的完整堆栈片段。
+    ///
+    /// 业务意图：
+    /// - 设置页允许用户粘贴完整线程堆栈过滤无效线程，过滤必须基于完整片段，不能只看悬浮气泡的前 5 行预览。
+    pub(super) stack_lines: Vec<String>,
 }
 
 /// 线程分析时间线中的可交互色块数据。
@@ -115,7 +120,25 @@ pub(super) struct ThreadStateSamplePending {
     /// 线程头零基行号。
     pub(super) line_index: usize,
     /// 线程头开始的前 5 行日志预览。
-    pub(super) preview_lines: Vec<String>,
+    ///
+    /// 业务意图：
+    /// - 解析过程中先完整收集线程片段，最终生成样本时再截取前 5 行作为气泡预览，避免预览和过滤片段来源不一致。
+    pub(super) stack_lines: Vec<String>,
+    /// 已解析到的 Java 线程状态。
+    ///
+    /// 边界条件：
+    /// - 部分异常 thread dump 可能只有线程头没有状态行；这类线程不会生成样本，避免污染状态时间线。
+    pub(super) state: Option<ThreadStateKind>,
+}
+
+/// 线程日志分析过滤规则。
+///
+/// 业务意图：
+/// - 设置页中一段粘贴的堆栈会转换为一条规则；规则中的非空行必须连续命中同一个线程完整堆栈才过滤。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ThreadAnalysisFilterRule {
+    /// 已去除首尾空白的非空规则行。
+    pub(super) lines: Vec<String>,
 }
 
 /// Java thread dump 中常见线程状态。
@@ -247,12 +270,19 @@ pub(super) struct ThreadAnalysisWindowView {
     /// 业务意图：
     /// - 分析页面需要显式横向和纵向滚动条；拖动时保存方向和鼠标在滑块内的偏移，避免滑块跳动。
     pub(super) scrollbar_drag: Option<ThreadAnalysisScrollbarDrag>,
-    /// 当前单击色块后展示的悬浮气泡。
+    /// 当前鼠标悬浮色块后展示的线程信息气泡。
     ///
     /// 业务意图：
-    /// - 气泡跟随用户最近一次单击的色块展示线程详情；窗口重绘或滚动时不重新解析日志。
-    /// - `None` 表示尚未选择色块或分析数据已被替换。
+    /// - 气泡跟随用户当前悬浮的色块展示线程详情；窗口重绘或滚动时不重新解析日志。
+    /// - `None` 表示鼠标未停留在可见状态色块上，或分析数据已被替换。
     pub(super) cell_popup: Option<ThreadAnalysisCellPopup>,
+    /// 最近一次点击跳转到主日志窗口的线程色块。
+    ///
+    /// 业务意图：
+    /// - 用户从主日志窗口返回线程分析窗口时，需要快速确认上一次定位的是哪个快照中的哪个线程。
+    /// - 使用矩阵内 `Arc` 的指针身份记录目标，不复制日志来源或线程名，避免同一线程在多个快照中出现时误高亮其它色块。
+    /// - `None` 表示当前分析结果还没有执行过色块跳转，或分析数据已被替换。
+    pub(super) jumped_cell: Option<Arc<ThreadTimelineCell>>,
     /// 当前线程分析图中允许显示的线程状态集合。
     ///
     /// 业务意图：
@@ -278,10 +308,10 @@ pub(super) struct ThreadAnalysisScrollbarDrag {
 /// 线程分析色块悬浮气泡状态。
 ///
 /// 业务意图：
-/// - GPUI 渲染是声明式的，单击事件只记录展示所需的数据和窗口坐标，真正的气泡由下一次 render 输出。
+/// - GPUI 渲染是声明式的，悬浮事件只记录展示所需的数据和窗口坐标，真正的气泡由下一次 render 输出。
 #[derive(Clone)]
 pub(super) struct ThreadAnalysisCellPopup {
-    /// 被单击的时间线单元。
+    /// 被鼠标悬浮的时间线单元。
     pub(super) cell: Arc<ThreadTimelineCell>,
     /// 气泡左上角相对窗口的横向位置。
     pub(super) x: Pixels,
@@ -306,6 +336,7 @@ impl ThreadAnalysisWindowView {
             scroll_handle: UniformListScrollHandle::new(),
             scrollbar_drag: None,
             cell_popup: None,
+            jumped_cell: None,
             visible_state_kinds: Self::default_visible_state_kinds(),
             _main_view_subscription: main_view_subscription,
         }
@@ -324,6 +355,7 @@ impl ThreadAnalysisWindowView {
         self.scroll_handle = UniformListScrollHandle::new();
         self.scrollbar_drag = None;
         self.cell_popup = None;
+        self.jumped_cell = None;
         self.visible_state_kinds = Self::default_visible_state_kinds();
         context.notify();
     }
@@ -444,15 +476,16 @@ impl ThreadAnalysisWindowView {
                     .child(thread_name.clone()),
             )
             .children(cells.iter().enumerate().map(|(cell_index, cell)| {
-                let color = cell
-                    .as_ref()
-                    .filter(|cell| visible_state_kinds.contains(&cell.state))
-                    .map(|cell| cell.state.color(theme))
-                    .unwrap_or(palette.surface);
                 let block = if let Some(cell) = cell
                     .as_ref()
                     .filter(|cell| visible_state_kinds.contains(&cell.state))
                 {
+                    let color = Self::timeline_cell_fill_color(
+                        cell.state,
+                        self.is_jumped_timeline_cell(cell),
+                        theme,
+                    );
+                    let cell_for_hover = Arc::clone(cell);
                     let cell_for_click = Arc::clone(cell);
                     div()
                         .id(SharedString::from(format!(
@@ -465,6 +498,16 @@ impl ThreadAnalysisWindowView {
                         .bg(rgb(color))
                         .cursor_pointer()
                         .hover(move |block| block.opacity(0.86))
+                        .on_hover(context.listener(
+                            move |view, is_hovered: &bool, window, context| {
+                                view.handle_timeline_cell_hover(
+                                    cell_for_hover.clone(),
+                                    *is_hovered,
+                                    window,
+                                    context,
+                                );
+                            },
+                        ))
                         .on_mouse_down(
                             MouseButton::Left,
                             context.listener(
@@ -487,7 +530,7 @@ impl ThreadAnalysisWindowView {
                         .w(px(THREAD_ANALYSIS_STATE_BLOCK_SIZE))
                         .h(px(THREAD_ANALYSIS_STATE_BLOCK_SIZE))
                         .rounded(px(3.0))
-                        .bg(rgb(color))
+                        .bg(rgb(palette.surface))
                 };
                 div()
                     .w(px(THREAD_ANALYSIS_SNAPSHOT_COLUMN_WIDTH))
@@ -497,30 +540,88 @@ impl ThreadAnalysisWindowView {
             }))
     }
 
+    /// 返回线程时间线色块的填充色。
+    ///
+    /// 业务意图：
+    /// - 普通色块使用线程状态色；最近一次点击跳转的色块使用独立强调色，避免和状态语义混淆。
+    /// - 该函数保持纯计算，便于单元测试锁定强调色不会和任一状态色冲突。
+    pub(super) fn timeline_cell_fill_color(
+        state: ThreadStateKind,
+        is_jump_target: bool,
+        theme: EffectiveTheme,
+    ) -> u32 {
+        if is_jump_target {
+            THREAD_ANALYSIS_JUMPED_CELL_COLOR
+        } else {
+            state.color(theme)
+        }
+    }
+
+    /// 判断指定色块是否是最近一次点击跳转目标。
+    ///
+    /// 业务意图：
+    /// - 同一个线程可能跨多个快照重复出现，只比较线程名或行号容易误高亮；指针身份能精确定位矩阵中的单个色块。
+    fn is_jumped_timeline_cell(&self, cell: &Arc<ThreadTimelineCell>) -> bool {
+        self.jumped_cell
+            .as_ref()
+            .map(|jumped_cell| Arc::ptr_eq(jumped_cell, cell))
+            .unwrap_or(false)
+    }
+
+    /// 处理线程分析色块悬浮状态变化。
+    ///
+    /// 业务意图：
+    /// - 鼠标悬浮用于展示线程信息气泡，避免单击既展开详情又跳转主日志窗口造成操作冲突。
+    /// - 离开色块时只关闭同一个色块打开的气泡，避免快速移动到相邻色块时旧的离开事件误关新气泡。
+    fn handle_timeline_cell_hover(
+        &mut self,
+        cell: Arc<ThreadTimelineCell>,
+        is_hovered: bool,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if is_hovered {
+            let pointer = window.mouse_position();
+            let (popup_x, popup_y) = Self::thread_analysis_popup_origin(
+                f32::from(pointer.x),
+                f32::from(pointer.y),
+                f32::from(window.bounds().size.width),
+                f32::from(window.bounds().size.height),
+            );
+            self.cell_popup = Some(ThreadAnalysisCellPopup {
+                cell,
+                x: popup_x,
+                y: popup_y,
+            });
+            context.notify();
+            return;
+        }
+
+        let should_close_popup = self
+            .cell_popup
+            .as_ref()
+            .map(|popup| Arc::ptr_eq(&popup.cell, &cell))
+            .unwrap_or(false);
+        if should_close_popup {
+            self.cell_popup = None;
+            context.notify();
+        }
+    }
+
     /// 处理线程分析色块点击。
     ///
     /// 业务意图：
-    /// - 单击用于在分析窗口内快速查看线程详情；双击用于回到主日志窗口并定位线程头。
-    /// - 鼠标三击及以上仍按双击处理，避免快速点击时出现无响应。
+    /// - 单击用于回到主日志窗口并定位线程头；线程详情改由鼠标悬浮气泡展示，避免一个点击承载两种行为。
+    /// - 鼠标多击会产生多次按下事件，按普通点击重复执行跳转，确保旧双击习惯仍能到达目标日志。
     fn handle_timeline_cell_mouse_down(
         &mut self,
         cell: Arc<ThreadTimelineCell>,
         event: &MouseDownEvent,
-        window: &mut Window,
+        _window: &mut Window,
         context: &mut Context<Self>,
     ) {
-        let (popup_x, popup_y) = Self::thread_analysis_popup_origin(
-            f32::from(event.position.x),
-            f32::from(event.position.y),
-            f32::from(window.bounds().size.width),
-            f32::from(window.bounds().size.height),
-        );
-        self.cell_popup = Some(ThreadAnalysisCellPopup {
-            cell: cell.clone(),
-            x: popup_x,
-            y: popup_y,
-        });
-        if event.click_count >= 2 {
+        if Self::timeline_cell_click_should_jump(event.click_count) {
+            self.jumped_cell = Some(cell.clone());
             let source = cell.source.clone();
             let line_index = cell.line_index;
             let main_window = self.main_view.update(context, |view, context| {
@@ -532,12 +633,21 @@ impl ThreadAnalysisWindowView {
                     window.activate_window();
                 });
             }
+            context.notify();
         }
         context.stop_propagation();
-        context.notify();
     }
 
-    /// 根据点击点和窗口尺寸计算悬浮气泡左上角。
+    /// 判断线程分析色块的一次鼠标按下是否应触发日志跳转。
+    ///
+    /// 业务意图：
+    /// - 新交互要求单击直接跳转；GPUI 在双击时仍会继续递增点击次数，因此所有有效左键点击次数都按跳转处理。
+    /// - 点击次数为 0 只可能来自测试或异常平台事件，不能触发定位，避免错误事件打开日志。
+    pub(super) fn timeline_cell_click_should_jump(click_count: usize) -> bool {
+        click_count >= 1
+    }
+
+    /// 根据鼠标悬浮点和窗口尺寸计算线程信息气泡左上角。
     ///
     /// 业务意图：
     /// - 色块可能位于窗口右下角，如果始终向右下弹出会被窗口裁切；这里按剩余空间自动改为向左或向上弹出。
@@ -584,6 +694,7 @@ impl ThreadAnalysisWindowView {
     ///
     /// 业务意图：
     /// - 用户查看完某个色块后，点击分析窗口的其它位置应恢复干净时间线视图。
+    /// - 正常离开色块时由悬浮事件关闭气泡；这里保留兜底，处理点击空白区域和滚动条拖动等场景。
     fn dismiss_cell_popup(&mut self, context: &mut Context<Self>) {
         if self.cell_popup.take().is_some() {
             context.notify();
@@ -593,7 +704,7 @@ impl ThreadAnalysisWindowView {
     /// 渲染线程色块悬浮气泡。
     ///
     /// 业务意图：
-    /// - 气泡展示用户点击色块对应的时间、完整线程名、线程 ID 和前 5 行原始日志，辅助快速确认线程上下文。
+    /// - 气泡展示用户悬浮色块对应的时间、完整线程名、线程 ID 和前 5 行原始日志，辅助快速确认线程上下文。
     /// - 预览文本可能很长，因此使用固定宽度和截断，避免覆盖整个分析窗口。
     fn render_cell_popup(
         &self,

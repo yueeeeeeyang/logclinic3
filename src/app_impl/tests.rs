@@ -63,6 +63,18 @@ mod tests {
         ))
     }
 
+    /// 构造唯一的线程分析过滤配置测试路径。
+    ///
+    /// 业务意图：
+    /// - 线程分析过滤配置会保存多行堆栈文本，测试必须使用独立临时目录，避免污染开发机真实设置。
+    fn test_thread_analysis_filter_file_path(name: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "logclinic3-thread-filter-test-{}-{}",
+            std::process::id(),
+            name
+        ))
+    }
+
     /// 构造唯一的另存为测试目录。
     ///
     /// 业务意图：
@@ -523,6 +535,61 @@ mod tests {
         }
     }
 
+    /// 验证线程分析过滤配置缺失时回退到内置默认堆栈。
+    ///
+    /// 业务意图：
+    /// - 首次使用线程分析时应默认过滤常见 Resin 网络线程，减少时间线噪声，同时不要求用户先进入设置维护规则。
+    #[test]
+    fn 线程分析过滤配置缺失返回默认堆栈() {
+        let path =
+            test_thread_analysis_filter_file_path("missing").join(THREAD_ANALYSIS_FILTER_FILE_NAME);
+
+        let text = read_thread_analysis_filter_preference(&path);
+        assert_eq!(text, DEFAULT_THREAD_ANALYSIS_FILTER_TEXT);
+        assert!(text.contains("TcpSocketAcceptThread.run"));
+        assert!(text.contains("SocketInputStream.socketRead0"));
+    }
+
+    /// 验证线程分析过滤配置的空文件会覆盖默认堆栈。
+    ///
+    /// 业务意图：
+    /// - 用户点击“清空”后必须真正禁用默认过滤；否则内置规则会在下次启动时悄悄恢复，导致设置行为不可预测。
+    #[test]
+    fn 线程分析过滤配置空文件保留为空文本() {
+        let path =
+            test_thread_analysis_filter_file_path("empty").join(THREAD_ANALYSIS_FILTER_FILE_NAME);
+
+        write_thread_analysis_filter_preference(&path, "").expect("线程过滤配置应能写入空文本");
+        assert_eq!(read_thread_analysis_filter_preference(&path), "");
+
+        let _ = fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    /// 验证线程分析过滤配置可以保存多行文本并规范化换行。
+    ///
+    /// 业务意图：
+    /// - 用户会从不同平台粘贴线程堆栈，配置读写必须把 CRLF 统一成 LF，保证后续规则解析稳定。
+    #[test]
+    fn 线程分析过滤配置多行读写往返并规范化换行() {
+        let path = test_thread_analysis_filter_file_path("roundtrip")
+            .join(THREAD_ANALYSIS_FILTER_FILE_NAME);
+
+        write_thread_analysis_filter_preference(&path, "\"worker\" #1\r\n  at demo.A.run\r\n")
+            .expect("线程过滤配置应能写入临时目录");
+        assert_eq!(
+            read_thread_analysis_filter_preference(&path),
+            "\"worker\" #1\n  at demo.A.run\n"
+        );
+
+        let _ = fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
     /// 验证用户强制主题优先于系统外观。
     ///
     /// 业务意图：
@@ -883,7 +950,7 @@ mod tests {
             path: PathBuf::from("thread.log"),
         };
         let snapshots = MainView::parse_thread_dump_snapshots(&lines, "thread.log", 0, &source);
-        let analysis = MainView::build_thread_analysis_data(1, 0, snapshots);
+        let analysis = MainView::build_thread_analysis_data(1, 0, snapshots, &[]);
 
         assert_eq!(analysis.snapshots.len(), 1);
         assert_eq!(analysis.snapshots[0].label, "2026-05-07 11:01:10");
@@ -908,6 +975,124 @@ mod tests {
         );
     }
 
+    /// 验证线程分析过滤规则按空行拆分，并执行连续片段匹配。
+    ///
+    /// 业务意图：
+    /// - 设置页允许用户直接粘贴多段线程堆栈；解析规则必须忽略多余空白，同时避免只凭单行误过滤其它线程。
+    #[test]
+    fn 线程分析过滤规则按空行拆分并连续匹配() {
+        let rules = MainView::parse_thread_analysis_filter_rules(
+            "\"worker\" #1\r\n  at demo.A.run\r\n\r\n\"timer\" #2\n  at demo.Timer.sleep",
+        );
+        assert_eq!(rules.len(), 2);
+        assert_eq!(
+            rules[0].lines,
+            vec!["\"worker\" #1".to_string(), "at demo.A.run".to_string()]
+        );
+
+        let stack = vec![
+            "\"worker\" #1".to_string(),
+            "   java.lang.Thread.State: RUNNABLE".to_string(),
+            "  at demo.A.run".to_string(),
+        ];
+        assert!(!MainView::thread_stack_matches_filter_rule(
+            &stack, &rules[0]
+        ));
+
+        let consecutive_stack = vec![
+            "\"worker\" #1".to_string(),
+            "  at demo.A.run".to_string(),
+            "  at demo.B.run".to_string(),
+        ];
+        assert!(MainView::thread_stack_matches_filter_rule(
+            &consecutive_stack,
+            &rules[0]
+        ));
+    }
+
+    /// 验证内置默认过滤堆栈会解析为两条独立规则。
+    ///
+    /// 业务意图：
+    /// - 默认配置包含 accept 和 keepalive 两类 Resin 网络线程，必须用空行拆成两条规则，避免用户只想调整其中一类时难以理解匹配结果。
+    #[test]
+    fn 线程分析默认过滤堆栈解析为两条规则() {
+        let rules =
+            MainView::parse_thread_analysis_filter_rules(DEFAULT_THREAD_ANALYSIS_FILTER_TEXT);
+
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].lines[0], "java.lang.Thread.State: RUNNABLE");
+        assert!(
+            rules[0]
+                .lines
+                .iter()
+                .any(|line| line.contains("PlainSocketImpl.socketAccept"))
+        );
+        assert!(
+            rules[1]
+                .lines
+                .iter()
+                .any(|line| line.contains("SocketInputStream.socketRead0"))
+        );
+    }
+
+    /// 验证线程分析会把命中过滤堆栈的线程从矩阵中移除。
+    ///
+    /// 业务意图：
+    /// - 无效线程过滤必须发生在线程名聚合和矩阵构建之前，否则被过滤线程仍会占据纵轴或空色块。
+    #[test]
+    fn 线程分析过滤命中堆栈后移除线程() {
+        let lines = vec![
+            "Full thread dump Java HotSpot(TM) 64-Bit Server VM:".to_string(),
+            "\"noise-thread\" #1 prio=5".to_string(),
+            "   java.lang.Thread.State: RUNNABLE".to_string(),
+            "        at demo.Noise.loop(Noise.java:10)".to_string(),
+            "\"business-thread\" #2 prio=5".to_string(),
+            "   java.lang.Thread.State: RUNNABLE".to_string(),
+            "        at demo.Business.run(Business.java:20)".to_string(),
+        ];
+        let source = LogFileSource::LocalFile {
+            path: PathBuf::from("thread.log"),
+        };
+        let snapshots = MainView::parse_thread_dump_snapshots(&lines, "thread.log", 0, &source);
+        let rules = MainView::parse_thread_analysis_filter_rules(
+            "\"noise-thread\" #1 prio=5\njava.lang.Thread.State: RUNNABLE\nat demo.Noise.loop(Noise.java:10)",
+        );
+
+        let analysis = MainView::build_thread_analysis_data(1, 0, snapshots, &rules);
+
+        assert_eq!(analysis.thread_names, vec!["business-thread"]);
+        assert_eq!(analysis.matrix.len(), 1);
+        assert!(analysis.summary.contains("过滤 1 个线程"));
+    }
+
+    /// 验证线程分析全部线程被过滤时仍保留快照统计。
+    ///
+    /// 业务意图：
+    /// - 用户可能临时过滤掉所有噪声线程；分析窗口应展示 0 个线程而不是误报没有识别到快照。
+    #[test]
+    fn 线程分析全部线程过滤后保留快照() {
+        let lines = vec![
+            "Full thread dump Java HotSpot(TM) 64-Bit Server VM:".to_string(),
+            "\"noise-thread\" #1 prio=5".to_string(),
+            "   java.lang.Thread.State: RUNNABLE".to_string(),
+        ];
+        let source = LogFileSource::LocalFile {
+            path: PathBuf::from("thread.log"),
+        };
+        let snapshots = MainView::parse_thread_dump_snapshots(&lines, "thread.log", 0, &source);
+        let rules = MainView::parse_thread_analysis_filter_rules(
+            "\"noise-thread\" #1 prio=5\njava.lang.Thread.State: RUNNABLE",
+        );
+
+        let analysis = MainView::build_thread_analysis_data(1, 0, snapshots, &rules);
+
+        assert_eq!(analysis.snapshots.len(), 1);
+        assert!(analysis.thread_names.is_empty());
+        assert!(analysis.matrix.is_empty());
+        assert!(analysis.summary.contains("1 个快照"));
+        assert!(analysis.summary.contains("过滤 1 个线程"));
+    }
+
     /// 验证多文件线程分析默认隐藏只在单个日志中出现的线程。
     ///
     /// 业务意图：
@@ -928,6 +1113,7 @@ mod tests {
                         state: ThreadStateKind::Runnable,
                         line_index: 0,
                         preview_lines: vec!["\"shared-thread\" #1".to_string()],
+                        stack_lines: vec!["\"shared-thread\" #1".to_string()],
                     },
                     ThreadStateSample {
                         name: "only-a".to_string(),
@@ -935,6 +1121,7 @@ mod tests {
                         state: ThreadStateKind::Waiting,
                         line_index: 1,
                         preview_lines: vec!["\"only-a\" #2".to_string()],
+                        stack_lines: vec!["\"only-a\" #2".to_string()],
                     },
                 ],
             },
@@ -951,6 +1138,7 @@ mod tests {
                         state: ThreadStateKind::Blocked,
                         line_index: 0,
                         preview_lines: vec!["\"shared-thread\" #1".to_string()],
+                        stack_lines: vec!["\"shared-thread\" #1".to_string()],
                     },
                     ThreadStateSample {
                         name: "only-b".to_string(),
@@ -958,12 +1146,13 @@ mod tests {
                         state: ThreadStateKind::Runnable,
                         line_index: 1,
                         preview_lines: vec!["\"only-b\" #3".to_string()],
+                        stack_lines: vec!["\"only-b\" #3".to_string()],
                     },
                 ],
             },
         ];
 
-        let analysis = MainView::build_thread_analysis_data(2, 0, snapshots);
+        let analysis = MainView::build_thread_analysis_data(2, 0, snapshots, &[]);
 
         assert_eq!(analysis.thread_names, vec!["shared-thread"]);
         assert_eq!(
@@ -976,10 +1165,54 @@ mod tests {
         );
     }
 
+    /// 验证线程分析色块单击即可触发日志跳转。
+    ///
+    /// 业务意图：
+    /// - 线程信息气泡已经改为悬浮显示，左键单击不再用于固定气泡，必须直接定位对应原始日志行。
+    /// - 双击会产生第二次鼠标按下事件；继续允许多击触发跳转，保证用户沿用旧双击习惯时不会失效。
+    #[test]
+    fn 线程分析色块单击即可跳转日志() {
+        assert!(!ThreadAnalysisWindowView::timeline_cell_click_should_jump(
+            0
+        ));
+        assert!(ThreadAnalysisWindowView::timeline_cell_click_should_jump(1));
+        assert!(ThreadAnalysisWindowView::timeline_cell_click_should_jump(2));
+    }
+
+    /// 验证线程分析跳转高亮色不会和任一状态色冲突。
+    ///
+    /// 业务意图：
+    /// - 点击跳转后的色块会覆盖原状态色；如果强调色和某个状态色相同，用户无法区分“最近跳转目标”和“线程状态”。
+    /// - 明暗主题下 OTHER 状态颜色不同，因此两个主题都需要覆盖。
+    #[test]
+    fn 线程分析跳转高亮色不与状态色冲突() {
+        let states = [
+            ThreadStateKind::Runnable,
+            ThreadStateKind::Blocked,
+            ThreadStateKind::Waiting,
+            ThreadStateKind::TimedWaiting,
+            ThreadStateKind::New,
+            ThreadStateKind::Terminated,
+            ThreadStateKind::Other,
+        ];
+
+        for theme in [EffectiveTheme::Light, EffectiveTheme::Dark] {
+            for state in states {
+                assert_ne!(
+                    ThreadAnalysisWindowView::timeline_cell_fill_color(state, true, theme),
+                    ThreadAnalysisWindowView::timeline_cell_fill_color(state, false, theme),
+                    "跳转高亮色不能和状态 {:?} 在 {:?} 主题下的颜色相同",
+                    state,
+                    theme
+                );
+            }
+        }
+    }
+
     /// 验证线程分析气泡在窗口右下角会自动改为向左上方弹出。
     ///
     /// 业务意图：
-    /// - 用户点击靠近窗口边缘的状态色块时，气泡不能被窗口裁切，否则关键线程 ID 和预览日志不可见。
+    /// - 用户悬浮在靠近窗口边缘的状态色块时，气泡不能被窗口裁切，否则关键线程 ID 和预览日志不可见。
     #[test]
     fn 线程分析气泡靠近边缘时反向弹出() {
         let (x, y) = ThreadAnalysisWindowView::thread_analysis_popup_origin(
@@ -1004,7 +1237,7 @@ mod tests {
     /// 验证线程分析气泡在普通位置默认向右下方弹出。
     ///
     /// 业务意图：
-    /// - 非边缘区域保留靠近点击点的默认方向，让用户能直接把气泡和刚点击的色块关联起来。
+    /// - 非边缘区域保留靠近悬浮点的默认方向，让用户能直接把气泡和当前悬浮的色块关联起来。
     #[test]
     fn 线程分析气泡普通位置向右下弹出() {
         let (x, y) = ThreadAnalysisWindowView::thread_analysis_popup_origin(

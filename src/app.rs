@@ -95,8 +95,8 @@ use hprof_analysis::HprofAnalysisWindowView;
 use search_window::SearchDialogWindowView;
 use settings_window::SettingsWindowView;
 use thread_analysis::{
-    SearchResultsResizeDrag, SearchTarget, ThreadSnapshot, ThreadStateKind, ThreadStateSample,
-    ThreadStateSamplePending, ThreadTimelineCell,
+    SearchResultsResizeDrag, SearchTarget, ThreadAnalysisFilterRule, ThreadSnapshot,
+    ThreadStateKind, ThreadStateSample, ThreadStateSamplePending, ThreadTimelineCell,
 };
 use thread_analysis::{ThreadAnalysisData, ThreadAnalysisWindowView};
 
@@ -148,6 +148,60 @@ const THEME_PREFERENCE_FILE_NAME: &str = "theme-preference.txt";
 /// - 日志字号是用户明确调整的阅读偏好，需要像主题一样跨启动恢复。
 /// - 文件只保存一个像素值，继续使用简单文本格式，避免为单项设置引入完整配置依赖。
 const LOG_VIEWER_FONT_SIZE_FILE_NAME: &str = "log-viewer-font-size.txt";
+
+/// 线程日志分析过滤配置文件名。
+///
+/// 业务意图：
+/// - 用户会在设置窗口中粘贴需要过滤的线程堆栈，配置必须跨重启保留，避免每次排查都重新维护无效线程列表。
+/// - 文件保存原始多行文本而不是结构化格式，方便用户直接打开配置文件排查或批量替换。
+const THREAD_ANALYSIS_FILTER_FILE_NAME: &str = "thread-analysis-filter.txt";
+
+/// 线程日志分析默认过滤配置。
+///
+/// 业务意图：
+/// - Resin 的网络 accept 和 keepalive 线程在大量 thread dump 中经常长期存在，通常不代表业务阻塞根因。
+/// - 首次使用线程分析时默认过滤这些稳定噪声线程，减少时间线中的无效线程；用户仍可在设置页清空或改写配置文件。
+///
+/// 边界条件：
+/// - 该默认值只在配置文件不存在时使用；如果用户点击“清空”，会写入空文件，后续启动必须尊重用户显式选择。
+/// - 文本使用 LF 作为内置换行，粘贴或保存路径仍会通过统一规范化函数处理 CRLF。
+const DEFAULT_THREAD_ANALYSIS_FILTER_TEXT: &str = concat!(
+    "java.lang.Thread.State: RUNNABLE\n",
+    "\tat java.net.PlainSocketImpl.socketAccept(Native Method)\n",
+    "\tat java.net.AbstractPlainSocketImpl.accept(AbstractPlainSocketImpl.java:409)\n",
+    "\tat java.net.ServerSocket.implAccept(ServerSocket.java:545)\n",
+    "\tat java.net.ServerSocket.accept(ServerSocket.java:513)\n",
+    "\tat com.caucho.vfs.QServerSocketWrapper.accept(QServerSocketWrapper.java:105)\n",
+    "\tat com.caucho.network.listen.TcpPort.accept(TcpPort.java:1380)\n",
+    "\tat com.caucho.network.listen.TcpSocketLink.accept(TcpSocketLink.java:1039)\n",
+    "\tat com.caucho.network.listen.TcpSocketLink.handleAcceptTaskImpl(TcpSocketLink.java:989)\n",
+    "\tat com.caucho.network.listen.ConnectionTask.runThread(ConnectionTask.java:117)\n",
+    "\tat com.caucho.network.listen.ConnectionTask.run(ConnectionTask.java:93)\n",
+    "\tat com.caucho.network.listen.SocketLinkThreadLauncher.handleTasks(SocketLinkThreadLauncher.java:175)\n",
+    "\tat com.caucho.network.listen.TcpSocketAcceptThread.run(TcpSocketAcceptThread.java:61)\n",
+    "\tat com.caucho.env.thread2.ResinThread2.runTasks(ResinThread2.java:173)\n",
+    "\tat com.caucho.env.thread2.ResinThread2.run(ResinThread2.java:118)\n",
+    "\n",
+    "java.lang.Thread.State: RUNNABLE\n",
+    "\tat java.net.SocketInputStream.socketRead0(Native Method)\n",
+    "\tat java.net.SocketInputStream.socketRead(SocketInputStream.java:116)\n",
+    "\tat java.net.SocketInputStream.read(SocketInputStream.java:171)\n",
+    "\tat java.net.SocketInputStream.read(SocketInputStream.java:141)\n",
+    "\tat com.caucho.vfs.SocketStream.read(SocketStream.java:187)\n",
+    "\tat com.caucho.vfs.SocketStream.readTimeout(SocketStream.java:239)\n",
+    "\tat com.caucho.vfs.ReadStream.fillWithTimeout(ReadStream.java:1147)\n",
+    "\tat com.caucho.network.listen.TcpSocketLink.threadKeepalive(TcpSocketLink.java:1482)\n",
+    "\tat com.caucho.network.listen.TcpSocketLink.processKeepalive(TcpSocketLink.java:1460)\n",
+    "\tat com.caucho.network.listen.TcpSocketLink.handleRequestsImpl(TcpSocketLink.java:1300)\n",
+    "\tat com.caucho.network.listen.TcpSocketLink.handleRequests(TcpSocketLink.java:1215)\n",
+    "\tat com.caucho.network.listen.TcpSocketLink.handleAcceptTaskImpl(TcpSocketLink.java:1011)\n",
+    "\tat com.caucho.network.listen.ConnectionTask.runThread(ConnectionTask.java:117)\n",
+    "\tat com.caucho.network.listen.ConnectionTask.run(ConnectionTask.java:93)\n",
+    "\tat com.caucho.network.listen.SocketLinkThreadLauncher.handleTasks(SocketLinkThreadLauncher.java:175)\n",
+    "\tat com.caucho.network.listen.TcpSocketAcceptThread.run(TcpSocketAcceptThread.java:61)\n",
+    "\tat com.caucho.env.thread2.ResinThread2.runTasks(ResinThread2.java:173)\n",
+    "\tat com.caucho.env.thread2.ResinThread2.run(ResinThread2.java:118)"
+);
 
 /// 左侧目录树右键菜单宽度。
 ///
@@ -203,6 +257,13 @@ const THREAD_ANALYSIS_SNAPSHOT_COLUMN_WIDTH: f32 = 24.0;
 /// - 用户要求色块高度保持不变且宽度与高度一致，因此使用固定 18px 正方形。
 const THREAD_ANALYSIS_STATE_BLOCK_SIZE: f32 = 18.0;
 
+/// 线程分析图中最近一次点击跳转色块的强调色。
+///
+/// 业务意图：
+/// - 点击跳转后的色块需要和 Java 线程状态色区分开，帮助用户回到分析窗口时快速确认刚才定位过哪一段日志。
+/// - 这里使用玫红色，避开当前状态色中的绿色、红色、橙色、青色、紫色和灰色；明暗主题下都保持可辨识。
+const THREAD_ANALYSIS_JUMPED_CELL_COLOR: u32 = 0xec4899;
+
 /// 线程分析色块悬浮气泡宽度。
 ///
 /// 业务意图：
@@ -212,14 +273,14 @@ const THREAD_ANALYSIS_POPUP_WIDTH: f32 = 520.0;
 /// 线程分析色块悬浮气泡预估高度。
 ///
 /// 业务意图：
-/// - GPUI 在点击事件阶段尚未布局气泡，不能读取真实高度；这里按三行信息和五行预览估算，
+/// - GPUI 在悬浮事件阶段尚未布局气泡，不能读取真实高度；这里按三行信息和五行预览估算，
 ///   用于选择向上或向下弹出，避免靠近窗口底部时被遮挡。
 const THREAD_ANALYSIS_POPUP_ESTIMATED_HEIGHT: f32 = 190.0;
 
-/// 线程分析色块悬浮气泡与鼠标点击点的间距。
+/// 线程分析色块悬浮气泡与鼠标悬浮点的间距。
 ///
 /// 业务意图：
-/// - 保留少量间距，避免气泡刚出现就盖住被点击的状态色块。
+/// - 保留少量间距，避免气泡刚出现就盖住当前悬浮的状态色块。
 const THREAD_ANALYSIS_POPUP_OFFSET: f32 = 12.0;
 
 /// 线程分析色块悬浮气泡与窗口边缘的最小间距。
@@ -625,6 +686,70 @@ fn save_log_viewer_font_size_preference(font_size: f32) {
     };
     if let Err(error) = write_log_viewer_font_size_preference(&path, font_size) {
         eprintln!("保存日志显示字号偏好失败：{}：{}", path.display(), error);
+    }
+}
+
+/// 获取线程日志分析过滤配置文件路径。
+fn thread_analysis_filter_preference_path() -> Option<PathBuf> {
+    app_config_dir().map(|dir| dir.join(THREAD_ANALYSIS_FILTER_FILE_NAME))
+}
+
+/// 规范化线程日志分析过滤配置文本。
+///
+/// 业务意图：
+/// - 用户可能从 Windows、macOS、终端或网页复制堆栈，换行格式不稳定；内部统一使用 LF，保证规则拆分和匹配可预测。
+/// - 不裁剪首尾空白，避免破坏用户粘贴的原始堆栈文本；真正匹配时再按行去首尾空白。
+fn normalize_thread_analysis_filter_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// 从指定文件读取线程日志分析过滤配置。
+///
+/// 错误处理：
+/// - 配置缺失时使用内置默认过滤堆栈，降低首次分析时的噪声线程数量。
+/// - 其它读取失败通常来自权限或文件系统异常，此时回退为空文本，避免默认内容覆盖用户已有但暂时不可读的配置。
+fn read_thread_analysis_filter_preference(path: &Path) -> String {
+    match fs::read_to_string(path) {
+        Ok(raw) => normalize_thread_analysis_filter_text(&raw),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            DEFAULT_THREAD_ANALYSIS_FILTER_TEXT.to_string()
+        }
+        Err(_) => String::new(),
+    }
+}
+
+/// 将线程日志分析过滤配置写入指定文件。
+///
+/// 业务意图：
+/// - 过滤内容是用户明确在设置页维护的排障偏好，应和主题、字号一样保存到应用配置目录。
+fn write_thread_analysis_filter_preference(path: &Path, text: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, normalize_thread_analysis_filter_text(text))
+}
+
+/// 读取线程日志分析过滤配置。
+fn load_thread_analysis_filter_preference() -> String {
+    thread_analysis_filter_preference_path()
+        .map(|path| read_thread_analysis_filter_preference(&path))
+        .unwrap_or_else(|| DEFAULT_THREAD_ANALYSIS_FILTER_TEXT.to_string())
+}
+
+/// 保存线程日志分析过滤配置。
+///
+/// 错误处理：
+/// - 写入失败不影响当前会话输入和后续分析，仅输出开发期诊断，避免配置目录权限问题阻断设置窗口操作。
+fn save_thread_analysis_filter_preference(text: &str) {
+    let Some(path) = thread_analysis_filter_preference_path() else {
+        return;
+    };
+    if let Err(error) = write_thread_analysis_filter_preference(&path, text) {
+        eprintln!(
+            "保存线程日志分析过滤配置失败：{}：{}",
+            path.display(),
+            error
+        );
     }
 }
 
@@ -1114,16 +1239,16 @@ const SEARCH_QUERY_HISTORY_LIMIT: usize = 10;
 /// 设置窗口默认宽度。
 ///
 /// 业务意图：
-/// - 设置窗口需要容纳左侧页签和右侧统一表单布局，右侧控件采用“说明 + 控件”的横向结构，因此需要比早期卡片式布局更宽。
+/// - 设置窗口需要容纳左侧页签和右侧统一表单布局；日志页包含多行线程堆栈过滤输入区，因此需要比早期设置窗口更宽。
 /// - 固定宽度可以让独立窗口在 macOS 和 Windows 上保持稳定布局，不受系统字体度量差异影响。
-const SETTINGS_WINDOW_WIDTH: f32 = 640.0;
+const SETTINGS_WINDOW_WIDTH: f32 = 760.0;
 
 /// 设置窗口默认高度。
 ///
 /// 业务意图：
-/// - 高度需要容纳通用页签中的主题选择，同时给后续模型设置预留基础空间。
+/// - 日志页需要直接粘贴线程堆栈，较高窗口可以减少输入区滚动，同时保留通用页紧凑布局。
 /// - 模型页签当前按需求留白，因此窗口高度不随页签切换变化，避免用户切换时窗口跳动。
-const SETTINGS_WINDOW_HEIGHT: f32 = 360.0;
+const SETTINGS_WINDOW_HEIGHT: f32 = 520.0;
 
 /// 关于窗口默认宽度。
 ///
@@ -1144,6 +1269,18 @@ const ABOUT_WINDOW_HEIGHT: f32 = 520.0;
 /// 业务意图：
 /// - 页签名称为中文短文本，固定宽度可以让右侧内容区宽度稳定，后续增加更多设置项时仍易于扫描。
 const SETTINGS_TAB_SIDEBAR_WIDTH: f32 = 132.0;
+
+/// 设置页线程过滤多行输入区高度。
+///
+/// 业务意图：
+/// - 线程堆栈通常包含多行调用栈，输入区需要在设置窗口内提供足够预览空间，同时不能挤掉标题和说明。
+const THREAD_ANALYSIS_FILTER_TEXTAREA_HEIGHT: f32 = 300.0;
+
+/// 设置页线程过滤输入区单行高度。
+///
+/// 业务意图：
+/// - 多行输入区使用等宽字体展示堆栈，固定行高便于鼠标命中、选区绘制和滚动内容高度计算保持一致。
+const THREAD_ANALYSIS_FILTER_TEXT_LINE_HEIGHT: f32 = 18.0;
 
 /// 搜索输入框高度。
 ///
@@ -1215,6 +1352,12 @@ const CONTROL_C_CODE: &str = "\u{3}";
 /// 业务意图：
 /// - 搜索关键字和目录输入框需要支持粘贴；日志查看器只读，因此在查看器中粘贴会打开搜索窗口并填入剪贴板文本。
 const CONTROL_V_CODE: &str = "\u{16}";
+
+/// `Ctrl+X` 在部分平台输入路径下对应的 ASCII 控制字符。
+///
+/// 业务意图：
+/// - 线程过滤多行输入区需要支持剪切；不同系统可能把 `Ctrl+X` 表示为字母 `x` 或控制字符。
+const CONTROL_X_CODE: &str = "\u{18}";
 
 /// `Ctrl+A` 在部分平台输入路径下对应的 ASCII 控制字符。
 ///
@@ -1846,6 +1989,20 @@ enum SearchTextInputKind {
     DirectoryTarget,
 }
 
+/// 线程日志分析过滤输入区中的单行排版缓存。
+///
+/// 业务意图：
+/// - 多行输入区需要根据用户点击的窗口坐标反推出 UTF-8 字节下标；保存每行真实字形布局可以复用 GPUI 文本系统的命中算法。
+/// - `byte_range` 不包含行尾换行符，光标落在换行符前后时分别映射到上一行末尾或下一行开头。
+struct ThreadAnalysisFilterLineLayout {
+    /// 当前可视行对应的原始文本 UTF-8 字节范围。
+    byte_range: Range<usize>,
+    /// 当前行的 GPUI 字形布局。
+    line: ShapedLine,
+    /// 当前行在窗口中的绘制边界。
+    bounds: Bounds<Pixels>,
+}
+
 /// 设置窗口当前激活的页签。
 ///
 /// 业务意图：
@@ -1855,6 +2012,8 @@ enum SearchTextInputKind {
 enum SettingsTab {
     /// 通用设置页签，当前承载主题和日志显示字号设置。
     General,
+    /// 日志设置页签，当前承载线程日志分析过滤配置。
+    Log,
     /// 模型设置页签，当前按需求留白。
     Model,
 }
@@ -1863,15 +2022,16 @@ impl SettingsTab {
     /// 返回设置页签固定展示顺序。
     ///
     /// 业务意图：
-    /// - 页签顺序是用户明确给出的“通用、模型”，集中定义避免渲染和测试出现顺序分歧。
+    /// - 页签顺序是用户明确给出的“通用、日志、模型”，集中定义避免渲染和测试出现顺序分歧。
     fn all() -> &'static [Self] {
-        &[Self::General, Self::Model]
+        &[Self::General, Self::Log, Self::Model]
     }
 
     /// 返回页签中文标签。
     fn label(self) -> &'static str {
         match self {
             Self::General => "通用",
+            Self::Log => "日志",
             Self::Model => "模型",
         }
     }
@@ -1883,6 +2043,7 @@ impl SettingsTab {
     fn icon(self) -> Icon {
         match self {
             Self::General => Icon::Settings,
+            Self::Log => Icon::FileText,
             Self::Model => Icon::MonitorCog,
         }
     }
@@ -2714,6 +2875,46 @@ struct MainView {
     /// - 只保存合法范围内的整数 px；行高暂不随字号变化，保证大日志虚拟列表信息密度不被设置改变。
     log_viewer_font_size: f32,
 
+    /// 线程日志分析过滤配置原文。
+    ///
+    /// 业务意图：
+    /// - 用户在日志设置页直接粘贴一个或多个无效线程堆栈，线程分析启动时从该字段快照生成过滤规则。
+    /// - 字段保存原始多行文本，便于设置窗口继续展示用户维护的规则；真正匹配前再拆分和去空白。
+    ///
+    /// 边界条件：
+    /// - 配置文件缺失时加载内置默认过滤堆栈，其它读取失败回退为空字符串；用户编辑后立即尝试写入配置文件，写入失败不影响当前会话分析。
+    thread_analysis_filter_text: String,
+
+    /// 线程日志分析过滤输入区的选择范围。
+    ///
+    /// 业务意图：
+    /// - 多行输入区需要支持粘贴、全选、删除和 IME 替换；范围按 UTF-8 字节边界保存，平台输入时再转换为 UTF-16。
+    thread_analysis_filter_selection_range: Range<usize>,
+
+    /// 线程日志分析过滤输入区的输入法组合文本范围。
+    ///
+    /// 边界条件：
+    /// - 中文 IME 会反复更新同一段组合文本；保存该范围可以避免拼音或候选词重复追加。
+    thread_analysis_filter_marked_range: Option<Range<usize>>,
+
+    /// 线程日志分析过滤输入区焦点句柄。
+    thread_analysis_filter_focus: gpui::FocusHandle,
+
+    /// 线程日志分析过滤输入区最近一次绘制的逐行布局。
+    ///
+    /// 业务意图：
+    /// - 鼠标点击和拖拽必须根据实际字体宽度命中字符；多行输入区保存每行布局供下一次鼠标事件使用。
+    thread_analysis_filter_last_layouts: Vec<ThreadAnalysisFilterLineLayout>,
+
+    /// 线程日志分析过滤输入区最近一次整体绘制边界。
+    thread_analysis_filter_last_bounds: Option<Bounds<Pixels>>,
+
+    /// 线程日志分析过滤输入区拖拽选择锚点。
+    ///
+    /// 业务意图：
+    /// - 按住鼠标拖动时需要保留按下时的字节下标，移动过程中只更新选区另一端。
+    thread_analysis_filter_selection_drag: Option<usize>,
+
     /// 当前窗口系统外观。
     ///
     /// 业务意图：
@@ -2877,6 +3078,13 @@ impl MainView {
             settings_active_tab: SettingsTab::General,
             theme_preference: load_theme_preference(),
             log_viewer_font_size: load_log_viewer_font_size_preference(),
+            thread_analysis_filter_text: load_thread_analysis_filter_preference(),
+            thread_analysis_filter_selection_range: 0..0,
+            thread_analysis_filter_marked_range: None,
+            thread_analysis_filter_focus: context.focus_handle(),
+            thread_analysis_filter_last_layouts: Vec::new(),
+            thread_analysis_filter_last_bounds: None,
+            thread_analysis_filter_selection_drag: None,
             system_window_appearance: WindowAppearance::Light,
             window_appearance_subscription: None,
             search_dialog_open_pending: false,
@@ -3690,6 +3898,8 @@ impl MainView {
             return;
         }
         let source_count = sources.len();
+        let filter_rules =
+            Self::parse_thread_analysis_filter_rules(&self.thread_analysis_filter_text);
         let main_view = context.entity();
         let main_view_for_loading = main_view.clone();
         let loading_analysis = ThreadAnalysisData {
@@ -3711,7 +3921,9 @@ impl MainView {
             .spawn(async move |view, app| {
                 let analysis = app
                     .background_executor()
-                    .spawn(async move { Self::analyze_thread_dump_sources(&sources) })
+                    .spawn(
+                        async move { Self::analyze_thread_dump_sources(&sources, &filter_rules) },
+                    )
                     .await;
 
                 let _ = view;
@@ -3731,7 +3943,10 @@ impl MainView {
     /// 边界条件：
     /// - 某个文件读取或解码失败时跳过该文件，继续分析其它文件，避免单个坏文件阻断整批分析。
     /// - 如果没有识别到任何快照，返回空分析数据，窗口会展示“未识别到快照”的摘要。
-    fn analyze_thread_dump_sources(sources: &[LogFileSource]) -> ThreadAnalysisData {
+    fn analyze_thread_dump_sources(
+        sources: &[LogFileSource],
+        filter_rules: &[ThreadAnalysisFilterRule],
+    ) -> ThreadAnalysisData {
         let mut snapshots = Vec::new();
         let mut skipped_files = 0usize;
         for (source_index, source) in sources.iter().enumerate() {
@@ -3753,7 +3968,7 @@ impl MainView {
             }
         }
 
-        Self::build_thread_analysis_data(sources.len(), skipped_files, snapshots)
+        Self::build_thread_analysis_data(sources.len(), skipped_files, snapshots, filter_rules)
     }
 
     /// 从解码后的日志行中解析 Java thread dump 快照。
@@ -3778,6 +3993,11 @@ impl MainView {
 
         for (line_index, line) in lines.iter().enumerate() {
             if line.contains("Full thread dump") {
+                if let (Some(snapshot), Some(pending)) =
+                    (current_snapshot.as_mut(), pending_thread.take())
+                {
+                    Self::finish_pending_thread_sample(snapshot, pending);
+                }
                 if let Some(snapshot) = current_snapshot.take()
                     && !snapshot.threads.is_empty()
                 {
@@ -3803,27 +4023,30 @@ impl MainView {
                 continue;
             };
             if let Some((thread_name, thread_id)) = Self::parse_thread_header_details(line) {
+                if let Some(pending) = pending_thread.take() {
+                    Self::finish_pending_thread_sample(snapshot, pending);
+                }
                 pending_thread = Some(ThreadStateSamplePending {
                     name: thread_name,
                     thread_id,
                     line_index,
-                    preview_lines: Self::thread_dump_preview_lines(lines, line_index),
+                    stack_lines: vec![line.clone()],
+                    state: None,
                 });
                 continue;
             }
-            if let Some(state_text) = line.split("java.lang.Thread.State:").nth(1)
-                && let Some(pending) = pending_thread.take()
-            {
-                snapshot.threads.push(ThreadStateSample {
-                    name: pending.name,
-                    thread_id: pending.thread_id,
-                    state: ThreadStateKind::parse(state_text),
-                    line_index: pending.line_index,
-                    preview_lines: pending.preview_lines,
-                });
+            if let Some(pending) = pending_thread.as_mut() {
+                pending.stack_lines.push(line.clone());
+                if let Some(state_text) = line.split("java.lang.Thread.State:").nth(1) {
+                    pending.state = Some(ThreadStateKind::parse(state_text));
+                }
             }
         }
 
+        if let (Some(snapshot), Some(pending)) = (current_snapshot.as_mut(), pending_thread.take())
+        {
+            Self::finish_pending_thread_sample(snapshot, pending);
+        }
         if let Some(snapshot) = current_snapshot
             && !snapshot.threads.is_empty()
         {
@@ -3833,26 +4056,36 @@ impl MainView {
         snapshots
     }
 
-    /// 提取单个线程头开始的最多 5 行预览。
+    /// 将已收集完的线程片段写入当前快照。
+    ///
+    /// 业务意图：
+    /// - 线程头、状态行和后续堆栈帧分散在多行；只有遇到下一个线程或快照边界时才知道完整片段。
+    /// - 没有状态行的片段不生成样本，避免未知状态污染时间线；有状态行的片段保留完整堆栈供设置过滤匹配。
+    fn finish_pending_thread_sample(
+        snapshot: &mut ThreadSnapshot,
+        pending: ThreadStateSamplePending,
+    ) {
+        let Some(state) = pending.state else {
+            return;
+        };
+        let preview_lines = Self::thread_stack_preview_lines(&pending.stack_lines);
+        snapshot.threads.push(ThreadStateSample {
+            name: pending.name,
+            thread_id: pending.thread_id,
+            state,
+            line_index: pending.line_index,
+            preview_lines,
+            stack_lines: pending.stack_lines,
+        });
+    }
+
+    /// 提取单个线程片段的前 5 行预览。
     ///
     /// 业务意图：
     /// - 悬浮气泡用于查看当前色块对应线程的原始上下文，不能把下一个线程头或下一个 dump 快照混入预览。
     /// - 预览限制为 5 行，避免超长堆栈在气泡中占满窗口。
-    fn thread_dump_preview_lines(lines: &[String], start_index: usize) -> Vec<String> {
-        let mut preview_lines = Vec::new();
-        for (line_index, line) in lines.iter().enumerate().skip(start_index) {
-            if line_index > start_index
-                && (line.contains("Full thread dump")
-                    || Self::parse_thread_header_details(line).is_some())
-            {
-                break;
-            }
-            preview_lines.push(line.clone());
-            if preview_lines.len() >= 5 {
-                break;
-            }
-        }
-        preview_lines
+    fn thread_stack_preview_lines(stack_lines: &[String]) -> Vec<String> {
+        stack_lines.iter().take(5).cloned().collect()
     }
 
     /// 提取 thread dump 附近的时间戳文案。
@@ -3952,6 +4185,64 @@ impl MainView {
         Some((thread_name, thread_id))
     }
 
+    /// 解析线程日志分析过滤配置文本。
+    ///
+    /// 业务意图：
+    /// - 设置页允许用户用空行分隔多段堆栈；每段堆栈去除行首尾空白后形成一条连续片段匹配规则。
+    /// - 空段和空行不形成规则，避免用户粘贴时多余空白导致所有线程都不匹配或产生无意义规则。
+    pub(super) fn parse_thread_analysis_filter_rules(raw: &str) -> Vec<ThreadAnalysisFilterRule> {
+        let normalized = normalize_thread_analysis_filter_text(raw);
+        let mut rules = Vec::new();
+        let mut current_lines = Vec::new();
+        for line in normalized.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                if !current_lines.is_empty() {
+                    rules.push(ThreadAnalysisFilterRule {
+                        lines: std::mem::take(&mut current_lines),
+                    });
+                }
+            } else {
+                current_lines.push(trimmed.to_string());
+            }
+        }
+        if !current_lines.is_empty() {
+            rules.push(ThreadAnalysisFilterRule {
+                lines: current_lines,
+            });
+        }
+        rules
+    }
+
+    /// 判断某个线程完整堆栈是否命中过滤规则。
+    ///
+    /// 业务意图：
+    /// - “无效线程”通常由一段稳定堆栈片段识别；要求规则行连续出现可以降低只凭单行类名误过滤其它线程的风险。
+    pub(super) fn thread_stack_matches_filter_rule(
+        stack_lines: &[String],
+        rule: &ThreadAnalysisFilterRule,
+    ) -> bool {
+        if rule.lines.is_empty() || stack_lines.len() < rule.lines.len() {
+            return false;
+        }
+        stack_lines.windows(rule.lines.len()).any(|window| {
+            window
+                .iter()
+                .map(|line| line.trim())
+                .eq(rule.lines.iter().map(String::as_str))
+        })
+    }
+
+    /// 判断某个线程是否应被线程日志分析过滤规则移除。
+    fn thread_sample_matches_filter_rules(
+        sample: &ThreadStateSample,
+        filter_rules: &[ThreadAnalysisFilterRule],
+    ) -> bool {
+        filter_rules
+            .iter()
+            .any(|rule| Self::thread_stack_matches_filter_rule(&sample.stack_lines, rule))
+    }
+
     /// 构建线程分析窗口可直接渲染的数据矩阵。
     ///
     /// 业务意图：
@@ -3960,8 +4251,19 @@ impl MainView {
     fn build_thread_analysis_data(
         source_count: usize,
         skipped_files: usize,
-        snapshots: Vec<ThreadSnapshot>,
+        mut snapshots: Vec<ThreadSnapshot>,
+        filter_rules: &[ThreadAnalysisFilterRule],
     ) -> ThreadAnalysisData {
+        let mut filtered_threads = 0usize;
+        if !filter_rules.is_empty() {
+            for snapshot in &mut snapshots {
+                let before = snapshot.threads.len();
+                snapshot.threads.retain(|sample| {
+                    !Self::thread_sample_matches_filter_rules(sample, filter_rules)
+                });
+                filtered_threads += before.saturating_sub(snapshot.threads.len());
+            }
+        }
         let _has_snapshot_labels = snapshots.iter().any(|snapshot| !snapshot.label.is_empty());
         let visible_thread_name_set = Self::default_visible_thread_names(&snapshots, source_count);
         let mut thread_names = Vec::new();
@@ -4005,11 +4307,12 @@ impl MainView {
             )
         } else {
             format!(
-                "{} 个文件，{} 个快照，{} 个线程，跳过 {} 个文件",
+                "{} 个文件，{} 个快照，{} 个线程，跳过 {} 个文件，过滤 {} 个线程",
                 source_count,
                 snapshots.len(),
                 thread_names.len(),
-                skipped_files
+                skipped_files,
+                filtered_threads
             )
         };
         ThreadAnalysisData {
@@ -4636,7 +4939,7 @@ impl MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) -> bool {
-        if self.search_text_input_focused(window)
+        if self.editable_text_input_focused(window)
             && (Self::is_copy_keystroke(&keystroke) || Self::is_paste_keystroke(&keystroke))
         {
             return false;
@@ -4695,6 +4998,18 @@ impl MainView {
         self.search_input_focus.is_focused(window) || self.search_directory_focus.is_focused(window)
     }
 
+    /// 判断当前焦点是否位于应用内自绘的可编辑文本输入框。
+    ///
+    /// 业务意图：
+    /// - GPUI 的应用级快捷键拦截会早于部分元素级 `on_key_down`，因此所有可编辑文本框聚焦时都要先放行
+    ///   `Ctrl+C` / `Ctrl+V`，让对应输入框完成复制和粘贴。
+    /// - 线程日志分析过滤框位于设置窗口，但状态保存在 `MainView`，这里统一判断焦点，避免粘贴堆栈时误触发
+    ///   “粘贴到搜索框并打开搜索窗口”的只读日志兜底行为。
+    fn editable_text_input_focused(&self, window: &Window) -> bool {
+        self.search_text_input_focused(window)
+            || self.thread_analysis_filter_focus.is_focused(window)
+    }
+
     /// 延迟打开搜索对话框。
     ///
     /// 业务意图：
@@ -4741,6 +5056,17 @@ impl MainView {
             && (keystroke.modifiers.control
                 || keystroke.modifiers.platform
                 || Self::keystroke_matches_control_code(keystroke, CONTROL_V_CODE))
+    }
+
+    /// 判断是否为剪切快捷键。
+    ///
+    /// 业务意图：
+    /// - 设置页线程过滤输入区是可编辑文本，必须支持常见 `Ctrl+X` / `Cmd+X` 剪切行为。
+    fn is_cut_keystroke(keystroke: &Keystroke) -> bool {
+        Self::keystroke_matches_letter_or_control_code(keystroke, "x", CONTROL_X_CODE)
+            && (keystroke.modifiers.control
+                || keystroke.modifiers.platform
+                || Self::keystroke_matches_control_code(keystroke, CONTROL_X_CODE))
     }
 
     /// 判断按键是否匹配指定字母或该字母的 ASCII 控制字符。
@@ -6630,6 +6956,176 @@ impl MainView {
         Some((text.to_string(), selection_range, marked_range))
     }
 
+    /// 读取线程日志分析过滤输入区当前文本、选择范围和组合文本范围的快照。
+    ///
+    /// 业务意图：
+    /// - 设置窗口的多行输入元素在绘制阶段只持有 `MainView` 实体，需要通过只读快照拿到稳定文本状态。
+    /// - 快照使用规范化后的 LF 文本，确保绘制行数、鼠标命中和后续过滤规则拆分一致。
+    fn thread_analysis_filter_text_snapshot(&self) -> (String, Range<usize>, Option<Range<usize>>) {
+        (
+            self.thread_analysis_filter_text.clone(),
+            Self::clamp_search_text_range(
+                &self.thread_analysis_filter_text,
+                self.thread_analysis_filter_selection_range.clone(),
+            ),
+            self.thread_analysis_filter_marked_range.clone(),
+        )
+    }
+
+    /// 保存线程日志分析过滤输入区最近一次多行排版结果。
+    ///
+    /// 业务意图：
+    /// - 鼠标点击和拖拽需要用上一帧真实字形位置换算文本下标；该缓存只服务当前会话，不参与持久化。
+    fn store_thread_analysis_filter_text_layouts(
+        &mut self,
+        layouts: Vec<ThreadAnalysisFilterLineLayout>,
+        bounds: Bounds<Pixels>,
+    ) {
+        self.thread_analysis_filter_last_layouts = layouts;
+        self.thread_analysis_filter_last_bounds = Some(bounds);
+    }
+
+    /// 返回线程日志分析过滤文本的可视行范围。
+    ///
+    /// 业务意图：
+    /// - 输入区按原始换行展示堆栈；空行也必须占一行，因为空行同时用于分隔多条过滤规则。
+    /// - 返回范围不包含换行符本身，便于每行单独排版和命中。
+    fn thread_analysis_filter_line_ranges(text: &str) -> Vec<Range<usize>> {
+        let mut ranges = Vec::new();
+        let mut start = 0usize;
+        for (index, character) in text.char_indices() {
+            if character == '\n' {
+                ranges.push(start..index);
+                start = index + character.len_utf8();
+            }
+        }
+        ranges.push(start..text.len());
+        ranges
+    }
+
+    /// 返回线程日志分析过滤输入区当前内容需要的可视行数。
+    fn thread_analysis_filter_visual_line_count(&self) -> usize {
+        Self::thread_analysis_filter_line_ranges(&self.thread_analysis_filter_text)
+            .len()
+            .max(1)
+    }
+
+    /// 开始线程日志分析过滤输入区的鼠标选择。
+    ///
+    /// 业务意图：
+    /// - 单击定位光标，Shift+单击扩展选择，双击选中连续非空白片段，三连击全选，保持和搜索输入框一致的基础文本习惯。
+    fn start_thread_analysis_filter_mouse_selection(
+        &mut self,
+        event: &MouseDownEvent,
+        context: &mut Context<Self>,
+    ) {
+        let index = self.thread_analysis_filter_index_for_point(event.position);
+        self.thread_analysis_filter_marked_range = None;
+        match event.click_count {
+            0 | 1 => {
+                if event.modifiers.shift {
+                    self.thread_analysis_filter_selection_range.end = index;
+                    self.thread_analysis_filter_selection_range = Self::clamp_search_text_range(
+                        &self.thread_analysis_filter_text,
+                        self.thread_analysis_filter_selection_range.clone(),
+                    );
+                } else {
+                    self.thread_analysis_filter_selection_range = index..index;
+                }
+                self.thread_analysis_filter_selection_drag =
+                    Some(self.thread_analysis_filter_selection_range.start);
+            }
+            2 => {
+                self.thread_analysis_filter_selection_range =
+                    Self::search_text_word_range_for_index(
+                        &self.thread_analysis_filter_text,
+                        index,
+                    );
+                self.thread_analysis_filter_selection_drag = None;
+            }
+            _ => {
+                self.thread_analysis_filter_selection_range =
+                    0..self.thread_analysis_filter_text.len();
+                self.thread_analysis_filter_selection_drag = None;
+            }
+        }
+        self.touch_search_text_cursor_activity();
+        context.notify();
+    }
+
+    /// 鼠标拖拽时更新线程日志分析过滤输入区选区终点。
+    fn update_thread_analysis_filter_mouse_selection(
+        &mut self,
+        position: Point<Pixels>,
+        context: &mut Context<Self>,
+    ) {
+        let Some(anchor) = self.thread_analysis_filter_selection_drag else {
+            return;
+        };
+        let index = self.thread_analysis_filter_index_for_point(position);
+        self.thread_analysis_filter_marked_range = None;
+        self.thread_analysis_filter_selection_range =
+            Self::clamp_search_text_range(&self.thread_analysis_filter_text, anchor..index);
+        self.touch_search_text_cursor_activity();
+        context.notify();
+    }
+
+    /// 结束线程日志分析过滤输入区鼠标拖拽选择。
+    fn finish_thread_analysis_filter_mouse_selection(&mut self, context: &mut Context<Self>) {
+        if self.thread_analysis_filter_selection_drag.take().is_some() {
+            context.notify();
+        }
+    }
+
+    /// 根据鼠标窗口坐标返回线程日志分析过滤输入区中的 UTF-8 字节下标。
+    ///
+    /// 边界条件：
+    /// - 首帧尚未完成排版时回退到文本末尾，避免点击空布局导致越界。
+    /// - 点击在整体输入区上方或下方时，分别夹到开头或末尾，符合多行文本框的常见行为。
+    fn thread_analysis_filter_index_for_point(&self, position: Point<Pixels>) -> usize {
+        let Some(bounds) = self.thread_analysis_filter_last_bounds.as_ref() else {
+            return self.thread_analysis_filter_text.len();
+        };
+        if position.y < bounds.top() {
+            return 0;
+        }
+        if position.y > bounds.bottom() {
+            return self.thread_analysis_filter_text.len();
+        }
+        for layout in &self.thread_analysis_filter_last_layouts {
+            if position.y >= layout.bounds.top() && position.y <= layout.bounds.bottom() {
+                let local_index = layout
+                    .line
+                    .closest_index_for_x(position.x - layout.bounds.left())
+                    .min(
+                        layout
+                            .byte_range
+                            .end
+                            .saturating_sub(layout.byte_range.start),
+                    );
+                return layout.byte_range.start + local_index;
+            }
+        }
+        self.thread_analysis_filter_text.len()
+    }
+
+    /// 清空线程日志分析过滤配置。
+    ///
+    /// 业务意图：
+    /// - 设置页提供明确的恢复入口，用户排查结束后可以一次性取消所有无效线程过滤规则。
+    fn clear_thread_analysis_filter_text(&mut self, context: &mut Context<Self>) {
+        if self.thread_analysis_filter_text.is_empty() {
+            return;
+        }
+        self.thread_analysis_filter_text.clear();
+        self.thread_analysis_filter_selection_range = 0..0;
+        self.thread_analysis_filter_marked_range = None;
+        self.thread_analysis_filter_selection_drag = None;
+        save_thread_analysis_filter_preference(&self.thread_analysis_filter_text);
+        self.touch_search_text_cursor_activity();
+        context.notify();
+    }
+
     /// 保存搜索输入框最近一次 GPUI 文本排版结果。
     ///
     /// 业务意图：
@@ -6985,6 +7481,225 @@ impl MainView {
             }
             _ => {}
         }
+    }
+
+    /// 处理线程日志分析过滤多行输入区的基础编辑按键。
+    ///
+    /// 业务意图：
+    /// - 该输入区用于粘贴完整线程堆栈，必须保留换行，并支持复制、剪切、粘贴、删除、全选和回车换行。
+    /// - 普通字符输入交给 `EntityInputHandler`，这里不处理 `key_char`，从而保留中文 IME 的平台提交路径。
+    fn handle_thread_analysis_filter_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        context: &mut Context<Self>,
+    ) {
+        if Self::is_paste_keystroke(&event.keystroke) {
+            if let Some(text) = context.read_from_clipboard().and_then(|item| item.text()) {
+                let replacement = normalize_thread_analysis_filter_text(&text);
+                self.replace_thread_analysis_filter_selection(&replacement);
+                self.persist_thread_analysis_filter_text();
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+                return;
+            }
+            context.stop_propagation();
+            return;
+        }
+
+        if Self::is_copy_keystroke(&event.keystroke) {
+            if let Some(text) = self.selected_thread_analysis_filter_text() {
+                context.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            context.stop_propagation();
+            return;
+        }
+
+        if Self::is_cut_keystroke(&event.keystroke) {
+            if let Some(text) = self.selected_thread_analysis_filter_text() {
+                context.write_to_clipboard(ClipboardItem::new_string(text));
+                self.replace_thread_analysis_filter_selection("");
+                self.persist_thread_analysis_filter_text();
+                self.touch_search_text_cursor_activity();
+                context.notify();
+            }
+            context.stop_propagation();
+            return;
+        }
+
+        if Self::is_select_all_keystroke(&event.keystroke) {
+            self.thread_analysis_filter_marked_range = None;
+            self.thread_analysis_filter_selection_range = 0..self.thread_analysis_filter_text.len();
+            self.touch_search_text_cursor_activity();
+            context.stop_propagation();
+            context.notify();
+            return;
+        }
+
+        match event.keystroke.key.as_str() {
+            "left" => {
+                self.thread_analysis_filter_marked_range = None;
+                if event.keystroke.modifiers.shift {
+                    self.thread_analysis_filter_selection_range.end =
+                        Self::previous_search_text_boundary(
+                            &self.thread_analysis_filter_text,
+                            self.thread_analysis_filter_selection_range.end,
+                        );
+                    self.thread_analysis_filter_selection_range = Self::clamp_search_text_range(
+                        &self.thread_analysis_filter_text,
+                        self.thread_analysis_filter_selection_range.clone(),
+                    );
+                } else if self.thread_analysis_filter_selection_range.start
+                    != self.thread_analysis_filter_selection_range.end
+                {
+                    self.thread_analysis_filter_selection_range =
+                        self.thread_analysis_filter_selection_range.start
+                            ..self.thread_analysis_filter_selection_range.start;
+                } else {
+                    let cursor = Self::previous_search_text_boundary(
+                        &self.thread_analysis_filter_text,
+                        self.thread_analysis_filter_selection_range.end,
+                    );
+                    self.thread_analysis_filter_selection_range = cursor..cursor;
+                }
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "right" => {
+                self.thread_analysis_filter_marked_range = None;
+                if event.keystroke.modifiers.shift {
+                    self.thread_analysis_filter_selection_range.end =
+                        Self::next_search_text_boundary(
+                            &self.thread_analysis_filter_text,
+                            self.thread_analysis_filter_selection_range.end,
+                        );
+                    self.thread_analysis_filter_selection_range = Self::clamp_search_text_range(
+                        &self.thread_analysis_filter_text,
+                        self.thread_analysis_filter_selection_range.clone(),
+                    );
+                } else if self.thread_analysis_filter_selection_range.start
+                    != self.thread_analysis_filter_selection_range.end
+                {
+                    self.thread_analysis_filter_selection_range =
+                        self.thread_analysis_filter_selection_range.end
+                            ..self.thread_analysis_filter_selection_range.end;
+                } else {
+                    let cursor = Self::next_search_text_boundary(
+                        &self.thread_analysis_filter_text,
+                        self.thread_analysis_filter_selection_range.end,
+                    );
+                    self.thread_analysis_filter_selection_range = cursor..cursor;
+                }
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "up" => {
+                self.thread_analysis_filter_marked_range = None;
+                self.thread_analysis_filter_selection_range = 0..0;
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "down" => {
+                self.thread_analysis_filter_marked_range = None;
+                let cursor = self.thread_analysis_filter_text.len();
+                self.thread_analysis_filter_selection_range = cursor..cursor;
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "backspace" => {
+                if self.thread_analysis_filter_selection_range.start
+                    != self.thread_analysis_filter_selection_range.end
+                    || self.thread_analysis_filter_marked_range.is_some()
+                {
+                    self.replace_thread_analysis_filter_selection("");
+                } else if let Some((previous_index, _)) = self.thread_analysis_filter_text
+                    [..self.thread_analysis_filter_selection_range.end]
+                    .char_indices()
+                    .next_back()
+                {
+                    let cursor = self.thread_analysis_filter_selection_range.end;
+                    self.thread_analysis_filter_text
+                        .replace_range(previous_index..cursor, "");
+                    self.thread_analysis_filter_selection_range = previous_index..previous_index;
+                    self.thread_analysis_filter_marked_range = None;
+                }
+                self.persist_thread_analysis_filter_text();
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "delete" => {
+                if self.thread_analysis_filter_selection_range.start
+                    != self.thread_analysis_filter_selection_range.end
+                    || self.thread_analysis_filter_marked_range.is_some()
+                {
+                    self.replace_thread_analysis_filter_selection("");
+                } else if let Some((next_index, next_character)) = self.thread_analysis_filter_text
+                    [self.thread_analysis_filter_selection_range.end..]
+                    .char_indices()
+                    .next()
+                {
+                    let start = self.thread_analysis_filter_selection_range.end + next_index;
+                    let end = start + next_character.len_utf8();
+                    self.thread_analysis_filter_text
+                        .replace_range(start..end, "");
+                    self.thread_analysis_filter_selection_range = start..start;
+                    self.thread_analysis_filter_marked_range = None;
+                }
+                self.persist_thread_analysis_filter_text();
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "enter" => {
+                self.replace_thread_analysis_filter_selection("\n");
+                self.persist_thread_analysis_filter_text();
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "escape" => {}
+            _ => {}
+        }
+    }
+
+    /// 返回线程日志分析过滤输入区当前选中文本。
+    fn selected_thread_analysis_filter_text(&self) -> Option<String> {
+        let range = Self::clamp_search_text_range(
+            &self.thread_analysis_filter_text,
+            self.thread_analysis_filter_selection_range.clone(),
+        );
+        (range.start < range.end).then(|| self.thread_analysis_filter_text[range].to_string())
+    }
+
+    /// 用给定文本替换线程日志分析过滤输入区当前选区。
+    ///
+    /// 业务意图：
+    /// - 平台 IME、快捷键粘贴和普通编辑都通过同一函数更新文本、组合范围和光标，保证多行输入状态一致。
+    fn replace_thread_analysis_filter_selection(&mut self, replacement: &str) {
+        let replacement = normalize_thread_analysis_filter_text(replacement);
+        let range = self
+            .thread_analysis_filter_marked_range
+            .take()
+            .unwrap_or_else(|| {
+                Self::clamp_search_text_range(
+                    &self.thread_analysis_filter_text,
+                    self.thread_analysis_filter_selection_range.clone(),
+                )
+            });
+        self.thread_analysis_filter_text
+            .replace_range(range.clone(), &replacement);
+        let cursor = range.start + replacement.len();
+        self.thread_analysis_filter_selection_range = cursor..cursor;
+    }
+
+    /// 保存线程日志分析过滤输入区当前文本。
+    fn persist_thread_analysis_filter_text(&self) {
+        save_thread_analysis_filter_preference(&self.thread_analysis_filter_text);
     }
 
     /// 返回指定输入槽位的可变文本、选择范围和组合范围。
@@ -8524,6 +9239,15 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<String> {
+        if self.thread_analysis_filter_focus.is_focused(window) {
+            let range =
+                Self::search_input_range_from_utf16(&self.thread_analysis_filter_text, range_utf16);
+            adjusted_range.replace(Self::search_input_range_to_utf16(
+                &self.thread_analysis_filter_text,
+                range.clone(),
+            ));
+            return Some(self.thread_analysis_filter_text[range].to_string());
+        }
         let input_kind = self.active_search_text_input_kind(window);
         let dialog = self.search_dialog.as_ref()?;
         let (text, _, _) = Self::search_text_state(dialog, input_kind);
@@ -8539,6 +9263,15 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
+        if self.thread_analysis_filter_focus.is_focused(window) {
+            return Some(UTF16Selection {
+                range: Self::search_input_range_to_utf16(
+                    &self.thread_analysis_filter_text,
+                    self.thread_analysis_filter_selection_range.clone(),
+                ),
+                reversed: false,
+            });
+        }
         let input_kind = self.active_search_text_input_kind(window);
         let dialog = self.search_dialog.as_ref()?;
         let (text, selection_range, _) = Self::search_text_state(dialog, input_kind);
@@ -8554,6 +9287,14 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<Range<usize>> {
+        if self.thread_analysis_filter_focus.is_focused(window) {
+            return self
+                .thread_analysis_filter_marked_range
+                .clone()
+                .map(|range| {
+                    Self::search_input_range_to_utf16(&self.thread_analysis_filter_text, range)
+                });
+        }
         let input_kind = self.active_search_text_input_kind(window);
         let dialog = self.search_dialog.as_ref()?;
         let (text, _, marked_range) = Self::search_text_state(dialog, input_kind);
@@ -8562,6 +9303,11 @@ impl EntityInputHandler for MainView {
 
     /// 清除输入法组合文本状态。
     fn unmark_text(&mut self, window: &mut Window, context: &mut Context<Self>) {
+        if self.thread_analysis_filter_focus.is_focused(window) {
+            self.thread_analysis_filter_marked_range = None;
+            context.notify();
+            return;
+        }
         let input_kind = self.active_search_text_input_kind(window);
         if let Some(dialog) = self.search_dialog.as_mut() {
             let (_, _, marked_range) = Self::search_text_state_mut(dialog, input_kind);
@@ -8582,6 +9328,25 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
+        if self.thread_analysis_filter_focus.is_focused(window) {
+            let replacement = normalize_thread_analysis_filter_text(text);
+            let range = range_utf16
+                .map(|range| {
+                    Self::search_input_range_from_utf16(&self.thread_analysis_filter_text, range)
+                })
+                .or_else(|| self.thread_analysis_filter_marked_range.clone())
+                .unwrap_or_else(|| self.thread_analysis_filter_selection_range.clone());
+            let range = Self::clamp_search_text_range(&self.thread_analysis_filter_text, range);
+            self.thread_analysis_filter_text
+                .replace_range(range.clone(), &replacement);
+            let cursor = range.start + replacement.len();
+            self.thread_analysis_filter_selection_range = cursor..cursor;
+            self.thread_analysis_filter_marked_range = None;
+            self.persist_thread_analysis_filter_text();
+            self.touch_search_text_cursor_activity();
+            context.notify();
+            return;
+        }
         let input_kind = self.active_search_text_input_kind(window);
         let Some(dialog) = self.search_dialog.as_mut() else {
             return;
@@ -8618,6 +9383,40 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
+        if self.thread_analysis_filter_focus.is_focused(window) {
+            let replacement = normalize_thread_analysis_filter_text(new_text);
+            let range = range_utf16
+                .map(|range| {
+                    Self::search_input_range_from_utf16(&self.thread_analysis_filter_text, range)
+                })
+                .or_else(|| self.thread_analysis_filter_marked_range.clone())
+                .unwrap_or_else(|| self.thread_analysis_filter_selection_range.clone());
+            let range = Self::clamp_search_text_range(&self.thread_analysis_filter_text, range);
+            self.thread_analysis_filter_text
+                .replace_range(range.clone(), &replacement);
+
+            if replacement.is_empty() {
+                self.thread_analysis_filter_marked_range = None;
+            } else {
+                self.thread_analysis_filter_marked_range =
+                    Some(range.start..range.start + replacement.len());
+            }
+
+            let selected_range = new_selected_range_utf16
+                .map(|utf16_range| Self::search_input_range_from_utf16(&replacement, utf16_range))
+                .map(|relative_range| {
+                    range.start + relative_range.start..range.start + relative_range.end
+                })
+                .unwrap_or_else(|| {
+                    let cursor = range.start + replacement.len();
+                    cursor..cursor
+                });
+            self.thread_analysis_filter_selection_range = selected_range;
+            self.persist_thread_analysis_filter_text();
+            self.touch_search_text_cursor_activity();
+            context.notify();
+            return;
+        }
         let input_kind = self.active_search_text_input_kind(window);
         let Some(dialog) = self.search_dialog.as_mut() else {
             return;
@@ -8667,6 +9466,23 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        if self.thread_analysis_filter_focus.is_focused(window) {
+            let range =
+                Self::search_input_range_from_utf16(&self.thread_analysis_filter_text, range_utf16);
+            let cursor = range.start;
+            for layout in &self.thread_analysis_filter_last_layouts {
+                if cursor >= layout.byte_range.start && cursor <= layout.byte_range.end {
+                    let x = layout
+                        .line
+                        .x_for_index(cursor.saturating_sub(layout.byte_range.start));
+                    return Some(Bounds::new(
+                        point(layout.bounds.left() + x, layout.bounds.top()),
+                        size(px(1.0), layout.bounds.bottom() - layout.bounds.top()),
+                    ));
+                }
+            }
+            return Some(element_bounds);
+        }
         let input_kind = self.active_search_text_input_kind(window);
         let dialog = self.search_dialog.as_ref()?;
         let (text, _, _) = Self::search_text_state(dialog, input_kind);
@@ -8701,6 +9517,13 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<usize> {
+        if self.thread_analysis_filter_focus.is_focused(window) {
+            let utf8_index = self.thread_analysis_filter_index_for_point(point);
+            return Some(Self::search_input_utf16_offset_from_byte(
+                &self.thread_analysis_filter_text,
+                utf8_index,
+            ));
+        }
         let input_kind = self.active_search_text_input_kind(window);
         let dialog = self.search_dialog.as_ref()?;
         let (text, _, _) = Self::search_text_state(dialog, input_kind);
