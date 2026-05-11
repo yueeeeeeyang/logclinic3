@@ -7,7 +7,7 @@
 // 边界条件：
 // - 搜索关键字历史只保存在当前会话内；该窗口只提供下拉选择入口，不把关键字持久化到配置目录。
 
-use super::search_input_element::SearchTextInputElement;
+use super::input_element::SearchTextInputElement;
 use super::*;
 
 pub(in crate::app) struct SearchDialogWindowView {

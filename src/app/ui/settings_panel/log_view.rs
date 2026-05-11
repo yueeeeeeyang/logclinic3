@@ -4,8 +4,8 @@
 // - 从设置窗口框架中拆出 快搜关键字和线程过滤设置渲染，避免页签内容继续堆在独立窗口入口文件中。
 // - 本轮只移动渲染方法，保持按钮、输入元素、配置读写和焦点流转行为不变。
 
-use super::settings_quick_search_input::QuickSearchKeywordsInputElement;
-use super::settings_thread_filter_input::ThreadAnalysisFilterTextAreaElement;
+use super::quick_search_input::QuickSearchKeywordsInputElement;
+use super::thread_filter_input::ThreadAnalysisFilterTextAreaElement;
 use super::*;
 
 impl SettingsWindowView {

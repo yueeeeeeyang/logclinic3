@@ -527,7 +527,7 @@ pub(in crate::app) const LOG_VIEWER_TAB_WIDTH: usize = 4;
 /// 边界条件：
 /// - 当前只内置 Regular 字重；日志正文高亮仍通过字体系统模拟粗体，后续若要求更高字重质量可追加 Bold 字体文件。
 pub(in crate::app) const JETBRAINS_MONO_REGULAR_FONT_BYTES: &[u8] =
-    include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
+    include_bytes!("../../../../assets/fonts/JetBrainsMono-Regular.ttf");
 
 /// 日志字号设置的单次调整步长。
 ///

@@ -4,8 +4,8 @@
 // - 从设置窗口框架中拆出 模型配置列表、表单和测试状态渲染，避免页签内容继续堆在独立窗口入口文件中。
 // - 本轮只移动渲染方法，保持按钮、输入元素、配置读写和焦点流转行为不变。
 
-use super::settings_model_input::ModelConfigInputElement;
-use super::settings_window_view::ModelIconButtonRequest;
+use super::model_input::ModelConfigInputElement;
+use super::window_view::ModelIconButtonRequest;
 use super::*;
 
 impl SettingsWindowView {

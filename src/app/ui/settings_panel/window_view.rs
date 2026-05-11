@@ -438,7 +438,7 @@ impl SettingsWindowView {
                 context,
             ),
             SettingsTab::Model => self.render_model_tab(palette, context),
-            SettingsTab::About => super::about_settings_view::render_about_settings_tab(palette),
+            SettingsTab::About => super::about_view::render_about_settings_tab(palette),
         }
     }
 }
