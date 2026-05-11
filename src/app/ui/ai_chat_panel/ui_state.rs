@@ -234,3 +234,18 @@ pub(in crate::app) fn clamp_ai_chat_input_height(
         .max(AI_CHAT_INPUT_MIN_HEIGHT);
     requested_height.clamp(AI_CHAT_INPUT_MIN_HEIGHT, max_height)
 }
+
+/// 判断 AI 流式消息是否需要显式触发虚拟列表行高失效。
+///
+/// 业务意图：
+/// - 可见消息行会由 GPUI 在当前帧重新布局；离屏消息只需要按批次失效，避免每个 SSE 增量都让滚动条重新计算。
+/// - 完成、停止或失败时必须允许强制失效一次，让终态文案和最终正文高度在用户再次滚动到该消息前保持一致。
+pub(in crate::app) fn ai_chat_stream_row_invalidation_due(
+    last_invalidated_len: usize,
+    current_len: usize,
+    force: bool,
+) -> bool {
+    force
+        || current_len.saturating_sub(last_invalidated_len)
+            >= AI_CHAT_STREAM_ROW_INVALIDATE_BYTE_THRESHOLD
+}

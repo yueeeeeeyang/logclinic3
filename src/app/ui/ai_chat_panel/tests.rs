@@ -310,6 +310,26 @@ fn ai_对话输入区高度拖拽会被限制() {
     );
 }
 
+/// 验证流式消息行高失效会按批次触发。
+///
+/// 业务意图：
+/// - AI 对话 SSE 输出期间不能每个增量都重置虚拟列表行高，否则滚动条会持续闪烁。
+/// - 离屏消息增长超过阈值或进入终态时仍必须允许显式失效，避免用户回看历史时沿用旧高度缓存。
+#[test]
+fn ai_对话流式行高失效按阈值批量触发() {
+    assert!(!ai_chat_stream_row_invalidation_due(
+        0,
+        AI_CHAT_STREAM_ROW_INVALIDATE_BYTE_THRESHOLD - 1,
+        false,
+    ));
+    assert!(ai_chat_stream_row_invalidation_due(
+        0,
+        AI_CHAT_STREAM_ROW_INVALIDATE_BYTE_THRESHOLD,
+        false,
+    ));
+    assert!(ai_chat_stream_row_invalidation_due(4096, 4096, true));
+}
+
 /// 验证 AI 对话 SSE 解析支持跨 chunk 和 DONE 事件。
 ///
 /// 边界条件：

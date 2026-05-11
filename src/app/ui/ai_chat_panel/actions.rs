@@ -285,11 +285,33 @@ impl MainView {
         }
     }
 
-    /// 标记单条 AI 消息的虚拟列表高度需要重新测量。
+    /// 判断指定 AI 消息行当前是否与消息视口相交。
     ///
     /// 业务意图：
-    /// - SSE 流式输出会持续改变助手气泡高度，只失效当前消息行可以避免每个增量都重建整个消息列表。
-    pub(in crate::app) fn invalidate_ai_chat_message_row(&mut self, message_id: &str) {
+    /// - GPUI `list` 对可见行会在布局阶段重新测量真实高度；只有离屏行才需要我们显式失效缓存。
+    /// - 返回 `None` 表示列表尚未完成该行测量，或者该行位于当前滚动位置之前；这种情况在流式过程中不主动归零行高，
+    ///   避免用户滚动时出现额外跳动。
+    pub(in crate::app) fn ai_chat_message_row_visible_state(&self, index: usize) -> Option<bool> {
+        let bounds = self.ai_chat.message_list_state.bounds_for_item(index)?;
+        let viewport = self.ai_chat.message_list_state.viewport_bounds();
+        Some(bounds.bottom() > viewport.top() && bounds.top() < viewport.bottom())
+    }
+
+    /// 按流式输出策略标记单条 AI 消息的虚拟列表高度需要重新测量。
+    ///
+    /// 业务意图：
+    /// - SSE 流式输出会持续改变助手气泡内容；可见行依赖 GPUI 正常重测，离屏行按阈值批量失效。
+    /// - 这样可以避免每个增量都 `splice` 导致滚动条持续闪烁，同时防止离屏消息一直沿用旧高度缓存。
+    ///
+    /// 边界条件：
+    /// - 新增消息仍由发送入口执行 `splice`，因为列表条目数量发生了变化；这里仅处理既有消息正文或状态变化。
+    /// - `force` 用于完成、停止和失败等终态变化，确保状态文案高度也能在用户回看历史前同步。
+    pub(in crate::app) fn invalidate_ai_chat_message_row(
+        &mut self,
+        message_id: &str,
+        content_len: usize,
+        force: bool,
+    ) {
         let Some(index) = self
             .ai_chat
             .messages
@@ -298,10 +320,42 @@ impl MainView {
         else {
             return;
         };
+
+        if self.ai_chat_message_row_visible_state(index) == Some(true) {
+            if let Some(task) = self.ai_chat.streaming_task.as_mut()
+                && task.assistant_message_id == message_id
+            {
+                task.last_list_invalidated_len = content_len;
+            }
+            return;
+        }
+
+        if !force && self.ai_chat_message_row_visible_state(index).is_none() {
+            return;
+        }
+
+        let should_invalidate = if let Some(task) = self.ai_chat.streaming_task.as_ref() {
+            task.assistant_message_id == message_id
+                && ai_chat_stream_row_invalidation_due(
+                    task.last_list_invalidated_len,
+                    content_len,
+                    force,
+                )
+        } else {
+            force
+        };
+        if !should_invalidate {
+            return;
+        }
+
         self.ai_chat
             .message_list_state
             .splice(index..index.saturating_add(1), 1);
-        self.ai_chat.message_list_state.scroll_to_reveal_item(index);
+        if let Some(task) = self.ai_chat.streaming_task.as_mut()
+            && task.assistant_message_id == message_id
+        {
+            task.last_list_invalidated_len = content_len;
+        }
     }
 
     /// 返回 AI 对话指定滚动区域的虚拟列表状态。
@@ -904,6 +958,7 @@ impl MainView {
             receiver,
             cancel,
             last_persisted_len: 0,
+            last_list_invalidated_len: 0,
         });
 
         context
@@ -972,15 +1027,24 @@ impl MainView {
 
     /// 处理后台 AI 流式事件。
     pub(in crate::app) fn drain_ai_chat_stream_events(&mut self, context: &mut Context<Self>) {
+        let mut received_event = false;
         while let Some(task) = self.ai_chat.streaming_task.as_ref() {
             let event = match task.receiver.try_recv() {
-                Ok(event) => event,
+                Ok(event) => {
+                    received_event = true;
+                    event
+                }
                 Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => AiChatStreamEvent::Done,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    received_event = true;
+                    AiChatStreamEvent::Done
+                }
             };
             self.apply_ai_chat_stream_event(event);
         }
-        context.notify();
+        if received_event {
+            context.notify();
+        }
     }
 
     /// 应用单个 AI 流式事件。
@@ -1003,6 +1067,7 @@ impl MainView {
             AiChatStreamEvent::Delta(delta) => {
                 let mut message_to_persist = None;
                 let mut changed_message_id = None;
+                let mut changed_message_content_len = 0;
                 if let Some(message) = self
                     .ai_chat
                     .messages
@@ -1012,6 +1077,7 @@ impl MainView {
                     message.content.push_str(&delta);
                     message.updated_at_ms = current_unix_time_millis();
                     changed_message_id = Some(message.id.clone());
+                    changed_message_content_len = message.content.len();
                     if let Some(task) = self.ai_chat.streaming_task.as_mut()
                         && message
                             .content
@@ -1027,7 +1093,11 @@ impl MainView {
                     self.persist_ai_chat_message(&message);
                 }
                 if let Some(message_id) = changed_message_id {
-                    self.invalidate_ai_chat_message_row(&message_id);
+                    self.invalidate_ai_chat_message_row(
+                        &message_id,
+                        changed_message_content_len,
+                        false,
+                    );
                 }
             }
             AiChatStreamEvent::Done => {
@@ -1072,8 +1142,8 @@ impl MainView {
         );
         if let Some(message) = message_to_persist {
             self.persist_ai_chat_message(&message);
+            self.invalidate_ai_chat_message_row(&message.id, message.content.len(), true);
         }
-        self.invalidate_ai_chat_message_row(message_id);
     }
 
     /// 持久化 AI 消息并把错误写回页面状态。

@@ -87,6 +87,14 @@ pub(in crate::app) const AI_CHAT_MODEL_MENU_BOTTOM_OFFSET: f32 = AI_CHAT_INPUT_B
 /// - 聊天消息和历史会话可能持续增长，虚拟列表只渲染可视区域及少量缓冲，避免滚动时为所有历史创建 GPUI 元素。
 pub(in crate::app) const AI_CHAT_VIRTUAL_LIST_OVERDRAW: f32 = 180.0;
 
+/// AI 流式消息离屏时触发虚拟列表行高失效的正文增长阈值。
+///
+/// 业务意图：
+/// - 可见消息行会在 GPUI `list` 的正常布局阶段重新测量，不需要显式失效。
+/// - 离屏消息如果完全不失效，用户滚动到正在增长的助手回复时会一次性修正缓存高度，导致滚动条跳变。
+/// - 每个 SSE 增量都失效又会把行高临时归零，造成滚动条持续闪烁；因此用批量阈值折中正确性和视觉稳定性。
+pub(in crate::app) const AI_CHAT_STREAM_ROW_INVALIDATE_BYTE_THRESHOLD: usize = 2048;
+
 /// AI 对话列表滚动条宽度。
 pub(in crate::app) const AI_CHAT_SCROLLBAR_WIDTH: f32 = 6.0;
 

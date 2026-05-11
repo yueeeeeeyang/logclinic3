@@ -166,6 +166,12 @@ pub(crate) struct AiChatStreamingTask {
     pub(crate) cancel: Arc<AtomicBool>,
     /// 最近一次持久化到 SQLite 的正文长度，用于减少流式过程中的写库频率。
     pub(crate) last_persisted_len: usize,
+    /// 最近一次虚拟列表行高已同步或显式失效时的正文长度。
+    ///
+    /// UI 约束：
+    /// - 流式输出可能每几十毫秒收到一个增量，如果每次都重置虚拟列表测量高度，滚动条会因为临时 0 高度持续闪烁。
+    /// - 该字段只记录当前任务内的 UI 行高同步进度，不写入数据库，也不影响请求上下文。
+    pub(crate) last_list_invalidated_len: usize,
 }
 
 /// 返回当前 Unix epoch 毫秒。
