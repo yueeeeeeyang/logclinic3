@@ -97,6 +97,17 @@ impl MainView {
             .flex_col()
             .flex_1()
             .overflow_hidden()
+            .on_mouse_move(
+                context.listener(|view, _event: &MouseMoveEvent, _window, _context| {
+                    view.note_keyboard_scroll_region(KeyboardScrollRegion::LogTree);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|view, _event: &MouseDownEvent, _window, _context| {
+                    view.note_keyboard_scroll_region(KeyboardScrollRegion::LogTree);
+                }),
+            )
             .child(
                 uniform_list(
                     "log-tree-virtual-list",
@@ -430,6 +441,7 @@ impl MainView {
         event: &MouseDownEvent,
         context: &mut Context<Self>,
     ) {
+        self.note_keyboard_scroll_region(KeyboardScrollRegion::LogTree);
         self.update_log_tree_selection_for_click(
             node_id,
             visible_index,
@@ -587,6 +599,7 @@ impl MainView {
         event: &MouseDownEvent,
         context: &mut Context<Self>,
     ) {
+        self.note_keyboard_scroll_region(KeyboardScrollRegion::LogTree);
         if !self.log_tree_selected_node_ids.contains(&node_id) {
             self.update_log_tree_selection_for_click(
                 node_id,

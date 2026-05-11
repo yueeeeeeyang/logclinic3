@@ -214,7 +214,7 @@ mod tests {
     ///
     /// 业务意图：
     /// - Windows 原生文件选择器的 `FOS_PICKFOLDERS` 会切换成只选目录模式；如果仍传 `directories=true`，
-    ///   用户点击“加载日志”时就看不到 ZIP/RAR/7Z/TAR.GZ 等压缩包文件。
+    ///   用户点击“加载日志”时就看不到 ZIP/RAR/7Z/TAR.GZ/GZ 等压缩包文件。
     #[test]
     fn 加载日志选择器在不支持混选平台优先显示文件() {
         let options = LoadPromptKind::LogSources.to_prompt_options(false);
@@ -227,7 +227,7 @@ mod tests {
     /// 验证文件/压缩包菜单项只打开文件选择器。
     ///
     /// 业务意图：
-    /// - Windows 菜单中的“文件/压缩包”必须让系统对话框展示 ZIP/RAR/7Z/TAR.GZ 等文件，不能再次落入只选目录模式。
+    /// - Windows 菜单中的“文件/压缩包”必须让系统对话框展示 ZIP/RAR/7Z/TAR.GZ/GZ 等文件，不能再次落入只选目录模式。
     #[test]
     fn 加载日志文件压缩包菜单项只允许选择文件() {
         let options = LoadPromptKind::LogFilesOrArchives.to_prompt_options(false);
@@ -512,6 +512,210 @@ mod tests {
             Some(SearchDialogControlKey::Close)
         );
         assert_eq!(MainView::search_dialog_control_key(&keystroke("a")), None);
+    }
+
+    /// 验证日志区域键盘滚动快捷键的按键映射。
+    ///
+    /// 业务意图：
+    /// - `PageUp` / `PageDown` 用于区域翻页，`Ctrl+Home` / `Ctrl+End` 用于顶底跳转；这些映射一旦变化会直接破坏用户肌肉记忆。
+    /// - 用户已明确去除 `Ctrl+Top`，测试需要锁定它不会被误识别为顶部跳转。
+    #[test]
+    fn 日志区域键盘滚动快捷键映射稳定() {
+        let keystroke = |key: &str, control: bool| Keystroke {
+            modifiers: gpui::Modifiers {
+                control,
+                ..Default::default()
+            },
+            key: key.to_string(),
+            key_char: None,
+        };
+
+        assert_eq!(
+            MainView::keyboard_scroll_command(&keystroke("pageup", false)),
+            Some(KeyboardScrollCommand::PageUp)
+        );
+        assert_eq!(
+            MainView::keyboard_scroll_command(&keystroke("page_down", false)),
+            Some(KeyboardScrollCommand::PageDown)
+        );
+        assert_eq!(
+            MainView::keyboard_scroll_command(&keystroke("end", true)),
+            Some(KeyboardScrollCommand::Bottom)
+        );
+        assert_eq!(
+            MainView::keyboard_scroll_command(&keystroke("home", true)),
+            Some(KeyboardScrollCommand::Top)
+        );
+        assert_eq!(
+            MainView::keyboard_scroll_command(&keystroke("end", false)),
+            None
+        );
+        assert_eq!(
+            MainView::keyboard_scroll_command(&keystroke("home", false)),
+            None
+        );
+        assert_eq!(
+            MainView::keyboard_scroll_command(&keystroke("top", true)),
+            None
+        );
+    }
+
+    /// 验证可编辑文本框聚焦时不拦截滚动快捷键。
+    ///
+    /// 业务意图：
+    /// - 搜索框和设置文本框需要保留平台默认编辑导航；全局滚动逻辑只能在非编辑焦点下生效。
+    #[test]
+    fn 可编辑文本框聚焦时放行键盘滚动快捷键() {
+        let keystroke = Keystroke {
+            modifiers: Default::default(),
+            key: "pagedown".to_string(),
+            key_char: None,
+        };
+
+        assert_eq!(
+            MainView::keyboard_scroll_command_for_focus(&keystroke, false),
+            Some(KeyboardScrollCommand::PageDown)
+        );
+        assert_eq!(
+            MainView::keyboard_scroll_command_for_focus(&keystroke, true),
+            None
+        );
+    }
+
+    /// 验证键盘滚动目标未记录时默认回退到日志正文。
+    ///
+    /// 业务意图：
+    /// - 应用启动后用户可能直接按翻页键；此时没有鼠标进入记录，应按日志查看器默认工作流滚动当前日志正文。
+    #[test]
+    fn 键盘滚动目标默认日志正文且可切换() {
+        assert_eq!(
+            MainView::keyboard_scroll_region_or_default(None),
+            KeyboardScrollRegion::LogContent
+        );
+        assert_eq!(
+            MainView::keyboard_scroll_region_or_default(Some(KeyboardScrollRegion::SearchResults)),
+            KeyboardScrollRegion::SearchResults
+        );
+        assert_eq!(
+            MainView::keyboard_scroll_region_or_default(Some(KeyboardScrollRegion::LogTree)),
+            KeyboardScrollRegion::LogTree
+        );
+    }
+
+    /// 验证键盘翻页滚动位置按视口高度计算并限制在合法范围。
+    ///
+    /// 业务意图：
+    /// - 翻页距离应为“视口高度减一行”，保留上下文；顶底和边界位置必须 clamp，避免滚动条越界。
+    #[test]
+    fn 键盘滚动位置按页距计算并夹紧() {
+        let viewport_height = px(100.0);
+        let row_height = 20.0;
+
+        assert_eq!(
+            MainView::keyboard_scroll_position(
+                px(10.0),
+                px(200.0),
+                viewport_height,
+                row_height,
+                KeyboardScrollCommand::PageDown,
+            ),
+            Some(px(90.0))
+        );
+        assert_eq!(
+            MainView::keyboard_scroll_position(
+                px(10.0),
+                px(200.0),
+                viewport_height,
+                row_height,
+                KeyboardScrollCommand::PageUp,
+            ),
+            Some(px(0.0))
+        );
+        assert_eq!(
+            MainView::keyboard_scroll_position(
+                px(195.0),
+                px(200.0),
+                viewport_height,
+                row_height,
+                KeyboardScrollCommand::PageDown,
+            ),
+            Some(px(200.0))
+        );
+        assert_eq!(
+            MainView::keyboard_scroll_position(
+                px(80.0),
+                px(200.0),
+                viewport_height,
+                row_height,
+                KeyboardScrollCommand::Top,
+            ),
+            Some(px(0.0))
+        );
+        assert_eq!(
+            MainView::keyboard_scroll_position(
+                px(80.0),
+                px(200.0),
+                viewport_height,
+                row_height,
+                KeyboardScrollCommand::Bottom,
+            ),
+            Some(px(200.0))
+        );
+        assert_eq!(
+            MainView::keyboard_scroll_position(
+                px(0.0),
+                px(0.0),
+                viewport_height,
+                row_height,
+                KeyboardScrollCommand::PageDown,
+            ),
+            None
+        );
+    }
+
+    /// 验证分页日志的 f64 滚动计算和普通列表保持同一页距语义。
+    ///
+    /// 业务意图：
+    /// - 超大日志走分页路径后不能出现快捷键翻页幅度不同的问题；该测试锁定 `PagedLogScrollState.top_px` 的计算策略。
+    #[test]
+    fn 分页日志键盘滚动位置按_f64_逻辑夹紧() {
+        let next = MainView::keyboard_scroll_position_px(
+            50.0,
+            500.0,
+            px(120.0),
+            20.0,
+            KeyboardScrollCommand::PageDown,
+        );
+        assert_eq!(next, Some(150.0));
+
+        let top = MainView::keyboard_scroll_position_px(
+            50.0,
+            500.0,
+            px(120.0),
+            20.0,
+            KeyboardScrollCommand::Top,
+        );
+        assert_eq!(top, Some(0.0));
+
+        let bottom = MainView::keyboard_scroll_position_px(
+            50.0,
+            500.0,
+            px(120.0),
+            20.0,
+            KeyboardScrollCommand::Bottom,
+        );
+        assert_eq!(bottom, Some(500.0));
+
+        assert_eq!(
+            MainView::keyboard_scroll_position_px(
+                0.0,
+                0.0,
+                px(120.0),
+                20.0,
+                KeyboardScrollCommand::PageDown,
+            ),
+            None
+        );
     }
 
     /// 验证搜索关键字历史按最近使用排序并限制数量。

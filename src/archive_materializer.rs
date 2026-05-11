@@ -1,13 +1,13 @@
 //! 压缩包成员流式物化模块。
 //!
 //! 业务意图：
-//! - 超大日志如果位于 ZIP/RAR/TAR.GZ/7Z 内部，不能先完整读入 `Vec<u8>` 再解码或搜索。
+//! - 超大日志如果位于 ZIP/RAR/TAR.GZ/GZ/7Z 内部，不能先完整读入 `Vec<u8>` 再解码或搜索。
 //! - 本模块把用户选中的压缩包成员用固定缓冲区写入应用临时目录，再复用本地分页日志管线。
 //! - 临时文件路径只在当前 tab 生命周期内有效，关闭 tab、重新加载或应用启动清理时会删除。
 //!
 //! 关键约束：
 //! - 所有压缩包内部路径必须先经过安全归一化，避免 `../`、绝对路径或盘符路径影响临时目录。
-//! - ZIP、TAR.GZ、7Z 使用 reader 到 writer 的流式复制；RAR 受 `unrar` API 限制，使用库提供的 `extract_to` 直接写入目标文件。
+//! - ZIP、TAR.GZ、GZ、7Z 使用 reader 到 writer 的流式复制；RAR 受 `unrar` API 限制，使用库提供的 `extract_to` 直接写入目标文件。
 //! - 加密、损坏、权限不足、磁盘空间不足等错误会转成中文 `LogContentError`，不会回退到内存读取。
 
 use std::{
@@ -268,6 +268,7 @@ fn materialize_archive_member(
         ArchiveFormat::Rar => materialize_rar_member(archive_path, member_path, &temp_path)?,
         ArchiveFormat::Tar => materialize_tar_member(archive_path, member_path, &temp_path)?,
         ArchiveFormat::TarGz => materialize_tar_gz_member(archive_path, member_path, &temp_path)?,
+        ArchiveFormat::Gzip => materialize_gzip_member(archive_path, member_path, &temp_path)?,
         ArchiveFormat::SevenZ => materialize_7z_member(archive_path, member_path, &temp_path)?,
     }
 
@@ -532,11 +533,31 @@ fn materialize_tar_gz_member(
     )))
 }
 
+/// 物化 GZIP 压缩日志的唯一虚拟成员。
+///
+/// 业务意图：
+/// - `.gz` 只有一个压缩日志流，分页模式需要把解压后的内容写成可 seek 的临时文件。
+/// - 成员路径必须是加载层生成的虚拟路径，避免把普通归档成员名误用到单文件 gzip。
+fn materialize_gzip_member(
+    archive_path: &Path,
+    member_path: &str,
+    temp_path: &Path,
+) -> Result<(), LogContentError> {
+    if is_single_gzip_member_path(member_path) {
+        return materialize_single_gzip_payload(archive_path, member_path, temp_path);
+    }
+
+    Err(LogContentError::new(format!(
+        "GZIP 日志中未找到虚拟成员：{}",
+        member_path
+    )))
+}
+
 /// 将“单个 gzip 日志”流式物化到分页临时文件。
 ///
 /// 业务意图：
-/// - 超过分页阈值的 `.tar.gz` 单 gzip 日志不能先完整读入内存，需要直接解压到临时文件再复用分页索引。
-/// - 该路径和普通 TAR.GZ 成员物化共用同一个目标文件生命周期，tab 关闭或重新加载时由上层清理。
+/// - 超过分页阈值的 `.gz` 或 `.tar.gz` 单 gzip 日志不能先完整读入内存，需要直接解压到临时文件再复用分页索引。
+/// - 该路径和普通压缩包成员物化共用同一个目标文件生命周期，tab 关闭或重新加载时由上层清理。
 fn materialize_single_gzip_payload(
     archive_path: &Path,
     member_path: &str,

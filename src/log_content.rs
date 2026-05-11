@@ -394,7 +394,7 @@ fn write_temporary_nested_archive_bytes(
 ///
 /// 业务意图：
 /// - 左侧树可能来自目录或外层压缩包，里面的 `thread_xxx.zip` 这类条目会被加载层当作普通文件节点展示。
-/// - 点击这种文件时不能把 ZIP/RAR/7Z 二进制直接交给编码检测，而应该先按压缩包规则读取其内部唯一文件。
+/// - 点击这种文件时不能把 ZIP/RAR/GZ/7Z 二进制直接交给编码检测，而应该先按压缩包规则读取其内部唯一文件。
 ///
 /// 边界条件：
 /// - 这里只根据文件名扩展名判断格式，和加载层 `ArchiveFormat::from_path` 保持一致。
@@ -482,6 +482,7 @@ fn read_archive_member(
         ArchiveFormat::Rar => read_rar_member(archive_path, member_path),
         ArchiveFormat::Tar => read_tar_member(archive_path, member_path),
         ArchiveFormat::TarGz => read_tar_gz_member(archive_path, member_path),
+        ArchiveFormat::Gzip => read_gzip_member(archive_path, member_path),
         ArchiveFormat::SevenZ => read_7z_member(archive_path, member_path),
     }
 }
@@ -492,7 +493,7 @@ fn read_archive_member(
 /// - 外层压缩包里的多文件内层压缩包在左侧树中会展开为目录，点击内层文件时需要按“内存中的内层压缩包 + 内层成员路径”读取。
 ///
 /// 边界条件：
-/// - ZIP、TAR.GZ 和 7Z 可以基于内存 reader 读取；RAR 需要文件路径，当前返回清晰错误。
+/// - ZIP、TAR.GZ、GZ 和 7Z 可以基于内存 reader 读取；RAR 需要文件路径，当前返回清晰错误。
 fn read_archive_member_from_bytes(
     archive_bytes: &[u8],
     archive_format: ArchiveFormat,
@@ -504,6 +505,7 @@ fn read_archive_member_from_bytes(
         ArchiveFormat::Zip => read_zip_member_from_bytes(archive_bytes, member_path, label),
         ArchiveFormat::Tar => read_tar_member_from_bytes(archive_bytes, member_path, label),
         ArchiveFormat::TarGz => read_tar_gz_member_from_bytes(archive_bytes, member_path, label),
+        ArchiveFormat::Gzip => read_gzip_member_from_bytes(archive_bytes, member_path, label),
         ArchiveFormat::SevenZ => read_7z_member_from_bytes(archive_bytes, member_path, label),
         ArchiveFormat::Rar => Err(LogContentError::new(format!(
             "嵌套 RAR {} 暂不支持直接从内存读取，请先选择外层解包后的 RAR 文件",
@@ -515,7 +517,7 @@ fn read_archive_member_from_bytes(
 /// 从本地压缩包文件中读取唯一的普通文件成员。
 ///
 /// 业务意图：
-/// - 用户可能在已加载目录树中直接点击 `.zip`、`.rar`、`.tar.gz` 或 `.7z` 文件。
+/// - 用户可能在已加载目录树中直接点击 `.zip`、`.rar`、`.tar.gz`、`.gz` 或 `.7z` 文件。
 /// - 如果该压缩包内部只有一个文件，直接打开这个文件可以减少一次展开和选择操作。
 ///
 /// 边界条件：
@@ -543,7 +545,7 @@ fn read_single_file_archive_from_path(
 /// - 这里直接基于外层成员的原始字节构造 reader，若内层只有一个文件，就继续读取该文件字节交给编码检测。
 ///
 /// 边界条件：
-/// - ZIP、TAR.GZ 和 7Z 支持从内存 reader 读取；RAR 当前 `unrar` API 需要路径，嵌套 RAR 暂时返回清晰错误。
+/// - ZIP、TAR.GZ、GZ 和 7Z 支持从内存 reader 读取；RAR 当前 `unrar` API 需要路径，嵌套 RAR 暂时返回清晰错误。
 fn read_single_file_archive_from_bytes(
     archive_bytes: &[u8],
     archive_format: ArchiveFormat,
@@ -555,6 +557,7 @@ fn read_single_file_archive_from_bytes(
         ArchiveFormat::Zip => read_single_file_zip_from_bytes(archive_bytes, label),
         ArchiveFormat::Tar => read_single_file_tar_from_bytes(archive_bytes, label),
         ArchiveFormat::TarGz => read_single_file_tar_gz_from_bytes(archive_bytes, label),
+        ArchiveFormat::Gzip => read_single_gzip_payload_from_bytes(archive_bytes, label),
         ArchiveFormat::SevenZ => read_single_file_7z_from_bytes(archive_bytes, label),
         ArchiveFormat::Rar => Err(LogContentError::new(format!(
             "{} {} 暂不支持直接从内存读取 RAR，请先选择外层解包后的 RAR 文件",
@@ -577,6 +580,7 @@ pub(crate) fn single_file_archive_member_path_from_path(
         ArchiveFormat::Rar => single_file_rar_member_path(archive_path, label),
         ArchiveFormat::Tar => single_file_tar_member_path(archive_path, label),
         ArchiveFormat::TarGz => single_file_tar_gz_member_path(archive_path, label),
+        ArchiveFormat::Gzip => single_file_gzip_member_path(archive_path, label),
         ArchiveFormat::SevenZ => single_file_7z_member_path(archive_path, label),
     }
 }
@@ -758,6 +762,28 @@ fn single_file_tar_gz_member_path(
     }
 
     require_single_archive_member(single_member, label)
+}
+
+/// 从 GZIP 文件中返回唯一虚拟成员路径。
+///
+/// 业务意图：
+/// - `.gz` 只包含一个压缩后的日志流，没有真实目录；为了复用压缩包成员读取、tab 去重和分页物化，需要生成稳定虚拟成员路径。
+/// - 这里先探测 gzip 层可读性，避免把损坏文件伪装成日志文本。
+///
+/// 边界条件：
+/// - 空 gzip 文件可以作为空日志打开；只要解码器没有返回错误，就认为压缩层有效。
+fn single_file_gzip_member_path(
+    archive_path: &Path,
+    label: &str,
+) -> Result<String, LogContentError> {
+    if single_gzip_payload_is_readable_from_path(archive_path) {
+        return Ok(single_gzip_member_path_for_archive(archive_path));
+    }
+
+    Err(LogContentError::new(format!(
+        "无法读取 GZIP 日志 {}：文件不是有效 gzip 内容或已损坏",
+        label
+    )))
 }
 
 /// 从 7Z 文件目录中找出唯一普通文件成员路径。
@@ -1206,6 +1232,22 @@ fn read_tar_gz_member(archive_path: &Path, member_path: &str) -> Result<Vec<u8>,
     )))
 }
 
+/// 从 GZIP 压缩日志中读取唯一虚拟成员。
+///
+/// 业务意图：
+/// - GZIP 不是多文件归档，目录树中的内部文件节点是应用生成的虚拟成员。
+/// - 明确校验虚拟成员前缀可以避免调用方把任意路径误当成 gzip 内部文件读取。
+fn read_gzip_member(archive_path: &Path, member_path: &str) -> Result<Vec<u8>, LogContentError> {
+    if is_single_gzip_member_path(member_path) {
+        return read_single_gzip_payload_from_path(archive_path, member_path);
+    }
+
+    Err(LogContentError::new(format!(
+        "GZIP 日志中未找到虚拟成员：{}",
+        member_path
+    )))
+}
+
 /// 从 7Z 压缩包中读取成员。
 ///
 /// 边界条件：
@@ -1354,10 +1396,30 @@ fn read_tar_gz_member_from_bytes(
     )))
 }
 
-/// 从本地 `.tar.gz` 文件中按“单个 gzip 日志”读取解压内容。
+/// 从内存 GZIP 字节中读取唯一虚拟成员。
 ///
 /// 业务意图：
-/// - 兼容扩展名是 `.tar.gz`，但实际没有 tar 目录、只包含一个 gzip 日志流的文件。
+/// - 外层压缩包或嵌套压缩包中的 `.gz` 成员会先被读取成字节，再在这里解压成日志正文。
+/// - 成员路径必须是加载层生成的虚拟路径，避免把多文件归档成员路径错误套用到单文件 gzip。
+fn read_gzip_member_from_bytes(
+    archive_bytes: &[u8],
+    member_path: &str,
+    label: &str,
+) -> Result<Vec<u8>, LogContentError> {
+    if is_single_gzip_member_path(member_path) {
+        return read_single_gzip_payload_from_bytes(archive_bytes, member_path);
+    }
+
+    Err(LogContentError::new(format!(
+        "嵌套 GZIP {} 中未找到虚拟成员：{}",
+        label, member_path
+    )))
+}
+
+/// 从本地 gzip 文件中按“单个 gzip 日志”读取解压内容。
+///
+/// 业务意图：
+/// - 兼容标准 `.gz` 日志，以及扩展名是 `.tar.gz` 但实际没有 tar 目录、只包含一个 gzip 日志流的文件。
 /// - 读取结果仍受 200MB 内存模式上限保护；超过阈值的文件会在分页路径中走物化读取。
 fn read_single_gzip_payload_from_path(
     archive_path: &Path,
@@ -1378,7 +1440,7 @@ fn read_single_gzip_payload_from_path(
 /// 从内存字节中按“单个 gzip 日志”读取解压内容。
 ///
 /// 业务意图：
-/// - 外层压缩包内可能包含单文件 gzip 日志并使用 `.tar.gz` 命名；该路径不能依赖本地文件 seek。
+/// - 外层压缩包内可能包含单文件 gzip 日志并使用 `.gz` 或 `.tar.gz` 命名；该路径不能依赖本地文件 seek。
 /// - 使用 `Cursor` 保持读取逻辑纯内存、无临时文件副作用。
 fn read_single_gzip_payload_from_bytes(
     archive_bytes: &[u8],
@@ -1396,7 +1458,7 @@ fn read_single_gzip_payload_from_bytes(
 /// 判断本地 gzip 层是否可以开始解压。
 ///
 /// 业务意图：
-/// - 单文件 gzip fallback 只应处理“gzip 有效但不是 tar”的文件，不能把损坏压缩包误判为普通日志。
+/// - 单文件 gzip 只应处理“gzip 有效”的文件，不能把损坏压缩包误判为普通日志。
 fn single_gzip_payload_is_readable_from_path(path: &Path) -> bool {
     let Ok(file) = File::open(path) else {
         return false;
@@ -1919,6 +1981,73 @@ mod tests {
         Ok(())
     }
 
+    /// 验证标准 `.gz` 日志文件可以直接读取解压后的原始字节。
+    ///
+    /// 业务意图：
+    /// - 用户直接打开 `app.log.gz` 时应看到解压后的日志文本，而不是 gzip 二进制内容。
+    /// - 该路径走一等 `ArchiveFormat::Gzip`，覆盖本地文件和目录树单文件快捷打开场景。
+    #[test]
+    fn 读取_gz_本地压缩日志原始字节() -> Result<(), Box<dyn Error>> {
+        let temp_dir = unique_temp_dir("logclinic3-gzip-content-test")?;
+        let archive_path = temp_dir.join("app.log.gz");
+        write_test_gzip(&archive_path, b"INFO gzip log")?;
+
+        let bytes = read_log_source_bytes(&LogFileSource::LocalFile {
+            path: archive_path.clone(),
+        })?;
+
+        assert_eq!(&bytes[..], b"INFO gzip log");
+        fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    /// 验证压缩包内部 `.gz` 成员会继续解压为日志正文。
+    ///
+    /// 业务意图：
+    /// - 用户加载 ZIP/RAR/TAR/7Z 等外层包时，内部的 `*.gz` 不应作为二进制文件显示。
+    /// - 点击外层包里的 `.gz` 文件节点时，读取链路会先取出 gzip 字节，再按单文件压缩日志解压。
+    #[test]
+    fn 读取_zip_压缩包内_gz_成员原始字节() -> Result<(), Box<dyn Error>> {
+        let temp_dir = unique_temp_dir("logclinic3-nested-gzip-content-test")?;
+        let archive_path = temp_dir.join("outer.zip");
+        let archive_file = File::create(&archive_path)?;
+        let mut zip_writer = zip::ZipWriter::new(archive_file);
+
+        zip_writer.start_file("logs/app.log.gz", zip::write::SimpleFileOptions::default())?;
+        zip_writer.write_all(&gzip_test_bytes(b"INFO gzip in zip")?)?;
+        zip_writer.finish()?;
+
+        let bytes = read_log_source_bytes(&LogFileSource::ArchiveMember {
+            archive_path: archive_path.clone(),
+            archive_format: ArchiveFormat::Zip,
+            member_path: "logs/app.log.gz".to_string(),
+        })?;
+
+        assert_eq!(&bytes[..], b"INFO gzip in zip");
+        fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    /// 验证损坏 `.gz` 会返回压缩读取错误。
+    ///
+    /// 业务意图：
+    /// - 损坏 gzip 文件不能被当作普通日志文本读取，否则 UI 会显示乱码并误导用户切换编码。
+    #[test]
+    fn 读取损坏_gz_返回错误() -> Result<(), Box<dyn Error>> {
+        let temp_dir = unique_temp_dir("logclinic3-bad-gzip-content-test")?;
+        let archive_path = temp_dir.join("bad.log.gz");
+        fs::write(&archive_path, b"not a gzip stream")?;
+
+        let error = read_log_source_bytes(&LogFileSource::LocalFile {
+            path: archive_path.clone(),
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("GZIP"));
+        fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
     /// 验证扩展名误写为 `.tar.gz` 的纯 tar 文件会按真实 TAR 内容读取。
     ///
     /// 业务意图：
@@ -2116,5 +2245,16 @@ mod tests {
         encoder.write_all(bytes)?;
         encoder.finish()?;
         Ok(())
+    }
+
+    /// 生成测试用 gzip 字节。
+    ///
+    /// 业务意图：
+    /// - 压缩包内 `.gz` 成员测试需要把 gzip 流直接写入外层 ZIP，不经过临时文件。
+    /// - 使用真实 `flate2` 编码器覆盖生产读取路径，避免手写固定字节导致测试和库行为脱节。
+    fn gzip_test_bytes(bytes: &[u8]) -> io::Result<Vec<u8>> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(bytes)?;
+        encoder.finish()
     }
 }

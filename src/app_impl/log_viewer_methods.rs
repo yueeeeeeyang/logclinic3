@@ -228,9 +228,21 @@ impl MainView {
                 .flex_1()
                 .overflow_hidden()
                 .bg(rgb(palette.background))
+                .on_mouse_move(context.listener(
+                    |view, _event: &MouseMoveEvent, _window, _context| {
+                        view.note_keyboard_scroll_region(KeyboardScrollRegion::LogContent);
+                    },
+                ))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    context.listener(|view, _event: &MouseDownEvent, _window, _context| {
+                        view.note_keyboard_scroll_region(KeyboardScrollRegion::LogContent);
+                    }),
+                )
                 .on_mouse_down(
                     MouseButton::Right,
                     context.listener(move |view, event: &MouseDownEvent, _window, context| {
+                        view.note_keyboard_scroll_region(KeyboardScrollRegion::LogContent);
                         view.open_log_viewer_context_menu(
                             tab_id,
                             f32::from(event.position.x),
@@ -528,13 +540,26 @@ impl MainView {
                 .track_scroll(&viewport_handle)
                 .on_scroll_wheel(context.listener(
                     move |view, event: &ScrollWheelEvent, _window, context| {
+                        view.note_keyboard_scroll_region(KeyboardScrollRegion::LogContent);
                         view.handle_paged_log_scroll_wheel(tab_id, event, context);
                         context.stop_propagation();
                     },
                 ))
+                .on_mouse_move(context.listener(
+                    |view, _event: &MouseMoveEvent, _window, _context| {
+                        view.note_keyboard_scroll_region(KeyboardScrollRegion::LogContent);
+                    },
+                ))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    context.listener(|view, _event: &MouseDownEvent, _window, _context| {
+                        view.note_keyboard_scroll_region(KeyboardScrollRegion::LogContent);
+                    }),
+                )
                 .on_mouse_down(
                     MouseButton::Right,
                     context.listener(move |view, event: &MouseDownEvent, _window, context| {
+                        view.note_keyboard_scroll_region(KeyboardScrollRegion::LogContent);
                         view.open_log_viewer_context_menu(
                             tab_id,
                             f32::from(event.position.x),
@@ -1144,6 +1169,7 @@ impl MainView {
         event: &MouseDownEvent,
         context: &mut Context<Self>,
     ) {
+        self.note_keyboard_scroll_region(KeyboardScrollRegion::LogContent);
         let Some(tab) = self.open_tabs.iter().find(|tab| tab.id == tab_id) else {
             return;
         };
@@ -1303,6 +1329,7 @@ impl MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
+        self.note_keyboard_scroll_region(KeyboardScrollRegion::LogContent);
         if self.search_results_resize_drag.is_some() || self.log_scrollbar_drag.is_some() {
             return;
         }

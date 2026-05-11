@@ -27,7 +27,7 @@ const ABOUT_AUTHOR_EMAIL: &str = "yueyang.cao@163.com";
 const ABOUT_FEATURE_GUIDES: &[FeatureGuide] = &[
     FeatureGuide {
         title: "加载任意日志、目录、压缩包",
-        guide: "点击“加载日志”或直接拖入文件、目录、ZIP/RAR/7Z/TAR.GZ 压缩包，左侧目录树会自动展开可读取日志。",
+        guide: "点击“加载日志”或直接拖入文件、目录、ZIP/RAR/7Z/TAR.GZ/GZ 压缩包，左侧目录树会自动展开可读取日志。",
     },
     FeatureGuide {
         title: "大日志正常打开",

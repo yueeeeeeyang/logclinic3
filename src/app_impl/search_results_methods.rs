@@ -34,9 +34,21 @@ impl MainView {
             .border_color(rgb(palette.border))
             .bg(rgb(palette.surface))
             .shadow_lg()
+            .on_mouse_move(
+                context.listener(|view, _event: &MouseMoveEvent, _window, _context| {
+                    view.note_keyboard_scroll_region(KeyboardScrollRegion::SearchResults);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|view, _event: &MouseDownEvent, _window, _context| {
+                    view.note_keyboard_scroll_region(KeyboardScrollRegion::SearchResults);
+                }),
+            )
             .on_mouse_down(
                 MouseButton::Right,
                 context.listener(|view, event: &MouseDownEvent, _window, context| {
+                    view.note_keyboard_scroll_region(KeyboardScrollRegion::SearchResults);
                     view.open_search_results_context_menu(
                         f32::from(event.position.x),
                         f32::from(event.position.y),

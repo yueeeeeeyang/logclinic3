@@ -2721,6 +2721,38 @@ enum SearchDialogControlKey {
     Close,
 }
 
+/// 键盘滚动快捷键的目标区域。
+///
+/// 业务意图：
+/// - 日志正文、搜索结果和左侧目录树都有独立滚动上下文，键盘滚动必须知道用户最近关注的是哪一块。
+/// - 该枚举只记录主窗口内的只读滚动区域；搜索框、设置文本框等可编辑控件聚焦时会直接放行按键。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyboardScrollRegion {
+    /// 右侧当前日志正文区域。
+    LogContent,
+    /// 右侧底部搜索结果面板。
+    SearchResults,
+    /// 左侧日志目录树。
+    LogTree,
+}
+
+/// 键盘滚动命令。
+///
+/// 业务意图：
+/// - 把平台按键字符串转换为有限命令后，滚动计算和 UI 事件处理都可以复用同一套逻辑。
+/// - 本次只支持垂直滚动，不改变横向滚动、日志选区或目录树展开规则。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyboardScrollCommand {
+    /// 向上滚动一页。
+    PageUp,
+    /// 向下滚动一页。
+    PageDown,
+    /// 滚动到顶部，对应 `Ctrl+Home`。
+    Top,
+    /// 滚动到底部，对应 `Ctrl+End`。
+    Bottom,
+}
+
 /// 搜索对话框的交互状态。
 ///
 /// 业务意图：
@@ -3250,7 +3282,7 @@ impl LoadPromptKind {
     ///
     /// 业务意图：
     /// - `files` 和 `directories` 同时开启，让 macOS 能像常见桌面工具一样在一次对话框里选择文件或目录。
-    /// - Windows 和部分 Linux 后端不支持文件、目录混选，此时优先显示文件，保证 ZIP/RAR/7Z/TAR.GZ 等压缩包可直接选择。
+    /// - Windows 和部分 Linux 后端不支持文件、目录混选，此时优先显示文件，保证 ZIP/RAR/7Z/TAR.GZ/GZ 等压缩包可直接选择。
     /// - `multiple` 保持为 `true`，允许用户一次加载多个文件、目录或压缩包来源。
     ///
     /// 边界条件：
@@ -3347,6 +3379,17 @@ struct MainView {
     /// - 导航栏只显示图标，入口名称通过自绘气泡展示；该字段只保存 hover 期间的临时 UI 状态。
     /// - 鼠标离开图标后立即清空，避免气泡长期遮挡日志目录树或 HPROF 表格。
     hovered_navigation_item: Option<MainNavigationItem>,
+
+    /// 最近一次鼠标所在或点击的键盘滚动区域。
+    ///
+    /// 业务意图：
+    /// - `PageUp`、`PageDown`、`Ctrl+Home` 和 `Ctrl+End` 应作用于用户正在看的区域，而不是固定滚动日志正文。
+    /// - 鼠标移动和点击都会刷新该字段；如果本会话还没有记录，则回退到日志正文，保持老版本快捷键直觉。
+    ///
+    /// 边界条件：
+    /// - 该状态不驱动任何视觉样式，因此更新时不需要触发重绘。
+    /// - 设置窗口和搜索输入框聚焦时不会读取该状态，避免全局滚动抢走编辑控件的按键。
+    keyboard_scroll_region: Option<KeyboardScrollRegion>,
 
     /// 左侧日志目录树当前的数据状态。
     ///
@@ -3867,6 +3910,7 @@ impl MainView {
             is_resizing_splitter: false,
             active_main_feature: MainFeature::default(),
             hovered_navigation_item: None,
+            keyboard_scroll_region: None,
             load_state: LogTreeLoadState::Empty,
             log_tree_scroll_handle: UniformListScrollHandle::new(),
             log_tree_selected_node_ids: HashSet::new(),
@@ -5785,6 +5829,7 @@ impl MainView {
         keystroke: Keystroke,
         window: &mut Window,
         context: &mut Context<Self>,
+        allow_keyboard_scroll: bool,
     ) -> bool {
         let editable_text_input_focused = self.editable_text_input_focused(window);
         if editable_text_input_focused
@@ -5816,6 +5861,13 @@ impl MainView {
             return true;
         }
 
+        if allow_keyboard_scroll
+            && let Some(command) =
+                Self::keyboard_scroll_command_for_focus(&keystroke, editable_text_input_focused)
+        {
+            return self.handle_keyboard_scroll(command, context);
+        }
+
         false
     }
 
@@ -5831,7 +5883,7 @@ impl MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
-        if self.handle_global_keystroke(event.keystroke.clone(), window, context) {
+        if self.handle_global_keystroke(event.keystroke.clone(), window, context, true) {
             context.stop_propagation();
             context.notify();
         }
@@ -5939,6 +5991,383 @@ impl MainView {
             "enter" => Some(SearchDialogControlKey::Submit),
             "escape" => Some(SearchDialogControlKey::Close),
             _ => None,
+        }
+    }
+
+    /// 在鼠标进入或点击滚动区域时记录键盘滚动目标。
+    ///
+    /// 业务意图：
+    /// - 用户可能先把鼠标移到搜索结果或目录树，再按 `PageDown`；此时滚动应落在鼠标关注的区域。
+    /// - 该方法只更新内部路由状态，不触发重绘，避免高频 `mouse_move` 导致无意义刷新。
+    fn note_keyboard_scroll_region(&mut self, region: KeyboardScrollRegion) {
+        self.keyboard_scroll_region = Some(region);
+    }
+
+    /// 返回当前键盘滚动目标，未记录时默认使用日志正文。
+    ///
+    /// 边界条件：
+    /// - 启动后还没有鼠标进入任何滚动区时，默认日志正文可以保持日志查看器最常见的使用路径。
+    fn keyboard_scroll_region_or_default(
+        region: Option<KeyboardScrollRegion>,
+    ) -> KeyboardScrollRegion {
+        region.unwrap_or(KeyboardScrollRegion::LogContent)
+    }
+
+    /// 根据焦点状态解析键盘滚动命令。
+    ///
+    /// 业务意图：
+    /// - 可编辑文本框聚焦时，`PageUp`、`PageDown`、`Ctrl+Home` 和 `Ctrl+End` 属于编辑控件自己的导航行为，
+    ///   主窗口不能拦截，否则会破坏搜索框、设置文本框和平台输入法体验。
+    fn keyboard_scroll_command_for_focus(
+        keystroke: &Keystroke,
+        editable_text_input_focused: bool,
+    ) -> Option<KeyboardScrollCommand> {
+        if editable_text_input_focused {
+            return None;
+        }
+
+        Self::keyboard_scroll_command(keystroke)
+    }
+
+    /// 解析主窗口支持的键盘滚动快捷键。
+    ///
+    /// 业务意图：
+    /// - `PageUp` 和 `PageDown` 使用裸按键，符合日志查看器中的滚动习惯。
+    /// - 顶部和底部跳转只接受用户明确要求的 `Ctrl+Home` / `Ctrl+End`，不识别 `Ctrl+Top`。
+    ///
+    /// 跨平台约束：
+    /// - GPUI 在不同系统或键盘路径下可能把按键名写成 `pageup`、`page_up` 或包含大小写差异，因此先做轻量规范化。
+    /// - `Home` / `End` 只要求 Control 修饰键，不把 macOS Command 键混入，避免和平台级文本导航语义冲突。
+    fn keyboard_scroll_command(keystroke: &Keystroke) -> Option<KeyboardScrollCommand> {
+        let key = Self::normalized_keyboard_key(&keystroke.key);
+        let key_char = keystroke
+            .key_char
+            .as_deref()
+            .map(Self::normalized_keyboard_key);
+        let matches_key = |expected: &str| {
+            key == expected || key_char.as_deref().is_some_and(|value| value == expected)
+        };
+
+        if !keystroke.modifiers.control && !keystroke.modifiers.platform && !keystroke.modifiers.alt
+        {
+            if matches_key("pageup") {
+                return Some(KeyboardScrollCommand::PageUp);
+            }
+            if matches_key("pagedown") {
+                return Some(KeyboardScrollCommand::PageDown);
+            }
+        }
+
+        if keystroke.modifiers.control && !keystroke.modifiers.platform && !keystroke.modifiers.alt
+        {
+            if matches_key("home") {
+                return Some(KeyboardScrollCommand::Top);
+            }
+            if matches_key("end") {
+                return Some(KeyboardScrollCommand::Bottom);
+            }
+        }
+
+        None
+    }
+
+    /// 规范化 GPUI 按键名称。
+    ///
+    /// 业务意图：
+    /// - 键盘滚动只关心少数功能键，去掉空格、下划线和短横线可以兼容 `PageUp` / `page_up` / `page-up` 等常见写法。
+    fn normalized_keyboard_key(key: &str) -> String {
+        key.chars()
+            .filter(|character| {
+                !character.is_ascii_whitespace() && *character != '_' && *character != '-'
+            })
+            .flat_map(|character| character.to_lowercase())
+            .collect()
+    }
+
+    /// 执行当前目标区域的键盘滚动命令。
+    ///
+    /// 业务意图：
+    /// - 全局按键处理只负责命令分发，具体滚动仍写入各区域已有滚动句柄，避免为键盘路径维护第二套状态。
+    /// - 只有目标区域真实可滚动时才消费事件；例如搜索结果未打开或目录树内容不足时，按键继续交给默认路径。
+    fn handle_keyboard_scroll(
+        &mut self,
+        command: KeyboardScrollCommand,
+        context: &mut Context<Self>,
+    ) -> bool {
+        let handled = match Self::keyboard_scroll_region_or_default(self.keyboard_scroll_region) {
+            KeyboardScrollRegion::LogContent => self.scroll_log_content_by_keyboard(command),
+            KeyboardScrollRegion::SearchResults => self.scroll_search_results_by_keyboard(command),
+            KeyboardScrollRegion::LogTree => self.scroll_log_tree_by_keyboard(command),
+        };
+
+        if handled {
+            context.notify();
+        }
+
+        handled
+    }
+
+    /// 按键盘命令滚动当前日志正文。
+    ///
+    /// 业务意图：
+    /// - 内存日志继续使用 `UniformListScrollHandle`，分页日志写入 `PagedLogScrollState.top_px`。
+    /// - 两种模式共享同一套页距计算，保证用户切换大文件分页路径后快捷键手感一致。
+    fn scroll_log_content_by_keyboard(&mut self, command: KeyboardScrollCommand) -> bool {
+        let Some(active_tab_id) = self.active_tab_id else {
+            return false;
+        };
+        let Some(tab_index) = self
+            .open_tabs
+            .iter()
+            .position(|tab| tab.id == active_tab_id)
+        else {
+            return false;
+        };
+
+        match &self.open_tabs[tab_index].state {
+            LogTabState::Ready {
+                document: LogTabDocument::InMemory(_),
+            } => {
+                let Some(metrics) =
+                    Self::log_vertical_scrollbar_metrics(&self.open_tabs[tab_index].scroll_handle)
+                else {
+                    return false;
+                };
+                let Some(viewport_height) = Self::uniform_list_vertical_viewport_height(
+                    &self.open_tabs[tab_index].scroll_handle,
+                ) else {
+                    return false;
+                };
+                Self::scroll_uniform_list_vertically_by_keyboard(
+                    &self.open_tabs[tab_index].scroll_handle,
+                    metrics.max_scroll,
+                    viewport_height,
+                    LOG_VIEWER_ROW_HEIGHT,
+                    command,
+                )
+            }
+            LogTabState::Ready {
+                document: LogTabDocument::Paged(document),
+            } => {
+                let viewport_height = self.open_tabs[tab_index]
+                    .paged_viewport_handle
+                    .bounds()
+                    .size
+                    .height;
+                if viewport_height <= px(0.0) {
+                    return false;
+                }
+
+                let max_scroll =
+                    Self::paged_log_vertical_max_scroll_px(document.line_count(), viewport_height);
+                let Some(next_top) = Self::keyboard_scroll_position_px(
+                    self.open_tabs[tab_index].paged_scroll.top_px,
+                    max_scroll,
+                    viewport_height,
+                    LOG_VIEWER_ROW_HEIGHT,
+                    command,
+                ) else {
+                    return false;
+                };
+
+                self.open_tabs[tab_index].paged_scroll.top_px = next_top;
+                true
+            }
+            LogTabState::Loading { .. } | LogTabState::Failed { .. } => false,
+        }
+    }
+
+    /// 按键盘命令滚动搜索结果面板。
+    ///
+    /// 边界条件：
+    /// - 面板关闭、结果不足一屏或首帧尚未完成滚动测量时不消费快捷键，避免用户按键后没有任何可见反馈。
+    fn scroll_search_results_by_keyboard(&mut self, command: KeyboardScrollCommand) -> bool {
+        let Some(panel) = self.search_results_panel.as_ref() else {
+            return false;
+        };
+        let Some(metrics) = Self::search_results_scrollbar_metrics(&panel.scroll_handle) else {
+            return false;
+        };
+        let Some(viewport_height) =
+            Self::uniform_list_vertical_viewport_height(&panel.scroll_handle)
+        else {
+            return false;
+        };
+
+        Self::scroll_uniform_list_vertically_by_keyboard(
+            &panel.scroll_handle,
+            metrics.max_scroll,
+            viewport_height,
+            SEARCH_RESULT_ROW_HEIGHT,
+            command,
+        )
+    }
+
+    /// 按键盘命令滚动左侧目录树。
+    ///
+    /// 边界条件：
+    /// - 只有真实内容高度超过视口时才滚动；临时 fallback 滚动条的 `max_scroll` 为 0，不会误消费快捷键。
+    fn scroll_log_tree_by_keyboard(&mut self, command: KeyboardScrollCommand) -> bool {
+        let Some(metrics) = Self::log_tree_scrollbar_metrics(&self.log_tree_scroll_handle) else {
+            return false;
+        };
+        let Some(viewport_height) =
+            Self::uniform_list_vertical_viewport_height(&self.log_tree_scroll_handle)
+        else {
+            return false;
+        };
+
+        Self::scroll_uniform_list_vertically_by_keyboard(
+            &self.log_tree_scroll_handle,
+            metrics.max_scroll,
+            viewport_height,
+            LOG_TREE_ROW_HEIGHT,
+            command,
+        )
+    }
+
+    /// 使用现有虚拟列表句柄执行一次纵向键盘滚动。
+    ///
+    /// 业务意图：
+    /// - 日志正文、搜索结果和目录树都使用 `UniformListScrollHandle`，统一写入底层 `ScrollHandle` 可以保证滚轮、
+    ///   自绘滚动条和键盘滚动共享同一个偏移来源。
+    fn scroll_uniform_list_vertically_by_keyboard(
+        scroll_handle: &UniformListScrollHandle,
+        max_scroll: Pixels,
+        viewport_height: Pixels,
+        row_height: f32,
+        command: KeyboardScrollCommand,
+    ) -> bool {
+        let current_top = Self::uniform_list_vertical_scroll_top(scroll_handle, max_scroll);
+        let Some(next_top) = Self::keyboard_scroll_position(
+            current_top,
+            max_scroll,
+            viewport_height,
+            row_height,
+            command,
+        ) else {
+            return false;
+        };
+
+        Self::set_uniform_list_vertical_scroll_top(scroll_handle, next_top);
+        true
+    }
+
+    /// 读取虚拟列表当前纵向滚动位置。
+    ///
+    /// 边界条件：
+    /// - GPUI 底层偏移使用负数表示向下滚动，这里统一转换成业务侧非负 `scroll_top` 并夹在合法范围内。
+    fn uniform_list_vertical_scroll_top(
+        scroll_handle: &UniformListScrollHandle,
+        max_scroll: Pixels,
+    ) -> Pixels {
+        let state = scroll_handle.0.borrow();
+        (-state.base_handle.offset().y).clamp(px(0.0), max_scroll)
+    }
+
+    /// 读取虚拟列表可见视口高度。
+    ///
+    /// 业务意图：
+    /// - `PageUp` / `PageDown` 的滚动距离要按真实视口高度计算，不能写死固定行数，否则用户调整窗口或面板高度后手感会失真。
+    fn uniform_list_vertical_viewport_height(
+        scroll_handle: &UniformListScrollHandle,
+    ) -> Option<Pixels> {
+        let state = scroll_handle.0.borrow();
+        let bounds_height = state.base_handle.bounds().size.height;
+        if bounds_height > px(0.0) {
+            return Some(bounds_height);
+        }
+
+        state
+            .last_item_size
+            .map(|size| size.item.height)
+            .filter(|height| *height > px(0.0))
+    }
+
+    /// 写入虚拟列表纵向滚动位置。
+    ///
+    /// 边界条件：
+    /// - 设置 Y 偏移时保留当前 X 偏移，避免用户横向滚动长日志后按 PageDown 导致横向位置被重置。
+    fn set_uniform_list_vertical_scroll_top(
+        scroll_handle: &UniformListScrollHandle,
+        scroll_top: Pixels,
+    ) {
+        let base_scroll_handle = {
+            // 先克隆底层句柄再释放 `RefCell` 借用，避免 `set_offset` 内部需要可变借用时产生嵌套借用。
+            scroll_handle.0.borrow().base_handle.clone()
+        };
+        let current_offset = base_scroll_handle.offset();
+        base_scroll_handle.set_offset(point(current_offset.x, -scroll_top));
+    }
+
+    /// 计算一次键盘滚动后的 `Pixels` 位置。
+    ///
+    /// 业务意图：
+    /// - 页滚动距离按“视口高度减一行”计算，让用户翻页时保留一行上下文；视口很小时至少滚动一行。
+    /// - 顶部、底部和翻页结果都统一 clamp，避免滚动条越界或出现负偏移。
+    fn keyboard_scroll_position(
+        current_top: Pixels,
+        max_scroll: Pixels,
+        viewport_height: Pixels,
+        row_height: f32,
+        command: KeyboardScrollCommand,
+    ) -> Option<Pixels> {
+        if max_scroll <= px(0.0) {
+            return None;
+        }
+
+        let current_top = current_top.clamp(px(0.0), max_scroll);
+        let page_delta = Self::keyboard_scroll_page_delta(viewport_height, row_height);
+        let next_top = match command {
+            KeyboardScrollCommand::PageUp => current_top - page_delta,
+            KeyboardScrollCommand::PageDown => current_top + page_delta,
+            KeyboardScrollCommand::Top => px(0.0),
+            KeyboardScrollCommand::Bottom => max_scroll,
+        };
+
+        Some(next_top.clamp(px(0.0), max_scroll))
+    }
+
+    /// 计算分页日志使用的 `f64` 逻辑滚动位置。
+    ///
+    /// 业务意图：
+    /// - 分页日志可能非常大，滚动位置保存在 `f64` 中避免深位置 `f32` 精度不足；这里只把页距从 `Pixels` 转成 `f64`。
+    fn keyboard_scroll_position_px(
+        current_top: f64,
+        max_scroll: f64,
+        viewport_height: Pixels,
+        row_height: f32,
+        command: KeyboardScrollCommand,
+    ) -> Option<f64> {
+        if max_scroll <= 0.0 {
+            return None;
+        }
+
+        let current_top = current_top.clamp(0.0, max_scroll);
+        let page_delta = f64::from(Self::keyboard_scroll_page_delta(
+            viewport_height,
+            row_height,
+        ));
+        let next_top = match command {
+            KeyboardScrollCommand::PageUp => current_top - page_delta,
+            KeyboardScrollCommand::PageDown => current_top + page_delta,
+            KeyboardScrollCommand::Top => 0.0,
+            KeyboardScrollCommand::Bottom => max_scroll,
+        };
+
+        Some(next_top.clamp(0.0, max_scroll))
+    }
+
+    /// 计算 PageUp/PageDown 的页距。
+    ///
+    /// 边界条件：
+    /// - 如果视口高度尚小于一行或测量异常，仍至少移动一行，避免快捷键看起来失效。
+    fn keyboard_scroll_page_delta(viewport_height: Pixels, row_height: f32) -> Pixels {
+        let row_height = px(row_height.max(1.0));
+        if viewport_height > row_height {
+            viewport_height - row_height
+        } else {
+            row_height
         }
     }
 
@@ -7395,6 +7824,7 @@ impl MainView {
         event: &MouseDownEvent,
         context: &mut Context<Self>,
     ) {
+        self.note_keyboard_scroll_region(KeyboardScrollRegion::SearchResults);
         let Some(panel) = &self.search_results_panel else {
             return;
         };
@@ -7543,6 +7973,7 @@ impl MainView {
     /// 边界条件：
     /// - 如果列表尚未完成测量或内容不足以滚动，则忽略本次按下。
     fn start_log_tree_scrollbar_drag(&mut self, event: &MouseDownEvent) {
+        self.note_keyboard_scroll_region(KeyboardScrollRegion::LogTree);
         let Some(metrics) = Self::log_tree_scrollbar_metrics(&self.log_tree_scroll_handle) else {
             return;
         };
@@ -11996,23 +12427,299 @@ impl Render for MainView {
     }
 }
 
+/// 主窗口运行期状态。
+///
+/// 业务意图：
+/// - macOS 关闭最后一个窗口后进程仍会保留，Dock 再次点按只会触发 reopen 事件，不会重新执行 `run`。
+/// - 这里把“当前主窗口句柄”和“可从平台回调重新进入 GPUI 的异步应用句柄”集中保存，让启动、open-url 和 reopen
+///   三条入口都能复用同一套主窗口恢复流程。
+///
+/// 边界条件：
+/// - `WindowHandle` 本身不会让窗口继续存活；窗口关闭后句柄可能失效，因此每次使用前都必须通过 `update` 验证。
+/// - `AsyncApp` 只在应用启动后可用；启动完成前收到的 macOS open-url 事件需要暂存，等主窗口初始化完成后再处理。
+#[derive(Default)]
+struct MainWindowRuntime {
+    /// 当前仍可能有效的主窗口句柄。
+    ///
+    /// 业务意图：
+    /// - 保存主窗口句柄是为了在 macOS reopen 或 Finder/Dock 打开文件时优先复用已有窗口。
+    /// - 主窗口关闭回调会清空该字段；如果因为平台时序导致仍残留旧句柄，后续 `ensure_main_window` 会通过 `update`
+    ///   失败识别并创建新窗口。
+    main_window: Option<WindowHandle<MainView>>,
+
+    /// 可在平台回调中重新进入 GPUI 主线程的应用句柄。
+    ///
+    /// 业务意图：
+    /// - `Application::on_open_urls` 不直接提供 `App`，但 macOS 可能在应用已经启动后继续从 Finder 或 Dock 交付文件。
+    /// - 保存 `AsyncApp` 后，open-url 回调可以在当前进程内恢复主窗口并加载路径，而不是因为主窗口关闭而静默丢弃请求。
+    async_app: Option<AsyncApp>,
+}
+
+impl MainWindowRuntime {
+    /// 记录当前可用的异步应用句柄。
+    ///
+    /// 边界条件：
+    /// - 该方法只保存 GPUI 提供的弱引用包装，不持有窗口或实体所有权，因此不会阻止应用正常退出。
+    fn remember_app(&mut self, app: &App) {
+        self.async_app = Some(app.to_async());
+    }
+
+    /// 记录一个刚创建或刚验证过仍有效的主窗口。
+    ///
+    /// 业务意图：
+    /// - 同时刷新 `AsyncApp`，保证后续 open-url 回调使用的是最新应用上下文。
+    fn remember_window(&mut self, main_window: WindowHandle<MainView>, app: &App) {
+        self.main_window = Some(main_window);
+        self.remember_app(app);
+    }
+
+    /// 清空主窗口句柄。
+    ///
+    /// 边界条件：
+    /// - 只清理窗口句柄，不清理 `AsyncApp`；macOS 关闭所有窗口后仍需要通过 `AsyncApp` 响应 Finder/Dock 事件。
+    fn clear_window(&mut self) {
+        self.main_window = None;
+    }
+
+    /// 返回可供平台回调使用的异步应用句柄快照。
+    ///
+    /// 边界条件：
+    /// - 返回 clone 是为了立即释放 `RefCell` 借用，避免在后续进入 GPUI 更新流程时发生运行期借用冲突。
+    fn async_app(&self) -> Option<AsyncApp> {
+        self.async_app.clone()
+    }
+}
+
+/// 构造主窗口选项。
+///
+/// 业务意图：
+/// - 启动创建窗口和 macOS reopen 恢复窗口必须使用同一套标题、尺寸和显示器策略。
+/// - 把 `WindowOptions` 集中到这里可以避免后续新增菜单栏、最小尺寸或平台差异时只改了一条入口。
+fn build_main_window_options(app: &App) -> WindowOptions {
+    WindowOptions {
+        // 显式设置系统标题栏标题，保证 macOS 和 Windows 的原生窗口标题都使用产品名。
+        // 后续如果标题需要包含文件名或状态，应在业务规则明确后统一修改这里的标题策略。
+        titlebar: Some(TitlebarOptions {
+            title: Some(MAIN_WINDOW_TITLE.into()),
+            ..Default::default()
+        }),
+        // 使用统一启动策略决定主窗口边界：历史宽高优先，其次小屏最大化，最后大屏固定 1600x900 居中。
+        // 这里不恢复历史位置，并且显式绑定主显示器，避免多屏环境下计算居中和实际打开使用不同屏幕。
+        window_bounds: Some(build_main_window_bounds(app)),
+        display_id: primary_display_id(app),
+        ..Default::default()
+    }
+}
+
+/// 在主窗口关闭前保存可恢复的窗口尺寸。
+///
+/// 业务意图：
+/// - 用户手动调整后的普通窗口尺寸应跨会话保留，保证日志查看工作区再次打开时仍符合用户习惯。
+///
+/// 边界条件：
+/// - 最大化和全屏是平台窗口状态，不是用户希望下次以超大普通窗口打开的尺寸，因此跳过保存。
+/// - 保存失败不阻止关闭，避免配置目录权限问题导致用户无法关闭日志查看客户端。
+fn save_main_window_size_before_close(window: &Window) {
+    if window.is_maximized() || window.is_fullscreen() {
+        return;
+    }
+
+    let bounds = window.window_bounds().get_bounds();
+    let width = bounds.size.width / px(1.0);
+    let height = bounds.size.height / px(1.0);
+    if let Some(size) = MainWindowSizePreference::new(width, height) {
+        save_main_window_size_preference(size);
+    }
+}
+
+/// 查找当前仍打开的主窗口。
+///
+/// 业务意图：
+/// - 防御运行期状态丢失或句柄缓存被清空但窗口仍存在的情况，避免 macOS reopen 或 open-url 创建重复主窗口。
+///
+/// 边界条件：
+/// - `AnyWindowHandle::downcast` 只按根视图类型判断；当前应用只有一个 `MainView` 主窗口，辅助窗口使用独立根视图类型。
+fn find_open_main_window(app: &App) -> Option<WindowHandle<MainView>> {
+    app.windows()
+        .into_iter()
+        .find_map(|window| window.downcast::<MainView>())
+}
+
+/// 激活一个已知主窗口，并确认句柄仍有效。
+///
+/// 业务意图：
+/// - macOS reopen 和 Finder/Dock 打开文件时，如果主窗口仍存在，应优先把它带回前台，而不是创建第二个主窗口。
+///
+/// 边界条件：
+/// - 如果窗口已经关闭或根视图类型不匹配，`update` 会失败；调用方据此清理缓存并创建新窗口。
+fn activate_main_window(main_window: WindowHandle<MainView>, app: &mut App) -> bool {
+    main_window
+        .update(app, |view, window, _context| {
+            view.main_window = Some(main_window);
+            window.activate_window();
+        })
+        .is_ok()
+}
+
+/// 为主窗口安装全局快捷键拦截器。
+///
+/// 业务意图：
+/// - GPUI 的应用级拦截器需要绑定一个当前有效的主窗口句柄，才能把 `Cmd+F`、复制等跨焦点快捷键派发回主视图。
+/// - macOS 关闭主窗口后旧 `MainView` 会释放订阅；reopen 创建新主窗口时必须重新安装，否则新窗口的全局快捷键会失效。
+///
+/// 边界条件：
+/// - 拦截器捕获的更新异常不能越过 Objective-C key equivalent 边界，否则 macOS 运行时可能直接 abort。
+/// - 订阅保存到主视图里，让窗口关闭时自动释放，不需要额外的全局清理逻辑。
+fn install_main_window_keystroke_subscription(main_window: WindowHandle<MainView>, app: &mut App) {
+    let main_view_for_keys = main_window;
+    let subscription = app.intercept_keystrokes(move |event, window, app| {
+        // GPUI 0.2.2 在 macOS 上会从 Objective-C `keyEquivalent` 回调进入这里；该回调不能让 Rust panic
+        // 继续向外 unwind，否则运行时会直接 abort。快捷键处理本身不是不可恢复业务，因此这里在边界处兜住
+        // 我们自己的状态更新异常，并让事件继续按默认路径传播，避免一次快捷键输入击穿整个进程。
+        let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            main_view_for_keys
+                .update(app, |view, _window, context| {
+                    // 应用级拦截器服务搜索、复制和粘贴这类跨焦点快捷键；区域键盘滚动只允许主窗口根节点处理，
+                    // 避免设置窗口或其它辅助窗口按 PageUp/PageDown 时滚动背后的日志内容并消费事件。
+                    view.handle_global_keystroke(event.keystroke.clone(), window, context, false)
+                })
+                .unwrap_or(false)
+        }))
+        .unwrap_or(false);
+        if handled {
+            app.stop_propagation();
+        }
+    });
+    main_window
+        .update(app, |view, _window, _context| {
+            view.global_keystroke_subscription = Some(subscription);
+        })
+        .ok();
+}
+
+/// 创建新的主窗口。
+///
+/// 业务意图：
+/// - 启动和 macOS reopen 都通过该函数创建窗口，保证主题观察、关闭保存、焦点和全局快捷键订阅完全一致。
+///
+/// 边界条件：
+/// - 该函数只创建空主窗口；启动参数、Finder/Dock 打开的路径由调用方在窗口创建成功后再加载，避免窗口创建失败时丢失错误边界。
+fn create_main_window(
+    runtime: &Rc<RefCell<MainWindowRuntime>>,
+    app: &mut App,
+) -> Result<WindowHandle<MainView>, String> {
+    let window_options = build_main_window_options(app);
+    let runtime_for_close = Rc::clone(runtime);
+    let main_window = app
+        .open_window(window_options, move |window, app| {
+            let view = app.new(|context| {
+                let mut view = MainView::new(context);
+                view.system_window_appearance = window.appearance();
+                view.window_appearance_subscription = Some(context.observe_window_appearance(
+                    window,
+                    |view, window, context| {
+                        view.set_system_window_appearance(window.appearance(), context);
+                    },
+                ));
+                view
+            });
+            window.on_window_should_close(app, move |window, _app| {
+                save_main_window_size_before_close(window);
+                runtime_for_close.borrow_mut().clear_window();
+                true
+            });
+            window.focus(&view.read(app).root_focus_handle);
+            view
+        })
+        .map_err(|error| format!("创建 LogClinic 主窗口失败：{error}"))?;
+
+    main_window
+        .update(app, |view, _window, context| {
+            // 主窗口句柄只能在 `open_window` 成功返回后获得；回填到主视图供独立工具窗口激活主窗口使用。
+            view.main_window = Some(main_window);
+            context.notify();
+        })
+        .map_err(|error| format!("初始化 LogClinic 主窗口状态失败：{error}"))?;
+    install_main_window_keystroke_subscription(main_window, app);
+    runtime.borrow_mut().remember_window(main_window, app);
+
+    Ok(main_window)
+}
+
+/// 确保当前进程内有可用主窗口。
+///
+/// 业务意图：
+/// - macOS 关闭所有窗口后进程不退出，Dock 再点时必须恢复主窗口。
+/// - Finder/Dock 在无窗口状态下再次打开日志文件时，也必须先恢复窗口再加载文件。
+///
+/// 边界条件：
+/// - 优先验证缓存句柄，失败后再扫描 GPUI 当前窗口列表，最后才创建新窗口，避免重复窗口。
+fn ensure_main_window(
+    runtime: &Rc<RefCell<MainWindowRuntime>>,
+    app: &mut App,
+) -> Result<WindowHandle<MainView>, String> {
+    let cached_main_window = runtime.borrow().main_window;
+    if let Some(main_window) = cached_main_window {
+        if activate_main_window(main_window, app) {
+            runtime.borrow_mut().remember_window(main_window, app);
+            return Ok(main_window);
+        }
+        runtime.borrow_mut().clear_window();
+    }
+
+    if let Some(main_window) = find_open_main_window(app) {
+        if activate_main_window(main_window, app) {
+            runtime.borrow_mut().remember_window(main_window, app);
+            return Ok(main_window);
+        }
+    }
+
+    create_main_window(runtime, app)
+}
+
+/// 在主窗口中加载一组日志路径。
+///
+/// 业务意图：
+/// - 启动参数、macOS open-url 和延迟处理的 pending URL 都应走同一条加载入口，保证文件、目录和压缩包行为一致。
+///
+/// 边界条件：
+/// - 空路径集合不触发加载，避免覆盖用户当前工作区。
+/// - 如果窗口在平台回调和加载之间被关闭，`update` 失败即可忽略，避免平台回调引发 panic。
+fn load_paths_in_main_window(
+    main_window: WindowHandle<MainView>,
+    app: &mut App,
+    paths: Vec<PathBuf>,
+    message: &str,
+) {
+    if paths.is_empty() {
+        return;
+    }
+
+    let message = message.to_string();
+    main_window
+        .update(app, |view, window, context| {
+            view.start_log_source_load(paths, message, context);
+            window.activate_window();
+        })
+        .ok();
+}
+
 /// 程序入口。
 ///
 /// 业务意图：
 /// - 初始化 GPUI 应用并创建唯一主窗口。
-/// - 当前阶段挂载窗口、工具栏、目录树、日志 tab 工作区和编码切换入口，暂不挂载菜单栏或配置系统。
+/// - macOS 关闭所有窗口后进程仍保留，因此额外注册 reopen 处理，在 Dock 再点时恢复主窗口。
 ///
 /// 错误处理：
-/// - 主窗口创建失败意味着桌面应用无法进入可交互状态，属于启动期不可恢复错误。
-/// - 这里使用 `expect` 并配套中文错误说明，是为了让开发期和测试期能直接暴露
-///   窗口系统、图形环境或 GPUI 初始化问题；普通业务错误后续不得采用这种处理方式。
+/// - 启动期主窗口创建失败意味着桌面应用无法进入可交互状态，属于不可恢复错误。
+/// - macOS reopen 或 open-url 回调中的窗口恢复失败只能写入 stderr，因为此时可能没有任何可展示错误的窗口。
 pub(crate) fn run() {
     let application = Application::new();
-    let open_url_target: Rc<RefCell<Option<(WindowHandle<MainView>, AsyncApp)>>> =
-        Rc::new(RefCell::new(None));
+    let main_window_runtime: Rc<RefCell<MainWindowRuntime>> =
+        Rc::new(RefCell::new(MainWindowRuntime::default()));
     let pending_open_urls: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     {
-        let open_url_target = Rc::clone(&open_url_target);
+        let main_window_runtime = Rc::clone(&main_window_runtime);
         let pending_open_urls = Rc::clone(&pending_open_urls);
         application.on_open_urls(move |urls| {
             let paths = log_source_paths_from_open_urls(urls.clone());
@@ -12020,22 +12727,41 @@ pub(crate) fn run() {
                 return;
             }
 
-            if let Some((main_view, async_app)) = open_url_target.borrow_mut().as_mut() {
-                // macOS/Finder 会在应用已经启动后继续通过 open-url 回调交付文件；此时直接复用主窗口加载流程。
-                // 如果主窗口已关闭，`update` 返回错误即可忽略，避免平台回调引发 panic。
-                main_view
-                    .update(async_app, |view, window, context| {
-                        view.start_log_source_load(
-                            paths,
-                            "正在加载拖入的日志".to_string(),
-                            context,
-                        );
-                        window.activate_window();
-                    })
-                    .ok();
-            } else {
+            let async_app = main_window_runtime.borrow().async_app();
+            let Some(async_app) = async_app else {
                 // 某些平台可能在主窗口创建前触发 open-url；先暂存，主窗口完成初始化后再统一处理。
                 pending_open_urls.borrow_mut().extend(urls);
+                return;
+            };
+
+            let main_window_runtime = Rc::clone(&main_window_runtime);
+            async_app
+                .update(move |app| {
+                    main_window_runtime.borrow_mut().remember_app(app);
+                    match ensure_main_window(&main_window_runtime, app) {
+                        Ok(main_window) => {
+                            load_paths_in_main_window(main_window, app, paths, "正在加载拖入的日志")
+                        }
+                        Err(error) => {
+                            eprintln!("macOS open-url 恢复 LogClinic 主窗口失败：{error}");
+                        }
+                    }
+                })
+                .ok();
+        });
+    }
+    {
+        let main_window_runtime = Rc::clone(&main_window_runtime);
+        application.on_reopen(move |app| {
+            main_window_runtime.borrow_mut().remember_app(app);
+            match ensure_main_window(&main_window_runtime, app) {
+                Ok(_main_window) => {
+                    // macOS Dock 再次点按应用图标时，应用可能处于后台；显式激活保证恢复出的主窗口可见。
+                    app.activate(true);
+                }
+                Err(error) => {
+                    eprintln!("macOS reopen 恢复 LogClinic 主窗口失败：{error}");
+                }
             }
         });
     }
@@ -12058,103 +12784,15 @@ pub(crate) fn run() {
                 Cow::Borrowed(JETBRAINS_MONO_REGULAR_FONT_BYTES),
             ])
             .expect("注册内置字体失败，工具栏图标或日志正文等宽字体无法可靠渲染");
+        main_window_runtime.borrow_mut().remember_app(app);
 
-        let main_display_id = primary_display_id(app);
-        let window_options = WindowOptions {
-            // 显式设置系统标题栏标题，保证 macOS 和 Windows 的原生窗口标题都使用产品名。
-            // 后续如果标题需要包含文件名或状态，应在业务规则明确后统一修改这里的标题策略。
-            titlebar: Some(TitlebarOptions {
-                title: Some(MAIN_WINDOW_TITLE.into()),
-                ..Default::default()
-            }),
-            // 使用统一启动策略决定主窗口边界：历史宽高优先，其次小屏最大化，最后大屏固定 1600x900 居中。
-            // 这里不恢复历史位置，并且显式绑定主显示器，避免多屏环境下计算居中和实际打开使用不同屏幕。
-            window_bounds: Some(build_main_window_bounds(app)),
-            display_id: main_display_id,
-            ..Default::default()
-        };
-
-        let main_view = app
-            .open_window(window_options, |window, app| {
-                let view = app.new(|context| {
-                    let mut view = MainView::new(context);
-                    view.system_window_appearance = window.appearance();
-                    view.window_appearance_subscription = Some(context.observe_window_appearance(
-                        window,
-                        |view, window, context| {
-                            view.set_system_window_appearance(window.appearance(), context);
-                        },
-                    ));
-                    view
-                });
-                // 主窗口关闭时只保存宽高，不保存位置或最大化状态。
-                // 保存失败不阻止关闭，避免配置目录权限问题影响日志查看客户端退出。
-                window.on_window_should_close(app, |window, _app| {
-                    if window.is_maximized() || window.is_fullscreen() {
-                        // 最大化和全屏是平台窗口状态，不是用户希望下次以超大普通窗口打开的尺寸。
-                        // 跳过保存可以避免大屏下次启动误用屏幕宽度作为历史窗口宽度。
-                        return true;
-                    }
-                    let bounds = window.window_bounds().get_bounds();
-                    let width = bounds.size.width / px(1.0);
-                    let height = bounds.size.height / px(1.0);
-                    if let Some(size) = MainWindowSizePreference::new(width, height) {
-                        save_main_window_size_preference(size);
-                    }
-                    true
-                });
-                window.focus(&view.read(app).root_focus_handle);
-                view
-            })
+        let main_window = ensure_main_window(&main_window_runtime, app)
             .expect("创建 LogClinic 主窗口失败，应用无法继续启动");
-        let _ = main_view.update(app, |view, _window, context| {
-            // 主窗口句柄只能在 `open_window` 成功返回后获得；回填到主视图供独立工具窗口激活主窗口使用。
-            view.main_window = Some(main_view);
-            if !launch_paths.is_empty() {
-                view.start_log_source_load(
-                    launch_paths,
-                    "正在加载启动传入的日志".to_string(),
-                    context,
-                );
-            }
-            context.notify();
-        });
-        let async_app_for_open_urls = app.to_async();
+        load_paths_in_main_window(main_window, app, launch_paths, "正在加载启动传入的日志");
+
         let pending_paths = log_source_paths_from_open_urls(pending_open_urls.take());
         if !pending_paths.is_empty() {
-            main_view
-                .update(app, |view, window, context| {
-                    view.start_log_source_load(
-                        pending_paths,
-                        "正在加载拖入的日志".to_string(),
-                        context,
-                    );
-                    window.activate_window();
-                })
-                .ok();
+            load_paths_in_main_window(main_window, app, pending_paths, "正在加载拖入的日志");
         }
-        *open_url_target.borrow_mut() = Some((main_view, async_app_for_open_urls));
-        let main_view_for_keys = main_view;
-        let subscription = app.intercept_keystrokes(move |event, window, app| {
-            // GPUI 0.2.2 在 macOS 上会从 Objective-C `keyEquivalent` 回调进入这里；该回调不能让 Rust panic
-            // 继续向外 unwind，否则运行时会直接 abort。快捷键处理本身不是不可恢复业务，因此这里在边界处兜住
-            // 我们自己的状态更新异常，并让事件继续按默认路径传播，避免一次快捷键输入击穿整个进程。
-            let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                main_view_for_keys
-                    .update(app, |view, _window, context| {
-                        view.handle_global_keystroke(event.keystroke.clone(), window, context)
-                    })
-                    .unwrap_or(false)
-            }))
-            .unwrap_or(false);
-            if handled {
-                app.stop_propagation();
-            }
-        });
-        main_view
-            .update(app, |view, _window, _context| {
-                view.global_keystroke_subscription = Some(subscription);
-            })
-            .ok();
     });
 }
