@@ -62,7 +62,7 @@ use crate::theme::{AppThemePalette, EffectiveTheme, ThemePreference};
 
 actions!(logclinic, [OpenSearchDialog]);
 
-/// 关于独立窗口功能域。
+/// 设置窗口关于页签功能域。
 #[path = "app_impl/about_window.rs"]
 mod about_window;
 /// HPROF dump 分析独立窗口功能域。
@@ -91,7 +91,6 @@ mod tests;
 #[path = "app_impl/thread_analysis.rs"]
 mod thread_analysis;
 
-use about_window::AboutWindowView;
 use hprof_analysis::HprofAnalysisView;
 use search_window::SearchDialogWindowView;
 use settings_window::SettingsWindowView;
@@ -1678,20 +1677,6 @@ const SETTINGS_WINDOW_WIDTH: f32 = 900.0;
 /// - 模型页签需要容纳配置列表、表单和测试状态；固定高度配合页内滚动，避免不同页签切换时窗口跳动。
 const SETTINGS_WINDOW_HEIGHT: f32 = 520.0;
 
-/// 关于窗口默认宽度。
-///
-/// 业务意图：
-/// - 关于窗口会展示软件名、版本、作者邮箱、特色功能和对应教程；宽度需要完整容纳教程短句，避免频繁换行导致高度被挤压。
-/// - 固定窗口尺寸可以让 macOS 和 Windows 的独立信息窗口保持一致，不受主窗口大小影响。
-const ABOUT_WINDOW_WIDTH: f32 = 640.0;
-
-/// 关于窗口默认高度。
-///
-/// 业务意图：
-/// - 高度按当前三块内容、作者邮箱和三条教程说明预留余量，保证无需滚动即可完整显示。
-/// - 关于窗口不承载动态列表，固定高度比自适应高度更可预测，也避免不同平台字体度量差异造成底部裁切。
-const ABOUT_WINDOW_HEIGHT: f32 = 520.0;
-
 /// 设置窗口左侧页签栏宽度。
 ///
 /// 业务意图：
@@ -2607,15 +2592,13 @@ impl MainFeature {
 /// 左侧大导航中的可悬浮入口。
 ///
 /// 业务意图：
-/// - 导航栏只显示图标，hover 气泡需要知道当前入口名称和纵向位置；设置、关于属于通用入口，不计入主功能状态。
+/// - 导航栏只显示图标，hover 气泡需要知道当前入口名称和纵向位置；设置属于通用入口，不计入主功能状态。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MainNavigationItem {
     /// 三个主功能页入口。
     Feature(MainFeature),
     /// 设置独立窗口入口。
     Settings,
-    /// 关于独立窗口入口。
-    About,
 }
 
 impl MainNavigationItem {
@@ -2624,7 +2607,6 @@ impl MainNavigationItem {
         match self {
             Self::Feature(feature) => feature.label(),
             Self::Settings => "设置",
-            Self::About => "关于",
         }
     }
 
@@ -2633,7 +2615,6 @@ impl MainNavigationItem {
         match self {
             Self::Feature(feature) => feature.icon(),
             Self::Settings => Icon::Settings,
-            Self::About => Icon::Info,
         }
     }
 
@@ -2659,12 +2640,6 @@ impl MainNavigationItem {
                     + MAIN_NAV_TOOLTIP_BUTTON_INSET,
             ),
             Self::Settings => MainNavigationTooltipAnchor::Bottom(
-                MAIN_NAV_PADDING
-                    + MAIN_NAV_BUTTON_SIZE
-                    + MAIN_NAV_BUTTON_GAP
-                    + MAIN_NAV_TOOLTIP_BUTTON_INSET,
-            ),
-            Self::About => MainNavigationTooltipAnchor::Bottom(
                 MAIN_NAV_PADDING + MAIN_NAV_TOOLTIP_BUTTON_INSET,
             ),
         }
@@ -2686,7 +2661,7 @@ enum MainNavigationTooltipAnchor {
 /// 设置窗口当前激活的页签。
 ///
 /// 业务意图：
-/// - 设置窗口按用户要求拆成“通用 / 日志 / 模型”页签；状态放在主视图中，避免关闭窗口后当前会话选择丢失。
+/// - 设置窗口按用户要求拆成“通用 / 日志 / 模型 / 关于”页签；状态放在主视图中，避免关闭窗口后当前会话选择丢失。
 /// - 当前页签状态只存在于进程内，不写入配置文件；后续若需要记忆页签，应先定义设置持久化策略。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsTab {
@@ -2696,15 +2671,17 @@ enum SettingsTab {
     Log,
     /// 模型设置页签，当前承载 OpenAI 兼容模型配置管理。
     Model,
+    /// 关于页签，承载软件版本、作者和特色功能说明。
+    About,
 }
 
 impl SettingsTab {
     /// 返回设置页签固定展示顺序。
     ///
     /// 业务意图：
-    /// - 页签顺序是用户明确给出的“通用、日志、模型”，集中定义避免渲染和测试出现顺序分歧。
+    /// - 页签顺序集中定义，避免渲染和测试出现顺序分歧；关于收入口设置后放在最后，保留配置类页签优先级。
     fn all() -> &'static [Self] {
-        &[Self::General, Self::Log, Self::Model]
+        &[Self::General, Self::Log, Self::Model, Self::About]
     }
 
     /// 返回页签中文标签。
@@ -2713,6 +2690,7 @@ impl SettingsTab {
             Self::General => "通用",
             Self::Log => "日志",
             Self::Model => "模型",
+            Self::About => "关于",
         }
     }
 
@@ -2725,6 +2703,7 @@ impl SettingsTab {
             Self::General => Icon::Settings,
             Self::Log => Icon::FileText,
             Self::Model => Icon::MonitorCog,
+            Self::About => Icon::Info,
         }
     }
 }
@@ -3530,15 +3509,6 @@ struct MainView {
     /// - 用户通过系统关闭按钮关闭设置窗口时，关闭回调必须清空该字段，避免后续点击设置按钮尝试激活失效窗口。
     settings_window: Option<WindowHandle<SettingsWindowView>>,
 
-    /// 关于窗口独立窗口句柄。
-    ///
-    /// 业务意图：
-    /// - 关于按钮会打开独立窗口；主窗口保存句柄用于重复点击时激活已有关于窗口，而不是创建多个重复窗口。
-    ///
-    /// 边界条件：
-    /// - 用户通过系统关闭按钮关闭关于窗口时，关闭回调必须清空该字段，避免后续点击关于按钮尝试激活失效窗口。
-    about_window: Option<WindowHandle<AboutWindowView>>,
-
     /// 线程日志分析独立窗口句柄。
     ///
     /// 业务意图：
@@ -3560,17 +3530,10 @@ struct MainView {
     /// - 真实窗口状态仍以 `settings_window` 为准，该字段只描述一次待执行的打开动作。
     settings_window_open_pending: bool,
 
-    /// 关于窗口打开请求是否已经排队到下一帧。
-    ///
-    /// 业务意图：
-    /// - 关于窗口会观察主视图主题状态，创建时需要避开当前按钮点击的 `MainView` 更新租借。
-    /// - 该标记用于合并同一帧内重复点击。
-    about_window_open_pending: bool,
-
     /// 设置窗口当前激活页签。
     ///
     /// 业务意图：
-    /// - 当前设置窗口包含“通用”和“模型”两个页签，该字段保存当前会话内最后访问的页签。
+    /// - 当前设置窗口包含“通用 / 日志 / 模型 / 关于”页签，该字段保存当前会话内最后访问的页签。
     /// - 默认打开“通用”，符合用户要求第一个页签先提供通用显示设置。
     settings_active_tab: SettingsTab,
 
@@ -3924,11 +3887,9 @@ impl MainView {
             search_query_history: Vec::new(),
             search_dialog_window: None,
             settings_window: None,
-            about_window: None,
             thread_analysis_window: None,
             hprof_analysis_view: None,
             settings_window_open_pending: false,
-            about_window_open_pending: false,
             settings_active_tab: SettingsTab::General,
             theme_preference: load_theme_preference(),
             log_viewer_font_size: load_log_viewer_font_size_preference(),
@@ -4009,7 +3970,8 @@ impl MainView {
     /// 渲染主窗口左侧大导航竖条。
     ///
     /// 业务意图：
-    /// - 左侧导航是主窗口唯一的全局功能入口，顶部三个图标切换大功能，底部两个图标打开设置和关于窗口。
+    /// - 左侧导航是主窗口唯一的全局功能入口，顶部三个图标切换大功能，底部设置图标打开设置窗口。
+    /// - 关于内容已经收入口设置窗口，不再在大导航底部占用独立入口。
     /// - 按用户要求导航本体不显示文字；功能名称只在 hover 气泡中显示。
     ///
     /// 边界条件：
@@ -4062,12 +4024,6 @@ impl MainView {
                         false,
                         palette,
                         context,
-                    ))
-                    .child(self.render_main_navigation_button(
-                        MainNavigationItem::About,
-                        false,
-                        palette,
-                        context,
                     )),
             )
     }
@@ -4076,7 +4032,7 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 按钮本体只渲染图标，hover 状态下把中文名称作为气泡渲染到按钮右侧。
-    /// - 设置和关于不是主功能页，不参与选中态；点击后仍复用现有独立窗口打开逻辑。
+    /// - 设置不是主功能页，不参与选中态；点击后打开设置窗口，关于内容从设置窗口页签访问。
     fn render_main_navigation_button(
         &self,
         item: MainNavigationItem,
@@ -4132,9 +4088,6 @@ impl MainView {
                         }
                         MainNavigationItem::Settings => {
                             view.schedule_open_settings_window(window, context);
-                        }
-                        MainNavigationItem::About => {
-                            view.schedule_open_about_window(window, context);
                         }
                     }
                     context.stop_propagation();
@@ -4573,24 +4526,6 @@ impl MainView {
         let main_view = context.entity();
         window.defer(context, move |_window, app| {
             Self::open_settings_window_after_main_update(main_view, app);
-        });
-        context.notify();
-    }
-
-    /// 在当前主视图更新结束后打开关于窗口。
-    ///
-    /// 业务意图：
-    /// - 关于窗口会读取主题调色板并观察 `MainView`，直接在按钮监听中创建会和当前更新租借冲突。
-    /// - 重复点击关于按钮时只排队一次，避免同一帧创建多个关于窗口。
-    fn schedule_open_about_window(&mut self, window: &mut Window, context: &mut Context<Self>) {
-        if self.about_window_open_pending {
-            return;
-        }
-
-        self.about_window_open_pending = true;
-        let main_view = context.entity();
-        window.defer(context, move |_window, app| {
-            Self::open_about_window_after_main_update(main_view, app);
         });
         context.notify();
     }
@@ -6612,84 +6547,6 @@ impl MainView {
                 main_view.update(app, |view, context| {
                     view.settings_window = None;
                     view.settings_window_open_pending = false;
-                    context.notify();
-                });
-            }
-        }
-    }
-
-    /// 在 `MainView` 更新租借结束后打开关于窗口。
-    ///
-    /// 业务意图：
-    /// - 工具栏关于按钮通过该入口打开独立窗口，保证重复点击只激活已有窗口而不是创建多个窗口。
-    /// - 关于窗口只展示编译期和静态产品信息，不访问文件系统、不请求网络，也不影响日志加载或搜索任务。
-    ///
-    /// 边界条件：
-    /// - 如果旧窗口句柄失效，清空后重新创建。
-    /// - 创建失败时仅清理 pending 状态；当前没有用户可见错误面板，避免把关于窗口失败混入日志内容区。
-    fn open_about_window_after_main_update(main_view: Entity<MainView>, app: &mut App) {
-        let existing_about_window = main_view.update(app, |view, context| {
-            view.about_window_open_pending = false;
-            view.tab_context_menu = None;
-            view.encoding_dropdown_menu = None;
-            view.search_results_context_menu = None;
-            view.log_viewer_context_menu = None;
-            context.notify();
-            view.about_window
-        });
-
-        if let Some(about_window) = existing_about_window {
-            if about_window
-                .update(app, |_, window, _| {
-                    window.activate_window();
-                })
-                .is_ok()
-            {
-                return;
-            }
-            main_view.update(app, |view, _| {
-                view.about_window = None;
-            });
-        }
-
-        let main_view_for_window = main_view.clone();
-        let main_view_for_close = main_view.clone();
-        let about_window_options = WindowOptions {
-            titlebar: Some(TitlebarOptions {
-                title: Some("关于 LogClinic".into()),
-                ..Default::default()
-            }),
-            window_bounds: Some(WindowBounds::centered(
-                size(px(ABOUT_WINDOW_WIDTH), px(ABOUT_WINDOW_HEIGHT)),
-                app,
-            )),
-            is_resizable: false,
-            is_minimizable: true,
-            window_min_size: Some(size(px(ABOUT_WINDOW_WIDTH), px(ABOUT_WINDOW_HEIGHT))),
-            ..Default::default()
-        };
-
-        match app.open_window(about_window_options, move |window, app| {
-            window.on_window_should_close(app, move |_, app| {
-                main_view_for_close.update(app, |view, context| {
-                    view.about_window = None;
-                    view.about_window_open_pending = false;
-                    context.notify();
-                });
-                true
-            });
-            app.new(|context| AboutWindowView::new(main_view_for_window, context))
-        }) {
-            Ok(about_window) => {
-                main_view.update(app, |view, context| {
-                    view.about_window = Some(about_window);
-                    context.notify();
-                });
-            }
-            Err(_error) => {
-                main_view.update(app, |view, context| {
-                    view.about_window = None;
-                    view.about_window_open_pending = false;
                     context.notify();
                 });
             }

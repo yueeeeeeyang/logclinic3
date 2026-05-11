@@ -331,9 +331,26 @@ mod tests {
             char::from(MainNavigationItem::Settings.icon()),
             char::from(Icon::Settings)
         );
-        assert_eq!(MainNavigationItem::About.label(), "关于");
+    }
+
+    /// 验证设置窗口页签包含关于入口。
+    ///
+    /// 业务意图：
+    /// - 关于功能已经收入口设置窗口，页签顺序和图标必须稳定，避免主导航移除关于入口后用户找不到关于信息。
+    #[test]
+    fn 设置页签包含关于入口() {
         assert_eq!(
-            char::from(MainNavigationItem::About.icon()),
+            SettingsTab::all(),
+            &[
+                SettingsTab::General,
+                SettingsTab::Log,
+                SettingsTab::Model,
+                SettingsTab::About
+            ]
+        );
+        assert_eq!(SettingsTab::About.label(), "关于");
+        assert_eq!(
+            char::from(SettingsTab::About.icon()),
             char::from(Icon::Info)
         );
     }
@@ -376,15 +393,6 @@ mod tests {
         );
         assert_eq!(
             MainNavigationItem::Settings.tooltip_anchor(),
-            MainNavigationTooltipAnchor::Bottom(
-                MAIN_NAV_PADDING
-                    + MAIN_NAV_BUTTON_SIZE
-                    + MAIN_NAV_BUTTON_GAP
-                    + MAIN_NAV_TOOLTIP_BUTTON_INSET
-            )
-        );
-        assert_eq!(
-            MainNavigationItem::About.tooltip_anchor(),
             MainNavigationTooltipAnchor::Bottom(MAIN_NAV_PADDING + MAIN_NAV_TOOLTIP_BUTTON_INSET)
         );
     }
