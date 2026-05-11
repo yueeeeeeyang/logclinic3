@@ -14,19 +14,19 @@
 //! 跨平台约束：
 //! - macOS 和 Windows 都从同一个 `main` 进入；平台差异必须留在对应功能模块中处理，不能重新堆回入口文件。
 
+mod ai_chat;
 mod app;
-mod archive_materializer;
+mod archive;
+mod config;
 mod highlighting;
 mod hprof;
-mod large_log;
 mod launch;
-mod line_index;
-mod log_content;
+mod log_document;
 mod log_loader;
-mod paged_document;
+mod log_source;
 mod search;
-mod stream_search;
 mod theme;
+mod thread_analysis;
 
 /// 程序入口。
 ///
