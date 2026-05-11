@@ -414,7 +414,7 @@ fn push_numeric_resource_id(output: &mut Vec<u8>, id: u16) {
 /// 边界条件：
 /// - `.res` 对齐字节必须为 0，避免不同链接器对未初始化填充字节产生不一致解释。
 fn pad_to_4_bytes(output: &mut Vec<u8>) {
-    while output.len() % 4 != 0 {
+    while !output.len().is_multiple_of(4) {
         output.push(0);
     }
 }

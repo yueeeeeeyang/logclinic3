@@ -42,7 +42,7 @@ impl SettingsWindowView {
     /// - 页签状态保存在 `MainView`，让窗口关闭后再次打开仍停留在当前会话最后访问的页签。
     pub(super) fn select_tab(&mut self, tab: SettingsTab, context: &mut Context<Self>) {
         self.main_view.update(context, |view, context| {
-            view.settings_active_tab = tab;
+            view.settings.settings_active_tab = tab;
             context.notify();
         });
         context.notify();
@@ -54,7 +54,7 @@ impl SettingsWindowView {
     /// - 用户在设置窗口中选择主题后应立即影响所有已打开窗口，并写入配置供下次启动恢复。
     pub(super) fn select_theme(&mut self, theme: ThemePreference, context: &mut Context<Self>) {
         self.main_view.update(context, |view, context| {
-            view.theme_preference = theme;
+            view.settings.theme_preference = theme;
             save_theme_preference(theme);
             context.notify();
         });
@@ -70,9 +70,9 @@ impl SettingsWindowView {
     /// - 调整结果超出允许范围时不写入，避免设置按钮或损坏状态把日志字号推到不可读或挤破行高的值。
     pub(super) fn adjust_log_viewer_font_size(&mut self, delta: f32, context: &mut Context<Self>) {
         self.main_view.update(context, |view, context| {
-            let target = view.log_viewer_font_size + delta;
+            let target = view.settings.log_viewer_font_size + delta;
             if let Some(font_size) = normalize_log_viewer_font_size(target) {
-                view.log_viewer_font_size = font_size;
+                view.settings.log_viewer_font_size = font_size;
                 save_log_viewer_font_size_preference(font_size);
                 context.notify();
             }
@@ -102,7 +102,7 @@ impl SettingsWindowView {
     ) {
         let focus_handle = self.main_view.update(context, |view, context| {
             view.start_thread_analysis_filter_mouse_selection(event, context);
-            view.thread_analysis_filter_focus.clone()
+            view.settings.thread_analysis_filter_focus.clone()
         });
         window.focus(&focus_handle);
         context.notify();
@@ -138,12 +138,12 @@ impl SettingsWindowView {
         context: &mut Context<Self>,
     ) -> Option<gpui::FocusHandle> {
         let focus_handle = self.main_view.update(context, |view, context| {
-            if view.thread_analysis_filter_is_editing {
+            if view.settings.thread_analysis_filter_is_editing {
                 view.save_thread_analysis_filter_edit(context);
                 None
             } else {
                 view.begin_thread_analysis_filter_edit(context);
-                Some(view.thread_analysis_filter_focus.clone())
+                Some(view.settings.thread_analysis_filter_focus.clone())
             }
         });
         context.notify();
@@ -172,7 +172,7 @@ impl SettingsWindowView {
     ) {
         let focus_handle = self.main_view.update(context, |view, context| {
             view.start_quick_search_keywords_mouse_selection(event, context);
-            view.quick_search_keywords_focus.clone()
+            view.settings.quick_search_keywords_focus.clone()
         });
         window.focus(&focus_handle);
         context.notify();
@@ -204,12 +204,12 @@ impl SettingsWindowView {
         context: &mut Context<Self>,
     ) -> Option<gpui::FocusHandle> {
         let focus_handle = self.main_view.update(context, |view, context| {
-            if view.quick_search_keywords_is_editing {
+            if view.settings.quick_search_keywords_is_editing {
                 view.save_quick_search_keywords_edit(context);
                 None
             } else {
                 view.begin_quick_search_keywords_edit(context);
-                Some(view.quick_search_keywords_focus.clone())
+                Some(view.settings.quick_search_keywords_focus.clone())
             }
         });
         context.notify();
@@ -350,6 +350,10 @@ impl SettingsWindowView {
     }
 
     /// 渲染设置内容区域。
+    ///
+    /// 业务意图：
+    /// - 设置页内容来自主视图快照和当前窗口上下文，保持显式参数能避免渲染阶段重新借用主视图状态。
+    #[allow(clippy::too_many_arguments)]
     fn render_content(
         &self,
         active_tab: SettingsTab,
@@ -1142,15 +1146,25 @@ impl SettingsWindowView {
         ) = {
             let main_view = self.main_view.read(context);
             (
-                main_view.model_config_profiles.clone(),
-                main_view.model_config_default_profile_id.clone(),
-                main_view.model_config_selected_profile_id.clone(),
-                main_view.model_config_form_profile_id.clone(),
-                main_view.model_config_name_input.text.clone(),
-                main_view.model_config_base_url_input.text.clone(),
-                main_view.model_config_model_input.text.clone(),
-                main_view.model_config_api_key_visible,
-                main_view.model_test_status.clone(),
+                main_view.model_config.model_config_profiles.clone(),
+                main_view
+                    .model_config
+                    .model_config_default_profile_id
+                    .clone(),
+                main_view
+                    .model_config
+                    .model_config_selected_profile_id
+                    .clone(),
+                main_view.model_config.model_config_form_profile_id.clone(),
+                main_view.model_config.model_config_name_input.text.clone(),
+                main_view
+                    .model_config
+                    .model_config_base_url_input
+                    .text
+                    .clone(),
+                main_view.model_config.model_config_model_input.text.clone(),
+                main_view.model_config.model_config_api_key_visible,
+                main_view.model_config.model_test_status.clone(),
             )
         };
         let can_save_or_test = validate_model_profile_fields(&name, &base_url, &model).is_ok();
@@ -1527,7 +1541,7 @@ impl SettingsWindowView {
             let main_view = self.main_view.read(context);
             (
                 main_view.model_config_input_focus(kind),
-                main_view.model_config_api_key_visible,
+                main_view.model_config.model_config_api_key_visible,
             )
         };
         div()
@@ -1657,6 +1671,10 @@ impl SettingsWindowView {
     }
 
     /// 渲染模型页通用按钮。
+    ///
+    /// 业务意图：
+    /// - 模型配置按钮需要同时携带展示样式和回写主视图的动作，保持一个小型渲染 helper 可以减少四个按钮重复。
+    #[allow(clippy::too_many_arguments)]
     fn render_model_icon_button<F>(
         &self,
         id: &'static str,
@@ -1767,13 +1785,13 @@ impl Render for SettingsWindowView {
         ) = {
             let main_view = self.main_view.read(context);
             (
-                main_view.settings_active_tab,
-                main_view.theme_preference,
-                main_view.log_viewer_font_size,
-                main_view.quick_search_keywords_is_editing,
-                main_view.quick_search_keywords_focus.clone(),
-                main_view.thread_analysis_filter_is_editing,
-                main_view.thread_analysis_filter_focus.clone(),
+                main_view.settings.settings_active_tab,
+                main_view.settings.theme_preference,
+                main_view.settings.log_viewer_font_size,
+                main_view.settings.quick_search_keywords_is_editing,
+                main_view.settings.quick_search_keywords_focus.clone(),
+                main_view.settings.thread_analysis_filter_is_editing,
+                main_view.settings.thread_analysis_filter_focus.clone(),
                 main_view.palette(),
             )
         };
@@ -2339,7 +2357,7 @@ impl Element for ThreadAnalysisFilterTextAreaElement {
         let line_height = px(THREAD_ANALYSIS_FILTER_TEXT_LINE_HEIGHT);
         let line_ranges = MainView::thread_analysis_filter_line_ranges(&text);
         let display_ranges = if text.is_empty() {
-            vec![0..0]
+            std::iter::once(0..0).collect::<Vec<_>>()
         } else {
             line_ranges
         };

@@ -6,6 +6,8 @@
 
 use super::*;
 
+// 该测试文件通过 `#[path]` 挂回 `app::tests`，内层模块名保留为历史测试路径，避免本轮重构造成测试名称大面积变化。
+#[allow(clippy::module_inception)]
 #[cfg(test)]
 mod tests {
     //! 主界面纯状态逻辑测试。
@@ -454,7 +456,10 @@ mod tests {
     #[test]
     fn 搜索输入范围保持_utf8_边界() {
         assert_eq!(MainView::clamp_search_text_range("a中b", 2..99), 1..5);
-        assert_eq!(MainView::clamp_search_text_range("a中b", 4..0), 0..4);
+        assert_eq!(
+            MainView::clamp_search_text_range("a中b", std::ops::Range { start: 4, end: 0 }),
+            0..4
+        );
     }
 
     /// 验证搜索输入框方向键按 UTF-8 字符边界移动。
@@ -884,14 +889,14 @@ mod tests {
     #[test]
     fn 搜索历史关键字选择后填入搜索框并关闭菜单() {
         let mut dialog = SearchDialogState {
-            query: "旧关键字".to_string(),
-            selection_range: 0.."旧关键字".len(),
-            marked_range: Some(0.."旧".len()),
+            query_input: SingleLineTextInputState {
+                text: "旧关键字".to_string(),
+                selection_range: 0.."旧关键字".len(),
+                marked_range: Some(0.."旧".len()),
+            },
             query_history_menu_open: true,
             scope: SearchScope::CurrentFile,
-            directory_target: String::new(),
-            directory_selection_range: 0..0,
-            directory_marked_range: None,
+            directory_input: SingleLineTextInputState::empty(),
             case_sensitive: false,
             match_mode: SearchMatchMode::Literal,
             current_file_match_count: Some(7),
@@ -905,10 +910,13 @@ mod tests {
             SearchQueryHistoryItem::new("error", SearchMatchMode::Regex).expect("历史项应有效");
         MainView::apply_search_history_query(&mut dialog, &history_item);
 
-        assert_eq!(dialog.query, "error");
+        assert_eq!(dialog.query_input.text, "error");
         assert_eq!(dialog.match_mode, SearchMatchMode::Regex);
-        assert_eq!(dialog.selection_range, "error".len().."error".len());
-        assert!(dialog.marked_range.is_none());
+        assert_eq!(
+            dialog.query_input.selection_range,
+            "error".len().."error".len()
+        );
+        assert!(dialog.query_input.marked_range.is_none());
         assert!(!dialog.query_history_menu_open);
         assert!(dialog.current_file_match_count.is_none());
         assert_eq!(dialog.message, "已选择历史关键字，按 Enter 或点击搜索");
@@ -921,14 +929,14 @@ mod tests {
     #[test]
     fn 切换正则模式会清空当前文件计数缓存() {
         let mut dialog = SearchDialogState {
-            query: "error|warn".to_string(),
-            selection_range: 0.."error|warn".len(),
-            marked_range: None,
+            query_input: SingleLineTextInputState {
+                text: "error|warn".to_string(),
+                selection_range: 0.."error|warn".len(),
+                marked_range: None,
+            },
             query_history_menu_open: true,
             scope: SearchScope::CurrentFile,
-            directory_target: String::new(),
-            directory_selection_range: 0..0,
-            directory_marked_range: None,
+            directory_input: SingleLineTextInputState::empty(),
             case_sensitive: true,
             match_mode: SearchMatchMode::Literal,
             current_file_match_count: Some(12),
@@ -953,14 +961,14 @@ mod tests {
     #[test]
     fn 停止搜索会保留输入并返回任务编号() {
         let mut dialog = SearchDialogState {
-            query: "Exception".to_string(),
-            selection_range: "Exception".len().."Exception".len(),
-            marked_range: None,
+            query_input: SingleLineTextInputState::from_text("Exception".to_string()),
             query_history_menu_open: true,
             scope: SearchScope::CurrentDirectory,
-            directory_target: "monitorThread".to_string(),
-            directory_selection_range: 0.."monitorThread".len(),
-            directory_marked_range: None,
+            directory_input: SingleLineTextInputState {
+                text: "monitorThread".to_string(),
+                selection_range: 0.."monitorThread".len(),
+                marked_range: None,
+            },
             case_sensitive: true,
             match_mode: SearchMatchMode::Literal,
             current_file_match_count: Some(3),
@@ -977,9 +985,9 @@ mod tests {
         let canceled_job_id = MainView::stop_search_dialog_task(&mut dialog);
 
         assert_eq!(canceled_job_id, Some(42));
-        assert_eq!(dialog.query, "Exception");
+        assert_eq!(dialog.query_input.text, "Exception");
         assert_eq!(dialog.scope, SearchScope::CurrentDirectory);
-        assert_eq!(dialog.directory_target, "monitorThread");
+        assert_eq!(dialog.directory_input.text, "monitorThread");
         assert!(dialog.case_sensitive);
         assert!(!dialog.is_searching);
         assert!(!dialog.query_history_menu_open);
@@ -1104,14 +1112,10 @@ mod tests {
     #[test]
     fn 日志查看器粘贴会覆盖已有搜索预填文本() {
         let mut dialog = SearchDialogState {
-            query: "日志选中文本".to_string(),
-            selection_range: "日志选中文本".len().."日志选中文本".len(),
-            marked_range: None,
+            query_input: SingleLineTextInputState::from_text("日志选中文本".to_string()),
             query_history_menu_open: false,
             scope: SearchScope::CurrentFile,
-            directory_target: String::new(),
-            directory_selection_range: 0..0,
-            directory_marked_range: None,
+            directory_input: SingleLineTextInputState::empty(),
             case_sensitive: false,
             match_mode: SearchMatchMode::Literal,
             current_file_match_count: Some(3),
@@ -1123,12 +1127,12 @@ mod tests {
 
         MainView::replace_search_query_with_clipboard_text(&mut dialog, "剪贴板文本".to_string());
 
-        assert_eq!(dialog.query, "剪贴板文本");
+        assert_eq!(dialog.query_input.text, "剪贴板文本");
         assert_eq!(
-            dialog.selection_range,
+            dialog.query_input.selection_range,
             "剪贴板文本".len().."剪贴板文本".len()
         );
-        assert!(dialog.marked_range.is_none());
+        assert!(dialog.query_input.marked_range.is_none());
         assert_eq!(dialog.current_file_match_count, None);
         assert_eq!(dialog.message, "已粘贴剪贴板文本，按 Enter 或点击搜索");
     }

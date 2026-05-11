@@ -87,28 +87,22 @@ impl AiChatSseParser {
         bytes: &[u8],
     ) -> Result<Vec<AiChatSseParsedEvent>, String> {
         self.pending_bytes.extend_from_slice(bytes);
-        loop {
-            match std::str::from_utf8(&self.pending_bytes) {
-                Ok(valid) => {
+        match std::str::from_utf8(&self.pending_bytes) {
+            Ok(valid) => {
+                self.text_buffer.push_str(valid);
+                self.pending_bytes.clear();
+            }
+            Err(error) if error.error_len().is_none() => {
+                let valid_up_to = error.valid_up_to();
+                if valid_up_to > 0 {
+                    let valid = std::str::from_utf8(&self.pending_bytes[..valid_up_to])
+                        .map_err(|utf8_error| format!("AI 响应 UTF-8 解析失败：{utf8_error}"))?;
                     self.text_buffer.push_str(valid);
-                    self.pending_bytes.clear();
-                    break;
+                    self.pending_bytes.drain(..valid_up_to);
                 }
-                Err(error) if error.error_len().is_none() => {
-                    let valid_up_to = error.valid_up_to();
-                    if valid_up_to > 0 {
-                        let valid = std::str::from_utf8(&self.pending_bytes[..valid_up_to])
-                            .map_err(|utf8_error| {
-                                format!("AI 响应 UTF-8 解析失败：{utf8_error}")
-                            })?;
-                        self.text_buffer.push_str(valid);
-                        self.pending_bytes.drain(..valid_up_to);
-                    }
-                    break;
-                }
-                Err(error) => {
-                    return Err(format!("AI 响应包含非法 UTF-8：{error}"));
-                }
+            }
+            Err(error) => {
+                return Err(format!("AI 响应包含非法 UTF-8：{error}"));
             }
         }
 

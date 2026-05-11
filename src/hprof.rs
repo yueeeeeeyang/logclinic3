@@ -1536,9 +1536,7 @@ mod hprof_cache {
             publish_tmp_dir(&sidecar_dir, &tmp_dir)
         })();
 
-        if let Err(error) = write_result {
-            return Err(error);
-        }
+        write_result?;
         Ok(())
     }
 
@@ -2472,7 +2470,7 @@ mod hprof_cache {
             write_u64(&mut chunk, *class_id)?;
             write_string(&mut chunk, name)?;
             done = done.saturating_add(1);
-            if done % HPROF_SIDECAR_RECORD_CHUNK == 0 {
+            if done.is_multiple_of(HPROF_SIDECAR_RECORD_CHUNK) {
                 check_cancel(cancel_flag)?;
                 flush_sidecar_chunk(&mut writer, &mut chunk)?;
                 report_cache_write_chunk(
@@ -2587,7 +2585,7 @@ mod hprof_cache {
             }
             write_option_string(&mut chunk, details.stack_message.as_deref())?;
             done = done.saturating_add(1);
-            if done % HPROF_SIDECAR_RECORD_CHUNK == 0
+            if done.is_multiple_of(HPROF_SIDECAR_RECORD_CHUNK)
                 || chunk.len() >= HPROF_SIDECAR_WRITER_BUFFER_BYTES
             {
                 check_cancel(cancel_flag)?;
@@ -3746,7 +3744,11 @@ where
                     "HEAP_DUMP 子记录越过 segment 边界：0x{sub_tag:02X}"
                 )));
             }
-            if self.progress.record_count % HPROF_PROGRESS_RECORD_INTERVAL == 0 {
+            if self
+                .progress
+                .record_count
+                .is_multiple_of(HPROF_PROGRESS_RECORD_INTERVAL)
+            {
                 self.refresh_progress_counts();
                 self.report_progress();
             }
@@ -4488,7 +4490,11 @@ where
 
     /// 按节流规则报告进度。
     fn maybe_report_progress(&mut self) {
-        if self.progress.record_count % HPROF_PROGRESS_RECORD_INTERVAL == 0 {
+        if self
+            .progress
+            .record_count
+            .is_multiple_of(HPROF_PROGRESS_RECORD_INTERVAL)
+        {
             self.report_progress();
         }
     }
@@ -4637,7 +4643,7 @@ fn report_work_progress<F>(
 
 /// 判断是否到达需要报告进度的批量边界。
 fn should_report_work(done: usize, total: usize) -> bool {
-    done == total || done % HPROF_PROGRESS_WORK_INTERVAL == 0
+    done == total || done.is_multiple_of(HPROF_PROGRESS_WORK_INTERVAL)
 }
 
 /// 把 `usize` 工作下标压缩为 `u32`。

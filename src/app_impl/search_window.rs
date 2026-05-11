@@ -58,10 +58,10 @@ impl SearchDialogWindowView {
         window.start_window_move();
         self.main_view.update(context, |view, context| {
             view.stop_log_text_selection(context);
-            view.tab_context_menu = None;
-            view.encoding_dropdown_menu = None;
-            view.search_results_context_menu = None;
-            view.log_viewer_context_menu = None;
+            view.log.tab_context_menu = None;
+            view.log.encoding_dropdown_menu = None;
+            view.search.search_results_context_menu = None;
+            view.log.log_viewer_context_menu = None;
             context.notify();
         });
     }
@@ -103,26 +103,26 @@ impl SearchDialogWindowView {
             let default_directory_target = (scope == SearchScope::CurrentDirectory)
                 .then(|| view.active_search_directory_label())
                 .flatten();
-            if let Some(dialog) = view.search_dialog.as_mut() {
+            if let Some(dialog) = view.search.search_dialog.as_mut() {
                 dialog.scope = scope;
                 dialog.query_history_menu_open = false;
                 if let Some(target) = default_directory_target
-                    && dialog.directory_target.trim().is_empty()
+                    && dialog.directory_input.text.trim().is_empty()
                 {
-                    dialog.directory_target = target;
+                    dialog.directory_input.text = target;
                 }
                 if scope == SearchScope::CurrentDirectory {
-                    let cursor = dialog.directory_target.len();
-                    dialog.directory_selection_range = cursor..cursor;
-                    dialog.directory_marked_range = None;
+                    let cursor = dialog.directory_input.text.len();
+                    dialog.directory_input.selection_range = cursor..cursor;
+                    dialog.directory_input.marked_range = None;
                 }
                 dialog.message = "输入关键字后按 Enter 或点击搜索".to_string();
             }
             context.notify();
             if scope == SearchScope::CurrentDirectory {
-                view.search_directory_focus.clone()
+                view.search.search_directory_focus.clone()
             } else {
-                view.search_input_focus.clone()
+                view.search.search_input_focus.clone()
             }
         });
         window.focus(&focus_handle);
@@ -132,7 +132,7 @@ impl SearchDialogWindowView {
     /// 切换大小写匹配选项。
     pub(super) fn toggle_case_sensitive(&mut self, context: &mut Context<Self>) {
         self.main_view.update(context, |view, context| {
-            if let Some(dialog) = view.search_dialog.as_mut() {
+            if let Some(dialog) = view.search.search_dialog.as_mut() {
                 if dialog.match_mode == SearchMatchMode::Regex {
                     dialog.query_history_menu_open = false;
                     context.notify();
@@ -153,7 +153,7 @@ impl SearchDialogWindowView {
     /// - 正则开关只影响普通搜索和当前文件计数，不影响快搜；状态仍保存在主窗口搜索对话框里。
     pub(super) fn toggle_regex_mode(&mut self, context: &mut Context<Self>) {
         self.main_view.update(context, |view, context| {
-            if let Some(dialog) = view.search_dialog.as_mut() {
+            if let Some(dialog) = view.search.search_dialog.as_mut() {
                 MainView::set_search_dialog_match_mode(dialog, dialog.match_mode.toggled());
             }
             context.notify();
@@ -164,7 +164,7 @@ impl SearchDialogWindowView {
     /// 统计当前关键字在当前文件中的出现次数。
     pub(super) fn count_current_file_matches(&mut self, context: &mut Context<Self>) {
         self.main_view.update(context, |view, context| {
-            if let Some(dialog) = view.search_dialog.as_mut() {
+            if let Some(dialog) = view.search.search_dialog.as_mut() {
                 dialog.query_history_menu_open = false;
             }
             view.count_search_query_in_current_file(context);
@@ -212,7 +212,7 @@ impl SearchDialogWindowView {
     ) {
         let focus_handle = self.main_view.update(context, |view, context| {
             view.start_search_text_mouse_selection(SearchTextInputKind::Query, event, context);
-            view.search_input_focus.clone()
+            view.search.search_input_focus.clone()
         });
         window.focus(&focus_handle);
         context.notify();
@@ -231,7 +231,7 @@ impl SearchDialogWindowView {
                 event,
                 context,
             );
-            view.search_directory_focus.clone()
+            view.search.search_directory_focus.clone()
         });
         window.focus(&focus_handle);
         context.notify();
@@ -268,12 +268,12 @@ impl SearchDialogWindowView {
         context: &mut Context<Self>,
     ) {
         let focus_handle = self.main_view.update(context, |view, context| {
-            let has_history = !view.search_query_history.is_empty();
-            if let Some(dialog) = view.search_dialog.as_mut() {
+            let has_history = !view.search.search_query_history.is_empty();
+            if let Some(dialog) = view.search.search_dialog.as_mut() {
                 dialog.query_history_menu_open = has_history && !dialog.query_history_menu_open;
             }
             context.notify();
-            view.search_input_focus.clone()
+            view.search.search_input_focus.clone()
         });
         window.focus(&focus_handle);
         context.notify();
@@ -285,7 +285,7 @@ impl SearchDialogWindowView {
     /// - 点击搜索窗口中除历史按钮和历史项外的区域时，应收起菜单，避免它持续遮挡范围和选项控件。
     pub(super) fn dismiss_search_history_menu(&mut self, context: &mut Context<Self>) {
         self.main_view.update(context, |view, context| {
-            if let Some(dialog) = view.search_dialog.as_mut()
+            if let Some(dialog) = view.search.search_dialog.as_mut()
                 && dialog.query_history_menu_open
             {
                 dialog.query_history_menu_open = false;
@@ -306,11 +306,11 @@ impl SearchDialogWindowView {
         context: &mut Context<Self>,
     ) {
         let focus_handle = self.main_view.update(context, |view, context| {
-            if let Some(dialog) = view.search_dialog.as_mut() {
+            if let Some(dialog) = view.search.search_dialog.as_mut() {
                 MainView::apply_search_history_query(dialog, &item);
             }
             context.notify();
-            view.search_input_focus.clone()
+            view.search.search_input_focus.clone()
         });
         window.focus(&focus_handle);
         context.notify();
@@ -1018,7 +1018,7 @@ impl Render for SearchDialogWindowView {
             palette,
         ) = {
             let main_view = self.main_view.read(context);
-            let Some(dialog) = main_view.search_dialog.clone() else {
+            let Some(dialog) = main_view.search.search_dialog.clone() else {
                 let palette = main_view.palette();
                 return div()
                     .id("search-dialog-window-empty")
@@ -1030,9 +1030,9 @@ impl Render for SearchDialogWindowView {
                 main_view.search_can_start(&dialog),
                 main_view.quick_search_can_start(&dialog),
                 main_view.search_can_count_current_file(&dialog) && !dialog.is_searching,
-                main_view.search_query_history.clone(),
-                main_view.search_input_focus.clone(),
-                main_view.search_directory_focus.clone(),
+                main_view.search.search_query_history.clone(),
+                main_view.search.search_input_focus.clone(),
+                main_view.search.search_directory_focus.clone(),
                 main_view.palette(),
             )
         };
@@ -1227,7 +1227,7 @@ impl Element for SearchTextInputElement {
         window: &mut Window,
         context: &mut App,
     ) -> Self::PrepaintState {
-        let Some((text, selection_range, marked_range, cursor_visible_by_activity)) = ({
+        let (text, selection_range, marked_range, cursor_visible_by_activity) = {
             let view = self.view.read(context);
             view.search_text_snapshot(self.input_kind).map(
                 |(text, selection_range, marked_range)| {
@@ -1239,9 +1239,7 @@ impl Element for SearchTextInputElement {
                     )
                 },
             )
-        }) else {
-            return None;
-        };
+        }?;
         let style = window.text_style();
         let display_text = if text.is_empty() {
             SharedString::from(self.placeholder)

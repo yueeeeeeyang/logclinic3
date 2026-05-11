@@ -83,7 +83,7 @@ impl Element for AiChatInputElement {
         let line_height = px(AI_CHAT_INPUT_LINE_HEIGHT);
         let line_ranges = MainView::thread_analysis_filter_line_ranges(&text);
         let display_ranges = if text.is_empty() {
-            vec![0..0]
+            std::iter::once(0..0).collect::<Vec<_>>()
         } else {
             line_ranges
         };

@@ -1691,6 +1691,8 @@ fn rewrite_nested_local_sources(
 /// 边界条件：
 /// - 加载树阶段不能为巨大内层压缩包无上限占用内存，超过 `NESTED_ARCHIVE_SCAN_MAX_BYTES` 时直接回退为普通文件节点。
 /// - RAR 内层压缩包需要路径型 API，因此会先写入临时文件，再复用普通压缩包扫描逻辑。
+/// - 参数分别描述外层来源、内层格式、错误计数和临时路径归属，第三阶段压缩包模块化前先保持现有显式边界。
+#[allow(clippy::too_many_arguments)]
 fn read_nested_archive_tree_from_reader(
     reader: &mut dyn Read,
     declared_size: Option<u64>,
@@ -2045,6 +2047,8 @@ fn add_archive_entry(
 ///
 /// 业务意图：
 /// - 内层压缩包被当作目录显示，但其子文件仍需要保留“外层压缩包 + 内层压缩包成员 + 内层文件成员”的完整读取来源。
+/// - 这里同时构建树节点和完整读取来源，参数较多但都属于压缩包链路的显式上下文，后续会随 archive 功能域再收敛。
+#[allow(clippy::too_many_arguments)]
 fn add_nested_archive_entry(
     root: &mut TreeNode,
     outer_archive_path: &Path,

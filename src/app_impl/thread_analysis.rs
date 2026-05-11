@@ -231,6 +231,8 @@ pub(super) struct SearchResultsResizeDrag {
 /// 业务意图：
 /// - 当前文件搜索复用已解码行；当前目录搜索复用加载树中收集到的文件来源。
 /// - 使用枚举可以在启动任务前完成所有 UI 状态校验，后台逻辑只处理明确输入。
+/// - 当前文件分支必须携带已解码文档，避免为了减小枚举尺寸而在后台搜索前重新读取日志。
+#[allow(clippy::large_enum_variant)]
 pub(super) enum SearchTarget {
     /// 搜索当前文件。
     CurrentFile {

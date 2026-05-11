@@ -269,19 +269,21 @@ impl MainView {
                         line_count,
                         context.processor(
                             move |view, range: std::ops::Range<usize>, _window, context| {
-                                let log_snapshot =
-                                    view.open_tabs.iter().find(|tab| tab.id == tab_id).and_then(
-                                        |tab| match &tab.state {
-                                            LogTabState::Ready { document } => Some((
-                                                document,
-                                                tab.highlighted_search_line,
-                                                tab.text_selection.clone(),
-                                                tab.marked_lines.clone(),
-                                            )),
-                                            LogTabState::Loading { .. }
-                                            | LogTabState::Failed { .. } => None,
-                                        },
-                                    );
+                                let log_snapshot = view
+                                    .log
+                                    .open_tabs
+                                    .iter()
+                                    .find(|tab| tab.id == tab_id)
+                                    .and_then(|tab| match &tab.state {
+                                        LogTabState::Ready { document } => Some((
+                                            document,
+                                            tab.highlighted_search_line,
+                                            tab.text_selection.clone(),
+                                            tab.marked_lines.clone(),
+                                        )),
+                                        LogTabState::Loading { .. }
+                                        | LogTabState::Failed { .. } => None,
+                                    });
                                 let lines = if let Some((
                                     document,
                                     highlighted_search_line,
@@ -396,15 +398,16 @@ impl MainView {
                                                     display_line,
                                                     highlights,
                                                     line_number_width,
-                                                    font_size: view.log_viewer_font_size,
+                                                    font_size: view.settings.log_viewer_font_size,
                                                     horizontal_line_number_offset,
                                                     horizontal_content_offset: px(0.0),
                                                     search_highlighted,
                                                     marked,
                                                     suppress_hover: view
+                                                        .search
                                                         .search_results_resize_drag
                                                         .is_some()
-                                                        || view.log_scrollbar_drag.is_some(),
+                                                        || view.log.log_scrollbar_drag.is_some(),
                                                     palette: view.palette(),
                                                 },
                                                 context,
@@ -505,13 +508,13 @@ impl MainView {
                                 display_line: expanded_line.text,
                                 highlights: display_highlights,
                                 line_number_width,
-                                font_size: self.log_viewer_font_size,
+                                font_size: self.settings.log_viewer_font_size,
                                 horizontal_line_number_offset: px(0.0),
                                 horizontal_content_offset,
                                 search_highlighted: highlighted_search_line == Some(line_index),
                                 marked: marked_lines.contains(&line_index),
-                                suppress_hover: self.search_results_resize_drag.is_some()
-                                    || self.log_scrollbar_drag.is_some(),
+                                suppress_hover: self.search.search_results_resize_drag.is_some()
+                                    || self.log.log_scrollbar_drag.is_some(),
                                 palette,
                             },
                             context,
@@ -1139,10 +1142,10 @@ impl MainView {
         event: &ScrollWheelEvent,
         context: &mut Context<Self>,
     ) {
-        let font_size = self.log_viewer_font_size;
+        let font_size = self.settings.log_viewer_font_size;
         let pixel_delta = event.delta.pixel_delta(px(20.0));
         {
-            let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            let Some(tab) = self.log.open_tabs.iter_mut().find(|tab| tab.id == tab_id) else {
                 return;
             };
             let LogTabState::Ready {
@@ -1170,7 +1173,7 @@ impl MainView {
             tab.paged_scroll.left_px = (tab.paged_scroll.left_px - f64::from(pixel_delta.x))
                 .clamp(0.0, max_horizontal_scroll);
         }
-        self.log_viewer_context_menu = None;
+        self.log.log_viewer_context_menu = None;
         context.notify();
     }
 
@@ -1190,7 +1193,7 @@ impl MainView {
         context: &mut Context<Self>,
     ) {
         self.note_keyboard_scroll_region(KeyboardScrollRegion::LogContent);
-        let Some(tab) = self.open_tabs.iter().find(|tab| tab.id == tab_id) else {
+        let Some(tab) = self.log.open_tabs.iter().find(|tab| tab.id == tab_id) else {
             return;
         };
         let Some(metrics) = self.log_scrollbar_metrics_for_tab(tab, axis) else {
@@ -1209,14 +1212,14 @@ impl MainView {
             LogScrollbarAxis::Horizontal => event.position.x,
         };
         let absolute_thumb_start = viewport_origin + metrics.thumb_start;
-        self.log_scrollbar_drag = Some(LogScrollbarDrag {
+        self.log.log_scrollbar_drag = Some(LogScrollbarDrag {
             tab_id,
             axis,
             cursor_offset: pointer_position - absolute_thumb_start,
         });
-        self.tab_context_menu = None;
-        self.encoding_dropdown_menu = None;
-        self.log_viewer_context_menu = None;
+        self.log.tab_context_menu = None;
+        self.log.encoding_dropdown_menu = None;
+        self.log.log_viewer_context_menu = None;
         self.stop_log_text_selection(context);
     }
 
@@ -1230,30 +1233,30 @@ impl MainView {
         event: &MouseMoveEvent,
         context: &mut Context<Self>,
     ) {
-        let Some(drag) = self.log_scrollbar_drag else {
+        let Some(drag) = self.log.log_scrollbar_drag else {
             return;
         };
         if !event.dragging() {
-            self.log_scrollbar_drag = None;
+            self.log.log_scrollbar_drag = None;
             context.notify();
             return;
         }
 
         let (metrics, viewport_origin, is_paged) = {
-            let Some(tab) = self.open_tabs.iter().find(|tab| tab.id == drag.tab_id) else {
-                self.log_scrollbar_drag = None;
+            let Some(tab) = self.log.open_tabs.iter().find(|tab| tab.id == drag.tab_id) else {
+                self.log.log_scrollbar_drag = None;
                 context.notify();
                 return;
             };
             let Some(metrics) = self.log_scrollbar_metrics_for_tab(tab, drag.axis) else {
-                self.log_scrollbar_drag = None;
+                self.log.log_scrollbar_drag = None;
                 context.notify();
                 return;
             };
             let Some(viewport_origin) =
                 Self::log_scrollbar_viewport_axis_origin_for_tab(tab, drag.axis)
             else {
-                self.log_scrollbar_drag = None;
+                self.log.log_scrollbar_drag = None;
                 context.notify();
                 return;
             };
@@ -1285,7 +1288,12 @@ impl MainView {
         let scroll_offset_px = metrics.max_scroll_px * scroll_ratio;
 
         if is_paged {
-            if let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.id == drag.tab_id) {
+            if let Some(tab) = self
+                .log
+                .open_tabs
+                .iter_mut()
+                .find(|tab| tab.id == drag.tab_id)
+            {
                 match drag.axis {
                     LogScrollbarAxis::Vertical => {
                         tab.paged_scroll.top_px =
@@ -1297,7 +1305,7 @@ impl MainView {
                     }
                 }
             }
-        } else if let Some(tab) = self.open_tabs.iter().find(|tab| tab.id == drag.tab_id) {
+        } else if let Some(tab) = self.log.open_tabs.iter().find(|tab| tab.id == drag.tab_id) {
             let scroll_offset = px(scroll_offset_px as f32);
             let base_scroll_handle = {
                 // `UniformListScrollHandle` 包装了真正的 `ScrollHandle`；这里克隆句柄后释放借用，再写入偏移。
@@ -1323,8 +1331,8 @@ impl MainView {
     /// 业务意图：
     /// - 鼠标释放后清空拖动状态，避免下一次普通鼠标移动继续改变日志滚动位置。
     pub(super) fn stop_log_scrollbar_drag(&mut self, context: &mut Context<Self>) {
-        if self.log_scrollbar_drag.is_some() {
-            self.log_scrollbar_drag = None;
+        if self.log.log_scrollbar_drag.is_some() {
+            self.log.log_scrollbar_drag = None;
             context.notify();
         }
     }
@@ -1350,7 +1358,8 @@ impl MainView {
         context: &mut Context<Self>,
     ) {
         self.note_keyboard_scroll_region(KeyboardScrollRegion::LogContent);
-        if self.search_results_resize_drag.is_some() || self.log_scrollbar_drag.is_some() {
+        if self.search.search_results_resize_drag.is_some() || self.log.log_scrollbar_drag.is_some()
+        {
             return;
         }
 
@@ -1359,7 +1368,7 @@ impl MainView {
         else {
             return;
         };
-        let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+        let Some(tab) = self.log.open_tabs.iter_mut().find(|tab| tab.id == tab_id) else {
             return;
         };
         if !matches!(&tab.state, LogTabState::Ready { .. }) {
@@ -1383,9 +1392,9 @@ impl MainView {
 
         tab.text_selection = Some(text_selection);
         tab.selection_drag_anchor = (event.click_count <= 1).then_some(position);
-        self.tab_context_menu = None;
-        self.encoding_dropdown_menu = None;
-        self.log_viewer_context_menu = None;
+        self.log.tab_context_menu = None;
+        self.log.encoding_dropdown_menu = None;
+        self.log.log_viewer_context_menu = None;
         context.notify();
     }
 
@@ -1500,7 +1509,8 @@ impl MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
-        if self.search_results_resize_drag.is_some() || self.log_scrollbar_drag.is_some() {
+        if self.search.search_results_resize_drag.is_some() || self.log.log_scrollbar_drag.is_some()
+        {
             self.stop_log_text_selection(context);
             return;
         }
@@ -1511,6 +1521,7 @@ impl MainView {
         }
 
         let Some(anchor) = self
+            .log
             .open_tabs
             .iter()
             .find(|tab| tab.id == tab_id)
@@ -1523,7 +1534,7 @@ impl MainView {
         else {
             return;
         };
-        let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+        let Some(tab) = self.log.open_tabs.iter_mut().find(|tab| tab.id == tab_id) else {
             return;
         };
 
@@ -1540,7 +1551,7 @@ impl MainView {
     /// - 鼠标释放后保留最终选区用于复制和搜索预填，但清理拖动锚点，避免下一次鼠标移动继续扩展旧选区。
     pub(super) fn stop_log_text_selection(&mut self, context: &mut Context<Self>) {
         let mut changed = false;
-        for tab in &mut self.open_tabs {
+        for tab in &mut self.log.open_tabs {
             if tab.selection_drag_anchor.take().is_some() {
                 changed = true;
             }
@@ -1570,7 +1581,7 @@ impl MainView {
         pointer_x: Pixels,
         window: &mut Window,
     ) -> Option<LogTextPosition> {
-        let tab = self.open_tabs.iter().find(|tab| tab.id == tab_id)?;
+        let tab = self.log.open_tabs.iter().find(|tab| tab.id == tab_id)?;
         let LogTabState::Ready { document } = &tab.state else {
             return None;
         };
@@ -1609,7 +1620,7 @@ impl MainView {
 
         let mut text_style = window.text_style();
         text_style.font_family = LOG_VIEWER_FONT_FAMILY.into();
-        text_style.font_size = px(self.log_viewer_font_size).into();
+        text_style.font_size = px(self.settings.log_viewer_font_size).into();
         let expanded_line = Self::expanded_log_line_for_display(line);
         let run = TextRun {
             len: expanded_line.text.len(),
@@ -1666,7 +1677,7 @@ impl MainView {
                 LogScrollbarAxis::Horizontal => Self::paged_log_horizontal_scrollbar_metrics(
                     tab,
                     document,
-                    self.log_viewer_font_size,
+                    self.settings.log_viewer_font_size,
                 ),
             },
             LogTabState::Ready {
@@ -1887,7 +1898,7 @@ impl MainView {
         line_index: usize,
         context: &mut Context<Self>,
     ) {
-        let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+        let Some(tab) = self.log.open_tabs.iter_mut().find(|tab| tab.id == tab_id) else {
             return;
         };
         if !matches!(tab.state, LogTabState::Ready { .. }) {
@@ -1898,10 +1909,10 @@ impl MainView {
         if !marked && tab.last_marker_jump_line == Some(line_index) {
             tab.last_marker_jump_line = None;
         }
-        self.log_viewer_context_menu = None;
-        self.tab_context_menu = None;
-        self.encoding_dropdown_menu = None;
-        self.search_results_context_menu = None;
+        self.log.log_viewer_context_menu = None;
+        self.log.tab_context_menu = None;
+        self.log.encoding_dropdown_menu = None;
+        self.search.search_results_context_menu = None;
         context.notify();
     }
 
@@ -1917,19 +1928,19 @@ impl MainView {
         window_y: f32,
         context: &mut Context<Self>,
     ) {
-        if !self.open_tabs.iter().any(|tab| tab.id == tab_id) {
+        if !self.log.open_tabs.iter().any(|tab| tab.id == tab_id) {
             return;
         }
         let panel_x = (window_x - self.right_panel_left_offset()).max(0.0);
         let panel_y = (window_y - TOOLBAR_HEIGHT).max(0.0);
-        self.log_viewer_context_menu = Some(LogViewerContextMenu {
+        self.log.log_viewer_context_menu = Some(LogViewerContextMenu {
             tab_id,
             x: panel_x,
             y: panel_y,
         });
-        self.tab_context_menu = None;
-        self.search_results_context_menu = None;
-        self.encoding_dropdown_menu = None;
+        self.log.tab_context_menu = None;
+        self.search.search_results_context_menu = None;
+        self.log.encoding_dropdown_menu = None;
         context.notify();
     }
 
@@ -1941,7 +1952,7 @@ impl MainView {
         &self,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let Some(menu) = &self.log_viewer_context_menu else {
+        let Some(menu) = &self.log.log_viewer_context_menu else {
             return div().id("log-viewer-context-menu-empty").hidden();
         };
         let tab_id = menu.tab_id;
@@ -2044,10 +2055,10 @@ impl MainView {
         action: LogViewerContextMenuAction,
         context: &mut Context<Self>,
     ) {
-        self.log_viewer_context_menu = None;
-        self.tab_context_menu = None;
-        self.encoding_dropdown_menu = None;
-        self.search_results_context_menu = None;
+        self.log.log_viewer_context_menu = None;
+        self.log.tab_context_menu = None;
+        self.log.encoding_dropdown_menu = None;
+        self.search.search_results_context_menu = None;
         match action {
             LogViewerContextMenuAction::Copy => {
                 let _ = self.copy_selected_log_text_for_tab(tab_id, context);
@@ -2066,7 +2077,7 @@ impl MainView {
     /// 业务意图：
     /// - 正文右键菜单命令应始终作用于打开菜单时所在的 tab，不能依赖当前激活 tab，避免用户切换 tab 后保存错文件。
     pub(super) fn log_viewer_save_source_for_tab(&self, tab_id: usize) -> Option<LogFileSource> {
-        Self::log_viewer_save_source_for_tab_from_tabs(&self.open_tabs, tab_id)
+        Self::log_viewer_save_source_for_tab_from_tabs(&self.log.open_tabs, tab_id)
     }
 
     /// 从打开 tab 集合中查找正文右键菜单绑定的另存为来源。

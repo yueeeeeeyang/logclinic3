@@ -631,7 +631,7 @@ fn materialize_7z_member(
                 }
             };
             if normalized != member_path {
-                io::copy(reader, &mut io::sink()).map_err(|error| sevenz_rust::Error::io(error))?;
+                io::copy(reader, &mut io::sink()).map_err(sevenz_rust::Error::io)?;
                 return Ok(true);
             }
             found = true;

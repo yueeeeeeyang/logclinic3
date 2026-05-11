@@ -83,6 +83,8 @@ struct HprofThreadContextMenu {
 ///
 /// 业务意图：
 /// - 主窗口内嵌页需要同时表达未选择文件、运行中、完成、失败和取消，状态枚举可以让渲染逻辑保持互斥。
+/// - 完成结果只在 GPUI 主线程状态和渲染闭包中共享，当前沿用 `Arc` 以减少 HPROF 视图边界改动。
+#[allow(clippy::arc_with_non_send_sync)]
 enum HprofAnalysisState {
     /// 尚未选择 dump 文件。
     Idle,
@@ -255,6 +257,10 @@ impl HprofAnalysisView {
     }
 
     /// 启动后台 HPROF 解析任务。
+    ///
+    /// 业务意图：
+    /// - 后台线程返回后在 UI 线程把结果包装进完成态；包装类型保持不变，避免本轮重构同时触碰 HPROF 结果渲染签名。
+    #[allow(clippy::arc_with_non_send_sync)]
     fn spawn_analysis_worker(
         &self,
         generation: usize,

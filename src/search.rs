@@ -131,6 +131,10 @@ pub struct SearchOptions {
 
 impl SearchOptions {
     /// 构造普通文本单关键字搜索选项。
+    ///
+    /// 业务意图：
+    /// - 当前生产路径会显式传入匹配模式，测试仍需要一个短入口构造默认普通文本搜索，避免每个用例重复写模式参数。
+    #[cfg(test)]
     pub fn single(query: impl Into<String>, case_sensitive: bool) -> Self {
         Self::single_with_mode(query, case_sensitive, SearchMatchMode::Literal)
     }
@@ -146,7 +150,7 @@ impl SearchOptions {
     ) -> Self {
         let query = query.into();
         let queries = (!query.trim().is_empty())
-            .then(|| query)
+            .then_some(query)
             .into_iter()
             .collect();
         Self {

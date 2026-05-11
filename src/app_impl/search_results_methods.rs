@@ -14,7 +14,7 @@ impl MainView {
         &self,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let Some(panel) = &self.search_results_panel else {
+        let Some(panel) = &self.search.search_results_panel else {
             return div().id("search-results-panel-empty").hidden();
         };
         let row_count = panel.rows.len();
@@ -77,6 +77,7 @@ impl MainView {
                             context.processor(
                                 move |view, range: std::ops::Range<usize>, _window, context| {
                                     let rows = view
+                                        .search
                                         .search_results_panel
                                         .as_ref()
                                         .map(|panel| {
@@ -327,12 +328,12 @@ impl MainView {
     ) {
         let panel_x = (window_x - self.right_panel_left_offset()).max(0.0);
         let panel_y = (window_y - TOOLBAR_HEIGHT).max(0.0);
-        self.search_results_context_menu = Some(SearchResultsContextMenu {
+        self.search.search_results_context_menu = Some(SearchResultsContextMenu {
             x: panel_x,
             y: panel_y,
         });
-        self.tab_context_menu = None;
-        self.encoding_dropdown_menu = None;
+        self.log.tab_context_menu = None;
+        self.log.encoding_dropdown_menu = None;
         context.notify();
     }
 
@@ -345,7 +346,7 @@ impl MainView {
         row: SearchResultsPanelRow,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let Some(panel) = self.search_results_panel.as_ref() else {
+        let Some(panel) = self.search.search_results_panel.as_ref() else {
             return div().id("search-results-row-missing-panel").hidden();
         };
 
@@ -414,7 +415,7 @@ impl MainView {
         &self,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let Some(menu) = &self.search_results_context_menu else {
+        let Some(menu) = &self.search.search_results_context_menu else {
             return div().id("search-results-context-menu-empty").hidden();
         };
         let palette = self.palette();
@@ -503,7 +504,7 @@ impl MainView {
             SearchResultsContextMenuAction::ExpandAll => self.expand_all_search_results(),
             SearchResultsContextMenuAction::CollapseAll => self.collapse_all_search_results(),
         }
-        self.search_results_context_menu = None;
+        self.search.search_results_context_menu = None;
         context.notify();
     }
 
@@ -513,7 +514,7 @@ impl MainView {
     /// - 用户在需要快速浏览全部命中时，可以一次性展开所有层级，不必逐个文件打开。
     /// - 展开后重建虚拟列表行缓存，保持滚动路径仍为 O(可见行数)。
     pub(super) fn expand_all_search_results(&mut self) {
-        let Some(panel) = self.search_results_panel.as_mut() else {
+        let Some(panel) = self.search.search_results_panel.as_mut() else {
             return;
         };
 
@@ -533,7 +534,7 @@ impl MainView {
     /// 业务意图：
     /// - 当搜索结果过多造成扫描困难时，用户可以一次回到只有历史摘要的紧凑视图。
     pub(super) fn collapse_all_search_results(&mut self) {
-        let Some(panel) = self.search_results_panel.as_mut() else {
+        let Some(panel) = self.search.search_results_panel.as_mut() else {
             return;
         };
 
@@ -661,11 +662,11 @@ impl MainView {
                     ))
                     .on_click(
                         context.listener(|view, _event: &ClickEvent, _window, context| {
-                            view.search_results_panel = None;
-                            view.search_results_resize_drag = None;
-                            view.search_results_scrollbar_drag = None;
-                            view.search_results_context_menu = None;
-                            view.log_viewer_context_menu = None;
+                            view.search.search_results_panel = None;
+                            view.search.search_results_resize_drag = None;
+                            view.search.search_results_scrollbar_drag = None;
+                            view.search.search_results_context_menu = None;
+                            view.log.log_viewer_context_menu = None;
                             context.notify();
                             // 关闭按钮位于搜索结果标题栏内部，按钮点击不应继续传给标题栏或面板。
                             context.stop_propagation();
@@ -804,7 +805,7 @@ impl MainView {
             )
             .on_click(
                 context.listener(move |view, _event: &ClickEvent, _window, context| {
-                    if let Some(panel) = view.search_results_panel.as_mut()
+                    if let Some(panel) = view.search.search_results_panel.as_mut()
                         && let Some(record) = panel.records.get_mut(record_index)
                     {
                         record.expanded = !record.expanded;
@@ -829,6 +830,7 @@ impl MainView {
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let expanded = self
+            .search
             .search_results_panel
             .as_ref()
             .and_then(|panel| panel.records.get(record_index))
@@ -887,7 +889,7 @@ impl MainView {
             )
             .on_click(
                 context.listener(move |view, _event: &ClickEvent, _window, context| {
-                    if let Some(panel) = view.search_results_panel.as_mut()
+                    if let Some(panel) = view.search.search_results_panel.as_mut()
                         && let Some(record) = panel.records.get_mut(record_index)
                     {
                         if !record.expanded_file_keys.remove(&source_key_for_click) {
@@ -964,7 +966,7 @@ impl MainView {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(self.log_viewer_font_size))
+                    .text_size(px(self.settings.log_viewer_font_size))
                     .font_family(LOG_VIEWER_FONT_FAMILY)
                     .text_color(rgb(palette.text))
                     .child(StyledText::new(preview_text).with_highlights(highlights)),
@@ -1107,10 +1109,10 @@ impl MainView {
         &self,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        if self.tab_context_menu.is_none()
-            && self.encoding_dropdown_menu.is_none()
-            && self.search_results_context_menu.is_none()
-            && self.log_viewer_context_menu.is_none()
+        if self.log.tab_context_menu.is_none()
+            && self.log.encoding_dropdown_menu.is_none()
+            && self.search.search_results_context_menu.is_none()
+            && self.log.log_viewer_context_menu.is_none()
         {
             return div().id("popup-dismiss-overlay-empty").hidden();
         }
@@ -1132,20 +1134,20 @@ impl MainView {
                 MouseButton::Right,
                 context.listener(|view, _event: &MouseDownEvent, _window, context| {
                     // 右键通常不会产生普通 click；这里直接关闭浮层并截断，防止右键穿透到底层重新打开其它菜单。
-                    view.tab_context_menu = None;
-                    view.encoding_dropdown_menu = None;
-                    view.search_results_context_menu = None;
-                    view.log_viewer_context_menu = None;
+                    view.log.tab_context_menu = None;
+                    view.log.encoding_dropdown_menu = None;
+                    view.search.search_results_context_menu = None;
+                    view.log.log_viewer_context_menu = None;
                     context.notify();
                     context.stop_propagation();
                 }),
             )
             .on_click(
                 context.listener(|view, _event: &ClickEvent, _window, context| {
-                    view.tab_context_menu = None;
-                    view.encoding_dropdown_menu = None;
-                    view.search_results_context_menu = None;
-                    view.log_viewer_context_menu = None;
+                    view.log.tab_context_menu = None;
+                    view.log.encoding_dropdown_menu = None;
+                    view.search.search_results_context_menu = None;
+                    view.log.log_viewer_context_menu = None;
                     context.notify();
                     // click 也必须在遮罩层截止，避免同一次点击落到遮罩后方的新目标。
                     context.stop_propagation();

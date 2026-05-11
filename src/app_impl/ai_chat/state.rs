@@ -53,7 +53,8 @@ impl MainView {
     /// 返回当前 AI 对话选择的模型配置。
     pub(in crate::app) fn active_ai_chat_model_profile(&self) -> Option<ModelProfile> {
         let profile_id = self.active_ai_chat_model_profile_id()?;
-        self.model_config_profiles
+        self.model_config
+            .model_config_profiles
             .iter()
             .find(|profile| profile.id == profile_id)
             .cloned()
@@ -78,8 +79,8 @@ impl MainView {
             return;
         };
         let model_profile_id = ai_chat_default_model_profile_id(
-            &self.model_config_profiles,
-            self.model_config_default_profile_id.as_deref(),
+            &self.model_config.model_config_profiles,
+            self.model_config.model_config_default_profile_id.as_deref(),
         );
         let conversation = new_ai_chat_conversation(model_profile_id);
         match insert_ai_chat_conversation(&path, &conversation) {
@@ -149,8 +150,8 @@ impl MainView {
                     .retain(|conversation| conversation.id != active_id);
                 if self.ai_chat_conversations.is_empty() {
                     let model_profile_id = ai_chat_default_model_profile_id(
-                        &self.model_config_profiles,
-                        self.model_config_default_profile_id.as_deref(),
+                        &self.model_config.model_config_profiles,
+                        self.model_config.model_config_default_profile_id.as_deref(),
                     );
                     let conversation = new_ai_chat_conversation(model_profile_id);
                     match insert_ai_chat_conversation(&path, &conversation) {
@@ -189,7 +190,7 @@ impl MainView {
 
     /// 切换 AI 对话模型下拉菜单。
     pub(in crate::app) fn toggle_ai_chat_model_menu(&mut self, context: &mut Context<Self>) {
-        if self.model_config_profiles.is_empty() {
+        if self.model_config.model_config_profiles.is_empty() {
             self.ai_chat_model_menu_open = false;
         } else {
             self.ai_chat_model_menu_open = !self.ai_chat_model_menu_open;
@@ -208,6 +209,7 @@ impl MainView {
             return;
         };
         if !self
+            .model_config
             .model_config_profiles
             .iter()
             .any(|profile| profile.id == profile_id)
@@ -956,14 +958,11 @@ impl MainView {
 
     /// 处理后台 AI 流式事件。
     pub(in crate::app) fn drain_ai_chat_stream_events(&mut self, context: &mut Context<Self>) {
-        loop {
-            let event = match self.ai_chat_streaming_task.as_ref() {
-                Some(task) => match task.receiver.try_recv() {
-                    Ok(event) => event,
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => AiChatStreamEvent::Done,
-                },
-                None => break,
+        while let Some(task) = self.ai_chat_streaming_task.as_ref() {
+            let event = match task.receiver.try_recv() {
+                Ok(event) => event,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => AiChatStreamEvent::Done,
             };
             self.apply_ai_chat_stream_event(event);
         }

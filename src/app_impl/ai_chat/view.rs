@@ -418,7 +418,8 @@ impl MainView {
                 }),
             )
             .children(
-                self.model_config_profiles
+                self.model_config
+                    .model_config_profiles
                     .iter()
                     .map(|profile| {
                         let profile_id = profile.id.clone();
@@ -565,9 +566,9 @@ impl MainView {
             .overflow_hidden()
             .bg(rgb(palette.background));
 
-        if self.model_config_profiles.is_empty() {
+        if self.model_config.model_config_profiles.is_empty() {
             messages = messages.child(self.render_ai_chat_empty_state(
-                ai_chat_placeholder_description(&self.model_config_profiles),
+                ai_chat_placeholder_description(&self.model_config.model_config_profiles),
                 palette,
             ));
         } else if let Some(error) = &self.ai_chat_database_error {

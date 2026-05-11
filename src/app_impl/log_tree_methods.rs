@@ -35,7 +35,7 @@ impl MainView {
     /// - 当前标题不显示真实绝对路径，避免在路径脱敏和悬浮提示规则未定义前挤压窄面板。
     pub(super) fn render_log_tree_header(&self) -> impl IntoElement {
         let palette = self.palette();
-        let summary = match &self.load_state {
+        let summary = match &self.log.load_state {
             LogTreeLoadState::Loaded(tree_state) => tree_state.summary().to_string(),
             LogTreeLoadState::Empty
             | LogTreeLoadState::Loading { .. }
@@ -83,7 +83,7 @@ impl MainView {
     /// - 目录树行高固定为 `LOG_TREE_ROW_HEIGHT`，符合 `uniform_list` 对等高元素的要求。
     /// - 虚拟列表数量来自当前可见行缓存，展开/收起后会重新计算并驱动列表更新。
     pub(super) fn render_log_tree_body(&self, context: &mut Context<Self>) -> impl IntoElement {
-        let visible_row_count = match &self.load_state {
+        let visible_row_count = match &self.log.load_state {
             LogTreeLoadState::Loaded(tree_state) => tree_state.visible_rows.len(),
             LogTreeLoadState::Empty
             | LogTreeLoadState::Loading { .. }
@@ -116,7 +116,7 @@ impl MainView {
                         // 先复制当前可见区间的数据，再渲染元素，避免同时持有 `load_state` 的不可变借用和
                         // 需要注册点击监听的可变 `Context`，这是 Rust 借用规则下最清晰的分界。
                         let range_start = range.start;
-                        let rows: Vec<LoadedLogTreeRow> = match &view.load_state {
+                        let rows: Vec<LoadedLogTreeRow> = match &view.log.load_state {
                             LogTreeLoadState::Loaded(tree_state) => range
                                 .filter_map(|index| tree_state.visible_rows.get(index).cloned())
                                 .collect(),
@@ -134,7 +134,7 @@ impl MainView {
                     }),
                 )
                 .size_full()
-                .track_scroll(self.log_tree_scroll_handle.clone()),
+                .track_scroll(self.log.log_tree_scroll_handle.clone()),
             )
             .child(self.render_log_tree_scrollbar(visible_row_count, context))
     }
@@ -152,7 +152,7 @@ impl MainView {
         visible_row_count: usize,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let Some(metrics) = Self::log_tree_scrollbar_metrics(&self.log_tree_scroll_handle)
+        let Some(metrics) = Self::log_tree_scrollbar_metrics(&self.log.log_tree_scroll_handle)
             .or_else(|| Self::fallback_log_tree_scrollbar_metrics(visible_row_count))
         else {
             return div().id("log-tree-scrollbar-empty").hidden();
@@ -289,7 +289,7 @@ impl MainView {
                 can_toggle,
                 source: row_source,
                 visible_index,
-                selected: self.log_tree_selected_node_ids.contains(&row.id),
+                selected: self.log.log_tree_selected_node_ids.contains(&row.id),
                 label: row.label.clone(),
                 meta: row.meta.clone(),
             },
@@ -448,11 +448,11 @@ impl MainView {
             event.modifiers.shift,
             event.modifiers.control || event.modifiers.platform,
         );
-        self.log_tree_context_menu = None;
-        self.tab_context_menu = None;
-        self.encoding_dropdown_menu = None;
-        self.log_viewer_context_menu = None;
-        self.search_results_context_menu = None;
+        self.log.log_tree_context_menu = None;
+        self.log.tab_context_menu = None;
+        self.log.encoding_dropdown_menu = None;
+        self.log.log_viewer_context_menu = None;
+        self.search.search_results_context_menu = None;
 
         match Self::log_tree_primary_action_for_click(
             source.is_some(),
@@ -518,8 +518,8 @@ impl MainView {
     ) {
         let visible_node_ids = self.visible_log_tree_node_ids();
         Self::apply_log_tree_selection_click(
-            &mut self.log_tree_selected_node_ids,
-            &mut self.log_tree_selection_anchor,
+            &mut self.log.log_tree_selected_node_ids,
+            &mut self.log.log_tree_selection_anchor,
             &visible_node_ids,
             node_id,
             visible_index,
@@ -573,7 +573,7 @@ impl MainView {
     /// 业务意图：
     /// - Shift 多选只能覆盖当前用户可见的连续行，折叠隐藏的子节点不参与范围计算。
     pub(super) fn visible_log_tree_node_ids(&self) -> Vec<usize> {
-        match &self.load_state {
+        match &self.log.load_state {
             LogTreeLoadState::Loaded(tree_state) => {
                 tree_state.visible_rows.iter().map(|row| row.id).collect()
             }
@@ -589,6 +589,8 @@ impl MainView {
     /// - 右键已选中文件时保留当前多选集合；右键未选中行时先把该行切换为唯一选择。
     /// - 菜单命令随后统一作用于当前选择中的可读取文件，目录和错误节点会被自动忽略。
     /// - 鼠标事件坐标来自主窗口，左侧固定大导航不属于目录树面板，定位菜单时必须先扣除导航宽度。
+    /// - 参数直接来自鼠标事件和树节点快照，保持显式传入可以避免菜单打开时再次按 ID 查询易变行。
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn open_log_tree_context_menu(
         &mut self,
         node_id: usize,
@@ -600,7 +602,7 @@ impl MainView {
         context: &mut Context<Self>,
     ) {
         self.note_keyboard_scroll_region(KeyboardScrollRegion::LogTree);
-        if !self.log_tree_selected_node_ids.contains(&node_id) {
+        if !self.log.log_tree_selected_node_ids.contains(&node_id) {
             self.update_log_tree_selection_for_click(
                 node_id,
                 visible_index,
@@ -608,15 +610,15 @@ impl MainView {
                 event.modifiers.control || event.modifiers.platform,
             );
         }
-        self.log_tree_context_menu = Some(LogTreeContextMenu {
+        self.log.log_tree_context_menu = Some(LogTreeContextMenu {
             node_id,
             source,
             x: Self::log_tree_context_menu_x(window_x, self.left_panel_width),
             y: (window_y - TOOLBAR_HEIGHT).max(0.0),
         });
-        self.tab_context_menu = None;
-        self.encoding_dropdown_menu = None;
-        self.search_results_context_menu = None;
+        self.log.tab_context_menu = None;
+        self.log.encoding_dropdown_menu = None;
+        self.search.search_results_context_menu = None;
         context.notify();
     }
 
@@ -629,7 +631,7 @@ impl MainView {
         &self,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let Some(menu) = &self.log_tree_context_menu else {
+        let Some(menu) = &self.log.log_tree_context_menu else {
             return div().id("log-tree-context-menu-empty").hidden();
         };
         let palette = self.palette();
@@ -691,7 +693,7 @@ impl MainView {
         &self,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        if self.log_tree_context_menu.is_none() {
+        if self.log.log_tree_context_menu.is_none() {
             return div()
                 .id("log-tree-context-menu-dismiss-overlay-empty")
                 .hidden();
@@ -714,14 +716,14 @@ impl MainView {
                 MouseButton::Right,
                 context.listener(|view, _event: &MouseDownEvent, _window, context| {
                     // 右键通常不触发普通 click；这里直接关闭旧菜单并截断，避免穿透到其它节点重新开菜单。
-                    view.log_tree_context_menu = None;
+                    view.log.log_tree_context_menu = None;
                     context.notify();
                     context.stop_propagation();
                 }),
             )
             .on_click(
                 context.listener(|view, _event: &ClickEvent, _window, context| {
-                    view.log_tree_context_menu = None;
+                    view.log.log_tree_context_menu = None;
                     context.notify();
                     // click 仍需截断，防止遮罩消失后同一次点击被底层树节点处理。
                     context.stop_propagation();
@@ -733,6 +735,8 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 菜单项点击后进入统一命令分发，避免另存为和分析各自重复收起菜单、筛选选中来源。
+    /// - 渲染 helper 需要同时拿到节点、动作、图标和主题，当前保持显式参数以减少临时结构类型扩散。
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn render_log_tree_context_menu_item(
         &self,
         node_id: usize,
@@ -796,10 +800,10 @@ impl MainView {
         {
             sources.push(fallback_source);
         }
-        self.log_tree_context_menu = None;
-        self.tab_context_menu = None;
-        self.encoding_dropdown_menu = None;
-        self.search_results_context_menu = None;
+        self.log.log_tree_context_menu = None;
+        self.log.tab_context_menu = None;
+        self.log.encoding_dropdown_menu = None;
+        self.search.search_results_context_menu = None;
 
         match action {
             LogTreeContextMenuAction::SaveAs => {
@@ -818,14 +822,14 @@ impl MainView {
     /// - 多选允许包含目录和错误节点，但“另存为”和“线程日志分析”只能处理真实文件。
     /// - 按加载树原始顺序返回，保证批量保存和分析结果稳定。
     pub(super) fn selected_log_tree_file_sources(&self) -> Vec<LogFileSource> {
-        let LogTreeLoadState::Loaded(tree_state) = &self.load_state else {
+        let LogTreeLoadState::Loaded(tree_state) = &self.log.load_state else {
             return Vec::new();
         };
         tree_state
             .tree
             .rows
             .iter()
-            .filter(|row| self.log_tree_selected_node_ids.contains(&row.id))
+            .filter(|row| self.log.log_tree_selected_node_ids.contains(&row.id))
             .filter_map(|row| {
                 row.source.clone().or_else(|| {
                     (row.kind == LogTreeEntryKind::Archive)
@@ -894,14 +898,14 @@ impl MainView {
                 view.update(app, |view, context| {
                     let conflicts = Self::save_target_conflicts(&sources, &target_directory);
                     if let Some(first_conflict_path) = conflicts.first().cloned() {
-                        view.save_overwrite_confirm_dialog = Some(SaveOverwriteConfirmDialog {
+                        view.log.save_overwrite_confirm_dialog = Some(SaveOverwriteConfirmDialog {
                             sources,
                             target_directory,
                             conflict_count: conflicts.len(),
                             first_conflict_path,
                         });
-                        view.log_tree_context_menu = None;
-                        view.log_viewer_context_menu = None;
+                        view.log.log_tree_context_menu = None;
+                        view.log.log_viewer_context_menu = None;
                     } else {
                         view.spawn_save_log_sources_to_directory(
                             sources,
@@ -949,9 +953,9 @@ impl MainView {
                         result.skipped_count,
                         result.failed_count,
                     );
-                    view.log_tree_context_menu = None;
-                    view.log_viewer_context_menu = None;
-                    view.save_overwrite_confirm_dialog = None;
+                    view.log.log_tree_context_menu = None;
+                    view.log.log_viewer_context_menu = None;
+                    view.log.save_overwrite_confirm_dialog = None;
                     context.notify();
                 })
                 .ok();
@@ -1054,7 +1058,7 @@ impl MainView {
         conflict_policy: SaveConflictPolicy,
         context: &mut Context<Self>,
     ) {
-        let Some(dialog) = self.save_overwrite_confirm_dialog.take() else {
+        let Some(dialog) = self.log.save_overwrite_confirm_dialog.take() else {
             return;
         };
         self.spawn_save_log_sources_to_directory(
@@ -1078,8 +1082,7 @@ impl MainView {
         pub(super) fn file_name_from_member_path(member_path: &str) -> PathBuf {
             member_path
                 .split('/')
-                .filter(|part| !part.is_empty())
-                .next_back()
+                .rfind(|part| !part.is_empty())
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("log.txt"))
         }
