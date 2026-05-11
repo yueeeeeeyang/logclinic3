@@ -314,7 +314,7 @@ mod tests {
         assert_eq!(MainFeature::LogAnalysis.label(), "日志分析");
         assert_eq!(
             char::from(MainFeature::LogAnalysis.icon()),
-            char::from(Icon::FileText)
+            char::from(Icon::Logs)
         );
         assert_eq!(MainFeature::HprofAnalysis.label(), "HPROF解析");
         assert_eq!(
