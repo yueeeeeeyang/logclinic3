@@ -2147,6 +2147,22 @@ struct OpenLogTab {
     /// - 点击搜索结果后不仅要滚动到目标位置，还要用背景色标记命中行，避免用户在密集日志中丢失上下文。
     /// - 该状态只属于当前 tab 的临时视觉反馈，不持久化，也不影响日志语法高亮。
     highlighted_search_line: Option<usize>,
+    /// 当前 tab 内由用户手动打标的日志行。
+    ///
+    /// 业务意图：
+    /// - 用户排查日志时经常需要在多个关键位置之间来回跳转，标记行只属于当前打开的 tab。
+    /// - 使用 `BTreeSet` 保存 0 基行号，可以天然按行号排序，便于 `F2` 查找下一个标记并在末尾循环回到第一个。
+    ///
+    /// 边界条件：
+    /// - 标记不写入配置、不跨会话保存；关闭 tab 或重新加载日志后自然清空。
+    /// - 切换编码时保留标记，因为同一份原始日志只是重新解码，用户已经标出的行号仍有参考价值。
+    marked_lines: BTreeSet<usize>,
+    /// 最近一次通过 `F2` 跳转到的标记行。
+    ///
+    /// 业务意图：
+    /// - 连续按 `F2` 时应从上一次跳转目标之后继续寻找，而不是每次都从当前视口顶部开始。
+    /// - 当用户手动滚动到其它位置后，如果该行不再可见，下一次 `F2` 会重新以当前可视顶部为起点。
+    last_marker_jump_line: Option<usize>,
     /// 当前 tab 内日志正文的只读文本选择范围。
     ///
     /// 业务意图：
@@ -2263,6 +2279,11 @@ struct LogLineRenderData {
     horizontal_content_offset: Pixels,
     /// 当前行是否是搜索结果跳转后的目标行。
     search_highlighted: bool,
+    /// 当前行是否被用户手动标记。
+    ///
+    /// 业务意图：
+    /// - 标记只显示在行号 gutter 内，避免改变正文背景后和搜索跳转高亮、选区高亮互相干扰。
+    marked: bool,
     /// 是否临时禁用行 hover 样式。
     ///
     /// 业务意图：
@@ -5444,6 +5465,8 @@ impl MainView {
             paged_scroll: PagedLogScrollState::default(),
             pending_scroll_to_line: None,
             highlighted_search_line: None,
+            marked_lines: BTreeSet::new(),
+            last_marker_jump_line: None,
             text_selection: None,
             selection_drag_anchor: None,
         });
@@ -5634,6 +5657,8 @@ impl MainView {
             tab.paged_scroll = PagedLogScrollState::default();
             tab.text_selection = None;
             tab.selection_drag_anchor = None;
+            tab.marked_lines.clear();
+            tab.last_marker_jump_line = None;
             match result {
                 LogTabLoadResult::Ready {
                     raw_bytes,
@@ -5705,6 +5730,7 @@ impl MainView {
         tab.scroll_handle = UniformListScrollHandle::new();
         tab.pending_scroll_to_line = None;
         tab.highlighted_search_line = None;
+        tab.last_marker_jump_line = None;
         tab.text_selection = None;
         tab.selection_drag_anchor = None;
         tab.state = LogTabState::Loading {
@@ -5833,6 +5859,7 @@ impl MainView {
             tab.paged_scroll = PagedLogScrollState::default();
             tab.text_selection = None;
             tab.selection_drag_anchor = None;
+            tab.last_marker_jump_line = None;
             match result {
                 LogTabDecodeResult::Ready { document, .. } => {
                     tab.state = LogTabState::Ready { document };
@@ -5893,6 +5920,12 @@ impl MainView {
                 SearchDialogControlKey::Submit => self.start_search(context),
                 SearchDialogControlKey::Close => self.close_search_dialog(window, context),
             }
+            return true;
+        }
+
+        if Self::marker_jump_keystroke_for_focus(&keystroke, editable_text_input_focused)
+            && self.jump_to_next_marked_line(context)
+        {
             return true;
         }
 
@@ -6104,6 +6137,209 @@ impl MainView {
         }
 
         None
+    }
+
+    /// 根据焦点状态判断是否允许处理日志标记跳转快捷键。
+    ///
+    /// 业务意图：
+    /// - `F2` 是日志正文的标记跳转入口，但用户在搜索框或设置输入框内编辑时，功能键应优先留给输入控件和系统。
+    /// - 这里仅做按键解析，不检查是否真的存在标记；没有标记时由执行函数返回不消费，避免阻断其它默认行为。
+    fn marker_jump_keystroke_for_focus(
+        keystroke: &Keystroke,
+        editable_text_input_focused: bool,
+    ) -> bool {
+        !editable_text_input_focused && Self::marker_jump_keystroke(keystroke)
+    }
+
+    /// 判断是否为普通 `F2` 标记跳转快捷键。
+    ///
+    /// 边界条件：
+    /// - 本次需求只支持向后循环跳转，因此 `Shift+F2`、`Ctrl+F2`、`Cmd+F2` 等组合键都不被识别。
+    /// - GPUI 可能把功能键名称放在 `key` 或 `key_char` 中，解析时同时兼容两种来源。
+    fn marker_jump_keystroke(keystroke: &Keystroke) -> bool {
+        if keystroke.modifiers.control
+            || keystroke.modifiers.platform
+            || keystroke.modifiers.alt
+            || keystroke.modifiers.shift
+        {
+            return false;
+        }
+
+        let key = Self::normalized_keyboard_key(&keystroke.key);
+        let key_char = keystroke
+            .key_char
+            .as_deref()
+            .map(Self::normalized_keyboard_key);
+        key == "f2" || key_char.as_deref().is_some_and(|value| value == "f2")
+    }
+
+    /// 切换指定行的标记状态。
+    ///
+    /// 业务意图：
+    /// - 行号点击需要在添加和取消之间快速切换；返回值告诉调用方点击后该行是否仍处于标记状态。
+    /// - 独立成纯状态函数后，UI 点击和单元测试可以复用同一套规则，避免行号交互和快捷键跳转使用不同语义。
+    fn toggle_marked_line(marked_lines: &mut BTreeSet<usize>, line_index: usize) -> bool {
+        if marked_lines.insert(line_index) {
+            true
+        } else {
+            marked_lines.remove(&line_index);
+            false
+        }
+    }
+
+    /// 执行当前活动 tab 的下一处标记跳转。
+    ///
+    /// 业务意图：
+    /// - `F2` 应围绕当前活动日志 tab 工作，避免用户在多 tab 场景中跳到后台文件。
+    /// - 跳转复用搜索结果定位的滚动与临时高亮能力，让标记目标在密集日志中有一致的视觉提示。
+    ///
+    /// 边界条件：
+    /// - 加载中、读取失败或当前 tab 没有任何标记时不消费按键。
+    /// - 如果用户手动滚动离开上次跳转目标，下一次 `F2` 会从新的可视顶部重新寻找最近后续标记。
+    fn jump_to_next_marked_line(&mut self, context: &mut Context<Self>) -> bool {
+        let Some(active_tab_id) = self.active_tab_id else {
+            return false;
+        };
+        let Some(tab_index) = self
+            .open_tabs
+            .iter()
+            .position(|tab| tab.id == active_tab_id)
+        else {
+            return false;
+        };
+
+        let Some((target_line, tab_id)) = self.open_tabs.get(tab_index).and_then(|tab| {
+            let (visible_start, visible_end) = Self::marker_visible_line_range(tab)?;
+            let target_line = Self::next_marked_line(
+                &tab.marked_lines,
+                visible_start,
+                visible_end,
+                tab.last_marker_jump_line,
+            )?;
+            Some((target_line, tab.id))
+        }) else {
+            return false;
+        };
+
+        if let Some(tab) = self.open_tabs.get_mut(tab_index) {
+            tab.last_marker_jump_line = Some(target_line);
+            tab.highlighted_search_line = Some(target_line);
+        }
+        self.log_viewer_context_menu = None;
+        self.tab_context_menu = None;
+        self.encoding_dropdown_menu = None;
+        self.search_results_context_menu = None;
+        self.scroll_log_tab_to_line(tab_id, target_line);
+        context.notify();
+        true
+    }
+
+    /// 计算指定 tab 当前日志正文的可视行号范围。
+    ///
+    /// 业务意图：
+    /// - 标记跳转需要判断“上次跳转的标记是否还在当前视口内”，否则用户滚动后继续按 `F2` 会从旧位置跳转，违背当前阅读上下文。
+    /// - 内存日志读取 GPUI 虚拟列表滚动句柄，分页日志读取应用侧 `PagedLogScrollState`，保持两种渲染路径的行为一致。
+    fn marker_visible_line_range(tab: &OpenLogTab) -> Option<(usize, usize)> {
+        match &tab.state {
+            LogTabState::Ready {
+                document: LogTabDocument::InMemory(document),
+            } => {
+                let viewport_height =
+                    Self::uniform_list_vertical_viewport_height(&tab.scroll_handle)
+                        .unwrap_or(px(LOG_VIEWER_ROW_HEIGHT * 24.0));
+                let scroll_top = {
+                    let state = tab.scroll_handle.0.borrow();
+                    f64::from((-state.base_handle.offset().y).max(px(0.0)))
+                };
+                Self::marker_visible_range_from_scroll(
+                    document.lines.len(),
+                    scroll_top,
+                    viewport_height,
+                )
+            }
+            LogTabState::Ready {
+                document: LogTabDocument::Paged(document),
+            } => {
+                let viewport_height = tab.paged_viewport_handle.bounds().size.height;
+                let viewport_height = if viewport_height > px(0.0) {
+                    viewport_height
+                } else {
+                    px(LOG_VIEWER_ROW_HEIGHT * 24.0)
+                };
+                let (visible_start, _) =
+                    Self::paged_log_visible_start(tab.paged_scroll.top_px, document.line_count());
+                Self::marker_visible_range_from_first_line(
+                    document.line_count(),
+                    visible_start,
+                    viewport_height,
+                )
+            }
+            LogTabState::Loading { .. } | LogTabState::Failed { .. } => None,
+        }
+    }
+
+    /// 根据滚动像素计算标记跳转使用的可视行号范围。
+    ///
+    /// 边界条件：
+    /// - 首帧尚未完成测量时调用方会传入 fallback 高度；这里仍处理空文档和异常负滚动值，避免快捷键路径 panic。
+    fn marker_visible_range_from_scroll(
+        line_count: usize,
+        scroll_top: f64,
+        viewport_height: Pixels,
+    ) -> Option<(usize, usize)> {
+        if line_count == 0 {
+            return None;
+        }
+
+        let row_height = f64::from(px(LOG_VIEWER_ROW_HEIGHT)).max(1.0);
+        let first_line = (scroll_top.max(0.0) / row_height).floor() as usize;
+        Self::marker_visible_range_from_first_line(line_count, first_line, viewport_height)
+    }
+
+    /// 根据首个可见行和视口高度计算标记跳转使用的可视行号范围。
+    ///
+    /// 业务意图：
+    /// - 范围末尾多包含一行缓冲，覆盖半行滚动或分页渲染中的小数偏移，避免刚好露出一点的标记被误判为不可见。
+    fn marker_visible_range_from_first_line(
+        line_count: usize,
+        first_line: usize,
+        viewport_height: Pixels,
+    ) -> Option<(usize, usize)> {
+        if line_count == 0 {
+            return None;
+        }
+
+        let row_height = f64::from(px(LOG_VIEWER_ROW_HEIGHT)).max(1.0);
+        let viewport_height = f64::from(viewport_height).max(row_height);
+        let visible_rows = (viewport_height / row_height).ceil().max(1.0) as usize + 1;
+        let visible_start = first_line.min(line_count.saturating_sub(1));
+        let visible_end = visible_start
+            .saturating_add(visible_rows.saturating_sub(1))
+            .min(line_count.saturating_sub(1));
+        Some((visible_start, visible_end))
+    }
+
+    /// 选择下一处应跳转的标记行。
+    ///
+    /// 业务意图：
+    /// - 如果上次 `F2` 目标仍在视口内，就从它后一行继续找；否则从当前可视顶部重新找最近后续标记。
+    /// - 使用 `BTreeSet::range` 直接查找有序集合中的后续标记，末尾没有结果时回到最小标记行。
+    fn next_marked_line(
+        marked_lines: &BTreeSet<usize>,
+        visible_start: usize,
+        visible_end: usize,
+        last_marker_jump_line: Option<usize>,
+    ) -> Option<usize> {
+        let start_line = match last_marker_jump_line {
+            Some(line) if (visible_start..=visible_end).contains(&line) => line.saturating_add(1),
+            _ => visible_start,
+        };
+
+        marked_lines
+            .range(start_line..)
+            .next()
+            .copied()
+            .or_else(|| marked_lines.iter().next().copied())
     }
 
     /// 规范化 GPUI 按键名称。

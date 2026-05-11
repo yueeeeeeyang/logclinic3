@@ -582,6 +582,112 @@ mod tests {
         );
     }
 
+    /// 验证日志标记跳转只识别普通 F2。
+    ///
+    /// 业务意图：
+    /// - 本次只支持向后循环跳转，`Shift+F2` 等组合键需要保留给未来反向跳转或系统默认行为。
+    /// - 输入框聚焦时必须放行，避免全局功能键破坏搜索和设置文本编辑体验。
+    #[test]
+    fn 日志标记跳转快捷键只识别普通_f2() {
+        let keystroke = |key: &str, modifiers: gpui::Modifiers| Keystroke {
+            modifiers,
+            key: key.to_string(),
+            key_char: None,
+        };
+
+        assert!(MainView::marker_jump_keystroke_for_focus(
+            &keystroke("f2", Default::default()),
+            false
+        ));
+        assert!(!MainView::marker_jump_keystroke_for_focus(
+            &keystroke("f2", Default::default()),
+            true
+        ));
+        assert!(!MainView::marker_jump_keystroke(&keystroke(
+            "f2",
+            gpui::Modifiers {
+                shift: true,
+                ..Default::default()
+            }
+        )));
+        assert!(!MainView::marker_jump_keystroke(&keystroke(
+            "f2",
+            gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            }
+        )));
+    }
+
+    /// 验证日志行标记点击状态的切换规则。
+    ///
+    /// 业务意图：
+    /// - 同一行再次点击应取消标记；多个标记必须按行号排序，才能让 `F2` 后续查找稳定。
+    #[test]
+    fn 日志行标记点击切换并按行号排序() {
+        let mut marked_lines = BTreeSet::new();
+
+        assert!(MainView::toggle_marked_line(&mut marked_lines, 8));
+        assert!(MainView::toggle_marked_line(&mut marked_lines, 2));
+        assert_eq!(marked_lines.iter().copied().collect::<Vec<_>>(), vec![2, 8]);
+
+        assert!(!MainView::toggle_marked_line(&mut marked_lines, 8));
+        assert_eq!(marked_lines.iter().copied().collect::<Vec<_>>(), vec![2]);
+    }
+
+    /// 验证 F2 标记跳转目标按当前视口和上次跳转位置选择。
+    ///
+    /// 业务意图：
+    /// - 第一次跳转从可视顶部找最近后续标记；连续 `F2` 从上一次目标之后继续；到末尾后循环回第一个标记。
+    /// - 用户手动滚动后，如果上次跳转目标已不在视口内，下一次应重新以当前视口为起点。
+    #[test]
+    fn 日志标记跳转目标按视口和上次跳转计算() {
+        let marked_lines = BTreeSet::from([3usize, 8, 12]);
+
+        assert_eq!(
+            MainView::next_marked_line(&marked_lines, 5, 9, None),
+            Some(8)
+        );
+        assert_eq!(
+            MainView::next_marked_line(&marked_lines, 5, 9, Some(8)),
+            Some(12)
+        );
+        assert_eq!(
+            MainView::next_marked_line(&marked_lines, 10, 14, Some(12)),
+            Some(3)
+        );
+        assert_eq!(
+            MainView::next_marked_line(&marked_lines, 10, 14, Some(8)),
+            Some(12)
+        );
+        assert_eq!(
+            MainView::next_marked_line(&BTreeSet::new(), 0, 10, None),
+            None
+        );
+    }
+
+    /// 验证标记跳转可视范围计算会处理滚动像素和文档边界。
+    ///
+    /// 边界条件：
+    /// - 内存日志滚动句柄给出的是像素偏移，必须换算成 0 基行号；超出文档末尾时要夹到最后一行。
+    #[test]
+    fn 日志标记可视范围从滚动像素换算为行号() {
+        let row_height = f64::from(px(LOG_VIEWER_ROW_HEIGHT));
+
+        assert_eq!(
+            MainView::marker_visible_range_from_scroll(100, row_height * 20.0 + 3.0, px(90.0)),
+            Some((20, 25))
+        );
+        assert_eq!(
+            MainView::marker_visible_range_from_first_line(10, 50, px(90.0)),
+            Some((9, 9))
+        );
+        assert_eq!(
+            MainView::marker_visible_range_from_scroll(0, 0.0, px(90.0)),
+            None
+        );
+    }
+
     /// 验证键盘滚动目标未记录时默认回退到日志正文。
     ///
     /// 业务意图：
@@ -2372,6 +2478,8 @@ mod tests {
             paged_scroll: PagedLogScrollState::default(),
             pending_scroll_to_line: None,
             highlighted_search_line: None,
+            marked_lines: BTreeSet::new(),
+            last_marker_jump_line: None,
             text_selection: None,
             selection_drag_anchor: None,
         };
@@ -2462,6 +2570,8 @@ mod tests {
                 paged_scroll: PagedLogScrollState::default(),
                 pending_scroll_to_line: None,
                 highlighted_search_line: None,
+                marked_lines: BTreeSet::new(),
+                last_marker_jump_line: None,
                 text_selection: None,
                 selection_drag_anchor: None,
             },
@@ -2480,6 +2590,8 @@ mod tests {
                 paged_scroll: PagedLogScrollState::default(),
                 pending_scroll_to_line: None,
                 highlighted_search_line: None,
+                marked_lines: BTreeSet::new(),
+                last_marker_jump_line: None,
                 text_selection: None,
                 selection_drag_anchor: None,
             },
