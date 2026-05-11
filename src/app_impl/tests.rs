@@ -323,6 +323,48 @@ mod tests {
         assert_eq!(MainFeature::default(), MainFeature::LogAnalysis);
     }
 
+    /// 验证主导航 hover 气泡使用根层覆盖坐标。
+    ///
+    /// 业务意图：
+    /// - 气泡不再作为按钮子元素渲染，否则会被右侧功能页遮挡；顶部功能和底部入口必须分别保持稳定锚点。
+    #[test]
+    fn 主导航气泡锚点稳定() {
+        assert_eq!(
+            MainNavigationItem::Feature(MainFeature::LogAnalysis).tooltip_anchor(),
+            MainNavigationTooltipAnchor::Top(MAIN_NAV_PADDING + MAIN_NAV_TOOLTIP_BUTTON_INSET)
+        );
+        assert_eq!(
+            MainNavigationItem::Feature(MainFeature::HprofAnalysis).tooltip_anchor(),
+            MainNavigationTooltipAnchor::Top(
+                MAIN_NAV_PADDING
+                    + MAIN_NAV_BUTTON_SIZE
+                    + MAIN_NAV_BUTTON_GAP
+                    + MAIN_NAV_TOOLTIP_BUTTON_INSET
+            )
+        );
+        assert_eq!(
+            MainNavigationItem::Feature(MainFeature::AiChat).tooltip_anchor(),
+            MainNavigationTooltipAnchor::Top(
+                MAIN_NAV_PADDING
+                    + (MAIN_NAV_BUTTON_SIZE + MAIN_NAV_BUTTON_GAP) * 2.0
+                    + MAIN_NAV_TOOLTIP_BUTTON_INSET
+            )
+        );
+        assert_eq!(
+            MainNavigationItem::Settings.tooltip_anchor(),
+            MainNavigationTooltipAnchor::Bottom(
+                MAIN_NAV_PADDING
+                    + MAIN_NAV_BUTTON_SIZE
+                    + MAIN_NAV_BUTTON_GAP
+                    + MAIN_NAV_TOOLTIP_BUTTON_INSET
+            )
+        );
+        assert_eq!(
+            MainNavigationItem::About.tooltip_anchor(),
+            MainNavigationTooltipAnchor::Bottom(MAIN_NAV_PADDING + MAIN_NAV_TOOLTIP_BUTTON_INSET)
+        );
+    }
+
     /// 验证日志页右侧弹层坐标会扣除固定大导航宽度。
     ///
     /// 业务意图：

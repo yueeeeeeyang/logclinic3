@@ -104,22 +104,6 @@ enum HprofAnalysisState {
     },
 }
 
-impl HprofAnalysisState {
-    /// 返回头部展示的状态文案。
-    ///
-    /// 业务意图：
-    /// - 失败、取消和完成状态需要在标题栏保持稳定中文文案；集中在纯状态方法里，避免渲染代码和测试各自拼装。
-    fn status_label(&self) -> String {
-        match self {
-            Self::Idle => "未选择文件".to_string(),
-            Self::Running { progress } => progress.stage.label().to_string(),
-            Self::Completed { .. } => "完成".to_string(),
-            Self::Failed { .. } => "失败".to_string(),
-            Self::Canceled { .. } => "已取消".to_string(),
-        }
-    }
-}
-
 /// HPROF 分析主窗口内嵌视图。
 ///
 /// 业务意图：
@@ -155,6 +139,15 @@ pub(super) struct HprofAnalysisView {
 }
 
 impl HprofAnalysisView {
+    /// 返回新建 HPROF 页的初始状态。
+    ///
+    /// 业务意图：
+    /// - 主窗口切到 HPROF 功能页时只能展示空态，不能因为实体创建就读取磁盘或启动后台解析。
+    /// - 初始状态集中在纯函数中，便于测试锁定“未选择文件”这一入口行为。
+    fn initial_state() -> HprofAnalysisState {
+        HprofAnalysisState::Idle
+    }
+
     /// 创建 HPROF 分析视图。
     ///
     /// 业务意图：
@@ -167,7 +160,7 @@ impl HprofAnalysisView {
         Self {
             main_view,
             file_path: None,
-            state: HprofAnalysisState::Idle,
+            state: Self::initial_state(),
             scroll_handle: UniformListScrollHandle::new(),
             expanded_node_ids: HashSet::new(),
             thread_context_menu: None,
@@ -448,54 +441,6 @@ impl HprofAnalysisView {
         }) {
             self.thread_details_window = Some(thread_window);
         }
-    }
-
-    /// 渲染视图头部。
-    fn render_header(&self, palette: AppThemePalette) -> impl IntoElement {
-        let status = self.state.status_label();
-        let file_label = self
-            .file_path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "请选择一个 .hprof 或 .bin dump 文件".to_string());
-        div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .h(px(58.0))
-            .px_4()
-            .border_b_1()
-            .border_color(rgb(palette.border))
-            .bg(rgb(palette.panel))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(palette.text))
-                            .truncate()
-                            .child("HPROF Dominator Tree"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(palette.muted_text))
-                            .truncate()
-                            .child(file_label),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .text_color(rgb(palette.muted_text))
-                    .child(status),
-            )
     }
 
     /// 渲染未选择文件的初始状态。
@@ -1177,7 +1122,7 @@ impl Render for HprofAnalysisView {
             .relative()
             .size_full()
             .bg(rgb(palette.background))
-            .child(self.render_header(palette))
+            // HPROF 已由主窗口页面提供顶部文件选择入口，内嵌视图不再重复渲染独立窗口时代的标题和文件状态栏。
             .child(body)
             .child(self.render_thread_context_menu_dismiss_overlay(context))
             .child(self.render_thread_context_menu(palette, context))
@@ -1464,32 +1409,16 @@ impl Render for HprofThreadDetailsWindowView {
 mod tests {
     use super::*;
 
-    /// 验证失败和取消状态使用稳定中文文案。
-    ///
-    /// 业务意图：
-    /// - HPROF 后台任务可能因为文件损坏、权限不足或用户主动取消结束，窗口头部必须展示可理解状态，不能泄漏底层错误枚举。
-    #[test]
-    fn 失败和取消状态文案稳定() {
-        let progress = HprofProgress::new(16);
-        let failed = HprofAnalysisState::Failed {
-            message: "文件头格式错误".to_string(),
-            progress: Some(progress.clone()),
-        };
-        let canceled = HprofAnalysisState::Canceled {
-            progress: Some(progress),
-        };
-
-        assert_eq!(failed.status_label(), "失败");
-        assert_eq!(canceled.status_label(), "已取消");
-    }
-
     /// 验证 HPROF 初始状态不会进入解析阶段。
     ///
     /// 业务意图：
     /// - HPROF 页迁入主窗口后，用户点击导航只应看到空态；只有选择文件后才允许后台读取 dump。
     #[test]
     fn hprof_初始状态保持未选择文件() {
-        assert_eq!(HprofAnalysisState::Idle.status_label(), "未选择文件");
+        assert!(matches!(
+            HprofAnalysisView::initial_state(),
+            HprofAnalysisState::Idle
+        ));
     }
 
     /// 验证线程堆栈行生成会保留线程名，并在缺失栈时给出中文提示。

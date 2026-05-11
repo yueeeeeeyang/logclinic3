@@ -1112,11 +1112,23 @@ const MAIN_NAV_PADDING: f32 = 8.0;
 /// - 气泡只展示功能名称，固定宽度可以避免不同中文名称长度导致 hover 时布局抖动。
 const MAIN_NAV_TOOLTIP_WIDTH: f32 = 84.0;
 
+/// 主导航悬浮气泡高度。
+///
+/// 业务意图：
+/// - 气泡高度小于图标按钮命中区，既能和按钮垂直居中，也不会遮住相邻导航入口。
+const MAIN_NAV_TOOLTIP_HEIGHT: f32 = 30.0;
+
 /// 主导航悬浮气泡相对竖条右侧的间距。
 ///
 /// 边界条件：
 /// - 气泡需要离开图标命中区一点距离，避免鼠标在图标和气泡之间移动时频繁闪烁。
 const MAIN_NAV_TOOLTIP_GAP: f32 = 8.0;
+
+/// 主导航悬浮气泡相对按钮顶部或底部的垂直内缩。
+///
+/// 实现原因：
+/// - 气泡由主窗口根节点覆盖绘制，不再是按钮子元素；独立常量能保证顶部入口和底部入口都仍与按钮视觉居中。
+const MAIN_NAV_TOOLTIP_BUTTON_INSET: f32 = (MAIN_NAV_BUTTON_SIZE - MAIN_NAV_TOOLTIP_HEIGHT) / 2.0;
 
 /// 主界面工具栏按钮的水平内边距。
 ///
@@ -2587,6 +2599,51 @@ impl MainNavigationItem {
             Self::About => Icon::Info,
         }
     }
+
+    /// 返回 hover 气泡在主窗口根节点中的垂直锚点。
+    ///
+    /// 业务意图：
+    /// - 气泡必须绘制在右侧功能页之上，不能作为导航按钮子元素被后续兄弟节点盖住；因此这里用纯函数复刻导航按钮的垂直位置。
+    /// - 顶部三个主功能从上向下定位，底部两个通用入口从下向上定位，避免依赖运行时窗口高度。
+    fn tooltip_anchor(self) -> MainNavigationTooltipAnchor {
+        match self {
+            Self::Feature(MainFeature::LogAnalysis) => {
+                MainNavigationTooltipAnchor::Top(MAIN_NAV_PADDING + MAIN_NAV_TOOLTIP_BUTTON_INSET)
+            }
+            Self::Feature(MainFeature::HprofAnalysis) => MainNavigationTooltipAnchor::Top(
+                MAIN_NAV_PADDING
+                    + MAIN_NAV_BUTTON_SIZE
+                    + MAIN_NAV_BUTTON_GAP
+                    + MAIN_NAV_TOOLTIP_BUTTON_INSET,
+            ),
+            Self::Feature(MainFeature::AiChat) => MainNavigationTooltipAnchor::Top(
+                MAIN_NAV_PADDING
+                    + (MAIN_NAV_BUTTON_SIZE + MAIN_NAV_BUTTON_GAP) * 2.0
+                    + MAIN_NAV_TOOLTIP_BUTTON_INSET,
+            ),
+            Self::Settings => MainNavigationTooltipAnchor::Bottom(
+                MAIN_NAV_PADDING
+                    + MAIN_NAV_BUTTON_SIZE
+                    + MAIN_NAV_BUTTON_GAP
+                    + MAIN_NAV_TOOLTIP_BUTTON_INSET,
+            ),
+            Self::About => MainNavigationTooltipAnchor::Bottom(
+                MAIN_NAV_PADDING + MAIN_NAV_TOOLTIP_BUTTON_INSET,
+            ),
+        }
+    }
+}
+
+/// 左侧大导航 hover 气泡的垂直锚点。
+///
+/// 业务意图：
+/// - 主功能入口贴近导航顶部，通用入口贴近导航底部；气泡提到根节点覆盖绘制后，必须保留这两类入口的原始视觉位置。
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MainNavigationTooltipAnchor {
+    /// 从主窗口顶部向下定位。
+    Top(f32),
+    /// 从主窗口底部向上定位。
+    Bottom(f32),
 }
 
 /// 设置窗口当前激活的页签。
@@ -4021,9 +4078,6 @@ impl MainView {
                 MAIN_NAV_ICON_SIZE,
                 text_color,
             ))
-            .when(hovered, |button| {
-                button.child(Self::render_main_navigation_tooltip(item.label(), palette))
-            })
             .on_hover(
                 context.listener(move |view, is_hovered: &bool, _window, context| {
                     let next_item = (*is_hovered).then_some(item);
@@ -4051,10 +4105,28 @@ impl MainView {
             )
     }
 
-    /// 渲染左侧导航 hover 名称气泡。
+    /// 渲染左侧导航 hover 名称气泡覆盖层。
     ///
     /// 业务意图：
     /// - 主导航只显示图标，为了避免用户猜测图标语义，鼠标悬浮时在右侧显示中文功能名称。
+    /// - 气泡必须作为主窗口根节点的后置覆盖层绘制；如果作为导航按钮子元素，右侧功能页会在后续绘制中覆盖它。
+    fn render_main_navigation_tooltip_overlay(&self) -> gpui::Stateful<gpui::Div> {
+        let Some(item) = self.hovered_navigation_item else {
+            return div().id("main-nav-tooltip-empty").hidden();
+        };
+        let palette = self.palette();
+        let tooltip = Self::render_main_navigation_tooltip(item.label(), palette);
+
+        match item.tooltip_anchor() {
+            MainNavigationTooltipAnchor::Top(top) => tooltip.top(px(top)),
+            MainNavigationTooltipAnchor::Bottom(bottom) => tooltip.bottom(px(bottom)),
+        }
+    }
+
+    /// 渲染左侧导航 hover 名称气泡本体。
+    ///
+    /// 业务意图：
+    /// - 气泡样式集中在这里，垂直位置由 `MainNavigationItem::tooltip_anchor` 决定，避免按钮布局和根层覆盖层重复写样式。
     fn render_main_navigation_tooltip(
         label: &'static str,
         palette: AppThemePalette,
@@ -4062,10 +4134,9 @@ impl MainView {
         div()
             .id(SharedString::from(format!("main-nav-tooltip-{label}")))
             .absolute()
-            .left(px(MAIN_NAV_BUTTON_SIZE + MAIN_NAV_TOOLTIP_GAP))
-            .top(px(5.0))
+            .left(px(MAIN_NAV_WIDTH + MAIN_NAV_TOOLTIP_GAP))
             .w(px(MAIN_NAV_TOOLTIP_WIDTH))
-            .h(px(30.0))
+            .h(px(MAIN_NAV_TOOLTIP_HEIGHT))
             .flex()
             .items_center()
             .justify_center()
@@ -12024,6 +12095,7 @@ impl Render for MainView {
                     .bg(rgb(palette.background))
                     .child(self.render_main_feature_page(context)),
             )
+            .child(self.render_main_navigation_tooltip_overlay())
             .child(self.render_load_source_menu_dismiss_overlay(context))
             .child(self.render_load_source_menu(context))
             .child(self.render_save_overwrite_confirm_dialog(context))
