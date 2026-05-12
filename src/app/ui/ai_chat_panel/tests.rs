@@ -498,6 +498,57 @@ fn ai_对话_markdown_html_按文本展示() {
     assert_eq!(text, "<b>危险</b>");
 }
 
+/// 验证 Markdown 普通换行按 CommonMark 软换行语义折叠为空格。
+///
+/// 业务意图：
+/// - AI 回复经常为了可读性在列表项或长句中插入普通换行；这些换行不是段落边界，渲染时不应撑出额外空白。
+/// - 命令参数和省略号也必须保持原文，避免展示层把 `--` 或 `...` 改写成其它 Unicode 标点。
+#[test]
+fn ai_对话_markdown_软换行折叠为空格且不改写标点() {
+    let document = parse_ai_chat_markdown(
+        "- 对英孚要谨慎：价格极高，且\n  千万别一次性付超过 3 个月的钱。\n\n运行 `cargo test -- --nocapture`...",
+        EffectiveTheme::Light,
+    );
+    let list_item_text = document
+        .blocks
+        .iter()
+        .find_map(|block| match block {
+            AiChatMarkdownBlock::List { items, .. } => items.first(),
+            _ => None,
+        })
+        .and_then(|blocks| blocks.first())
+        .and_then(|block| match block {
+            AiChatMarkdownBlock::Paragraph(inlines) => Some(inlines),
+            _ => None,
+        })
+        .map(|inlines| {
+            flatten_ai_chat_markdown_inlines(
+                inlines,
+                AppThemePalette::for_theme(EffectiveTheme::Light),
+            )
+            .0
+        })
+        .expect("列表项段落应被解析出来");
+    assert_eq!(
+        list_item_text,
+        "对英孚要谨慎：价格极高，且 千万别一次性付超过 3 个月的钱。"
+    );
+
+    let trailing_paragraph = document
+        .blocks
+        .iter()
+        .find_map(|block| match block {
+            AiChatMarkdownBlock::Paragraph(inlines) => Some(inlines),
+            _ => None,
+        })
+        .expect("列表后的普通段落应被解析出来");
+    let (text, _) = flatten_ai_chat_markdown_inlines(
+        trailing_paragraph,
+        AppThemePalette::for_theme(EffectiveTheme::Light),
+    );
+    assert_eq!(text, "运行 cargo test -- --nocapture...");
+}
+
 /// 验证流式输出中的未闭合 Markdown 不会丢失可见内容。
 ///
 /// 边界条件：

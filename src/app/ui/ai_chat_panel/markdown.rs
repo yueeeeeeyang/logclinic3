@@ -187,12 +187,26 @@ pub(in crate::app) fn ai_chat_markdown_content_hash(content: &str) -> u64 {
     hasher.finish()
 }
 
+/// 返回 AI 助手消息使用的 Markdown 扩展集合。
+///
+/// 业务意图：
+/// - 只启用聊天回复常用的 GFM 展示能力，避免 `Options::all()` 打开 smart punctuation 后把 `--`、`---`、`...` 等命令或日志文本改写成不同字符。
+/// - 表格、任务列表和删除线是模型回复中常见结构；其它扩展先保持关闭，减少展示层对原始回答文本的语义改写。
+fn ai_chat_markdown_options() -> Options {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    options.insert(Options::ENABLE_GFM);
+    options
+}
+
 /// 解析 AI 助手 Markdown 正文。
 pub(in crate::app) fn parse_ai_chat_markdown(
     content: &str,
     theme: EffectiveTheme,
 ) -> AiChatMarkdownDocument {
-    let mut parser = Parser::new_ext(content, Options::all()).peekable();
+    let mut parser = Parser::new_ext(content, ai_chat_markdown_options()).peekable();
     let blocks = parse_markdown_blocks_until(&mut parser, markdown_never_end, theme);
     if blocks.is_empty() && !content.is_empty() {
         AiChatMarkdownDocument {
@@ -256,7 +270,12 @@ where
                     AiChatMarkdownInline::Text(text.to_string()),
                 ]));
             }
-            Event::SoftBreak | Event::HardBreak => {
+            Event::SoftBreak => {
+                blocks.push(AiChatMarkdownBlock::Paragraph(vec![
+                    AiChatMarkdownInline::Text(" ".to_string()),
+                ]));
+            }
+            Event::HardBreak => {
                 blocks.push(AiChatMarkdownBlock::Paragraph(vec![
                     AiChatMarkdownInline::Text("\n".to_string()),
                 ]));
@@ -287,7 +306,7 @@ where
                 inlines.push(AiChatMarkdownInline::Text(text.to_string()));
             }
             Event::Code(code) => inlines.push(AiChatMarkdownInline::Code(code.to_string())),
-            Event::SoftBreak => inlines.push(AiChatMarkdownInline::Text("\n".to_string())),
+            Event::SoftBreak => inlines.push(AiChatMarkdownInline::Text(" ".to_string())),
             Event::HardBreak => inlines.push(AiChatMarkdownInline::Text("\n".to_string())),
             Event::TaskListMarker(checked) => {
                 inlines.push(AiChatMarkdownInline::Text(if checked {
@@ -339,16 +358,115 @@ where
         match event {
             Event::End(end) if matches!(end, TagEnd::List(_)) => break,
             Event::Start(Tag::Item) => {
-                items.push(parse_markdown_blocks_until(
-                    parser,
-                    markdown_is_item_end,
-                    theme,
-                ));
+                let item_blocks = parse_markdown_blocks_until(parser, markdown_is_item_end, theme);
+                items.push(normalize_ai_chat_markdown_list_item_blocks(item_blocks));
             }
             _ => {}
         }
     }
     AiChatMarkdownBlock::List { start, items }
+}
+
+/// 规范化列表项内部块结构。
+///
+/// 业务意图：
+/// - 大模型经常在列表项中按视觉宽度插入普通换行，pulldown-cmark 在部分懒延续场景下会把后续文本暴露成相邻段落块。
+/// - 聊天窗口如果直接按段落渲染，会在同一个列表项中产生异常大空白；这里把相邻段落按空格合并，符合普通软换行的展示预期。
+///
+/// 边界条件：
+/// - 代码块、表格、引用等非段落块不参与合并，避免破坏有明确结构的 Markdown 内容。
+fn normalize_ai_chat_markdown_list_item_blocks(
+    blocks: Vec<AiChatMarkdownBlock>,
+) -> Vec<AiChatMarkdownBlock> {
+    let mut normalized: Vec<AiChatMarkdownBlock> = Vec::new();
+    for block in blocks {
+        match (normalized.last_mut(), block) {
+            (
+                Some(AiChatMarkdownBlock::Paragraph(previous)),
+                AiChatMarkdownBlock::Paragraph(mut current),
+            ) => {
+                trim_ai_chat_markdown_inlines_start(&mut current);
+                if !previous.is_empty()
+                    && !current.is_empty()
+                    && !ai_chat_markdown_inlines_end_with_whitespace(previous)
+                {
+                    previous.push(AiChatMarkdownInline::Text(" ".to_string()));
+                }
+                previous.append(&mut current);
+            }
+            (_, block) => normalized.push(block),
+        }
+    }
+    normalized
+}
+
+/// 去除段落开头的缩进空白。
+///
+/// 业务意图：
+/// - 列表项延续行通常会带有 Markdown 缩进；合并到上一段时这些缩进只服务源码排版，不应成为聊天气泡里的多余空白。
+fn trim_ai_chat_markdown_inlines_start(inlines: &mut Vec<AiChatMarkdownInline>) {
+    while let Some(first) = inlines.first_mut() {
+        match first {
+            AiChatMarkdownInline::Text(value) | AiChatMarkdownInline::Code(value) => {
+                let trimmed = value.trim_start().to_string();
+                if trimmed.is_empty() {
+                    inlines.remove(0);
+                } else {
+                    *value = trimmed;
+                    break;
+                }
+            }
+            AiChatMarkdownInline::Strong(children)
+            | AiChatMarkdownInline::Emphasis(children)
+            | AiChatMarkdownInline::Strikethrough(children) => {
+                trim_ai_chat_markdown_inlines_start(children);
+                if children.is_empty() {
+                    inlines.remove(0);
+                } else {
+                    break;
+                }
+            }
+            AiChatMarkdownInline::Link { label, .. } => {
+                trim_ai_chat_markdown_inlines_start(label);
+                if label.is_empty() {
+                    inlines.remove(0);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// 判断段落末尾是否已经带有空白。
+///
+/// 实现原因：
+/// - 合并软换行段落时，如果上一段已因 `SoftBreak` 追加空格，再额外插入分隔空格会导致截图中的异常空白变宽。
+fn ai_chat_markdown_inlines_end_with_whitespace(inlines: &[AiChatMarkdownInline]) -> bool {
+    inlines
+        .iter()
+        .rev()
+        .find_map(ai_chat_markdown_inline_end_with_whitespace)
+        .unwrap_or(false)
+}
+
+/// 判断单个内联元素末尾是否为空白。
+fn ai_chat_markdown_inline_end_with_whitespace(inline: &AiChatMarkdownInline) -> Option<bool> {
+    match inline {
+        AiChatMarkdownInline::Text(value) | AiChatMarkdownInline::Code(value) => {
+            value.chars().next_back().map(char::is_whitespace)
+        }
+        AiChatMarkdownInline::Strong(children)
+        | AiChatMarkdownInline::Emphasis(children)
+        | AiChatMarkdownInline::Strikethrough(children) => children
+            .iter()
+            .rev()
+            .find_map(ai_chat_markdown_inline_end_with_whitespace),
+        AiChatMarkdownInline::Link { label, .. } => label
+            .iter()
+            .rev()
+            .find_map(ai_chat_markdown_inline_end_with_whitespace),
+    }
 }
 
 /// 解析 Markdown 代码块并执行语法高亮。
