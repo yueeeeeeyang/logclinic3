@@ -18,6 +18,7 @@ impl MainView {
     ) -> gpui::AnyElement {
         match self.navigation.active_main_feature {
             MainFeature::LogAnalysis => self.render_log_analysis_page(context).into_any_element(),
+            MainFeature::Notes => self.render_notes_page(context).into_any_element(),
             MainFeature::HprofAnalysis => {
                 self.render_hprof_analysis_page(context).into_any_element()
             }

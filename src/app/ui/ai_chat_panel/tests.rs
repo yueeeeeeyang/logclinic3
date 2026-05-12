@@ -391,7 +391,7 @@ fn ai_对话_markdown_解析常见块和内联样式() {
     assert!(document.blocks.iter().any(|block| {
         matches!(
             block,
-            AiChatMarkdownBlock::Heading {
+            AppMarkdownBlock::Heading {
                 level: 1,
                 inlines: _
             }
@@ -401,32 +401,32 @@ fn ai_对话_markdown_解析常见块和内联样式() {
         document
             .blocks
             .iter()
-            .any(|block| matches!(block, AiChatMarkdownBlock::List { .. }))
+            .any(|block| matches!(block, AppMarkdownBlock::List { .. }))
     );
     assert!(
         document
             .blocks
             .iter()
-            .any(|block| matches!(block, AiChatMarkdownBlock::BlockQuote(_)))
+            .any(|block| matches!(block, AppMarkdownBlock::BlockQuote(_)))
     );
     assert!(
         document
             .blocks
             .iter()
-            .any(|block| matches!(block, AiChatMarkdownBlock::Table { .. }))
+            .any(|block| matches!(block, AppMarkdownBlock::Table { .. }))
     );
     assert!(
         document
             .blocks
             .iter()
-            .any(|block| matches!(block, AiChatMarkdownBlock::ThematicBreak))
+            .any(|block| matches!(block, AppMarkdownBlock::ThematicBreak))
     );
 
     let paragraph = document
         .blocks
         .iter()
         .find_map(|block| match block {
-            AiChatMarkdownBlock::Paragraph(inlines) => Some(inlines),
+            AppMarkdownBlock::Paragraph(inlines) => Some(inlines),
             _ => None,
         })
         .expect("正文段落应被解析出来");
@@ -452,7 +452,7 @@ fn ai_对话_markdown_代码块高亮和未知语言回退() {
         .blocks
         .iter()
         .find_map(|block| match block {
-            AiChatMarkdownBlock::CodeBlock { language, lines } => Some((language, lines)),
+            AppMarkdownBlock::CodeBlock { language, lines } => Some((language, lines)),
             _ => None,
         })
         .expect("已知语言代码块应被解析出来");
@@ -468,7 +468,7 @@ fn ai_对话_markdown_代码块高亮和未知语言回退() {
         .blocks
         .iter()
         .find_map(|block| match block {
-            AiChatMarkdownBlock::CodeBlock { language, lines } => Some((language, lines)),
+            AppMarkdownBlock::CodeBlock { language, lines } => Some((language, lines)),
             _ => None,
         })
         .expect("未知语言代码块也应被解析出来");
@@ -487,7 +487,7 @@ fn ai_对话_markdown_html_按文本展示() {
         .blocks
         .iter()
         .find_map(|block| match block {
-            AiChatMarkdownBlock::Paragraph(inlines) => Some(inlines),
+            AppMarkdownBlock::Paragraph(inlines) => Some(inlines),
             _ => None,
         })
         .expect("HTML 文本应降级为段落");
@@ -513,12 +513,12 @@ fn ai_对话_markdown_软换行折叠为空格且不改写标点() {
         .blocks
         .iter()
         .find_map(|block| match block {
-            AiChatMarkdownBlock::List { items, .. } => items.first(),
+            AppMarkdownBlock::List { items, .. } => items.first(),
             _ => None,
         })
         .and_then(|blocks| blocks.first())
         .and_then(|block| match block {
-            AiChatMarkdownBlock::Paragraph(inlines) => Some(inlines),
+            AppMarkdownBlock::Paragraph(inlines) => Some(inlines),
             _ => None,
         })
         .map(|inlines| {
@@ -538,7 +538,7 @@ fn ai_对话_markdown_软换行折叠为空格且不改写标点() {
         .blocks
         .iter()
         .find_map(|block| match block {
-            AiChatMarkdownBlock::Paragraph(inlines) => Some(inlines),
+            AppMarkdownBlock::Paragraph(inlines) => Some(inlines),
             _ => None,
         })
         .expect("列表后的普通段落应被解析出来");
@@ -560,7 +560,7 @@ fn ai_对话_markdown_未闭合代码块保留内容() {
         .blocks
         .iter()
         .find_map(|block| match block {
-            AiChatMarkdownBlock::CodeBlock { lines, .. } => Some(lines),
+            AppMarkdownBlock::CodeBlock { lines, .. } => Some(lines),
             _ => None,
         })
         .expect("未闭合代码块也应被解析成代码块");

@@ -904,12 +904,14 @@ pub(in crate::app) struct ThreadAnalysisFilterLineLayout {
 /// 主窗口当前展示的大功能页。
 ///
 /// 业务意图：
-/// - 主窗口左侧固定大导航只负责在日志分析、HPROF 解析和 AI 对话三个主要工作区之间切换。
+/// - 主窗口左侧固定大导航只负责在日志分析、笔记、HPROF 解析和 AI 对话主要工作区之间切换。
 /// - 状态只保存在当前会话，不写入配置文件，避免后续调整默认入口或恢复策略时被旧配置约束。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::app) enum MainFeature {
     /// 日志分析页，承载日志加载、目录树、日志 tab、搜索和线程日志分析入口。
     LogAnalysis,
+    /// 笔记页，承载本地目录树、只读阅读器和编辑器。
+    Notes,
     /// HPROF 解析页，承载 heap dump 文件选择、解析进度和 dominator tree 结果。
     HprofAnalysis,
     /// AI 对话页，承载本地会话历史、模型选择和 OpenAI 兼容流式对话。
@@ -926,13 +928,19 @@ impl Default for MainFeature {
 impl MainFeature {
     /// 返回主功能在左侧大导航中的固定展示顺序。
     pub(in crate::app) fn all() -> &'static [Self] {
-        &[Self::LogAnalysis, Self::HprofAnalysis, Self::AiChat]
+        &[
+            Self::LogAnalysis,
+            Self::Notes,
+            Self::HprofAnalysis,
+            Self::AiChat,
+        ]
     }
 
     /// 返回主功能中文名称。
     pub(in crate::app) fn label(self) -> &'static str {
         match self {
             Self::LogAnalysis => "日志分析",
+            Self::Notes => "笔记",
             Self::HprofAnalysis => "HPROF解析",
             Self::AiChat => "AI对话",
         }
@@ -942,6 +950,7 @@ impl MainFeature {
     pub(in crate::app) fn icon(self) -> Icon {
         match self {
             Self::LogAnalysis => Icon::Search,
+            Self::Notes => Icon::NotebookText,
             Self::HprofAnalysis => Icon::ChartNoAxesCombined,
             Self::AiChat => Icon::BotMessageSquare,
         }
@@ -987,15 +996,20 @@ impl MainNavigationItem {
             Self::Feature(MainFeature::LogAnalysis) => {
                 MainNavigationTooltipAnchor::Top(MAIN_NAV_PADDING + MAIN_NAV_TOOLTIP_BUTTON_INSET)
             }
-            Self::Feature(MainFeature::HprofAnalysis) => MainNavigationTooltipAnchor::Top(
+            Self::Feature(MainFeature::Notes) => MainNavigationTooltipAnchor::Top(
                 MAIN_NAV_PADDING
                     + MAIN_NAV_BUTTON_SIZE
                     + MAIN_NAV_BUTTON_GAP
                     + MAIN_NAV_TOOLTIP_BUTTON_INSET,
             ),
-            Self::Feature(MainFeature::AiChat) => MainNavigationTooltipAnchor::Top(
+            Self::Feature(MainFeature::HprofAnalysis) => MainNavigationTooltipAnchor::Top(
                 MAIN_NAV_PADDING
                     + (MAIN_NAV_BUTTON_SIZE + MAIN_NAV_BUTTON_GAP) * 2.0
+                    + MAIN_NAV_TOOLTIP_BUTTON_INSET,
+            ),
+            Self::Feature(MainFeature::AiChat) => MainNavigationTooltipAnchor::Top(
+                MAIN_NAV_PADDING
+                    + (MAIN_NAV_BUTTON_SIZE + MAIN_NAV_BUTTON_GAP) * 3.0
                     + MAIN_NAV_TOOLTIP_BUTTON_INSET,
             ),
             Self::Settings => MainNavigationTooltipAnchor::Bottom(

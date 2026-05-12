@@ -108,6 +108,13 @@ pub(in crate::app) struct MainView {
     /// - 主视图只负责在大功能页之间协调，避免根实体继续直接理解 AI 数据库初始化细节。
     pub(in crate::app) ai_chat: AiChatWorkspaceState,
 
+    /// 笔记页面完整工作区状态。
+    ///
+    /// 业务意图：
+    /// - 笔记目录树、当前笔记、阅读器选区、编辑草稿和确认弹窗统一收口到该字段。
+    /// - 主视图只负责在大功能页之间协调，避免根实体直接理解笔记 SQLite 初始化细节。
+    pub(in crate::app) notes: NotesWorkspaceState,
+
     /// 当前窗口系统外观。
     ///
     /// 业务意图：
@@ -151,6 +158,7 @@ impl MainView {
         let model_config = ModelConfigState::new(context, model_configs);
         let ai_chat =
             AiChatWorkspaceState::load_or_initialize(context, default_ai_model_profile_id);
+        let notes = NotesWorkspaceState::load_or_initialize(context);
 
         Self {
             left_panel_width: LEFT_PANEL_DEFAULT_WIDTH,
@@ -164,6 +172,7 @@ impl MainView {
             thread_analysis_window: None,
             hprof_analysis_view: None,
             ai_chat,
+            notes,
             system_window_appearance: WindowAppearance::Light,
             window_appearance_subscription: None,
             global_keystroke_subscription: None,

@@ -354,11 +354,16 @@ mod state_tests {
     /// - 左侧大导航只显示图标，hover 气泡依赖 `label()` 返回中文名称；图标和名称错配会直接影响用户识别功能入口。
     #[test]
     fn 主功能导航名称和图标稳定() {
-        assert_eq!(MainFeature::all().len(), 3);
+        assert_eq!(MainFeature::all().len(), 4);
         assert_eq!(MainFeature::LogAnalysis.label(), "日志分析");
         assert_eq!(
             char::from(MainFeature::LogAnalysis.icon()),
             char::from(Icon::Search)
+        );
+        assert_eq!(MainFeature::Notes.label(), "笔记");
+        assert_eq!(
+            char::from(MainFeature::Notes.icon()),
+            char::from(Icon::NotebookText)
         );
         assert_eq!(MainFeature::HprofAnalysis.label(), "HPROF解析");
         assert_eq!(
@@ -419,7 +424,7 @@ mod state_tests {
             MainNavigationTooltipAnchor::Top(MAIN_NAV_PADDING + MAIN_NAV_TOOLTIP_BUTTON_INSET)
         );
         assert_eq!(
-            MainNavigationItem::Feature(MainFeature::HprofAnalysis).tooltip_anchor(),
+            MainNavigationItem::Feature(MainFeature::Notes).tooltip_anchor(),
             MainNavigationTooltipAnchor::Top(
                 MAIN_NAV_PADDING
                     + MAIN_NAV_BUTTON_SIZE
@@ -428,10 +433,18 @@ mod state_tests {
             )
         );
         assert_eq!(
-            MainNavigationItem::Feature(MainFeature::AiChat).tooltip_anchor(),
+            MainNavigationItem::Feature(MainFeature::HprofAnalysis).tooltip_anchor(),
             MainNavigationTooltipAnchor::Top(
                 MAIN_NAV_PADDING
                     + (MAIN_NAV_BUTTON_SIZE + MAIN_NAV_BUTTON_GAP) * 2.0
+                    + MAIN_NAV_TOOLTIP_BUTTON_INSET
+            )
+        );
+        assert_eq!(
+            MainNavigationItem::Feature(MainFeature::AiChat).tooltip_anchor(),
+            MainNavigationTooltipAnchor::Top(
+                MAIN_NAV_PADDING
+                    + (MAIN_NAV_BUTTON_SIZE + MAIN_NAV_BUTTON_GAP) * 3.0
                     + MAIN_NAV_TOOLTIP_BUTTON_INSET
             )
         );
@@ -471,6 +484,20 @@ mod state_tests {
         assert_eq!(
             MainView::log_tree_context_menu_x(MAIN_NAV_WIDTH + 280.0, 300.0),
             300.0 - LOG_TREE_CONTEXT_MENU_WIDTH
+        );
+    }
+
+    /// 验证笔记树右键菜单坐标同样扣除固定大导航宽度并限制在笔记树面板内。
+    #[test]
+    fn 笔记树菜单横坐标包含主导航宽度() {
+        assert_eq!(MainView::notes_tree_context_menu_x(24.0), 0.0);
+        assert_eq!(
+            MainView::notes_tree_context_menu_x(MAIN_NAV_WIDTH + 72.0),
+            72.0
+        );
+        assert_eq!(
+            MainView::notes_tree_context_menu_x(MAIN_NAV_WIDTH + 270.0),
+            NOTES_TREE_WIDTH - LOG_TREE_CONTEXT_MENU_WIDTH
         );
     }
 

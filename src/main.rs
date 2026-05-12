@@ -24,6 +24,7 @@ mod launch;
 mod log_document;
 mod log_loader;
 mod log_source;
+mod notes;
 mod search;
 mod theme;
 mod thread_analysis;

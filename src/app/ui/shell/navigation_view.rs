@@ -222,6 +222,16 @@ impl MainView {
         feature: MainFeature,
         context: &mut Context<Self>,
     ) {
+        if self.navigation.active_main_feature == MainFeature::Notes
+            && feature != MainFeature::Notes
+            && self.notes.has_unsaved_changes()
+        {
+            self.notes.unsaved_dialog = Some(NotesUnsavedDialog {
+                action: NotesPendingAction::SwitchFeature(feature),
+            });
+            context.notify();
+            return;
+        }
         self.navigation.active_main_feature = feature;
         self.log.load_source_menu = None;
         self.log.tab_context_menu = None;

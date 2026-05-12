@@ -31,6 +31,13 @@ impl MainView {
             return false;
         }
 
+        if self.navigation.active_main_feature == MainFeature::Notes
+            && Self::is_copy_keystroke(&keystroke)
+            && self.copy_selected_note_source_text(context)
+        {
+            return true;
+        }
+
         if Self::is_copy_keystroke(&keystroke) && self.copy_selected_log_text(context) {
             return true;
         }
@@ -125,6 +132,8 @@ impl MainView {
         self.search_text_input_focused(window)
             || self.settings_text_input_focused(window)
             || self.ai_chat.input_focus.is_focused(window)
+            || self.notes.title_focus.is_focused(window)
+            || self.notes.editor_focus.is_focused(window)
     }
 
     /// 延迟打开搜索对话框。

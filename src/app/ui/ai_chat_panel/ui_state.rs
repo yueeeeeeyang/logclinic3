@@ -111,7 +111,7 @@ pub(in crate::app) struct AiChatWorkspaceState {
     /// 业务意图：
     /// - AI 回复可能包含较长 Markdown 和代码块语法高亮；缓存解析结果可以避免滚动虚拟列表时反复解析同一条历史消息。
     /// - 缓存只保存展示结构，不写入数据库；键按消息 ID 管理，内容哈希或主题变化时会自动替换。
-    pub(in crate::app) markdown_cache: RefCell<HashMap<String, AiChatMarkdownCacheEntry>>,
+    pub(in crate::app) markdown_cache: RefCell<HashMap<String, AppMarkdownCacheEntry>>,
 }
 
 impl AiChatWorkspaceState {
