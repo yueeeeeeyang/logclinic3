@@ -4,7 +4,7 @@
 // - 该文件只承载会话、消息、滚动、输入、流式任务等 AI 对话面板 UI 状态，以及不触碰 SQLite/网络的纯逻辑。
 // - 类型可见性限制在 app 模块内，避免把第一版 AI 对话内部状态暴露成 crate 级 API。
 
-use std::ops::Range;
+use std::{cell::RefCell, collections::HashMap, ops::Range};
 
 use super::*;
 
@@ -106,6 +106,12 @@ pub(in crate::app) struct AiChatWorkspaceState {
     pub(in crate::app) streaming_task: Option<AiChatStreamingTask>,
     /// 下一个 AI 流式任务 ID。
     pub(in crate::app) next_job_id: usize,
+    /// 助手 Markdown 渲染缓存。
+    ///
+    /// 业务意图：
+    /// - AI 回复可能包含较长 Markdown 和代码块语法高亮；缓存解析结果可以避免滚动虚拟列表时反复解析同一条历史消息。
+    /// - 缓存只保存展示结构，不写入数据库；键按消息 ID 管理，内容哈希或主题变化时会自动替换。
+    pub(in crate::app) markdown_cache: RefCell<HashMap<String, AiChatMarkdownCacheEntry>>,
 }
 
 impl AiChatWorkspaceState {
@@ -192,6 +198,7 @@ impl AiChatWorkspaceState {
             input_resize_drag: None,
             streaming_task: None,
             next_job_id: 1,
+            markdown_cache: RefCell::new(HashMap::new()),
         }
     }
 }

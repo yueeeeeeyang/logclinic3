@@ -679,6 +679,31 @@ impl MainView {
             AiChatMessageStatus::Failed => message.error_message.as_deref().or(Some("请求失败")),
             AiChatMessageStatus::Complete => None,
         };
+        let message_content = if message.content.is_empty() {
+            div()
+                .mt_1()
+                .w_full()
+                .min_w_0()
+                .text_sm()
+                .line_height(px(21.0))
+                .whitespace_normal()
+                .text_color(rgb(palette.text))
+                .child(status_text.unwrap_or("").to_string())
+                .into_any_element()
+        } else if is_user {
+            div()
+                .mt_1()
+                .w_full()
+                .min_w_0()
+                .text_sm()
+                .line_height(px(21.0))
+                .whitespace_normal()
+                .text_color(rgb(palette.text))
+                .child(message.content.clone())
+                .into_any_element()
+        } else {
+            self.render_ai_chat_markdown_message(message, palette)
+        };
         div()
             .id(SharedString::from(format!(
                 "ai-chat-message-{}",
@@ -721,21 +746,7 @@ impl MainView {
                             }))
                             .child(if is_user { "你" } else { "助手" }),
                     )
-                    .child(
-                        div()
-                            .mt_1()
-                            .w_full()
-                            .min_w_0()
-                            .text_sm()
-                            .line_height(px(21.0))
-                            .whitespace_normal()
-                            .text_color(rgb(palette.text))
-                            .child(if message.content.is_empty() {
-                                status_text.unwrap_or("").to_string()
-                            } else {
-                                message.content.clone()
-                            }),
-                    )
+                    .child(message_content)
                     .when(
                         status_text.is_some() && !message.content.is_empty(),
                         |bubble| {

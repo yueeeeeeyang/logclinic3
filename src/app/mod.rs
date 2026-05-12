@@ -58,14 +58,15 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     Animation, AnimationExt as _, AnyWindowHandle, App, AppContext, Application, AsyncApp, Bounds,
     ClickEvent, ClipboardItem, Context, DisplayId, Element, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, ExternalPaths, FontWeight, GlobalElementId, InteractiveElement,
-    IntoElement, KeyBinding, KeyDownEvent, Keystroke, LayoutId, ListAlignment,
+    EntityInputHandler, ExternalPaths, FontStyle, FontWeight, GlobalElementId, HighlightStyle,
+    InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, Keystroke, LayoutId, ListAlignment,
     ListHorizontalSizingBehavior, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PaintQuad, ParentElement, PathPromptOptions, Pixels, Point, Render, ScrollHandle,
-    ScrollStrategy, ScrollWheelEvent, ShapedLine, SharedString, StatefulInteractiveElement, Style,
-    Styled as _, StyledText, TextRun, TitlebarOptions, UTF16Selection, UnderlineStyle,
-    UniformListScrollHandle, Window, WindowAppearance, WindowBounds, WindowHandle, WindowKind,
-    WindowOptions, actions, div, fill, list, point, px, relative, rgb, size, uniform_list,
+    ScrollStrategy, ScrollWheelEvent, ShapedLine, SharedString, StatefulInteractiveElement,
+    StrikethroughStyle, Style, Styled as _, StyledText, TextRun, TitlebarOptions, UTF16Selection,
+    UnderlineStyle, UniformListScrollHandle, Window, WindowAppearance, WindowBounds, WindowHandle,
+    WindowKind, WindowOptions, actions, div, fill, list, point, px, relative, rgb, rgba, size,
+    uniform_list,
 };
 use lucide_icons::{Icon, LUCIDE_FONT_BYTES};
 use main_view::MainView;

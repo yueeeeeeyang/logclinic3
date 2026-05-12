@@ -375,3 +375,159 @@ fn ai_对话标题折叠空白并截断() {
     assert!(title.ends_with("..."));
     assert_eq!(title.chars().count(), AI_CHAT_TITLE_MAX_CHARS + 3);
 }
+
+/// 验证 AI 助手 Markdown 会解析常见块级结构和内联样式。
+///
+/// 业务意图：
+/// - 助手回复常见的标题、段落、列表、引用、表格和分隔线必须进入结构化渲染路径，避免继续按纯文本堆叠。
+/// - 内联样式通过 `StyledText` 高亮表达，测试只验证文本和样式范围存在，不绑定具体颜色，降低主题调整时的维护成本。
+#[test]
+fn ai_对话_markdown_解析常见块和内联样式() {
+    let document = parse_ai_chat_markdown(
+        "# 标题\n\n正文 **加粗** *斜体* ~~删除~~ `代码` [链接](https://example.com)\n\n- [x] 任务\n- 普通\n\n> 引用\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n---\n",
+        EffectiveTheme::Light,
+    );
+
+    assert!(document.blocks.iter().any(|block| {
+        matches!(
+            block,
+            AiChatMarkdownBlock::Heading {
+                level: 1,
+                inlines: _
+            }
+        )
+    }));
+    assert!(
+        document
+            .blocks
+            .iter()
+            .any(|block| matches!(block, AiChatMarkdownBlock::List { .. }))
+    );
+    assert!(
+        document
+            .blocks
+            .iter()
+            .any(|block| matches!(block, AiChatMarkdownBlock::BlockQuote(_)))
+    );
+    assert!(
+        document
+            .blocks
+            .iter()
+            .any(|block| matches!(block, AiChatMarkdownBlock::Table { .. }))
+    );
+    assert!(
+        document
+            .blocks
+            .iter()
+            .any(|block| matches!(block, AiChatMarkdownBlock::ThematicBreak))
+    );
+
+    let paragraph = document
+        .blocks
+        .iter()
+        .find_map(|block| match block {
+            AiChatMarkdownBlock::Paragraph(inlines) => Some(inlines),
+            _ => None,
+        })
+        .expect("正文段落应被解析出来");
+    let (text, highlights) = flatten_ai_chat_markdown_inlines(
+        paragraph,
+        AppThemePalette::for_theme(EffectiveTheme::Light),
+    );
+    assert!(text.contains("正文 加粗 斜体 删除 代码 链接"));
+    assert!(
+        highlights.len() >= 5,
+        "粗体、斜体、删除线、行内代码和链接文本都应生成样式范围"
+    );
+}
+
+/// 验证 AI 助手 Markdown 代码块会保留文本并尝试语法高亮。
+///
+/// 边界条件：
+/// - 已知语言应能走 syntect 高亮路径；未知语言应回退为纯文本语法，仍然保留原始代码行。
+#[test]
+fn ai_对话_markdown_代码块高亮和未知语言回退() {
+    let known = parse_ai_chat_markdown("```rust\nfn main() {}\n```\n", EffectiveTheme::Light);
+    let known_code = known
+        .blocks
+        .iter()
+        .find_map(|block| match block {
+            AiChatMarkdownBlock::CodeBlock { language, lines } => Some((language, lines)),
+            _ => None,
+        })
+        .expect("已知语言代码块应被解析出来");
+    assert_eq!(known_code.0.as_deref(), Some("rust"));
+    assert_eq!(known_code.1[0].text, "fn main() {}");
+    assert!(
+        !known_code.1[0].highlights.is_empty(),
+        "已知语言代码块应生成至少一个高亮范围"
+    );
+
+    let unknown = parse_ai_chat_markdown("```unknown-lang\nabc\n```\n", EffectiveTheme::Dark);
+    let unknown_code = unknown
+        .blocks
+        .iter()
+        .find_map(|block| match block {
+            AiChatMarkdownBlock::CodeBlock { language, lines } => Some((language, lines)),
+            _ => None,
+        })
+        .expect("未知语言代码块也应被解析出来");
+    assert_eq!(unknown_code.0.as_deref(), Some("unknown-lang"));
+    assert_eq!(unknown_code.1[0].text, "abc");
+}
+
+/// 验证原始 HTML 只按普通文本展示。
+///
+/// 安全约束：
+/// - AI 回复来自外部模型，首版 Markdown 渲染不能执行 HTML，也不能把 HTML 注入成可交互节点。
+#[test]
+fn ai_对话_markdown_html_按文本展示() {
+    let document = parse_ai_chat_markdown("<b>危险</b>", EffectiveTheme::Light);
+    let paragraph = document
+        .blocks
+        .iter()
+        .find_map(|block| match block {
+            AiChatMarkdownBlock::Paragraph(inlines) => Some(inlines),
+            _ => None,
+        })
+        .expect("HTML 文本应降级为段落");
+    let (text, _) = flatten_ai_chat_markdown_inlines(
+        paragraph,
+        AppThemePalette::for_theme(EffectiveTheme::Light),
+    );
+    assert_eq!(text, "<b>危险</b>");
+}
+
+/// 验证流式输出中的未闭合 Markdown 不会丢失可见内容。
+///
+/// 边界条件：
+/// - SSE 增量过程中常出现未闭合代码块；解析器必须接受半成品内容，等后续增量补齐后再自然更新缓存。
+#[test]
+fn ai_对话_markdown_未闭合代码块保留内容() {
+    let document = parse_ai_chat_markdown("```rust\nfn main()", EffectiveTheme::Light);
+    let code = document
+        .blocks
+        .iter()
+        .find_map(|block| match block {
+            AiChatMarkdownBlock::CodeBlock { lines, .. } => Some(lines),
+            _ => None,
+        })
+        .expect("未闭合代码块也应被解析成代码块");
+    assert_eq!(code[0].text, "fn main()");
+}
+
+/// 验证 Markdown 缓存哈希只随原始内容变化。
+///
+/// 业务意图：
+/// - 缓存键不能依赖渲染后的结构，否则 SSE 更新时难以精确判断当前消息是否需要重新解析。
+#[test]
+fn ai_对话_markdown_正文哈希随内容变化() {
+    assert_eq!(
+        ai_chat_markdown_content_hash("**相同**"),
+        ai_chat_markdown_content_hash("**相同**")
+    );
+    assert_ne!(
+        ai_chat_markdown_content_hash("**相同**"),
+        ai_chat_markdown_content_hash("**不同**")
+    );
+}

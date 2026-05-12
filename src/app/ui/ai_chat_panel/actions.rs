@@ -273,6 +273,8 @@ impl MainView {
     /// 业务意图：
     /// - 切换会话、删除会话或重新加载消息时，消息列表的行数和已测量高度都需要失效，避免旧会话的高度缓存影响新会话。
     pub(in crate::app) fn reset_ai_chat_message_list_state(&mut self) {
+        // 会话切换或重新加载消息时，历史消息集合已经发生整体替换；同步清空展示缓存，避免旧消息 ID 的解析结果占用内存。
+        self.ai_chat.markdown_cache.borrow_mut().clear();
         self.ai_chat
             .message_list_state
             .reset(self.ai_chat.messages.len());

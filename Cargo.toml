@@ -17,6 +17,8 @@ flate2 = "1.1.9"
 gpui = "0.2.2"
 # lucide-icons 提供工具栏和目录树图标字体，避免继续使用难看的手写符号。
 lucide-icons = "1.14.0"
+# pulldown-cmark 用于 AI 对话助手回复 Markdown 解析，只影响本地展示，不改变消息存储和请求体。
+pulldown-cmark = "0.13.3"
 # crc32fast 用于 HPROF sidecar 缓存的首尾块快速校验，避免为了秒开重新计算全文件哈希。
 crc32fast = "1.4.2"
 # memmap2 用于 HPROF dump 快速只读映射；映射失败时会回退整文件读入内存，保证 Windows/macOS 行为可恢复。
@@ -30,6 +32,8 @@ serde_json = "1.0.145"
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 # rusqlite 用于 AI 对话历史的本地 SQLite 存储；启用 bundled 以避免 macOS/Windows 依赖系统 SQLite 动态库。
 rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
+# syntect 用于 AI 对话 Markdown 代码块语法高亮；使用纯 Rust regex-fancy 路径，避免默认 onig C 依赖影响跨平台打包。
+syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 # regex 用于普通搜索窗口的正则模式；语法遵循 Rust regex，避免为日志查找引入额外运行时依赖。
 regex = "1.12.3"
 # sevenz-rust 只读取 7z 目录元数据，当前不调用任何实际解压到磁盘的接口。
