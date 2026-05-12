@@ -12,8 +12,6 @@
 //! - 压缩包内部路径必须做安全归一化，绝对路径、盘符路径和 `..` 路径即使不落盘也不能作为正常树节点展示。
 
 use std::{
-    error::Error,
-    fmt::{self, Display},
     fs,
     path::{Component, Path, PathBuf},
 };
@@ -26,162 +24,9 @@ use crate::archive::{
 };
 use crate::log_source::{LogFileSource, display_name_for_path};
 
-/// 加载完成后提供给左侧目录树渲染的稳定数据结构。
-///
-/// 业务意图：
-/// - `rows` 已经是按展示顺序扁平化后的树节点，UI 层无需再递归遍历文件系统或压缩包。
-/// - `summary` 用于标题右侧展示加载结果摘要，避免 UI 层重复计算节点和错误数量。
-///
-/// 边界条件：
-/// - 当前结构不保存真实文件句柄，也不缓存压缩包解码器；点击节点读取正文时会按 `LogFileSource` 重新打开。
-/// - 展开状态属于 UI 会话状态，不写入该加载结果，避免业务数据和交互状态耦合。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LoadedLogTree {
-    /// 左侧树的标题补充信息。
-    ///
-    /// 业务意图：
-    /// - 多个来源加载时使用统一摘要，让用户知道当前树来自真实选择而不是示例数据。
-    /// - 摘要只表达节点规模和错误数量，不承诺日志条数或文件编码状态。
-    pub summary: String,
-
-    /// 按展示顺序扁平化后的目录树行。
-    ///
-    /// 边界条件：
-    /// - 行内只包含展示所需的名称、层级、类型、元信息和可打开来源，不包含完整正文。
-    /// - 可打开来源只出现在普通文件节点上，目录、压缩包根和错误节点不会伪装成可读取文件。
-    pub rows: Vec<LogTreeRow>,
-
-    /// 加载过程中收集到的非致命错误数量。
-    ///
-    /// 业务意图：
-    /// - 权限失败、坏压缩包条目或不支持的特殊路径不应中断其它可读取节点。
-    /// - UI 可以通过该字段决定是否展示额外的错误提示或诊断入口。
-    pub error_count: usize,
-
-    /// 当前加载结果创建的临时文件或目录。
-    ///
-    /// 业务意图：
-    /// - 7Z 不适合按点击随机读取单个小文件，因此加载阶段会把内部普通成员物化到临时目录。
-    /// - UI 在重新加载日志或应用退出时可以清理这些路径，避免临时磁盘长期累积。
-    ///
-    /// 边界条件：
-    /// - 路径只属于当前进程 session，不跨启动复用；异常退出残留由启动期过期清理兜底。
-    pub temporary_paths: Vec<PathBuf>,
-}
-
-/// 左侧目录树的一行真实加载节点。
-///
-/// 业务意图：
-/// - 用统一结构表达普通文件、目录、压缩包、符号链接和错误节点，降低 UI 渲染分支复杂度。
-/// - `id` 和 `has_children` 让 UI 可以只维护展开集合，而不用重新推导树结构或解析缩进层级。
-/// - `depth` 由加载层计算，UI 层只根据层级缩进，不需要知道真实路径父子关系。
-///
-/// 边界条件：
-/// - `id` 只在一次加载结果内部稳定，不跨加载、不跨进程持久化，后续不能把它当作文件来源 ID 使用。
-/// - `source` 只存在于可打开的普通文件节点，目录或错误节点没有来源定位。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LogTreeRow {
-    /// 当前加载结果内部的稳定节点 ID。
-    ///
-    /// 业务意图：
-    /// - UI 需要用稳定键维护展开/收起状态，不能使用行号，因为虚拟列表和折叠会改变可见行位置。
-    /// - ID 由加载阶段按前序遍历分配，保证同一次加载中父节点、子节点和可见缓存都能引用同一节点。
-    ///
-    /// 边界条件：
-    /// - ID 只对当前 `LoadedLogTree` 有意义；重新加载日志后即使路径相同也会重新分配。
-    pub id: usize,
-
-    /// 节点在目录树中的层级深度。
-    ///
-    /// 边界条件：
-    /// - 根节点深度为 0，子节点逐级递增。
-    /// - 深度只服务于当前扁平展示，不代表未来持久化模型。
-    pub depth: usize,
-
-    /// 节点显示名称。
-    ///
-    /// 业务意图：
-    /// - 目录扫描使用文件名，压缩包内部使用安全归一化后的路径片段。
-    /// - 发生错误时也会提供可读名称，帮助用户定位问题来源。
-    pub label: String,
-
-    /// 节点类型。
-    ///
-    /// 业务意图：
-    /// - UI 用该字段选择图标和颜色，不应从文件名扩展名推断显示类型。
-    pub kind: LogTreeEntryKind,
-
-    /// 当前节点是否拥有子节点。
-    ///
-    /// 业务意图：
-    /// - UI 根据该字段决定是否显示展开箭头，以及点击时是否切换展开状态。
-    /// - 使用加载层计算结果比 UI 根据后续行深度推断更可靠，也减少虚拟列表滚动时的重复计算。
-    pub has_children: bool,
-
-    /// 节点补充信息。
-    ///
-    /// 边界条件：
-    /// - 文件节点通常展示大小；目录节点展示递归包含的文件数量；错误节点展示简短错误类别。
-    /// - 这里不展示绝对路径，避免窄面板被长路径挤压。
-    pub meta: Option<String>,
-
-    /// 错误节点或降级节点的详细说明。
-    ///
-    /// 业务意图：
-    /// - 当前 UI 只展示简短元信息，后续可以把该字段接入悬浮提示或状态面板。
-    /// - 非错误节点通常为 `None`。
-    pub error_message: Option<String>,
-
-    /// 当前节点对应的日志正文来源。
-    ///
-    /// 业务意图：
-    /// - 文件节点点击后必须能准确知道该读取本地文件，还是压缩包内部成员。
-    /// - 来源模型由加载层生成，UI 层不能从展示名称、缩进或父节点文本反推真实路径。
-    ///
-    /// 边界条件：
-    /// - 只有 `LogTreeEntryKind::File` 节点可以携带来源；其它节点保持 `None`。
-    /// - 来源只表示“如何重新读取原始字节”，不缓存文件句柄、解码结果或压缩包 reader。
-    pub source: Option<LogFileSource>,
-}
-
-/// 目录树节点的业务类型。
-///
-/// 业务意图：
-/// - 类型枚举让 UI 渲染保持稳定，不依赖扩展名、颜色或错误文案等易变展示细节。
-/// - 压缩包作为独立类型展示，方便用户区分真实目录和归档文件内部结构。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LogTreeEntryKind {
-    /// 普通目录节点。
-    Directory,
-    /// 普通文件节点。
-    File,
-    /// 压缩包根节点。
-    Archive,
-    /// 符号链接节点。
-    Symlink,
-    /// 加载、权限或路径安全错误节点。
-    Error,
-}
-
-/// 日志加载阶段的致命错误。
-///
-/// 业务意图：
-/// - 大多数单个节点错误会被转为目录树错误节点并继续加载。
-/// - 只有整个加载流程无法形成结果时才返回该错误，例如应用层传入空路径以外的异常状态。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LogLoadError {
-    /// 面向开发者和 UI 的中文错误说明。
-    message: String,
-}
-
-impl Display for LogLoadError {
-    /// 将加载错误格式化为中文可读文本。
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl Error for LogLoadError {}
+#[path = "log_loader/types.rs"]
+mod types;
+pub use types::{LoadedLogTree, LogLoadError, LogTreeEntryKind, LogTreeRow};
 
 /// 加载用户选择的一个或多个日志来源。
 ///
@@ -788,6 +633,7 @@ mod tests {
         split_archive_entry_path,
     };
     use flate2::{Compression, write::GzEncoder};
+    use std::error::Error;
     use std::fs::File;
     use std::io::{self, Cursor, Write};
     use std::time::{SystemTime, UNIX_EPOCH};

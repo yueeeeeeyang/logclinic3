@@ -14,6 +14,8 @@ pub(in crate::app) struct ModelConfigInputPrepaint {
     selection: Option<PaintQuad>,
     /// 当前插入光标矩形。
     cursor: Option<PaintQuad>,
+    /// 当前帧文本水平滚动偏移，单位为 GPUI 逻辑像素。
+    horizontal_scroll_px: f32,
 }
 
 /// 模型配置单行输入元素。
@@ -76,15 +78,22 @@ impl Element for ModelConfigInputElement {
         window: &mut Window,
         context: &mut App,
     ) -> Self::PrepaintState {
-        let (text, display_text, selection_range, marked_range, cursor_visible_by_activity) = {
+        let (
+            text,
+            display_text,
+            selection_range,
+            marked_range,
+            current_scroll_px,
+            cursor_visible_by_activity,
+        ) = {
             let view = self.view.read(context);
-            let (text, display_text, selection_range, marked_range) =
-                view.model_config_input_text_snapshot(self.kind);
+            let snapshot = view.model_config_input_text_snapshot(self.kind);
             (
-                text,
-                display_text,
-                selection_range,
-                marked_range,
+                snapshot.text,
+                snapshot.display_text,
+                snapshot.selection_range,
+                snapshot.marked_range,
+                snapshot.horizontal_scroll_px,
                 view.search_text_cursor_visible(),
             )
         };
@@ -147,28 +156,46 @@ impl Element for ModelConfigInputElement {
         let has_selection =
             focused && !text.is_empty() && selection_range.start < selection_range.end;
         let cursor_index = selection_range.end;
+        let content_width = if text.is_empty() {
+            px(0.0)
+        } else {
+            line.x_for_index(text.len())
+        };
+        let horizontal_scroll_px = MainView::single_line_horizontal_scroll_offset(
+            current_scroll_px,
+            line.x_for_index(cursor_index),
+            content_width,
+            bounds.size.width,
+            focused,
+        );
+        let text_origin = point(bounds.left() - px(horizontal_scroll_px), bounds.top());
         let selection = has_selection.then(|| {
             let mut selection_color = rgb(self.palette.accent);
             selection_color.a = 0.32;
+            let left = f32::from(text_origin.x + line.x_for_index(selection_range.start))
+                .clamp(f32::from(bounds.left()), f32::from(bounds.right()));
+            let right = f32::from(text_origin.x + line.x_for_index(selection_range.end))
+                .clamp(f32::from(bounds.left()), f32::from(bounds.right()));
             fill(
                 Bounds::from_corners(
-                    point(
-                        bounds.left() + line.x_for_index(selection_range.start),
-                        bounds.top(),
-                    ),
-                    point(
-                        bounds.left() + line.x_for_index(selection_range.end),
-                        bounds.bottom(),
-                    ),
+                    point(px(left.min(right)), bounds.top()),
+                    point(px(left.max(right)), bounds.bottom()),
                 ),
                 selection_color,
             )
         });
         let cursor = (focused && !has_selection && cursor_visible_by_activity).then(|| {
+            let cursor_right_limit = (f32::from(bounds.right()) - SINGLE_LINE_INPUT_CARET_WIDTH)
+                .max(f32::from(bounds.left()));
+            let cursor_x = f32::from(text_origin.x + line.x_for_index(cursor_index))
+                .clamp(f32::from(bounds.left()), cursor_right_limit);
             fill(
                 Bounds::new(
-                    point(bounds.left() + line.x_for_index(cursor_index), bounds.top()),
-                    size(px(1.5), bounds.bottom() - bounds.top()),
+                    point(px(cursor_x), bounds.top()),
+                    size(
+                        px(SINGLE_LINE_INPUT_CARET_WIDTH),
+                        bounds.bottom() - bounds.top(),
+                    ),
                 ),
                 rgb(self.palette.accent),
             )
@@ -178,6 +205,7 @@ impl Element for ModelConfigInputElement {
             line,
             selection,
             cursor,
+            horizontal_scroll_px,
         })
     }
 
@@ -204,7 +232,15 @@ impl Element for ModelConfigInputElement {
         }
         prepaint
             .line
-            .paint(bounds.origin, window.line_height(), window, context)
+            .paint(
+                point(
+                    bounds.left() - px(prepaint.horizontal_scroll_px),
+                    bounds.top(),
+                ),
+                window.line_height(),
+                window,
+                context,
+            )
             .ok();
         if let Some(cursor) = prepaint.cursor {
             window.paint_quad(cursor);
@@ -213,7 +249,12 @@ impl Element for ModelConfigInputElement {
             window.request_animation_frame();
         }
         self.view.update(context, |view, _context| {
-            view.store_model_config_input_layout(self.kind, prepaint.line, bounds);
+            view.store_model_config_input_layout(
+                self.kind,
+                prepaint.line,
+                bounds,
+                prepaint.horizontal_scroll_px,
+            );
         });
     }
 }

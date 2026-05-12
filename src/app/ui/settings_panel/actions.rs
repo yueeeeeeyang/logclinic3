@@ -15,10 +15,16 @@ impl MainView {
     pub(in crate::app) fn search_text_snapshot(
         &self,
         input_kind: SearchTextInputKind,
-    ) -> Option<(String, Range<usize>, Option<Range<usize>>)> {
+    ) -> Option<SingleLineTextInputSnapshot> {
         let dialog = self.search.search_dialog.as_ref()?;
-        let (text, selection_range, marked_range) = Self::search_text_state(dialog, input_kind);
-        Some((text.to_string(), selection_range, marked_range))
+        let (text, selection_range, marked_range, horizontal_scroll_px) =
+            Self::search_text_state(dialog, input_kind);
+        Some(SingleLineTextInputSnapshot {
+            text: text.to_string(),
+            selection_range,
+            marked_range,
+            horizontal_scroll_px,
+        })
     }
 
     /// 返回当前应参与线程日志分析过滤的已保存文本。
@@ -137,14 +143,18 @@ impl MainView {
     pub(in crate::app) fn model_config_input_text_snapshot(
         &self,
         kind: ModelConfigInputKind,
-    ) -> (String, String, Range<usize>, Option<Range<usize>>) {
+    ) -> ModelConfigInputSnapshot {
         let state = self.model_config_input_state(kind);
-        (
-            state.text.clone(),
-            self.model_config_input_display_text(kind),
-            Self::clamp_search_text_range(&state.text, state.selection_range.clone()),
-            state.marked_range.clone(),
-        )
+        ModelConfigInputSnapshot {
+            text: state.text.clone(),
+            display_text: self.model_config_input_display_text(kind),
+            selection_range: Self::clamp_search_text_range(
+                &state.text,
+                state.selection_range.clone(),
+            ),
+            marked_range: state.marked_range.clone(),
+            horizontal_scroll_px: state.horizontal_scroll_px,
+        }
     }
 
     /// 保存模型配置输入框最近一次单行排版结果。
@@ -153,10 +163,12 @@ impl MainView {
         kind: ModelConfigInputKind,
         line: ShapedLine,
         bounds: Bounds<Pixels>,
+        horizontal_scroll_px: f32,
     ) {
         let state = self.model_config_input_state_mut(kind);
         state.last_layout = Some(line);
         state.last_bounds = Some(bounds);
+        state.horizontal_scroll_px = horizontal_scroll_px;
     }
 
     /// 根据鼠标窗口坐标返回模型配置输入框中的 UTF-8 字节下标。
@@ -177,7 +189,7 @@ impl MainView {
             return state.text.len();
         }
         layout
-            .closest_index_for_x(position.x - bounds.left())
+            .closest_index_for_x(position.x - bounds.left() + px(state.horizontal_scroll_px))
             .min(state.text.len())
     }
 
@@ -739,21 +751,26 @@ impl MainView {
     /// 读取快搜关键字输入区当前文本、选择范围和组合文本范围的快照。
     pub(in crate::app) fn quick_search_keywords_text_snapshot(
         &self,
-    ) -> (String, Range<usize>, Option<Range<usize>>) {
-        (
-            self.settings.quick_search_keywords_input.text.clone(),
-            Self::clamp_search_text_range(
+    ) -> SingleLineTextInputSnapshot {
+        SingleLineTextInputSnapshot {
+            text: self.settings.quick_search_keywords_input.text.clone(),
+            selection_range: Self::clamp_search_text_range(
                 &self.settings.quick_search_keywords_input.text,
                 self.settings
                     .quick_search_keywords_input
                     .selection_range
                     .clone(),
             ),
-            self.settings
+            marked_range: self
+                .settings
                 .quick_search_keywords_input
                 .marked_range
                 .clone(),
-        )
+            horizontal_scroll_px: self
+                .settings
+                .quick_search_keywords_input
+                .horizontal_scroll_px,
+        }
     }
 
     /// 保存快搜关键字输入区最近一次单行排版结果。
@@ -761,9 +778,13 @@ impl MainView {
         &mut self,
         line: ShapedLine,
         bounds: Bounds<Pixels>,
+        horizontal_scroll_px: f32,
     ) {
         self.settings.quick_search_keywords_last_layout = Some(line);
         self.settings.quick_search_keywords_last_bounds = Some(bounds);
+        self.settings
+            .quick_search_keywords_input
+            .horizontal_scroll_px = horizontal_scroll_px;
     }
 
     /// 根据鼠标窗口坐标返回快搜关键字输入区中的 UTF-8 字节下标。
@@ -785,7 +806,13 @@ impl MainView {
             return text.len();
         }
         layout
-            .closest_index_for_x(position.x - bounds.left())
+            .closest_index_for_x(
+                position.x - bounds.left()
+                    + px(self
+                        .settings
+                        .quick_search_keywords_input
+                        .horizontal_scroll_px),
+            )
             .min(text.len())
     }
 
@@ -1203,15 +1230,22 @@ impl MainView {
         input_kind: SearchTextInputKind,
         line: ShapedLine,
         bounds: Bounds<Pixels>,
+        horizontal_scroll_px: f32,
     ) {
         match input_kind {
             SearchTextInputKind::Query => {
                 self.search.search_query_last_layout = Some(line);
                 self.search.search_query_last_bounds = Some(bounds);
+                if let Some(dialog) = self.search.search_dialog.as_mut() {
+                    dialog.query_input.horizontal_scroll_px = horizontal_scroll_px;
+                }
             }
             SearchTextInputKind::DirectoryTarget => {
                 self.search.search_directory_last_layout = Some(line);
                 self.search.search_directory_last_bounds = Some(bounds);
+                if let Some(dialog) = self.search.search_dialog.as_mut() {
+                    dialog.directory_input.horizontal_scroll_px = horizontal_scroll_px;
+                }
             }
         }
     }
@@ -1296,9 +1330,11 @@ impl MainView {
         input_kind: SearchTextInputKind,
         position: Point<Pixels>,
     ) -> usize {
-        let Some((text, _, _)) = self.search_text_snapshot(input_kind) else {
+        let Some(snapshot) = self.search_text_snapshot(input_kind) else {
             return 0;
         };
+        let text = snapshot.text;
+        let horizontal_scroll_px = snapshot.horizontal_scroll_px;
         let (layout, bounds) = match input_kind {
             SearchTextInputKind::Query => (
                 self.search.search_query_last_layout.as_ref(),
@@ -1319,7 +1355,7 @@ impl MainView {
             return text.len();
         }
         layout
-            .closest_index_for_x(position.x - bounds.left())
+            .closest_index_for_x(position.x - bounds.left() + px(horizontal_scroll_px))
             .min(text.len())
     }
 
@@ -2152,17 +2188,19 @@ impl MainView {
     pub(in crate::app) fn search_text_state(
         dialog: &SearchDialogState,
         input_kind: SearchTextInputKind,
-    ) -> (&str, Range<usize>, Option<Range<usize>>) {
+    ) -> (&str, Range<usize>, Option<Range<usize>>, f32) {
         match input_kind {
             SearchTextInputKind::Query => (
                 &dialog.query_input.text,
                 dialog.query_input.selection_range.clone(),
                 dialog.query_input.marked_range.clone(),
+                dialog.query_input.horizontal_scroll_px,
             ),
             SearchTextInputKind::DirectoryTarget => (
                 &dialog.directory_input.text,
                 dialog.directory_input.selection_range.clone(),
                 dialog.directory_input.marked_range.clone(),
+                dialog.directory_input.horizontal_scroll_px,
             ),
         }
     }
@@ -2200,9 +2238,54 @@ impl MainView {
         dialog.query_input.text = text;
         dialog.query_input.selection_range = cursor..cursor;
         dialog.query_input.marked_range = None;
+        dialog.query_input.horizontal_scroll_px = 0.0;
         dialog.query_history_menu_open = false;
         dialog.current_file_match_count = None;
         dialog.message = "已粘贴剪贴板文本，按 Enter 或点击搜索".to_string();
+    }
+
+    /// 计算单行自绘输入框的水平滚动偏移。
+    ///
+    /// 业务意图：
+    /// - 搜索关键字、当前目录、模型配置和快搜关键字都使用完整文本排版后裁剪显示；当光标移动到可视区域外时，
+    ///   需要调整绘制偏移，让光标重新回到输入框内，体验与系统单行输入框一致。
+    ///
+    /// 边界条件：
+    /// - 内容宽度加上光标宽度仍能完整显示时始终返回 0，避免短文本出现非零偏移。
+    /// - 输入框未聚焦时只夹紧已有偏移，不主动跟随光标，避免非编辑态文本在重绘时跳动。
+    /// - 文本末尾允许额外滚出“右侧边距 + 光标宽度”的空白，确保光标停在最后一个字符后面时不会被裁剪。
+    pub(in crate::app) fn single_line_horizontal_scroll_offset(
+        current_scroll_px: f32,
+        cursor_x: Pixels,
+        content_width: Pixels,
+        viewport_width: Pixels,
+        keep_cursor_visible: bool,
+    ) -> f32 {
+        let viewport_width = f32::from(viewport_width).max(0.0);
+        let content_width = f32::from(content_width).max(0.0);
+        let caret_width = SINGLE_LINE_INPUT_CARET_WIDTH.min(viewport_width);
+        if viewport_width <= 0.0 || content_width + caret_width <= viewport_width {
+            return 0.0;
+        }
+
+        let margin = SINGLE_LINE_INPUT_SCROLL_MARGIN.min(viewport_width / 2.0);
+        let right_guard = (margin + caret_width).min(viewport_width);
+        let max_scroll = (content_width + right_guard - viewport_width).max(0.0);
+        let mut scroll = current_scroll_px.clamp(0.0, max_scroll);
+        if !keep_cursor_visible {
+            return scroll;
+        }
+
+        let cursor_x = f32::from(cursor_x).clamp(0.0, content_width);
+        let visible_left = scroll + margin;
+        let visible_right = scroll + viewport_width - right_guard;
+        if cursor_x < visible_left {
+            scroll = (cursor_x - margin).max(0.0);
+        } else if cursor_x > visible_right {
+            scroll = (cursor_x - viewport_width + right_guard).min(max_scroll);
+        }
+
+        scroll
     }
 
     /// 判断是否为搜索输入框全选快捷键。

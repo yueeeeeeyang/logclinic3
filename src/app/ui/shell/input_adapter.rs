@@ -64,7 +64,7 @@ impl EntityInputHandler for MainView {
         }
         let input_kind = self.active_search_text_input_kind(window);
         let dialog = self.search.search_dialog.as_ref()?;
-        let (text, _, _) = Self::search_text_state(dialog, input_kind);
+        let (text, _, _, _) = Self::search_text_state(dialog, input_kind);
         let range = Self::search_input_range_from_utf16(text, range_utf16);
         adjusted_range.replace(Self::search_input_range_to_utf16(text, range.clone()));
         Some(text[range].to_string())
@@ -123,7 +123,7 @@ impl EntityInputHandler for MainView {
         }
         let input_kind = self.active_search_text_input_kind(window);
         let dialog = self.search.search_dialog.as_ref()?;
-        let (text, selection_range, _) = Self::search_text_state(dialog, input_kind);
+        let (text, selection_range, _, _) = Self::search_text_state(dialog, input_kind);
         Some(UTF16Selection {
             range: Self::search_input_range_to_utf16(text, selection_range),
             reversed: false,
@@ -181,7 +181,7 @@ impl EntityInputHandler for MainView {
         }
         let input_kind = self.active_search_text_input_kind(window);
         let dialog = self.search.search_dialog.as_ref()?;
-        let (text, _, marked_range) = Self::search_text_state(dialog, input_kind);
+        let (text, _, marked_range, _) = Self::search_text_state(dialog, input_kind);
         marked_range.map(|range| Self::search_input_range_to_utf16(text, range))
     }
 
@@ -593,11 +593,13 @@ impl EntityInputHandler for MainView {
             };
             return Some(Bounds::from_corners(
                 point(
-                    element_bounds.left() + layout.x_for_index(range.start),
+                    element_bounds.left() + layout.x_for_index(range.start)
+                        - px(state.horizontal_scroll_px),
                     element_bounds.top(),
                 ),
                 point(
-                    element_bounds.left() + layout.x_for_index(range.end),
+                    element_bounds.left() + layout.x_for_index(range.end)
+                        - px(state.horizontal_scroll_px),
                     element_bounds.bottom(),
                 ),
             ));
@@ -626,13 +628,19 @@ impl EntityInputHandler for MainView {
             let Some(layout) = self.settings.quick_search_keywords_last_layout.as_ref() else {
                 return Some(element_bounds);
             };
+            let horizontal_scroll_px = self
+                .settings
+                .quick_search_keywords_input
+                .horizontal_scroll_px;
             return Some(Bounds::from_corners(
                 point(
-                    element_bounds.left() + layout.x_for_index(range.start),
+                    element_bounds.left() + layout.x_for_index(range.start)
+                        - px(horizontal_scroll_px),
                     element_bounds.top(),
                 ),
                 point(
-                    element_bounds.left() + layout.x_for_index(range.end),
+                    element_bounds.left() + layout.x_for_index(range.end)
+                        - px(horizontal_scroll_px),
                     element_bounds.bottom(),
                 ),
             ));
@@ -662,7 +670,7 @@ impl EntityInputHandler for MainView {
         }
         let input_kind = self.active_search_text_input_kind(window);
         let dialog = self.search.search_dialog.as_ref()?;
-        let (text, _, _) = Self::search_text_state(dialog, input_kind);
+        let (text, _, _, horizontal_scroll_px) = Self::search_text_state(dialog, input_kind);
         let range = Self::search_input_range_from_utf16(text, range_utf16);
         let layout = match input_kind {
             SearchTextInputKind::Query => self.search.search_query_last_layout.as_ref(),
@@ -675,11 +683,11 @@ impl EntityInputHandler for MainView {
         };
         Some(Bounds::from_corners(
             point(
-                element_bounds.left() + layout.x_for_index(range.start),
+                element_bounds.left() + layout.x_for_index(range.start) - px(horizontal_scroll_px),
                 element_bounds.top(),
             ),
             point(
-                element_bounds.left() + layout.x_for_index(range.end),
+                element_bounds.left() + layout.x_for_index(range.end) - px(horizontal_scroll_px),
                 element_bounds.bottom(),
             ),
         ))
@@ -731,7 +739,7 @@ impl EntityInputHandler for MainView {
         }
         let input_kind = self.active_search_text_input_kind(window);
         let dialog = self.search.search_dialog.as_ref()?;
-        let (text, _, _) = Self::search_text_state(dialog, input_kind);
+        let (text, _, _, _) = Self::search_text_state(dialog, input_kind);
         let utf8_index = self.search_text_index_for_point(input_kind, point);
         Some(Self::search_input_utf16_offset_from_byte(text, utf8_index))
     }

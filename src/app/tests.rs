@@ -537,6 +537,86 @@ mod state_tests {
         ));
     }
 
+    /// 验证单行输入框会按光标位置调整水平滚动。
+    ///
+    /// 业务意图：
+    /// - 搜索关键字、当前目录、模型配置和快搜关键字都是自绘单行输入；当文本超过输入框可视范围后，
+    ///   光标向右移动必须推动内容左移，向左移动时也必须把内容滚回可见区域。
+    #[test]
+    fn 单行输入水平滚动会跟随光标() {
+        assert_eq!(
+            MainView::single_line_horizontal_scroll_offset(
+                0.0,
+                px(180.0),
+                px(240.0),
+                px(100.0),
+                true,
+            ),
+            89.5
+        );
+        assert_eq!(
+            MainView::single_line_horizontal_scroll_offset(
+                120.0,
+                px(20.0),
+                px(240.0),
+                px(100.0),
+                true,
+            ),
+            12.0
+        );
+    }
+
+    /// 验证短文本和非聚焦单行输入不会发生不必要的横向跳动。
+    ///
+    /// 边界条件：
+    /// - 内容宽度小于输入框时偏移必须归零；未聚焦时只夹紧已有偏移，避免普通重绘导致文本显示位置变化。
+    #[test]
+    fn 单行输入水平滚动会夹紧边界() {
+        assert_eq!(
+            MainView::single_line_horizontal_scroll_offset(
+                20.0,
+                px(80.0),
+                px(90.0),
+                px(100.0),
+                true,
+            ),
+            0.0
+        );
+        assert_eq!(
+            MainView::single_line_horizontal_scroll_offset(
+                300.0,
+                px(20.0),
+                px(240.0),
+                px(100.0),
+                false,
+            ),
+            149.5
+        );
+    }
+
+    /// 验证光标位于文本末尾时仍会保留完整可见空间。
+    ///
+    /// 业务意图：
+    /// - 自绘单行输入在文本末尾需要允许额外滚出一小段空白，否则光标会贴在输入框右边界并被裁剪。
+    /// - 这里锁定右侧保护区计算，避免搜索框和当前目录输入在长文本末尾回归为“看不到光标”。
+    #[test]
+    fn 单行输入末尾光标不会被右边界遮挡() {
+        let scroll = MainView::single_line_horizontal_scroll_offset(
+            0.0,
+            px(240.0),
+            px(240.0),
+            px(100.0),
+            true,
+        );
+        let cursor_viewport_x = 240.0 - scroll;
+        let right_limit = 100.0 - SINGLE_LINE_INPUT_SCROLL_MARGIN - SINGLE_LINE_INPUT_CARET_WIDTH;
+
+        assert_eq!(scroll, 149.5);
+        assert!(cursor_viewport_x <= right_limit);
+        assert!(cursor_viewport_x + SINGLE_LINE_INPUT_CARET_WIDTH < 100.0);
+        assert!(cursor_viewport_x >= SINGLE_LINE_INPUT_SCROLL_MARGIN);
+    }
+
     /// 验证搜索窗口级控制键只识别 Enter 和 Escape。
     ///
     /// 业务意图：
@@ -935,6 +1015,7 @@ mod state_tests {
                 text: "旧关键字".to_string(),
                 selection_range: 0.."旧关键字".len(),
                 marked_range: Some(0.."旧".len()),
+                horizontal_scroll_px: 0.0,
             },
             query_history_menu_open: true,
             scope: SearchScope::CurrentFile,
@@ -975,6 +1056,7 @@ mod state_tests {
                 text: "error|warn".to_string(),
                 selection_range: 0.."error|warn".len(),
                 marked_range: None,
+                horizontal_scroll_px: 0.0,
             },
             query_history_menu_open: true,
             scope: SearchScope::CurrentFile,
@@ -1010,6 +1092,7 @@ mod state_tests {
                 text: "monitorThread".to_string(),
                 selection_range: 0.."monitorThread".len(),
                 marked_range: None,
+                horizontal_scroll_px: 0.0,
             },
             case_sensitive: true,
             match_mode: SearchMatchMode::Literal,

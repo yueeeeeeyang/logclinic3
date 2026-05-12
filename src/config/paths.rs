@@ -1,0 +1,118 @@
+// 应用配置路径功能域。
+//
+// 业务意图：
+// - 集中维护 macOS 和 Windows 的配置目录选择，以及各类配置文件的稳定文件名。
+// - 上层偏好、模型配置和 AI 对话存储都通过这里取路径，避免平台判断散落在不同业务域。
+//
+// 边界条件：
+// - 当前产品目标平台是 macOS 和 Windows；其它平台返回 `None`，调用方继续使用内存默认值。
+// - 这里只拼接路径，不创建目录；具体写入函数负责按需创建父目录并处理权限错误。
+
+use std::{env, path::PathBuf};
+
+/// 主窗口尺寸偏好文件名。
+///
+/// 业务意图：
+/// - 当前只保存主窗口宽高，不保存位置、最大化状态或其他设置，因此使用独立小文本文件即可。
+/// - 如果后续接入完整设置系统，应迁移到统一配置文件并保留兼容读取逻辑。
+pub(crate) const MAIN_WINDOW_SIZE_FILE_NAME: &str = "window-size.txt";
+
+/// 主题偏好文件名。
+///
+/// 业务意图：
+/// - 主题属于用户明确设置，必须和窗口大小一样跨启动保留。
+/// - 文件内容保持为简单英文枚举值，避免仅为单个配置新增 JSON/TOML 依赖。
+pub(crate) const THEME_PREFERENCE_FILE_NAME: &str = "theme-preference.txt";
+
+/// 日志显示字号偏好文件名。
+///
+/// 业务意图：
+/// - 日志字号是用户明确调整的阅读偏好，需要像主题一样跨启动恢复。
+/// - 文件只保存一个像素值，继续使用简单文本格式，避免为单项设置引入完整配置依赖。
+pub(crate) const LOG_VIEWER_FONT_SIZE_FILE_NAME: &str = "log-viewer-font-size.txt";
+
+/// 线程日志分析过滤配置文件名。
+///
+/// 业务意图：
+/// - 用户会在设置窗口中粘贴需要过滤的线程堆栈，配置必须跨重启保留，避免每次排查都重新维护无效线程列表。
+/// - 文件保存原始多行文本而不是结构化格式，方便用户直接打开配置文件排查或批量替换。
+pub(crate) const THREAD_ANALYSIS_FILTER_FILE_NAME: &str = "thread-analysis-filter.txt";
+
+/// 快搜关键字配置文件名。
+///
+/// 业务意图：
+/// - 快搜关键字是用户面向排障场景维护的常用搜索词集合，需要跨应用重启保留。
+/// - 文件保存英文逗号分隔的单行文本，保持可手工编辑，同时避免为一个简单列表引入结构化配置依赖。
+pub(crate) const QUICK_SEARCH_KEYWORDS_FILE_NAME: &str = "quick-search-keywords.txt";
+
+/// 模型配置文件名。
+///
+/// 业务意图：
+/// - 模型配置包含多个 OpenAI 兼容接口档案和默认模型选择，需要跨应用重启恢复。
+/// - 文件使用 JSON 而不是多个文本文件，便于一次性保存列表、默认 ID 和 API Key 等结构化字段。
+///
+/// 安全边界：
+/// - 用户已确认第一版 API Key 明文保存在应用配置目录；UI 默认掩码显示，代码中避免把 Key 写入错误文案。
+pub(crate) const MODEL_CONFIGS_FILE_NAME: &str = "model-configs.json";
+
+/// 获取当前平台的应用配置目录。
+///
+/// 跨平台约束：
+/// - macOS 使用 `$HOME/Library/Application Support/LogClinic`，符合普通桌面应用配置目录习惯。
+/// - Windows 使用 `%APPDATA%\LogClinic`，避免写入程序安装目录或当前工作目录。
+/// - 其他平台当前不是目标运行平台，返回 `None` 并退回内存默认值。
+pub(crate) fn app_config_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        env::var_os("HOME").map(PathBuf::from).map(|home| {
+            home.join("Library")
+                .join("Application Support")
+                .join("LogClinic")
+        })
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|app_data| app_data.join("LogClinic"))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        None
+    }
+}
+
+/// 获取当前平台的主窗口宽高偏好文件路径。
+///
+/// 跨平台约束：
+/// - 该函数只负责路径拼接，不判断历史尺寸是否适合当前显示器；窗口启动策略在 `app` 层处理。
+pub(crate) fn main_window_size_preference_path() -> Option<PathBuf> {
+    app_config_dir().map(|dir| dir.join(MAIN_WINDOW_SIZE_FILE_NAME))
+}
+
+/// 获取主题偏好文件路径。
+pub(crate) fn theme_preference_path() -> Option<PathBuf> {
+    app_config_dir().map(|dir| dir.join(THEME_PREFERENCE_FILE_NAME))
+}
+
+/// 获取日志显示字号偏好文件路径。
+pub(crate) fn log_viewer_font_size_preference_path() -> Option<PathBuf> {
+    app_config_dir().map(|dir| dir.join(LOG_VIEWER_FONT_SIZE_FILE_NAME))
+}
+
+/// 获取线程日志分析过滤配置文件路径。
+pub(crate) fn thread_analysis_filter_preference_path() -> Option<PathBuf> {
+    app_config_dir().map(|dir| dir.join(THREAD_ANALYSIS_FILTER_FILE_NAME))
+}
+
+/// 获取快搜关键字配置文件路径。
+pub(crate) fn quick_search_keywords_preference_path() -> Option<PathBuf> {
+    app_config_dir().map(|dir| dir.join(QUICK_SEARCH_KEYWORDS_FILE_NAME))
+}
+
+/// 获取模型配置文件路径。
+pub(crate) fn model_configs_preference_path() -> Option<PathBuf> {
+    app_config_dir().map(|dir| dir.join(MODEL_CONFIGS_FILE_NAME))
+}

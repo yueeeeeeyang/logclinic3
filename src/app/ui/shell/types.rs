@@ -672,6 +672,47 @@ pub(in crate::app) struct SingleLineTextInputState {
     pub(in crate::app) selection_range: Range<usize>,
     /// 中文等输入法正在组合的文本范围，提交或取消组合时清空。
     pub(in crate::app) marked_range: Option<Range<usize>>,
+    /// 当前单行输入内容的水平滚动偏移，单位为 GPUI 逻辑像素。
+    ///
+    /// 业务意图：
+    /// - 当文本宽度超过输入框可视宽度时，自绘输入框需要像系统输入框一样左右滚动，保证光标和选区终点始终可见。
+    /// - 该值只属于当前 UI 会话，不写入配置；文本被整体替换时重置为 0，避免新内容继承旧内容的滚动位置。
+    pub(in crate::app) horizontal_scroll_px: f32,
+}
+
+/// 单行输入框绘制阶段需要读取的只读快照。
+///
+/// 业务意图：
+/// - 自绘输入元素在 GPUI `prepaint` 阶段只能短暂读取 `MainView`，不能长期持有状态借用。
+/// - 使用结构化快照承载文本、选区、IME 组合范围和水平滚动偏移，可以避免复杂元组在搜索、快搜和目录输入之间反复传播。
+#[derive(Clone)]
+pub(in crate::app) struct SingleLineTextInputSnapshot {
+    /// 当前需要绘制和命中的真实文本。
+    pub(in crate::app) text: String,
+    /// 已夹到 UTF-8 字符边界的选择范围。
+    pub(in crate::app) selection_range: Range<usize>,
+    /// 输入法组合文本范围。
+    pub(in crate::app) marked_range: Option<Range<usize>>,
+    /// 当前单行输入内容的水平滚动偏移。
+    pub(in crate::app) horizontal_scroll_px: f32,
+}
+
+/// 模型配置输入框绘制阶段需要读取的只读快照。
+///
+/// 业务意图：
+/// - API Key 字段需要区分真实文本和掩码展示文本；其它字段二者相同。
+/// - 单独的快照结构能明确“保存和 IME 使用真实文本、绘制使用展示文本”的边界。
+pub(in crate::app) struct ModelConfigInputSnapshot {
+    /// 真实字段文本，用于选区、IME 范围和保存。
+    pub(in crate::app) text: String,
+    /// 当前应展示的文本，API Key 在隐藏状态下会被星号替换。
+    pub(in crate::app) display_text: String,
+    /// 已夹到 UTF-8 字符边界的选择范围。
+    pub(in crate::app) selection_range: Range<usize>,
+    /// 输入法组合文本范围。
+    pub(in crate::app) marked_range: Option<Range<usize>>,
+    /// 当前单行输入内容的水平滚动偏移。
+    pub(in crate::app) horizontal_scroll_px: f32,
 }
 
 impl SingleLineTextInputState {
@@ -687,6 +728,7 @@ impl SingleLineTextInputState {
             text,
             selection_range: cursor..cursor,
             marked_range: None,
+            horizontal_scroll_px: 0.0,
         }
     }
 
@@ -699,6 +741,7 @@ impl SingleLineTextInputState {
         self.text = text;
         self.selection_range = cursor..cursor;
         self.marked_range = None;
+        self.horizontal_scroll_px = 0.0;
     }
 }
 
