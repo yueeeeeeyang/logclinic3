@@ -151,14 +151,17 @@ impl MainView {
     /// - 左侧栏默认 300px 是用户明确要求，必须从这里作为唯一入口初始化。
     pub(in crate::app) fn new(context: &mut Context<Self>) -> Self {
         let model_configs = load_model_configs_preference();
-        let default_ai_model_profile_id = ai_chat_default_model_profile_id(
-            &model_configs.profiles,
-            model_configs.default_profile_id.as_deref(),
-        );
         let model_config = ModelConfigState::new(context, model_configs);
-        let ai_chat =
-            AiChatWorkspaceState::load_or_initialize(context, default_ai_model_profile_id);
+        let ai_chat = AiChatWorkspaceState::new_unloaded(context);
         let notes = NotesWorkspaceState::load_or_initialize(context);
+
+        // AI 对话页第一次渲染代码块时需要初始化 syntect 语法和主题集合；该初始化与 UI 状态无关，
+        // 提前放到 GPUI 后台执行器中完成，避免用户首次点击 AI 导航时把这部分成本压到主线程。
+        context
+            .background_spawn(async {
+                prewarm_app_markdown_code_highlighting();
+            })
+            .detach();
 
         Self {
             left_panel_width: LEFT_PANEL_DEFAULT_WIDTH,

@@ -4,7 +4,7 @@
 // - 测试随 AI 对话模块迁移，直接覆盖 SQLite、SSE、请求体、模型选择和输入区高度等内部规则。
 // - 断言保持迁移前语义不变，用于证明本次只是代码组织重构。
 
-use std::{env, fs, path::PathBuf};
+use std::{env, fs, path::PathBuf, sync::mpsc};
 
 use rusqlite::Connection;
 
@@ -176,6 +176,39 @@ fn ai_对话默认模型优先默认否则首个() {
         Some("first".to_string())
     );
     assert_eq!(ai_chat_default_model_profile_id(&[], None), None);
+}
+
+/// 验证 AI 历史消息首帧测量阈值。
+///
+/// 业务意图：
+/// - 首次进入 AI 对话页时，大历史会话不能同步测量全部消息，否则会触发 Markdown 解析、代码高亮初始化和文本排版的主线程卡顿。
+/// - 阈值边界需要固定，避免后续调整列表状态时把所有会话重新改回全量测量。
+#[test]
+fn ai_对话大历史会话跳过首帧全量测量() {
+    assert!(ai_chat_should_measure_all_messages(
+        AI_CHAT_MESSAGE_MEASURE_ALL_THRESHOLD
+    ));
+    assert!(!ai_chat_should_measure_all_messages(
+        AI_CHAT_MESSAGE_MEASURE_ALL_THRESHOLD + 1
+    ));
+
+    let large_list_state = ai_chat_message_list_state(AI_CHAT_MESSAGE_MEASURE_ALL_THRESHOLD + 1);
+    assert_eq!(
+        large_list_state.item_count(),
+        AI_CHAT_MESSAGE_MEASURE_ALL_THRESHOLD + 1
+    );
+}
+
+/// 验证 AI 历史加载状态能区分加载中和完成态。
+///
+/// 业务意图：
+/// - AI 页现在先渲染页面骨架，再后台加载 SQLite 历史；状态判断必须稳定，否则加载动画、发送按钮和新建会话入口会出现错误启用。
+#[test]
+fn ai_对话历史加载状态区分加载中和已完成() {
+    let (_sender, receiver) = mpsc::channel();
+    assert!(AiChatLoadState::Loading { receiver }.is_loading());
+    assert!(AiChatLoadState::Loaded.is_loaded());
+    assert!(!AiChatLoadState::NotStarted.is_loaded());
 }
 
 /// 验证 AI 对话请求体只包含可用上下文且不带日志内容。

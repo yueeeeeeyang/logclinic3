@@ -4,7 +4,7 @@
 // - 该文件只承载会话、消息、滚动、输入、流式任务等 AI 对话面板 UI 状态，以及不触碰 SQLite/网络的纯逻辑。
 // - 类型可见性限制在 app 模块内，避免把第一版 AI 对话内部状态暴露成 crate 级 API。
 
-use std::{cell::RefCell, collections::HashMap, ops::Range};
+use std::{cell::RefCell, collections::HashMap, ops::Range, sync::mpsc};
 
 use super::*;
 
@@ -45,6 +45,59 @@ pub(in crate::app) struct AiChatInputResizeDrag {
     pub(in crate::app) start_height: f32,
 }
 
+/// AI 对话历史数据加载状态。
+///
+/// 业务意图：
+/// - AI 页第一次进入时要先完成页面切换，再在后台读取 SQLite 历史数据，避免数据库打开、schema 初始化和历史消息读取阻塞导航点击。
+/// - 状态机明确区分尚未加载、加载中和已加载，避免用户反复点击导航时重复启动后台任务。
+///
+/// 边界条件：
+/// - `Loading` 内保存后台线程回传结果的接收器，只能在 UI 线程轮询读取，不能在渲染阶段阻塞等待。
+pub(in crate::app) enum AiChatLoadState {
+    /// 尚未请求加载历史数据。
+    NotStarted,
+    /// 后台任务正在读取或初始化 AI 对话数据库。
+    Loading {
+        /// 后台任务回传的加载结果。
+        receiver: mpsc::Receiver<AiChatLoadResult>,
+    },
+    /// 历史数据已经完成加载；即使加载失败，也会进入该状态并通过 `database_error` 展示错误。
+    Loaded,
+}
+
+impl AiChatLoadState {
+    /// 判断 AI 历史数据是否已经进入后台加载中。
+    ///
+    /// 业务意图：
+    /// - 渲染层需要据此显示加载动画，交互层需要据此禁用依赖会话 ID 的操作。
+    pub(in crate::app) fn is_loading(&self) -> bool {
+        matches!(self, Self::Loading { .. })
+    }
+
+    /// 判断 AI 历史数据是否已经完成首次加载。
+    ///
+    /// 边界条件：
+    /// - 加载失败也算完成，因为错误会展示在页面中，后续新建或发送仍由数据库路径检查兜底。
+    pub(in crate::app) fn is_loaded(&self) -> bool {
+        matches!(self, Self::Loaded)
+    }
+}
+
+/// AI 对话后台加载结果。
+///
+/// 业务意图：
+/// - 后台线程不能直接修改 GPUI 状态，因此把会话列表、当前会话和消息列表打包回 UI 线程统一应用。
+pub(in crate::app) struct AiChatLoadResult {
+    /// AI 对话会话列表。
+    pub(in crate::app) conversations: Vec<AiChatConversation>,
+    /// 当前激活的 AI 会话 ID。
+    pub(in crate::app) active_conversation_id: Option<String>,
+    /// 当前激活会话的消息列表。
+    pub(in crate::app) messages: Vec<AiChatMessage>,
+    /// 数据库初始化或读取错误。
+    pub(in crate::app) database_error: Option<String>,
+}
+
 /// AI 对话输入区中的单行排版缓存。
 ///
 /// 业务意图：
@@ -68,6 +121,11 @@ pub(in crate::app) struct AiChatInputLineLayout {
 /// - 构造函数会读取原有 AI 对话数据库并在空库时创建默认会话，数据库路径、错误文案和默认模型选择保持不变。
 /// - 所有字段仍限制在 `app` 内部访问，不新增公开 API，也不改变用户可见配置或持久化 schema。
 pub(in crate::app) struct AiChatWorkspaceState {
+    /// AI 历史数据加载状态。
+    ///
+    /// 业务意图：
+    /// - 主窗口启动时不再同步读取 `ai-chat.db`，第一次进入 AI 页后先渲染页面骨架，再通过该状态驱动后台加载和加载动画。
+    pub(in crate::app) load_state: AiChatLoadState,
     /// AI 对话会话列表。
     pub(in crate::app) conversations: Vec<AiChatConversation>,
     /// 当前 AI 对话会话 ID。
@@ -115,77 +173,25 @@ pub(in crate::app) struct AiChatWorkspaceState {
 }
 
 impl AiChatWorkspaceState {
-    /// 从持久化数据库和 UI 上下文创建 AI 对话工作区状态。
+    /// 创建尚未加载历史数据的 AI 对话工作区状态。
     ///
     /// 业务意图：
-    /// - 主视图构造只需要传入默认模型配置 ID，AI 面板状态自己处理会话加载、空库初始化和输入框焦点创建。
-    /// - 数据库不可用时只记录 AI 页错误，不影响日志查看主流程启动。
-    pub(in crate::app) fn load_or_initialize(
-        context: &mut Context<MainView>,
-        default_model_profile_id: Option<String>,
-    ) -> Self {
-        let (conversations, active_conversation_id, messages, database_error) = if let Some(path) =
-            ai_chat_database_path()
-        {
-            match load_ai_chat_conversations(&path) {
-                Ok(mut conversations) => {
-                    if conversations.is_empty() {
-                        let conversation =
-                            new_ai_chat_conversation(default_model_profile_id.clone());
-                        match insert_ai_chat_conversation(&path, &conversation) {
-                            Ok(()) => {
-                                let active_id = Some(conversation.id.clone());
-                                conversations.push(conversation);
-                                (conversations, active_id, Vec::new(), None)
-                            }
-                            Err(error) => (Vec::new(), None, Vec::new(), Some(error)),
-                        }
-                    } else {
-                        let active_id = conversations
-                            .first()
-                            .map(|conversation| conversation.id.clone());
-                        let messages = active_id
-                            .as_deref()
-                            .map(|conversation_id| load_ai_chat_messages(&path, conversation_id))
-                            .transpose();
-                        match messages {
-                            Ok(messages) => {
-                                (conversations, active_id, messages.unwrap_or_default(), None)
-                            }
-                            Err(error) => (conversations, active_id, Vec::new(), Some(error)),
-                        }
-                    }
-                }
-                Err(error) => (Vec::new(), None, Vec::new(), Some(error)),
-            }
-        } else {
-            (
-                Vec::new(),
-                None,
-                Vec::new(),
-                Some("当前平台没有可用的应用配置目录，无法保存 AI 对话历史".to_string()),
-            )
-        };
-
+    /// - 主窗口默认启动在日志分析页，AI 历史数据库不应在启动或首次导航点击路径上同步读取。
+    /// - 输入框焦点等轻量 UI 资源仍在这里初始化，保证页面骨架可以立刻渲染。
+    pub(in crate::app) fn new_unloaded(context: &mut Context<MainView>) -> Self {
         Self {
+            load_state: AiChatLoadState::NotStarted,
             conversation_list_state: ListState::new(
-                conversations.len(),
+                0,
                 ListAlignment::Top,
                 px(AI_CHAT_VIRTUAL_LIST_OVERDRAW),
             ),
-            // 消息列表使用可变高度气泡；新打开窗口时如果只测量底部可见消息，向上滚动会不断发现更早消息的真实高度，
-            // 导致滚动条滑块越来越短。这里让 GPUI 在首帧计算完整消息高度，但后续仍只绘制可见区域，保持滚动条比例稳定。
-            message_list_state: ListState::new(
-                messages.len(),
-                ListAlignment::Bottom,
-                px(AI_CHAT_VIRTUAL_LIST_OVERDRAW),
-            )
-            .measure_all(),
-            conversations,
-            active_conversation_id,
-            messages,
+            message_list_state: ai_chat_message_list_state(0),
+            conversations: Vec::new(),
+            active_conversation_id: None,
+            messages: Vec::new(),
             scrollbar_drag: None,
-            database_error,
+            database_error: None,
             model_menu_open: false,
             input_text: String::new(),
             input_selection_range: 0..0,
@@ -201,6 +207,107 @@ impl AiChatWorkspaceState {
             markdown_cache: RefCell::new(HashMap::new()),
         }
     }
+}
+
+/// 在后台读取或初始化 AI 对话历史数据。
+///
+/// 业务意图：
+/// - 该函数不依赖 GPUI 上下文，便于放到后台执行器中运行，避免 SQLite I/O 和 schema 初始化阻塞页面切换。
+/// - 空数据库仍按旧行为创建默认会话，保证加载完成后用户可以直接输入并发送。
+pub(in crate::app) fn load_ai_chat_initial_data(
+    default_model_profile_id: Option<String>,
+) -> AiChatLoadResult {
+    let Some(path) = ai_chat_database_path() else {
+        return AiChatLoadResult {
+            conversations: Vec::new(),
+            active_conversation_id: None,
+            messages: Vec::new(),
+            database_error: Some(
+                "当前平台没有可用的应用配置目录，无法保存 AI 对话历史".to_string(),
+            ),
+        };
+    };
+
+    match load_ai_chat_conversations(&path) {
+        Ok(conversations) => {
+            if conversations.is_empty() {
+                let conversation = new_ai_chat_conversation(default_model_profile_id);
+                return match insert_ai_chat_conversation(&path, &conversation) {
+                    Ok(()) => AiChatLoadResult {
+                        active_conversation_id: Some(conversation.id.clone()),
+                        conversations: vec![conversation],
+                        messages: Vec::new(),
+                        database_error: None,
+                    },
+                    Err(error) => AiChatLoadResult {
+                        conversations: Vec::new(),
+                        active_conversation_id: None,
+                        messages: Vec::new(),
+                        database_error: Some(error),
+                    },
+                };
+            }
+
+            let active_conversation_id = conversations
+                .first()
+                .map(|conversation| conversation.id.clone());
+            let messages = active_conversation_id
+                .as_deref()
+                .map(|conversation_id| load_ai_chat_messages(&path, conversation_id))
+                .transpose();
+            match messages {
+                Ok(messages) => AiChatLoadResult {
+                    conversations,
+                    active_conversation_id,
+                    messages: messages.unwrap_or_default(),
+                    database_error: None,
+                },
+                Err(error) => AiChatLoadResult {
+                    conversations,
+                    active_conversation_id,
+                    messages: Vec::new(),
+                    database_error: Some(error),
+                },
+            }
+        }
+        Err(error) => AiChatLoadResult {
+            conversations: Vec::new(),
+            active_conversation_id: None,
+            messages: Vec::new(),
+            database_error: Some(error),
+        },
+    }
+}
+
+/// 创建 AI 消息列表状态。
+///
+/// 业务意图：
+/// - 消息列表使用可变高度气泡，小会话完整测量能让滚动条比例从首帧开始准确。
+/// - 历史消息较多时，完整测量会在第一次进入 AI 页同步解析 Markdown、初始化代码高亮并排版所有气泡，
+///   直接造成 1-2 秒主线程卡顿，因此大列表改为 GPUI 默认的可见区域渐进测量。
+///
+/// 边界条件：
+/// - 大列表的滚动条总高度会随着用户向上滚动逐步校准，这是用首帧响应速度换取的明确折中。
+pub(in crate::app) fn ai_chat_message_list_state(message_count: usize) -> ListState {
+    let list_state = ListState::new(
+        message_count,
+        ListAlignment::Bottom,
+        px(AI_CHAT_VIRTUAL_LIST_OVERDRAW),
+    );
+    if ai_chat_should_measure_all_messages(message_count) {
+        list_state.measure_all()
+    } else {
+        list_state
+    }
+}
+
+/// 判断 AI 消息列表首帧是否允许完整测量全部历史消息。
+///
+/// 业务意图：
+/// - 小会话保留完整测量，保证滚动条高度和底部对齐从首帧开始稳定。
+/// - 大会话必须跳过完整测量，否则第一次进入 AI 页会同步解析和排版所有历史消息，造成明显卡顿。
+pub(in crate::app) fn ai_chat_should_measure_all_messages(message_count: usize) -> bool {
+    message_count <= AI_CHAT_MESSAGE_MEASURE_ALL_THRESHOLD
 }
 
 /// AI 对话输入区绘制状态。

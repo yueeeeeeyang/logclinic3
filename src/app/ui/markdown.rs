@@ -1121,6 +1121,19 @@ fn ai_chat_theme_set() -> &'static ThemeSet {
     THEME_SET.get_or_init(ThemeSet::load_defaults)
 }
 
+/// 预热 Markdown 代码块高亮所需的 syntect 缓存。
+///
+/// 业务意图：
+/// - AI 历史消息第一次渲染代码块时会触发 syntect 默认语法集和主题集加载，这个过程可能占用 1 秒左右。
+/// - 该函数允许主窗口启动后在后台线程提前完成初始化，避免用户第一次进入 AI 对话页时把成本压到 UI 线程。
+///
+/// 边界条件：
+/// - `OnceLock` 保证多次调用只会真实初始化一次；后台预热失败风险等同于正常渲染路径，不改变 Markdown 解析结果。
+pub(in crate::app) fn prewarm_app_markdown_code_highlighting() {
+    let _ = ai_chat_syntax_set();
+    let _ = ai_chat_theme_set();
+}
+
 /// 根据应用主题选择 syntect 主题。
 fn ai_chat_syntect_theme(theme: EffectiveTheme) -> &'static Theme {
     let theme_set = ai_chat_theme_set();

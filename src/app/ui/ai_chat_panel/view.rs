@@ -79,6 +79,34 @@ impl MainView {
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        let is_loading = self.ai_chat.load_state.is_loading();
+        let conversation_list_content = if is_loading {
+            self.render_ai_chat_loading_state("正在加载 AI 对话历史", palette)
+                .into_any_element()
+        } else {
+            div()
+                .id("ai-chat-conversation-list-viewport")
+                .relative()
+                .size_full()
+                .p_2()
+                .overflow_hidden()
+                .child(
+                    list(
+                        self.ai_chat.conversation_list_state.clone(),
+                        context.processor(move |view, index: usize, _window, context| {
+                            view.render_ai_chat_conversation_item_at_index(index, palette, context)
+                        }),
+                    )
+                    .size_full(),
+                )
+                .child(self.render_ai_chat_list_scrollbar(
+                    AiChatScrollArea::Conversations,
+                    &self.ai_chat.conversation_list_state,
+                    palette,
+                    context,
+                ))
+                .into_any_element()
+        };
         div()
             .id("ai-chat-sidebar")
             .flex()
@@ -124,6 +152,7 @@ impl MainView {
                             .h(px(28.0))
                             .rounded(px(5.0))
                             .cursor_pointer()
+                            .when(is_loading, |button| button.opacity(0.45))
                             .hover(move |button| button.bg(rgb(palette.hover)))
                             .child(Self::render_lucide_icon(
                                 Some(Icon::Plus),
@@ -145,33 +174,7 @@ impl MainView {
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
-                    .child(
-                        div()
-                            .id("ai-chat-conversation-list-viewport")
-                            .relative()
-                            .size_full()
-                            .p_2()
-                            .overflow_hidden()
-                            .child(
-                                list(
-                                    self.ai_chat.conversation_list_state.clone(),
-                                    context.processor(
-                                        move |view, index: usize, _window, context| {
-                                            view.render_ai_chat_conversation_item_at_index(
-                                                index, palette, context,
-                                            )
-                                        },
-                                    ),
-                                )
-                                .size_full(),
-                            )
-                            .child(self.render_ai_chat_list_scrollbar(
-                                AiChatScrollArea::Conversations,
-                                &self.ai_chat.conversation_list_state,
-                                palette,
-                                context,
-                            )),
-                    ),
+                    .child(conversation_list_content),
             )
     }
 
@@ -567,7 +570,10 @@ impl MainView {
             .overflow_hidden()
             .bg(rgb(palette.background));
 
-        if self.model_config.model_config_profiles.is_empty() {
+        if self.ai_chat.load_state.is_loading() {
+            messages =
+                messages.child(self.render_ai_chat_loading_state("正在加载 AI 对话历史", palette));
+        } else if self.model_config.model_config_profiles.is_empty() {
             messages = messages.child(self.render_ai_chat_empty_state(
                 ai_chat_placeholder_description(&self.model_config.model_config_profiles),
                 palette,
@@ -603,6 +609,31 @@ impl MainView {
             );
         }
         messages
+    }
+
+    /// 渲染 AI 对话加载态。
+    ///
+    /// 业务意图：
+    /// - 第一次进入 AI 页时页面骨架应先显示出来，再通过该加载态告诉用户历史数据正在后台读取。
+    /// - 加载动画复用日志页的脉冲点实现，只做轻量重绘，不触碰 SQLite 任务本身。
+    pub(in crate::app) fn render_ai_chat_loading_state(
+        &self,
+        message: &str,
+        palette: AppThemePalette,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("ai-chat-loading-state")
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .size_full()
+            .px_4()
+            .text_center()
+            .text_color(rgb(palette.muted_text))
+            .child(Self::render_loading_spinner(palette.accent))
+            .child(div().text_sm().child(message.to_string()))
     }
 
     /// 渲染 AI 对话空态。

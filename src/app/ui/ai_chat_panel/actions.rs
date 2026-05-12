@@ -16,6 +16,108 @@ use std::{
 use super::*;
 
 impl MainView {
+    /// 确保 AI 对话历史数据已经开始异步加载。
+    ///
+    /// 业务意图：
+    /// - 用户点击左侧 AI 导航后应立即看到 AI 页面，而不是等待 SQLite 打开、schema 初始化和历史消息读取完成。
+    /// - 首次进入时只启动一次后台任务；后续切回 AI 页直接复用已经加载的内存状态。
+    pub(in crate::app) fn ensure_ai_chat_initial_data_loaded(
+        &mut self,
+        context: &mut Context<Self>,
+    ) {
+        if !matches!(self.ai_chat.load_state, AiChatLoadState::NotStarted) {
+            return;
+        }
+
+        let default_model_profile_id = ai_chat_default_model_profile_id(
+            &self.model_config.model_config_profiles,
+            self.model_config.model_config_default_profile_id.as_deref(),
+        );
+        let (sender, receiver) = mpsc::channel();
+        self.ai_chat.load_state = AiChatLoadState::Loading { receiver };
+        self.ai_chat.database_error = None;
+        self.ai_chat.model_menu_open = false;
+
+        context
+            .background_spawn(async move {
+                let result = load_ai_chat_initial_data(default_model_profile_id);
+                // 如果用户在加载完成前关闭窗口，接收端会被释放；此时丢弃结果即可，不能因为关闭路径报错。
+                let _ = sender.send(result);
+            })
+            .detach();
+        self.schedule_ai_chat_initial_load_poll(context);
+    }
+
+    /// 安排 UI 线程轮询 AI 历史加载结果。
+    ///
+    /// 业务意图：
+    /// - GPUI 状态只能在实体更新闭包内修改；后台 SQLite 任务完成后通过通道回传，再由这里把结果应用到页面状态。
+    pub(in crate::app) fn schedule_ai_chat_initial_load_poll(&self, context: &mut Context<Self>) {
+        context
+            .spawn(async move |view, app| {
+                loop {
+                    app.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                    let keep_polling = view
+                        .update(app, |view, context| {
+                            view.drain_ai_chat_initial_load_result(context);
+                            view.ai_chat.load_state.is_loading()
+                        })
+                        .unwrap_or(false);
+                    if !keep_polling {
+                        break;
+                    }
+                }
+            })
+            .detach();
+    }
+
+    /// 读取并应用 AI 历史后台加载结果。
+    ///
+    /// 边界条件：
+    /// - 轮询时如果结果尚未到达，必须立即返回，禁止在 UI 线程阻塞等待。
+    /// - 如果后台任务异常断开，页面进入已加载错误态，让用户看到明确错误而不是永久加载动画。
+    pub(in crate::app) fn drain_ai_chat_initial_load_result(
+        &mut self,
+        context: &mut Context<Self>,
+    ) {
+        let receive_result = match &self.ai_chat.load_state {
+            AiChatLoadState::Loading { receiver } => receiver.try_recv(),
+            AiChatLoadState::NotStarted | AiChatLoadState::Loaded => return,
+        };
+
+        match receive_result {
+            Ok(result) => {
+                self.apply_ai_chat_initial_load_result(result);
+                context.notify();
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.ai_chat.load_state = AiChatLoadState::Loaded;
+                self.ai_chat.database_error =
+                    Some("加载 AI 对话历史失败：后台任务已结束".to_string());
+                context.notify();
+            }
+        }
+    }
+
+    /// 应用 AI 历史加载结果到页面状态。
+    ///
+    /// 业务意图：
+    /// - 后台加载完成后一次性替换会话、当前会话和消息列表，避免渲染层看到半更新状态。
+    /// - 列表状态必须同步重建，否则虚拟列表条目数和实际数据长度会不一致。
+    pub(in crate::app) fn apply_ai_chat_initial_load_result(&mut self, result: AiChatLoadResult) {
+        self.ai_chat.conversations = result.conversations;
+        self.ai_chat.active_conversation_id = result.active_conversation_id;
+        self.ai_chat.messages = result.messages;
+        self.ai_chat.database_error = result.database_error;
+        self.ai_chat.load_state = AiChatLoadState::Loaded;
+        self.ai_chat.model_menu_open = false;
+        self.reset_ai_chat_conversation_list_state();
+        self.reset_ai_chat_message_list_state();
+    }
+
     /// 返回 AI 对话数据库路径，失败时同步记录错误。
     pub(in crate::app) fn ai_chat_database_path_or_error(&mut self) -> Option<PathBuf> {
         let path = ai_chat_database_path();
@@ -64,7 +166,8 @@ impl MainView {
 
     /// 判断 AI 对话当前是否可以发送。
     pub(in crate::app) fn ai_chat_can_send(&self) -> bool {
-        self.ai_chat.streaming_task.is_none()
+        self.ai_chat.load_state.is_loaded()
+            && self.ai_chat.streaming_task.is_none()
             && self.ai_chat.database_error.is_none()
             && self.ai_chat.active_conversation_id.is_some()
             && self.active_ai_chat_model_profile().is_some()
@@ -76,6 +179,9 @@ impl MainView {
     /// 业务意图：
     /// - 用户点击“新对话”时立即创建持久化会话，后续输入和模型选择都可以稳定落到该会话 ID。
     pub(in crate::app) fn create_ai_chat_conversation(&mut self, context: &mut Context<Self>) {
+        if !self.ai_chat.load_state.is_loaded() {
+            return;
+        }
         let Some(path) = self.ai_chat_database_path_or_error() else {
             context.notify();
             return;
@@ -109,6 +215,9 @@ impl MainView {
         conversation_id: &str,
         context: &mut Context<Self>,
     ) {
+        if !self.ai_chat.load_state.is_loaded() {
+            return;
+        }
         if self.ai_chat.active_conversation_id.as_deref() == Some(conversation_id) {
             return;
         }
@@ -138,6 +247,9 @@ impl MainView {
         &mut self,
         context: &mut Context<Self>,
     ) {
+        if !self.ai_chat.load_state.is_loaded() {
+            return;
+        }
         let Some(active_id) = self.ai_chat.active_conversation_id.clone() else {
             return;
         };
@@ -193,7 +305,9 @@ impl MainView {
 
     /// 切换 AI 对话模型下拉菜单。
     pub(in crate::app) fn toggle_ai_chat_model_menu(&mut self, context: &mut Context<Self>) {
-        if self.model_config.model_config_profiles.is_empty() {
+        if !self.ai_chat.load_state.is_loaded()
+            || self.model_config.model_config_profiles.is_empty()
+        {
             self.ai_chat.model_menu_open = false;
         } else {
             self.ai_chat.model_menu_open = !self.ai_chat.model_menu_open;
@@ -207,6 +321,9 @@ impl MainView {
         profile_id: &str,
         context: &mut Context<Self>,
     ) {
+        if !self.ai_chat.load_state.is_loaded() {
+            return;
+        }
         let Some(path) = self.ai_chat_database_path_or_error() else {
             context.notify();
             return;
@@ -275,9 +392,8 @@ impl MainView {
     pub(in crate::app) fn reset_ai_chat_message_list_state(&mut self) {
         // 会话切换或重新加载消息时，历史消息集合已经发生整体替换；同步清空展示缓存，避免旧消息 ID 的解析结果占用内存。
         self.ai_chat.markdown_cache.borrow_mut().clear();
-        self.ai_chat
-            .message_list_state
-            .reset(self.ai_chat.messages.len());
+        // 大会话重新进入时继续使用渐进测量，避免切换会话后再次首帧测量全部历史消息。
+        self.ai_chat.message_list_state = ai_chat_message_list_state(self.ai_chat.messages.len());
         if self
             .ai_chat
             .scrollbar_drag
@@ -859,6 +975,9 @@ impl MainView {
 
     /// 开始发送 AI 对话消息。
     pub(in crate::app) fn start_ai_chat_send(&mut self, context: &mut Context<Self>) {
+        if !self.ai_chat.load_state.is_loaded() {
+            return;
+        }
         if !self.ai_chat_can_send() {
             return;
         }

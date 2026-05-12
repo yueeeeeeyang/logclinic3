@@ -142,7 +142,7 @@ impl MainView {
                 .size_full()
                 .track_scroll(self.log.log_tree_scroll_handle.clone()),
             )
-            .child(self.render_log_tree_scrollbar(visible_row_count, context))
+            .child(self.render_log_tree_scrollbar(context))
     }
 
     /// 渲染左侧目录树的纵向可见滚动条。
@@ -152,14 +152,12 @@ impl MainView {
     /// - 滚动条复用目录树虚拟列表的 `UniformListScrollHandle`，确保滚轮滚动、虚拟渲染和滑块位置保持同源。
     ///
     /// 边界条件：
-    /// - 只有内容高度超过视口时显示；首帧尚未完成测量但节点明显较多时，会显示一个临时滑块提示可滚动。
+    /// - 只有真实测量到内容高度超过视口时显示；首帧尚未完成测量时保持隐藏，避免高窗口中按节点数误判并显示无效滚动条。
     pub(in crate::app) fn render_log_tree_scrollbar(
         &self,
-        visible_row_count: usize,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let Some(metrics) = Self::log_tree_scrollbar_metrics(&self.log.log_tree_scroll_handle)
-            .or_else(|| Self::fallback_log_tree_scrollbar_metrics(visible_row_count))
         else {
             return div().id("log-tree-scrollbar-empty").hidden();
         };
@@ -222,28 +220,6 @@ impl MainView {
             track_length,
             max_scroll,
             max_scroll_px: f64::from(max_scroll),
-        })
-    }
-
-    /// 在目录树首帧尚未完成测量时提供临时滚动条提示。
-    ///
-    /// 业务意图：
-    /// - 大目录刚加载完成时，虚拟列表需要一帧后才写入真实测量；临时滑块可以立即告诉用户左侧列表可滚动。
-    /// - 该结果只用于视觉提示，真实布局完成后会被 `log_tree_scrollbar_metrics` 替换。
-    pub(in crate::app) fn fallback_log_tree_scrollbar_metrics(
-        visible_row_count: usize,
-    ) -> Option<LogScrollbarMetrics> {
-        if visible_row_count <= 24 {
-            return None;
-        }
-
-        Some(LogScrollbarMetrics {
-            thumb_start: px(LOG_TREE_SCROLLBAR_PADDING),
-            thumb_length: px(LOG_TREE_SCROLLBAR_MIN_THUMB_HEIGHT),
-            track_start: px(LOG_TREE_SCROLLBAR_PADDING),
-            track_length: px(LOG_TREE_SCROLLBAR_MIN_THUMB_HEIGHT),
-            max_scroll: px(0.0),
-            max_scroll_px: 0.0,
         })
     }
 

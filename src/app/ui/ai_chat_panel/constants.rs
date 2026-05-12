@@ -87,6 +87,14 @@ pub(in crate::app) const AI_CHAT_MODEL_MENU_BOTTOM_OFFSET: f32 = AI_CHAT_INPUT_B
 /// - 聊天消息和历史会话可能持续增长，虚拟列表只渲染可视区域及少量缓冲，避免滚动时为所有历史创建 GPUI 元素。
 pub(in crate::app) const AI_CHAT_VIRTUAL_LIST_OVERDRAW: f32 = 180.0;
 
+/// AI 对话消息首帧允许完整测量的最大条数。
+///
+/// 性能约束：
+/// - 小会话完整测量可以保持滚动条比例稳定，成本也很低。
+/// - 大会话如果首次进入页面就测量所有历史消息，会同步触发 Markdown 解析、代码高亮和文本排版，造成明显卡顿。
+/// - 超过该阈值后只测量可见消息和少量 overdraw，向上滚动时再渐进测量历史消息。
+pub(in crate::app) const AI_CHAT_MESSAGE_MEASURE_ALL_THRESHOLD: usize = 40;
+
 /// AI 流式消息离屏时触发虚拟列表行高失效的正文增长阈值。
 ///
 /// 业务意图：

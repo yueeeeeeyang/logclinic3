@@ -239,6 +239,9 @@ impl MainView {
         self.log.log_viewer_context_menu = None;
         self.log.log_tree_context_menu = None;
         self.search.search_results_context_menu = None;
+        if feature == MainFeature::AiChat {
+            self.ensure_ai_chat_initial_data_loaded(context);
+        }
         context.notify();
     }
 
