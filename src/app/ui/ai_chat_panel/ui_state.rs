@@ -167,11 +167,14 @@ impl AiChatWorkspaceState {
                 ListAlignment::Top,
                 px(AI_CHAT_VIRTUAL_LIST_OVERDRAW),
             ),
+            // 消息列表使用可变高度气泡；新打开窗口时如果只测量底部可见消息，向上滚动会不断发现更早消息的真实高度，
+            // 导致滚动条滑块越来越短。这里让 GPUI 在首帧计算完整消息高度，但后续仍只绘制可见区域，保持滚动条比例稳定。
             message_list_state: ListState::new(
                 messages.len(),
                 ListAlignment::Bottom,
                 px(AI_CHAT_VIRTUAL_LIST_OVERDRAW),
-            ),
+            )
+            .measure_all(),
             conversations,
             active_conversation_id,
             messages,
