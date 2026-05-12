@@ -9,12 +9,14 @@ use super::*;
 mod actions;
 mod constants;
 mod input_element;
+mod rich_editor;
 mod ui_state;
 mod view;
 
 pub(in crate::app) use crate::notes::*;
 pub(in crate::app) use constants::*;
 pub(in crate::app) use input_element::*;
+pub(in crate::app) use rich_editor::*;
 pub(in crate::app) use ui_state::*;
 
 #[cfg(test)]

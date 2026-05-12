@@ -49,36 +49,43 @@ fn 笔记源码双击选词只包含文字() {
     );
 }
 
-/// 验证笔记编辑器上下方向键按字符列移动且保持 UTF-8 边界。
+/// 验证旧 Markdown 笔记进入编辑态后即使正文未变也会提示保存。
 ///
 /// 业务意图：
-/// - 笔记正文支持中文编辑，上下移动不能按字节列截断中文，也不能直接跳到全文首尾。
+/// - Markdown UI 已隐藏，旧数据按普通文本富文本化展示和编辑；保存后需要把格式字段转为 `RichText`，避免后续再次触发旧格式分支。
 #[test]
-fn 笔记编辑器上下移动保持字符列() {
-    let text = "ABCD\n中文\nXYZ";
-    let cursor = "ABCD\n中".len();
+fn markdown_笔记编辑后会按富文本保存() {
+    let note = Note {
+        id: "note-1".to_string(),
+        directory_id: None,
+        title: "旧笔记".to_string(),
+        content: "# 标题".to_string(),
+        content_format: NoteContentFormat::Markdown,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+    };
 
-    assert_eq!(
-        MainView::note_editor_vertical_target_index(text, cursor, -1),
-        "A".len()
-    );
-    assert_eq!(
-        MainView::note_editor_vertical_target_index(text, cursor, 1),
-        "ABCD\n中文\nX".len()
-    );
-}
+    assert!(NotesWorkspaceState::note_editor_has_unsaved_changes(
+        true,
+        "旧笔记",
+        &NoteRichTextDocument::from_plain_text("# 标题")
+            .to_json()
+            .unwrap(),
+        &note
+    ));
 
-/// 验证笔记编辑器垂直移动到短行时会夹到目标行末尾。
-///
-/// 边界条件：
-/// - 当前列超过目标行长度时，返回目标行末尾，且仍是合法 UTF-8 字节下标。
-#[test]
-fn 笔记编辑器上下移动会夹到短行末尾() {
-    let text = "ABCD\n中\nXYZ";
-    let cursor = "ABCD".len();
-
-    assert_eq!(
-        MainView::note_editor_vertical_target_index(text, cursor, 1),
-        "ABCD\n中".len()
-    );
+    let rich_content = NoteRichTextDocument::from_plain_text("# 标题")
+        .to_json()
+        .unwrap();
+    let rich_note = Note {
+        content: rich_content.clone(),
+        content_format: NoteContentFormat::RichText,
+        ..note
+    };
+    assert!(!NotesWorkspaceState::note_editor_has_unsaved_changes(
+        true,
+        "旧笔记",
+        &rich_content,
+        &rich_note
+    ));
 }

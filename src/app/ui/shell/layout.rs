@@ -537,13 +537,21 @@ pub(in crate::app) const LOG_VIEWER_TAB_WIDTH: usize = 4;
 /// 内置 JetBrains Mono Regular 字体数据。
 ///
 /// 业务意图：
-/// - 日志正文必须使用 JetBrains Mono，不能依赖用户系统是否安装该字体。
+/// - 日志正文和笔记富文本正文必须使用 JetBrains Mono，不能依赖用户系统是否安装该字体。
 /// - `include_bytes!` 会把字体文件编译进可执行产物，macOS 和 Windows 启动时通过同一套 GPUI 字体注册流程加载。
 ///
 /// 边界条件：
-/// - 当前只内置 Regular 字重；日志正文高亮仍通过字体系统模拟粗体，后续若要求更高字重质量可追加 Bold 字体文件。
+/// - Regular 和 Italic 必须一起注册，否则富文本斜体在部分系统字体 fallback 下会退化成不可控的伪样式。
 pub(in crate::app) const JETBRAINS_MONO_REGULAR_FONT_BYTES: &[u8] =
     include_bytes!("../../../../assets/fonts/JetBrainsMono-Regular.ttf");
+
+/// 内置 JetBrains Mono Italic 字体数据。
+///
+/// 业务意图：
+/// - 笔记富文本的斜体必须使用真实字体 face，避免绘制层伪斜体导致中文和数字糊成一团。
+/// - 字体文件与 Regular 同属 JetBrains Mono OFL 许可，仓库中的 OFL.txt 覆盖该字体家族。
+pub(in crate::app) const JETBRAINS_MONO_ITALIC_FONT_BYTES: &[u8] =
+    include_bytes!("../../../../assets/fonts/JetBrainsMono-Italic.ttf");
 
 /// 日志字号设置的单次调整步长。
 ///

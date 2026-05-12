@@ -34,6 +34,39 @@ impl MainView {
         }
     }
 
+    /// 将笔记正文加载为富文本文档。
+    ///
+    /// 业务意图：
+    /// - 旧纯文本和 Markdown 笔记在打开时懒转换为富文本文档，只在保存时写回 JSON，避免启动时迁移整库。
+    /// - 富文本 JSON 解析失败说明单篇笔记数据损坏，需要展示中文错误并阻止用户在错误文档上误保存。
+    ///
+    /// 边界条件：
+    /// - `focus` 只在真实窗口交互路径启用；测试路径可只重置文档而不触碰平台焦点。
+    fn reset_note_rich_editor_from_note(
+        &mut self,
+        note: &Note,
+        focus: bool,
+        window: Option<&mut Window>,
+    ) -> bool {
+        match rich_text_document_from_note(note) {
+            Ok(document) => {
+                self.notes.rich_editor.reset_document(document);
+                if focus && let Some(window) = window {
+                    window.focus(&self.notes.rich_editor.focus);
+                }
+                self.notes.database_error = None;
+                true
+            }
+            Err(error) => {
+                self.notes
+                    .rich_editor
+                    .reset_document(NoteRichTextDocument::empty());
+                self.notes.database_error = Some(error);
+                false
+            }
+        }
+    }
+
     /// 选中笔记树节点。
     pub(in crate::app) fn select_note_tree_row(
         &mut self,
@@ -89,11 +122,12 @@ impl MainView {
                 self.toggle_note_directory(&selection.id);
                 self.notes.active_note = None;
                 self.notes.is_editing = false;
-                self.notes.editor_text.clear();
+                self.notes
+                    .rich_editor
+                    .reset_document(NoteRichTextDocument::empty());
                 self.notes.editor_title.clear();
                 self.notes.title_selection_range = 0..0;
                 self.notes.title_marked_range = None;
-                self.notes.editor_selection_range = 0..0;
             }
             NoteTreeRowKind::Note => {
                 self.load_note_into_workspace(&selection.id);
@@ -130,24 +164,13 @@ impl MainView {
         };
         match load_note(&path, note_id) {
             Ok(Some(note)) => {
-                self.notes.reader_mode = if note.content_format == NoteContentFormat::Markdown {
-                    NoteReaderMode::Preview
-                } else {
-                    NoteReaderMode::Source
-                };
                 self.notes.editor_title = note.title.clone();
                 let title_cursor = self.notes.editor_title.len();
                 self.notes.title_selection_range = title_cursor..title_cursor;
                 self.notes.title_marked_range = None;
-                self.notes.editor_text = note.content.clone();
-                self.notes.editor_format = note.content_format;
-                self.notes.editor_selection_range = 0..0;
-                self.notes.editor_marked_range = None;
-                self.notes.editor_undo_stack.clear();
-                self.notes.editor_redo_stack.clear();
+                self.reset_note_rich_editor_from_note(&note, false, None);
                 self.notes.active_note = Some(note);
                 self.notes.is_editing = false;
-                self.notes.database_error = None;
             }
             Ok(None) => {
                 self.notes.active_note = None;
@@ -236,10 +259,11 @@ impl MainView {
                 });
                 self.notes.active_note = None;
                 self.notes.is_editing = false;
-                self.notes.editor_text.clear();
+                self.notes
+                    .rich_editor
+                    .reset_document(NoteRichTextDocument::empty());
                 self.notes.editor_title.clear();
                 self.notes.title_selection_range = 0..0;
-                self.notes.editor_selection_range = 0..0;
             }
             Err(error) => self.notes.database_error = Some(error),
         }
@@ -249,16 +273,18 @@ impl MainView {
     /// 创建笔记。
     pub(in crate::app) fn create_note_in_selected_directory(
         &mut self,
+        window: &mut Window,
         context: &mut Context<Self>,
     ) {
         let directory_id = self.selected_note_parent_directory_id();
-        self.request_create_note(directory_id, context);
+        self.request_create_note(directory_id, Some(window), context);
     }
 
     /// 请求创建笔记，必要时先处理未保存编辑草稿。
     pub(in crate::app) fn request_create_note(
         &mut self,
         directory_id: Option<String>,
+        window: Option<&mut Window>,
         context: &mut Context<Self>,
     ) {
         if self.notes.has_unsaved_changes() {
@@ -268,13 +294,14 @@ impl MainView {
             context.notify();
             return;
         }
-        self.create_note_under(directory_id, context);
+        self.create_note_under(directory_id, window, context);
     }
 
     /// 创建笔记并自动进入编辑状态。
     pub(in crate::app) fn create_note_under(
         &mut self,
         directory_id: Option<String>,
+        window: Option<&mut Window>,
         context: &mut Context<Self>,
     ) {
         let Some(path) = self.notes_database_path_or_error() else {
@@ -292,17 +319,15 @@ impl MainView {
                     kind: NoteTreeRowKind::Note,
                 });
                 self.notes.active_note = Some(note.clone());
-                self.notes.editor_title = note.title;
+                self.notes.editor_title = note.title.clone();
                 let title_cursor = self.notes.editor_title.len();
                 self.notes.title_selection_range = title_cursor..title_cursor;
                 self.notes.title_marked_range = None;
-                self.notes.editor_text = note.content;
-                self.notes.editor_format = note.content_format;
-                self.notes.editor_selection_range = 0..0;
-                self.notes.editor_undo_stack.clear();
-                self.notes.editor_redo_stack.clear();
+                self.reset_note_rich_editor_from_note(&note, false, None);
                 self.notes.is_editing = true;
-                self.notes.reader_mode = NoteReaderMode::Preview;
+                if let Some(window) = window {
+                    window.focus(&self.notes.rich_editor.focus);
+                }
             }
             Err(error) => self.notes.database_error = Some(error),
         }
@@ -494,9 +519,10 @@ impl MainView {
                 if should_clear_active_note {
                     self.notes.active_note = None;
                     self.notes.is_editing = false;
-                    self.notes.editor_text.clear();
+                    self.notes
+                        .rich_editor
+                        .reset_document(NoteRichTextDocument::empty());
                     self.notes.editor_title.clear();
-                    self.notes.editor_selection_range = 0..0;
                     self.notes.title_selection_range = 0..0;
                 }
                 self.notes.selected = None;
@@ -551,51 +577,57 @@ impl MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
-        let Some(note) = &self.notes.active_note else {
+        let Some(note) = self.notes.active_note.clone() else {
             return;
         };
         self.notes.editor_title = note.title.clone();
         let title_cursor = self.notes.editor_title.len();
         self.notes.title_selection_range = title_cursor..title_cursor;
         self.notes.title_marked_range = None;
-        self.notes.editor_text = note.content.clone();
-        self.notes.editor_format = note.content_format;
-        let cursor = self.notes.editor_text.len();
-        self.notes.editor_selection_range = cursor..cursor;
-        self.notes.editor_marked_range = None;
-        self.notes.editor_undo_stack.clear();
-        self.notes.editor_redo_stack.clear();
+        // 富文本 JSON 解析失败时不能进入编辑态，否则编辑器中的空文档会覆盖原始损坏内容。
+        // 这里先完成正文加载，再打开编辑状态；失败时保留只读错误展示，等待用户处理原始数据。
+        if !self.reset_note_rich_editor_from_note(&note, true, Some(window)) {
+            self.notes.is_editing = false;
+            context.notify();
+            return;
+        }
         self.notes.is_editing = true;
-        window.focus(&self.notes.editor_focus);
         context.notify();
     }
 
     /// 取消笔记编辑。
     pub(in crate::app) fn cancel_note_editing(&mut self, context: &mut Context<Self>) {
-        if let Some(note) = &self.notes.active_note {
+        if let Some(note) = self.notes.active_note.clone() {
             self.notes.editor_title = note.title.clone();
             let title_cursor = self.notes.editor_title.len();
             self.notes.title_selection_range = title_cursor..title_cursor;
             self.notes.title_marked_range = None;
-            self.notes.editor_text = note.content.clone();
-            self.notes.editor_format = note.content_format;
+            self.reset_note_rich_editor_from_note(&note, false, None);
         }
-        self.notes.editor_marked_range = None;
-        self.notes.editor_selection_range = 0..0;
-        self.notes.editor_undo_stack.clear();
-        self.notes.editor_redo_stack.clear();
         self.notes.is_editing = false;
         context.notify();
     }
 
     /// 保存当前笔记草稿。
     pub(in crate::app) fn save_active_note(&mut self, context: &mut Context<Self>) -> bool {
+        // 保存只允许发生在显式编辑态；只读阅读器复用正文选区和焦点，不能因为快捷键或未来调用路径误触发写库。
+        if !self.notes.is_editing {
+            return false;
+        }
         let Some(note) = self.notes.active_note.clone() else {
             return false;
         };
         let Some(path) = self.notes_database_path_or_error() else {
             context.notify();
             return false;
+        };
+        let content = match self.notes.rich_editor.serialized_content() {
+            Ok(content) => content,
+            Err(error) => {
+                self.notes.database_error = Some(error);
+                context.notify();
+                return false;
+            }
         };
         let trimmed_title = self.notes.editor_title.trim();
         let title = if trimmed_title.is_empty() {
@@ -607,21 +639,18 @@ impl MainView {
             &path,
             &note.id,
             title,
-            &self.notes.editor_text,
-            self.notes.editor_format,
+            &content,
+            NoteContentFormat::RichText,
         );
         match result {
             Ok(updated_at_ms) => {
                 let mut updated = note;
                 updated.title = title.to_string();
-                updated.content = self.notes.editor_text.clone();
-                updated.content_format = self.notes.editor_format;
+                updated.content = content;
+                updated.content_format = NoteContentFormat::RichText;
                 updated.updated_at_ms = updated_at_ms;
                 self.notes.active_note = Some(updated);
                 self.notes.is_editing = false;
-                self.notes.editor_marked_range = None;
-                self.notes.editor_undo_stack.clear();
-                self.notes.editor_redo_stack.clear();
                 self.notes.database_error = None;
                 self.reload_notes_tree();
                 context.notify();
@@ -635,64 +664,11 @@ impl MainView {
         }
     }
 
-    /// 切换编辑草稿格式。
-    pub(in crate::app) fn toggle_note_editor_format(&mut self, context: &mut Context<Self>) {
-        self.notes.editor_format = match self.notes.editor_format {
-            NoteContentFormat::PlainText => NoteContentFormat::Markdown,
-            NoteContentFormat::Markdown => NoteContentFormat::PlainText,
-        };
-        context.notify();
-    }
-
-    /// 切换 Markdown 阅读模式。
-    pub(in crate::app) fn toggle_note_reader_mode(&mut self, context: &mut Context<Self>) {
-        self.notes.reader_mode = match self.notes.reader_mode {
-            NoteReaderMode::Preview => NoteReaderMode::Source,
-            NoteReaderMode::Source => NoteReaderMode::Preview,
-        };
-        self.notes.source_selection = None;
-        self.notes.source_selection_drag_anchor = None;
-        context.notify();
-    }
-
-    /// 返回笔记 Markdown 预览文档。
-    ///
-    /// 业务意图：
-    /// - 笔记阅读器会在滚动、窗口重绘和主题变化时反复渲染；Markdown 解析和代码高亮必须缓存，避免大笔记卡住 UI。
-    /// - 缓存只按当前笔记 ID、正文哈希和主题命中，保存后的正文变化会自然失效，源码模式不依赖该缓存。
-    pub(in crate::app) fn note_markdown_preview_document(
-        &self,
-        note: &Note,
-        theme: EffectiveTheme,
-    ) -> AppMarkdownDocument {
-        let content_hash = ai_chat_markdown_content_hash(&note.content);
-        {
-            let cache = self.notes.markdown_preview_cache.borrow();
-            if let Some(entry) = cache.as_ref()
-                && entry.note_id == note.id
-                && entry.content_hash == content_hash
-                && entry.theme == theme
-            {
-                return entry.document.clone();
-            }
-        }
-
-        let document = parse_ai_chat_markdown(&note.content, theme);
-        self.notes
-            .markdown_preview_cache
-            .replace(Some(NoteMarkdownPreviewCacheEntry {
-                note_id: note.id.clone(),
-                content_hash,
-                theme,
-                document: document.clone(),
-            }));
-        document
-    }
-
     /// 处理未保存确认选择。
     pub(in crate::app) fn resolve_notes_unsaved_dialog(
         &mut self,
         choice: NotesUnsavedChoice,
+        window: &mut Window,
         context: &mut Context<Self>,
     ) {
         let Some(dialog) = self.notes.unsaved_dialog.take() else {
@@ -704,12 +680,12 @@ impl MainView {
             }
             NotesUnsavedChoice::Save => {
                 if self.save_active_note(context) {
-                    self.continue_notes_pending_action(dialog.action, context);
+                    self.continue_notes_pending_action(dialog.action, window, context);
                 }
             }
             NotesUnsavedChoice::Discard => {
                 self.cancel_note_editing(context);
-                self.continue_notes_pending_action(dialog.action, context);
+                self.continue_notes_pending_action(dialog.action, window, context);
             }
         }
     }
@@ -718,6 +694,7 @@ impl MainView {
     pub(in crate::app) fn continue_notes_pending_action(
         &mut self,
         action: NotesPendingAction,
+        window: &mut Window,
         context: &mut Context<Self>,
     ) {
         match action {
@@ -732,13 +709,13 @@ impl MainView {
                 self.create_note_directory_under(parent_id, context)
             }
             NotesPendingAction::CreateNote(directory_id) => {
-                self.create_note_under(directory_id, context)
+                self.create_note_under(directory_id, Some(window), context)
             }
             NotesPendingAction::Delete(selection) => {
                 self.open_note_delete_confirm(selection, context)
             }
             NotesPendingAction::Rename(selection) => {
-                self.open_note_rename_dialog(selection, None, context)
+                self.open_note_rename_dialog(selection, Some(window), context)
             }
         }
     }
@@ -796,7 +773,7 @@ impl MainView {
             }
             NotesTreeContextMenuAction::NewNote => {
                 let directory_id = (target.kind == NoteTreeRowKind::Directory).then_some(target.id);
-                self.request_create_note(directory_id, context);
+                self.request_create_note(directory_id, Some(window), context);
             }
             NotesTreeContextMenuAction::Rename => {
                 self.request_rename_note_tree_item(target, window, context);
@@ -806,20 +783,6 @@ impl MainView {
             }
         }
         context.stop_propagation();
-    }
-
-    /// 读取笔记编辑器当前文本、选择范围和组合文本范围快照。
-    pub(in crate::app) fn note_editor_text_snapshot(
-        &self,
-    ) -> (String, Range<usize>, Option<Range<usize>>) {
-        (
-            self.notes.editor_text.clone(),
-            Self::clamp_search_text_range(
-                &self.notes.editor_text,
-                self.notes.editor_selection_range.clone(),
-            ),
-            self.notes.editor_marked_range.clone(),
-        )
     }
 
     /// 根据窗口坐标返回笔记标题 UTF-8 字节下标。
@@ -1003,232 +966,119 @@ impl MainView {
         context.notify();
     }
 
-    /// 保存笔记编辑器最近一次排版结果。
-    pub(in crate::app) fn store_note_editor_text_layouts(
-        &mut self,
-        layouts: Vec<NoteEditorLineLayout>,
-        bounds: Bounds<Pixels>,
-    ) {
-        self.notes.editor_last_layouts = layouts;
-        self.notes.editor_last_bounds = Some(bounds);
+    /// 判断是否为保存快捷键。
+    pub(in crate::app) fn is_save_keystroke(keystroke: &Keystroke) -> bool {
+        Self::keystroke_matches_letter_or_control_code(keystroke, "s", "\u{13}")
+            && (keystroke.modifiers.control || keystroke.modifiers.platform)
     }
 
-    /// 返回笔记编辑器当前内容需要的可视行数。
-    pub(in crate::app) fn note_editor_visual_line_count(&self) -> usize {
-        Self::thread_analysis_filter_line_ranges(&self.notes.editor_text)
-            .len()
-            .max(1)
-    }
-
-    /// 根据窗口坐标返回笔记编辑器 UTF-8 字节下标。
-    pub(in crate::app) fn note_editor_index_for_point(&self, position: Point<Pixels>) -> usize {
-        if self.notes.editor_text.is_empty() {
-            return 0;
-        }
-        for layout in &self.notes.editor_last_layouts {
-            if position.y >= layout.bounds.top() && position.y <= layout.bounds.bottom() {
-                return layout
-                    .byte_range
-                    .start
-                    .saturating_add(
-                        layout
-                            .line
-                            .closest_index_for_x(position.x - layout.bounds.left()),
-                    )
-                    .min(layout.byte_range.end);
-            }
-        }
-        if let Some(bounds) = &self.notes.editor_last_bounds
-            && position.y < bounds.top()
-        {
-            return 0;
-        }
-        self.notes.editor_text.len()
-    }
-
-    /// 记录撤销快照。
-    pub(in crate::app) fn record_note_editor_undo_snapshot(&mut self) {
-        if self
-            .notes
-            .editor_undo_stack
-            .last()
-            .is_some_and(|text| text == &self.notes.editor_text)
-        {
-            return;
-        }
-        self.notes
-            .editor_undo_stack
-            .push(self.notes.editor_text.clone());
-        if self.notes.editor_undo_stack.len() > NOTE_EDITOR_HISTORY_LIMIT {
-            self.notes.editor_undo_stack.remove(0);
-        }
-        self.notes.editor_redo_stack.clear();
-    }
-
-    /// 替换笔记编辑器当前选区。
-    pub(in crate::app) fn replace_note_editor_selection(&mut self, replacement: &str) {
-        self.record_note_editor_undo_snapshot();
-        let replacement = replacement.replace("\r\n", "\n").replace('\r', "\n");
-        let range = self.notes.editor_marked_range.take().unwrap_or_else(|| {
-            Self::clamp_search_text_range(
-                &self.notes.editor_text,
-                self.notes.editor_selection_range.clone(),
-            )
-        });
-        self.notes
-            .editor_text
-            .replace_range(range.clone(), &replacement);
-        let cursor = range.start + replacement.len();
-        self.notes.editor_selection_range = cursor..cursor;
-    }
-
-    /// 返回笔记编辑器当前选中文本。
-    pub(in crate::app) fn selected_note_editor_text(&self) -> Option<String> {
-        let range = Self::clamp_search_text_range(
-            &self.notes.editor_text,
-            self.notes.editor_selection_range.clone(),
-        );
-        (range.start < range.end).then(|| self.notes.editor_text[range].to_string())
-    }
-
-    /// 开始笔记编辑器鼠标选择。
-    pub(in crate::app) fn start_note_editor_mouse_selection(
-        &mut self,
-        event: &MouseDownEvent,
-        context: &mut Context<Self>,
-    ) {
-        let index = self.note_editor_index_for_point(event.position);
-        self.notes.editor_marked_range = None;
-        match event.click_count {
-            0 | 1 => {
-                if event.modifiers.shift {
-                    self.notes.editor_selection_range.end = index;
-                    self.notes.editor_selection_range = Self::clamp_search_text_range(
-                        &self.notes.editor_text,
-                        self.notes.editor_selection_range.clone(),
-                    );
-                } else {
-                    self.notes.editor_selection_range = index..index;
-                }
-                self.notes.editor_selection_drag = Some(self.notes.editor_selection_range.start);
-            }
-            2 => {
-                self.notes.editor_selection_range =
-                    Self::search_text_word_range_for_index(&self.notes.editor_text, index);
-                self.notes.editor_selection_drag = None;
-            }
-            _ => {
-                self.notes.editor_selection_range = 0..self.notes.editor_text.len();
-                self.notes.editor_selection_drag = None;
-            }
-        }
-        self.touch_search_text_cursor_activity();
-        context.notify();
-    }
-
-    /// 鼠标拖拽时更新笔记编辑器选区终点。
-    pub(in crate::app) fn update_note_editor_mouse_selection(
-        &mut self,
-        position: Point<Pixels>,
-        context: &mut Context<Self>,
-    ) {
-        let Some(anchor) = self.notes.editor_selection_drag else {
-            return;
-        };
-        let index = self.note_editor_index_for_point(position);
-        self.notes.editor_marked_range = None;
-        self.notes.editor_selection_range =
-            Self::clamp_search_text_range(&self.notes.editor_text, anchor..index);
-        self.touch_search_text_cursor_activity();
-        context.notify();
-    }
-
-    /// 结束笔记编辑器鼠标拖拽选择。
-    pub(in crate::app) fn finish_note_editor_mouse_selection(
-        &mut self,
-        context: &mut Context<Self>,
-    ) {
-        if self.notes.editor_selection_drag.take().is_some() {
-            context.notify();
-        }
-    }
-
-    /// 处理笔记编辑器按键。
-    pub(in crate::app) fn handle_note_editor_key_down(
+    /// 处理正文富文本编辑器快捷键。
+    ///
+    /// 业务意图：
+    /// - 富文本编辑器是项目内自绘控件，必须显式处理保存、复制、剪切、粘贴、撤销重做和基础导航。
+    /// - 普通文本输入和中文 IME 仍走 `EntityInputHandler::replace_text_in_range`，这里不处理 printable 字符，避免截断组合输入。
+    pub(in crate::app) fn handle_note_editor_container_key_down(
         &mut self,
         event: &KeyDownEvent,
         context: &mut Context<Self>,
     ) {
-        if Self::is_paste_keystroke(&event.keystroke) {
-            if let Some(text) = context.read_from_clipboard().and_then(|item| item.text()) {
-                self.replace_note_editor_selection(&text);
-                self.touch_search_text_cursor_activity();
-                context.notify();
-            }
-            context.stop_propagation();
-            return;
-        }
-        if Self::is_copy_keystroke(&event.keystroke) {
-            if let Some(text) = self.selected_note_editor_text() {
-                context.write_to_clipboard(ClipboardItem::new_string(text));
-            }
-            context.stop_propagation();
-            return;
-        }
-        if Self::is_cut_keystroke(&event.keystroke) {
-            if let Some(text) = self.selected_note_editor_text() {
-                context.write_to_clipboard(ClipboardItem::new_string(text));
-                self.replace_note_editor_selection("");
-                self.touch_search_text_cursor_activity();
-                context.notify();
-            }
-            context.stop_propagation();
-            return;
-        }
-        if Self::is_select_all_keystroke(&event.keystroke) {
-            self.notes.editor_marked_range = None;
-            self.notes.editor_selection_range = 0..self.notes.editor_text.len();
-            self.touch_search_text_cursor_activity();
-            context.stop_propagation();
-            context.notify();
-            return;
-        }
         if Self::is_save_keystroke(&event.keystroke) {
             self.save_active_note(context);
             context.stop_propagation();
             return;
         }
+        if Self::is_copy_keystroke(&event.keystroke) {
+            self.copy_selected_note_rich_text(context);
+            context.stop_propagation();
+            return;
+        }
+        if Self::is_cut_keystroke(&event.keystroke) {
+            self.cut_selected_note_rich_text(context);
+            context.stop_propagation();
+            return;
+        }
+        if Self::is_paste_keystroke(&event.keystroke) {
+            self.paste_note_rich_text_from_clipboard(context);
+            context.stop_propagation();
+            return;
+        }
+        if Self::is_select_all_keystroke(&event.keystroke) {
+            let len = self.notes.rich_editor.document.len();
+            self.notes.rich_editor.set_selection(0..len);
+            context.stop_propagation();
+            context.notify();
+            return;
+        }
         if Self::is_undo_keystroke(&event.keystroke) {
-            self.undo_note_editor(context);
+            if self.notes.rich_editor.undo() {
+                context.notify();
+            }
             context.stop_propagation();
             return;
         }
         if Self::is_redo_keystroke(&event.keystroke) {
-            self.redo_note_editor(context);
+            if self.notes.rich_editor.redo() {
+                context.notify();
+            }
             context.stop_propagation();
             return;
         }
 
         match event.keystroke.key.as_str() {
-            "tab" => self.replace_note_editor_selection("    "),
-            "enter" => self.replace_note_editor_selection("\n"),
-            "left" => self.move_note_editor_cursor_left(event.keystroke.modifiers.shift),
-            "right" => self.move_note_editor_cursor_right(event.keystroke.modifiers.shift),
-            "home" => self.move_note_editor_cursor_home(event.keystroke.modifiers.shift),
-            "end" => self.move_note_editor_cursor_end(event.keystroke.modifiers.shift),
-            "up" => self.move_note_editor_cursor_vertical(-1, event.keystroke.modifiers.shift),
-            "down" => self.move_note_editor_cursor_vertical(1, event.keystroke.modifiers.shift),
-            "pageup" => self.move_note_editor_cursor_vertical(
-                -(NOTE_EDITOR_PAGE_STEP_LINES as isize),
-                event.keystroke.modifiers.shift,
-            ),
-            "pagedown" => self.move_note_editor_cursor_vertical(
-                NOTE_EDITOR_PAGE_STEP_LINES as isize,
-                event.keystroke.modifiers.shift,
-            ),
-            "backspace" => self.delete_note_editor_backward(),
-            "delete" => self.delete_note_editor_forward(),
-            "escape" => {}
+            "backspace" => self.notes.rich_editor.delete_backward(),
+            "delete" => self.notes.rich_editor.delete_forward(),
+            "enter" => self.notes.rich_editor.replace_range_with_text(None, "\n"),
+            "tab" => self.notes.rich_editor.replace_range_with_text(None, "    "),
+            "left" => {
+                let text = self.notes.rich_editor.plain_text();
+                let cursor = self.notes.rich_editor.clamped_selection().end;
+                let target = text[..cursor]
+                    .char_indices()
+                    .next_back()
+                    .map(|(index, _)| index)
+                    .unwrap_or(0);
+                self.notes
+                    .rich_editor
+                    .move_cursor(target, event.keystroke.modifiers.shift);
+            }
+            "right" => {
+                let text = self.notes.rich_editor.plain_text();
+                let cursor = self.notes.rich_editor.clamped_selection().end;
+                let target = text[cursor..]
+                    .char_indices()
+                    .next()
+                    .map(|(offset, character)| cursor + offset + character.len_utf8())
+                    .unwrap_or(text.len());
+                self.notes
+                    .rich_editor
+                    .move_cursor(target, event.keystroke.modifiers.shift);
+            }
+            "home" => {
+                let cursor = self.notes.rich_editor.clamped_selection().end;
+                let target =
+                    Self::note_rich_text_line_start(&self.notes.rich_editor.plain_text(), cursor);
+                self.notes
+                    .rich_editor
+                    .move_cursor(target, event.keystroke.modifiers.shift);
+            }
+            "end" => {
+                let cursor = self.notes.rich_editor.clamped_selection().end;
+                let target =
+                    Self::note_rich_text_line_end(&self.notes.rich_editor.plain_text(), cursor);
+                self.notes
+                    .rich_editor
+                    .move_cursor(target, event.keystroke.modifiers.shift);
+            }
+            "pageup" => self
+                .notes
+                .rich_editor
+                .move_cursor(0, event.keystroke.modifiers.shift),
+            "pagedown" => {
+                let len = self.notes.rich_editor.document.len();
+                self.notes
+                    .rich_editor
+                    .move_cursor(len, event.keystroke.modifiers.shift);
+            }
             _ => return,
         }
         self.touch_search_text_cursor_activity();
@@ -1236,10 +1086,27 @@ impl MainView {
         context.notify();
     }
 
-    /// 判断是否为保存快捷键。
-    pub(in crate::app) fn is_save_keystroke(keystroke: &Keystroke) -> bool {
-        Self::keystroke_matches_letter_or_control_code(keystroke, "s", "\u{13}")
-            && (keystroke.modifiers.control || keystroke.modifiers.platform)
+    /// 处理只读富文本阅读器快捷键。
+    ///
+    /// 业务意图：
+    /// - 只读状态不注册平台文本输入处理器，但仍必须像普通阅读器一样支持 `Ctrl/Cmd+C` 复制选区。
+    /// - `Ctrl/Cmd+A` 只修改阅读器选区，不进入编辑态也不写库，保证只读阅读不会产生持久化副作用。
+    pub(in crate::app) fn handle_note_reader_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        context: &mut Context<Self>,
+    ) {
+        if Self::is_copy_keystroke(&event.keystroke) {
+            self.copy_selected_note_rich_text(context);
+            context.stop_propagation();
+            return;
+        }
+        if Self::is_select_all_keystroke(&event.keystroke) {
+            let len = self.notes.rich_editor.document.len();
+            self.notes.rich_editor.set_selection(0..len);
+            context.stop_propagation();
+            context.notify();
+        }
     }
 
     /// 判断是否为撤销快捷键。
@@ -1258,222 +1125,218 @@ impl MainView {
                 && keystroke.modifiers.shift)
     }
 
-    /// 撤销笔记编辑器文本。
-    pub(in crate::app) fn undo_note_editor(&mut self, context: &mut Context<Self>) {
-        let Some(previous) = self.notes.editor_undo_stack.pop() else {
-            return;
-        };
-        self.notes
-            .editor_redo_stack
-            .push(self.notes.editor_text.clone());
-        self.notes.editor_text = previous;
-        let cursor = self.notes.editor_text.len();
-        self.notes.editor_selection_range = cursor..cursor;
-        context.notify();
+    /// 返回光标所在行起点。
+    pub(in crate::app) fn note_rich_text_line_start(text: &str, cursor: usize) -> usize {
+        let cursor = clamp_note_rich_text_boundary(text, cursor);
+        text[..cursor]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(0)
     }
 
-    /// 重做笔记编辑器文本。
-    pub(in crate::app) fn redo_note_editor(&mut self, context: &mut Context<Self>) {
-        let Some(next) = self.notes.editor_redo_stack.pop() else {
-            return;
-        };
-        self.notes
-            .editor_undo_stack
-            .push(self.notes.editor_text.clone());
-        self.notes.editor_text = next;
-        let cursor = self.notes.editor_text.len();
-        self.notes.editor_selection_range = cursor..cursor;
-        context.notify();
+    /// 返回光标所在行终点。
+    pub(in crate::app) fn note_rich_text_line_end(text: &str, cursor: usize) -> usize {
+        let cursor = clamp_note_rich_text_boundary(text, cursor);
+        text[cursor..]
+            .find('\n')
+            .map(|offset| cursor + offset)
+            .unwrap_or(text.len())
     }
 
-    /// 光标左移。
-    fn move_note_editor_cursor_left(&mut self, extend: bool) {
-        self.notes.editor_marked_range = None;
-        if extend {
-            self.notes.editor_selection_range.end = Self::previous_search_text_boundary(
-                &self.notes.editor_text,
-                self.notes.editor_selection_range.end,
-            );
-        } else if self.notes.editor_selection_range.start != self.notes.editor_selection_range.end {
-            self.notes.editor_selection_range =
-                self.notes.editor_selection_range.start..self.notes.editor_selection_range.start;
-        } else {
-            let cursor = Self::previous_search_text_boundary(
-                &self.notes.editor_text,
-                self.notes.editor_selection_range.end,
-            );
-            self.notes.editor_selection_range = cursor..cursor;
-        }
-        self.notes.editor_selection_range = Self::clamp_search_text_range(
-            &self.notes.editor_text,
-            self.notes.editor_selection_range.clone(),
-        );
-    }
-
-    /// 光标右移。
-    fn move_note_editor_cursor_right(&mut self, extend: bool) {
-        self.notes.editor_marked_range = None;
-        if extend {
-            self.notes.editor_selection_range.end = Self::next_search_text_boundary(
-                &self.notes.editor_text,
-                self.notes.editor_selection_range.end,
-            );
-        } else if self.notes.editor_selection_range.start != self.notes.editor_selection_range.end {
-            self.notes.editor_selection_range =
-                self.notes.editor_selection_range.end..self.notes.editor_selection_range.end;
-        } else {
-            let cursor = Self::next_search_text_boundary(
-                &self.notes.editor_text,
-                self.notes.editor_selection_range.end,
-            );
-            self.notes.editor_selection_range = cursor..cursor;
-        }
-        self.notes.editor_selection_range = Self::clamp_search_text_range(
-            &self.notes.editor_text,
-            self.notes.editor_selection_range.clone(),
-        );
-    }
-
-    /// 光标移动到文档起点。
-    fn move_note_editor_cursor_home(&mut self, extend: bool) {
-        self.notes.editor_marked_range = None;
-        if extend {
-            self.notes.editor_selection_range.end = 0;
-        } else {
-            self.notes.editor_selection_range = 0..0;
-        }
-    }
-
-    /// 光标移动到文档末尾。
-    fn move_note_editor_cursor_end(&mut self, extend: bool) {
-        self.notes.editor_marked_range = None;
-        let end = self.notes.editor_text.len();
-        if extend {
-            self.notes.editor_selection_range.end = end;
-        } else {
-            self.notes.editor_selection_range = end..end;
-        }
-    }
-
-    /// 按可视行移动笔记编辑器光标。
-    ///
-    /// 业务意图：
-    /// - 多行笔记需要符合常见编辑器的上下方向键语义：保留当前字符列并移动到上一行或下一行。
-    /// - `PageUp`/`PageDown` 复用同一套计算，只是行数更大，避免跳到全文首尾导致用户丢失编辑位置。
-    fn move_note_editor_cursor_vertical(&mut self, line_delta: isize, extend: bool) {
-        self.notes.editor_marked_range = None;
-        let selection = Self::clamp_search_text_range(
-            &self.notes.editor_text,
-            self.notes.editor_selection_range.clone(),
-        );
-        let cursor = if !extend && selection.start != selection.end {
-            if line_delta < 0 {
-                selection.start
-            } else {
-                selection.end
+    /// 开始富文本鼠标选择。
+    pub(in crate::app) fn start_note_rich_text_selection(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let index = self.notes.rich_editor.index_for_point(event.position);
+        window.focus(&self.notes.rich_editor.focus);
+        match event.click_count {
+            0 | 1 => self.notes.rich_editor.set_selection(index..index),
+            2 => {
+                let text = self.notes.rich_editor.plain_text();
+                self.notes
+                    .rich_editor
+                    .set_selection(Self::search_text_word_range_for_index(&text, index));
             }
-        } else {
-            selection.end
+            _ => {
+                let text = self.notes.rich_editor.plain_text();
+                let start = Self::note_rich_text_line_start(&text, index);
+                let end = Self::note_rich_text_line_end(&text, index);
+                self.notes.rich_editor.set_selection(start..end);
+            }
+        }
+        self.notes.rich_editor.drag_anchor = (event.click_count <= 1).then_some(index);
+        self.touch_search_text_cursor_activity();
+        context.notify();
+    }
+
+    /// 更新富文本鼠标拖选。
+    pub(in crate::app) fn update_note_rich_text_selection(
+        &mut self,
+        event: &MouseMoveEvent,
+        context: &mut Context<Self>,
+    ) {
+        if !event.dragging() {
+            self.finish_note_rich_text_selection(context);
+            return;
+        }
+        let Some(anchor) = self.notes.rich_editor.drag_anchor else {
+            return;
         };
-        let target =
-            Self::note_editor_vertical_target_index(&self.notes.editor_text, cursor, line_delta);
-        if extend {
-            self.notes.editor_selection_range = selection.start..target;
-        } else {
-            self.notes.editor_selection_range = target..target;
+        let focus = self.notes.rich_editor.index_for_point(event.position);
+        self.notes.rich_editor.set_selection(anchor..focus);
+        context.notify();
+    }
+
+    /// 完成富文本鼠标拖选。
+    pub(in crate::app) fn finish_note_rich_text_selection(&mut self, context: &mut Context<Self>) {
+        if self.notes.rich_editor.drag_anchor.take().is_some() {
+            context.notify();
         }
     }
 
-    /// 根据行偏移计算笔记编辑器目标 UTF-8 字节下标。
-    ///
-    /// 边界条件：
-    /// - 中文、emoji 等多字节字符必须按字符列移动，返回值始终是合法 UTF-8 边界。
-    /// - 目标行比当前列短时夹到目标行末尾；越过首尾行时夹到第一行或最后一行。
-    pub(in crate::app) fn note_editor_vertical_target_index(
-        text: &str,
-        cursor: usize,
-        line_delta: isize,
-    ) -> usize {
-        let lines = Self::thread_analysis_filter_line_ranges(text);
-        if lines.is_empty() {
-            return 0;
-        }
-        let cursor = Self::search_input_clamp_byte_index(text, cursor);
-        let current_line_index = Self::note_editor_line_index_for_offset(text, cursor);
-        let current_line = &lines[current_line_index];
-        let current_local_cursor = cursor
-            .saturating_sub(current_line.start)
-            .min(current_line.end.saturating_sub(current_line.start));
-        let current_line_text = &text[current_line.clone()];
-        let target_column =
-            Self::char_column_for_byte_index(current_line_text, current_local_cursor);
-        let target_line_index = if line_delta < 0 {
-            current_line_index.saturating_sub((-line_delta) as usize)
-        } else {
-            current_line_index
-                .saturating_add(line_delta as usize)
-                .min(lines.len().saturating_sub(1))
+    /// 复制当前富文本选区。
+    pub(in crate::app) fn copy_selected_note_rich_text(&self, context: &mut Context<Self>) -> bool {
+        let Some(text) = self.notes.rich_editor.selected_text() else {
+            return false;
         };
-        let target_line = &lines[target_line_index];
-        let target_line_text = &text[target_line.clone()];
-        target_line.start + Self::byte_index_for_char_column(target_line_text, target_column)
+        if text.is_empty() {
+            return false;
+        }
+        let Some(document) = self.notes.rich_editor.selected_document() else {
+            context.write_to_clipboard(ClipboardItem::new_string(text));
+            return true;
+        };
+        let payload = NoteRichTextClipboardPayload::new(document);
+        context.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(text, payload));
+        true
     }
 
-    /// 返回 UTF-8 字节下标所在的笔记编辑器行号。
-    ///
-    /// 业务意图：
-    /// - 自绘编辑器内部没有系统文本控件的行列模型，需要把单一光标偏移映射回逻辑行，供上下方向键复用。
-    pub(in crate::app) fn note_editor_line_index_for_offset(text: &str, offset: usize) -> usize {
-        let offset = Self::search_input_clamp_byte_index(text, offset);
-        let lines = Self::thread_analysis_filter_line_ranges(text);
-        lines
-            .iter()
-            .position(|range| offset <= range.end)
-            .unwrap_or_else(|| lines.len().saturating_sub(1))
+    /// 剪切当前富文本选区。
+    pub(in crate::app) fn cut_selected_note_rich_text(
+        &mut self,
+        context: &mut Context<Self>,
+    ) -> bool {
+        if !self.copy_selected_note_rich_text(context) {
+            return false;
+        }
+        self.notes.rich_editor.delete_backward();
+        context.notify();
+        true
     }
 
-    /// 删除光标前一个字符或当前选区。
-    fn delete_note_editor_backward(&mut self) {
-        if self.notes.editor_selection_range.start != self.notes.editor_selection_range.end
-            || self.notes.editor_marked_range.is_some()
+    /// 从剪贴板粘贴富文本或纯文本。
+    pub(in crate::app) fn paste_note_rich_text_from_clipboard(
+        &mut self,
+        context: &mut Context<Self>,
+    ) -> bool {
+        let Some(item) = context.read_from_clipboard() else {
+            return false;
+        };
+        if let Some(metadata) = item.metadata()
+            && let Ok(payload) = serde_json::from_str::<NoteRichTextClipboardPayload>(metadata)
+            && let Some(document) = payload.into_document()
         {
-            self.replace_note_editor_selection("");
-        } else if let Some((previous_index, _)) = self.notes.editor_text
-            [..self.notes.editor_selection_range.end]
-            .char_indices()
-            .next_back()
-        {
-            self.record_note_editor_undo_snapshot();
-            let cursor = self.notes.editor_selection_range.end;
             self.notes
-                .editor_text
-                .replace_range(previous_index..cursor, "");
-            self.notes.editor_selection_range = previous_index..previous_index;
-            self.notes.editor_marked_range = None;
+                .rich_editor
+                .replace_selection_with_document(&document);
+            context.notify();
+            return true;
         }
+        let Some(text) = item.text() else {
+            return false;
+        };
+        self.notes.rich_editor.replace_range_with_text(None, &text);
+        context.notify();
+        true
     }
 
-    /// 删除光标后一个字符或当前选区。
-    fn delete_note_editor_forward(&mut self) {
-        if self.notes.editor_selection_range.start != self.notes.editor_selection_range.end
-            || self.notes.editor_marked_range.is_some()
-        {
-            self.replace_note_editor_selection("");
-        } else if let Some((next_index, next_character)) = self.notes.editor_text
-            [self.notes.editor_selection_range.end..]
-            .char_indices()
-            .next()
-        {
-            self.record_note_editor_undo_snapshot();
-            let start = self.notes.editor_selection_range.end + next_index;
-            let end = start + next_character.len_utf8();
-            self.notes.editor_text.replace_range(start..end, "");
-            self.notes.editor_selection_range = start..start;
-            self.notes.editor_marked_range = None;
-        }
+    /// 对富文本当前选区设置字号。
+    pub(in crate::app) fn apply_note_rich_text_font_size(
+        &mut self,
+        font_size_px: u32,
+        context: &mut Context<Self>,
+    ) {
+        self.notes.rich_editor.font_size_menu_open = false;
+        self.notes.rich_editor.color_menu_open = false;
+        self.notes.rich_editor.background_color_menu_open = false;
+        self.notes
+            .rich_editor
+            .apply_style_patch(NoteRichTextStylePatch {
+                font_size_px: Some(font_size_px),
+                ..Default::default()
+            });
+        context.notify();
+    }
+
+    /// 切换富文本内联样式。
+    pub(in crate::app) fn toggle_note_rich_text_inline_style(
+        &mut self,
+        command: NoteRichTextInlineCommand,
+        context: &mut Context<Self>,
+    ) {
+        self.notes.rich_editor.toggle_inline_command(command);
+        context.notify();
+    }
+
+    /// 设置富文本文字颜色。
+    pub(in crate::app) fn apply_note_rich_text_color(
+        &mut self,
+        color: Option<NoteRichTextColor>,
+        context: &mut Context<Self>,
+    ) {
+        self.notes.rich_editor.color_menu_open = false;
+        self.notes.rich_editor.font_size_menu_open = false;
+        self.notes.rich_editor.background_color_menu_open = false;
+        self.notes
+            .rich_editor
+            .apply_style_patch(NoteRichTextStylePatch {
+                color: Some(color),
+                ..Default::default()
+            });
+        context.notify();
+    }
+
+    /// 设置富文本文字背景颜色。
+    pub(in crate::app) fn apply_note_rich_text_background_color(
+        &mut self,
+        color: Option<NoteRichTextColor>,
+        context: &mut Context<Self>,
+    ) {
+        self.notes.rich_editor.background_color_menu_open = false;
+        self.notes.rich_editor.font_size_menu_open = false;
+        self.notes.rich_editor.color_menu_open = false;
+        self.notes
+            .rich_editor
+            .apply_style_patch(NoteRichTextStylePatch {
+                background_color: Some(color),
+                ..Default::default()
+            });
+        context.notify();
+    }
+
+    /// 关闭富文本工具栏所有下拉菜单。
+    pub(in crate::app) fn close_note_rich_text_menus(&mut self, context: &mut Context<Self>) {
+        self.notes.rich_editor.font_size_menu_open = false;
+        self.notes.rich_editor.color_menu_open = false;
+        self.notes.rich_editor.background_color_menu_open = false;
+        context.notify();
+    }
+
+    /// 切换富文本列表块类型。
+    pub(in crate::app) fn toggle_note_rich_text_list(
+        &mut self,
+        kind: NoteRichTextBlockKind,
+        context: &mut Context<Self>,
+    ) {
+        self.notes.rich_editor.toggle_list_kind(kind);
+        context.notify();
     }
 
     /// 根据只读源码行和横坐标生成文本位置。
+    #[allow(dead_code)]
     pub(in crate::app) fn note_source_position_from_pointer(
         &self,
         line_index: usize,
@@ -1489,6 +1352,7 @@ impl MainView {
     }
 
     /// 开始只读源码选区。
+    #[allow(dead_code)]
     pub(in crate::app) fn start_note_source_selection(
         &mut self,
         line_index: usize,
@@ -1527,6 +1391,7 @@ impl MainView {
     }
 
     /// 更新只读源码拖拽选区。
+    #[allow(dead_code)]
     pub(in crate::app) fn update_note_source_selection(
         &mut self,
         line_index: usize,
@@ -1550,6 +1415,7 @@ impl MainView {
     }
 
     /// 结束只读源码选区拖拽。
+    #[allow(dead_code)]
     pub(in crate::app) fn finish_note_source_selection(&mut self, context: &mut Context<Self>) {
         if self.notes.source_selection_drag_anchor.take().is_some() {
             context.notify();
@@ -1557,6 +1423,7 @@ impl MainView {
     }
 
     /// 返回当前笔记源码选中文本。
+    #[allow(dead_code)]
     pub(in crate::app) fn selected_note_source_text(&self) -> Option<String> {
         let note = self.notes.active_note.as_ref()?;
         let selection = self.notes.source_selection.as_ref()?;
@@ -1592,17 +1459,11 @@ impl MainView {
         &self,
         context: &mut Context<Self>,
     ) -> bool {
-        let Some(text) = self.selected_note_source_text() else {
-            return false;
-        };
-        if text.is_empty() {
-            return false;
-        }
-        context.write_to_clipboard(ClipboardItem::new_string(text));
-        true
+        self.copy_selected_note_rich_text(context)
     }
 
     /// 将笔记正文拆成源码阅读器行。
+    #[allow(dead_code)]
     pub(in crate::app) fn note_source_lines(content: &str) -> Vec<&str> {
         if content.is_empty() {
             Vec::new()
@@ -1612,6 +1473,7 @@ impl MainView {
     }
 
     /// 返回某一行被选择覆盖的 UTF-8 字节范围。
+    #[allow(dead_code)]
     pub(in crate::app) fn selected_byte_range_for_note_line(
         selection: &NoteTextSelection,
         line_index: usize,
@@ -1638,6 +1500,7 @@ impl MainView {
     }
 
     /// 根据点击位置构造当前词选区。
+    #[allow(dead_code)]
     pub(in crate::app) fn note_word_selection_for_position(
         line_index: usize,
         line: &str,

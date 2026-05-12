@@ -97,8 +97,8 @@ impl MainView {
                         "notes-new-note",
                         Icon::FilePlus,
                         palette,
-                        context.listener(|view, _event: &ClickEvent, _window, context| {
-                            view.create_note_in_selected_directory(context);
+                        context.listener(|view, _event: &ClickEvent, window, context| {
+                            view.create_note_in_selected_directory(window, context);
                             context.stop_propagation();
                         }),
                     )),
@@ -488,11 +488,11 @@ impl MainView {
                             .text_color(rgb(palette.text))
                             .child(title),
                     )
-                    .children(self.notes.active_note.as_ref().map(|note| {
+                    .children(self.notes.active_note.as_ref().map(|_| {
                         div()
                             .text_xs()
                             .text_color(rgb(palette.muted_text))
-                            .child(note.content_format.label())
+                            .child("文本")
                     })),
             )
             .child(self.render_notes_header_actions(palette, context))
@@ -504,32 +504,14 @@ impl MainView {
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let Some(note) = self.notes.active_note.as_ref() else {
+        if self.notes.active_note.is_none() {
             return div().id("notes-header-actions-empty").hidden();
-        };
+        }
         div()
             .id("notes-header-actions")
             .flex()
             .items_center()
             .gap_2()
-            .when(
-                !self.notes.is_editing && note.content_format == NoteContentFormat::Markdown,
-                |actions| {
-                    actions.child(self.render_notes_text_button(
-                        if self.notes.reader_mode == NoteReaderMode::Preview {
-                            "源码"
-                        } else {
-                            "预览"
-                        },
-                        Icon::BookOpenText,
-                        palette,
-                        context.listener(|view, _event: &ClickEvent, _window, context| {
-                            view.toggle_note_reader_mode(context);
-                            context.stop_propagation();
-                        }),
-                    ))
-                },
-            )
             .when(!self.notes.is_editing, |actions| {
                 actions.child(self.render_notes_text_button(
                     "编辑",
@@ -543,15 +525,6 @@ impl MainView {
             })
             .when(self.notes.is_editing, |actions| {
                 actions
-                    .child(self.render_notes_text_button(
-                        self.notes.editor_format.label(),
-                        Icon::FileText,
-                        palette,
-                        context.listener(|view, _event: &ClickEvent, _window, context| {
-                            view.toggle_note_editor_format(context);
-                            context.stop_propagation();
-                        }),
-                    ))
                     .child(self.render_notes_text_button(
                         "取消",
                         Icon::X,
@@ -672,116 +645,42 @@ impl MainView {
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let note = self.notes.active_note.as_ref().expect("已检查存在笔记");
-        if note.content_format == NoteContentFormat::Markdown
-            && self.notes.reader_mode == NoteReaderMode::Preview
-        {
-            let theme = self.effective_theme();
-            let document = self.note_markdown_preview_document(note, theme);
-            return div()
-                .id("note-markdown-preview")
-                .size_full()
-                .overflow_y_scroll()
-                .scrollbar_width(px(6.0))
-                .px_6()
-                .py_5()
-                .child(render_app_markdown_document(&document, &note.id, palette));
-        }
-        self.render_note_source_reader(&note.content, palette, context)
-    }
-
-    /// 渲染只读源码阅读器。
-    fn render_note_source_reader(
-        &self,
-        content: &str,
-        palette: AppThemePalette,
-        context: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let lines = Self::note_source_lines(content);
-        if lines.is_empty() {
-            return div()
-                .id("note-source-empty")
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_sm()
-                .text_color(rgb(palette.muted_text))
-                .child("空笔记");
-        }
         div()
-            .id("note-source-reader")
+            .id("note-rich-reader")
             .size_full()
             .overflow_scroll()
             .scrollbar_width(px(6.0))
-            .font_family(LOG_VIEWER_FONT_FAMILY)
-            .text_size(px(NOTES_TEXT_FONT_SIZE))
-            .line_height(px(NOTES_TEXT_LINE_HEIGHT))
-            .text_color(rgb(palette.text))
-            .py_4()
-            .children(
-                lines.into_iter().enumerate().map(|(index, line)| {
-                    self.render_note_source_line(index, line, palette, context)
+            .bg(rgb(palette.background))
+            .track_focus(&self.notes.rich_editor.focus)
+            .key_context("note-rich-reader")
+            .on_key_down(
+                context.listener(|view, event: &KeyDownEvent, _window, context| {
+                    view.handle_note_reader_key_down(event, context);
                 }),
             )
-    }
-
-    /// 渲染只读源码单行。
-    fn render_note_source_line(
-        &self,
-        line_index: usize,
-        line: &str,
-        _palette: AppThemePalette,
-        context: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let highlights = self
-            .notes
-            .source_selection
-            .as_ref()
-            .and_then(|selection| {
-                Self::selected_byte_range_for_note_line(selection, line_index, line)
-            })
-            .map(|range| vec![(range, Self::log_text_selection_highlight_style())])
-            .unwrap_or_default();
-        let line_text = if line.is_empty() { " " } else { line };
-        let line_for_down = line.to_string();
-        let line_for_move = line.to_string();
-        div()
-            .id(SharedString::from(format!("note-source-line-{line_index}")))
-            .h(px(NOTES_TEXT_LINE_HEIGHT))
-            .px(px(NOTES_SOURCE_HORIZONTAL_PADDING))
-            .whitespace_nowrap()
-            .child(StyledText::new(line_text.to_string()).with_highlights(highlights))
             .on_mouse_down(
                 MouseButton::Left,
-                context.listener(move |view, event: &MouseDownEvent, window, context| {
-                    view.start_note_source_selection(
-                        line_index,
-                        &line_for_down,
-                        event,
-                        window,
-                        context,
-                    );
+                context.listener(|view, event: &MouseDownEvent, window, context| {
+                    view.start_note_rich_text_selection(event, window, context);
                     context.stop_propagation();
                 }),
             )
-            .on_mouse_move(context.listener(
-                move |view, event: &MouseMoveEvent, _window, context| {
-                    view.update_note_source_selection(line_index, &line_for_move, event, context);
-                },
-            ))
+            .on_mouse_move(
+                context.listener(|view, event: &MouseMoveEvent, _window, context| {
+                    view.update_note_rich_text_selection(event, context);
+                }),
+            )
             .on_mouse_up(
                 MouseButton::Left,
                 context.listener(|view, _event: &MouseUpEvent, _window, context| {
-                    view.finish_note_source_selection(context);
+                    view.finish_note_rich_text_selection(context);
                 }),
             )
-            .on_mouse_up_out(
-                MouseButton::Left,
-                context.listener(|view, _event: &MouseUpEvent, _window, context| {
-                    view.finish_note_source_selection(context);
-                }),
-            )
+            .child(NoteRichTextElement {
+                view: context.entity(),
+                editable: false,
+                palette,
+            })
     }
 
     /// 渲染笔记编辑器。
@@ -839,61 +738,520 @@ impl MainView {
                     .relative()
                     .flex_1()
                     .min_h_0()
+                    .flex()
+                    .flex_col()
                     .rounded(px(8.0))
                     .border_1()
                     .border_color(rgb(palette.border))
                     .bg(rgb(palette.input))
-                    .track_focus(&self.notes.editor_focus)
-                    .key_context("note-editor")
+                    .track_focus(&self.notes.rich_editor.focus)
+                    .key_context("note-rich-editor")
                     .on_key_down(context.listener(
                         |view, event: &KeyDownEvent, _window, context| {
-                            view.handle_note_editor_key_down(event, context);
+                            view.handle_note_editor_container_key_down(event, context);
                         },
                     ))
                     .on_mouse_down(
                         MouseButton::Left,
                         context.listener(|view, event: &MouseDownEvent, window, context| {
-                            view.start_note_editor_mouse_selection(event, context);
-                            window.focus(&view.notes.editor_focus);
+                            view.start_note_rich_text_selection(event, window, context);
                             context.stop_propagation();
                         }),
                     )
                     .on_mouse_move(context.listener(
                         |view, event: &MouseMoveEvent, _window, context| {
-                            view.update_note_editor_mouse_selection(event.position, context);
+                            view.update_note_rich_text_selection(event, context);
                         },
                     ))
                     .on_mouse_up(
                         MouseButton::Left,
                         context.listener(|view, _event: &MouseUpEvent, _window, context| {
-                            view.finish_note_editor_mouse_selection(context);
+                            view.finish_note_rich_text_selection(context);
                         }),
                     )
-                    .on_mouse_up_out(
-                        MouseButton::Left,
-                        context.listener(|view, _event: &MouseUpEvent, _window, context| {
-                            view.finish_note_editor_mouse_selection(context);
-                        }),
-                    )
+                    .child(self.render_note_rich_text_toolbar(palette, context))
                     .child(
                         div()
                             .id("note-editor-scroll")
-                            .size_full()
-                            .px_3()
-                            .py_3()
+                            .flex_1()
+                            .min_h_0()
+                            .w_full()
                             .overflow_scroll()
                             .scrollbar_width(px(6.0))
-                            .font_family(LOG_VIEWER_FONT_FAMILY)
-                            .text_size(px(NOTES_TEXT_FONT_SIZE))
-                            .line_height(px(NOTES_TEXT_LINE_HEIGHT))
                             .text_color(rgb(palette.text))
-                            .child(NoteEditorElement {
+                            .child(NoteRichTextElement {
                                 view: context.entity(),
-                                focus_handle: self.notes.editor_focus.clone(),
+                                editable: true,
                                 palette,
                             }),
-                    ),
+                    )
+                    .child(self.render_note_rich_toolbar_menus(palette, context)),
             )
+    }
+
+    /// 渲染富文本编辑工具栏。
+    fn render_note_rich_text_toolbar(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        // 工具栏是正文编辑器的一部分：固定在编辑框顶部，共用编辑器边框和背景，
+        // 这样标题输入、工具栏、正文之间的层级清晰，也避免浮层点击透传成正文选区变更。
+        div()
+            .id("note-rich-toolbar")
+            .relative()
+            .flex()
+            .items_center()
+            .gap_1()
+            .h(px(NOTES_RICH_TEXT_TOOLBAR_HEIGHT))
+            .flex_none()
+            .w_full()
+            .px_2()
+            .border_b_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.input))
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    context.stop_propagation();
+                }),
+            )
+            .child(self.render_note_rich_font_size_button(palette, context))
+            .child(
+                self.render_note_rich_toolbar_icon(
+                    "bold",
+                    Icon::Bold,
+                    self.notes
+                        .rich_editor
+                        .current_inline_command_active(NoteRichTextInlineCommand::Bold),
+                    palette,
+                    context.listener(|view, _event: &ClickEvent, _window, context| {
+                        view.toggle_note_rich_text_inline_style(
+                            NoteRichTextInlineCommand::Bold,
+                            context,
+                        );
+                        context.stop_propagation();
+                    }),
+                ),
+            )
+            .child(
+                self.render_note_rich_toolbar_icon(
+                    "italic",
+                    Icon::Italic,
+                    self.notes
+                        .rich_editor
+                        .current_inline_command_active(NoteRichTextInlineCommand::Italic),
+                    palette,
+                    context.listener(|view, _event: &ClickEvent, _window, context| {
+                        view.toggle_note_rich_text_inline_style(
+                            NoteRichTextInlineCommand::Italic,
+                            context,
+                        );
+                        context.stop_propagation();
+                    }),
+                ),
+            )
+            .child(
+                self.render_note_rich_toolbar_icon(
+                    "underline",
+                    Icon::Underline,
+                    self.notes
+                        .rich_editor
+                        .current_inline_command_active(NoteRichTextInlineCommand::Underline),
+                    palette,
+                    context.listener(|view, _event: &ClickEvent, _window, context| {
+                        view.toggle_note_rich_text_inline_style(
+                            NoteRichTextInlineCommand::Underline,
+                            context,
+                        );
+                        context.stop_propagation();
+                    }),
+                ),
+            )
+            .child(
+                self.render_note_rich_toolbar_icon(
+                    "strikethrough",
+                    Icon::Strikethrough,
+                    self.notes
+                        .rich_editor
+                        .current_inline_command_active(NoteRichTextInlineCommand::Strikethrough),
+                    palette,
+                    context.listener(|view, _event: &ClickEvent, _window, context| {
+                        view.toggle_note_rich_text_inline_style(
+                            NoteRichTextInlineCommand::Strikethrough,
+                            context,
+                        );
+                        context.stop_propagation();
+                    }),
+                ),
+            )
+            .child(self.render_note_rich_color_button(palette, context))
+            .child(self.render_note_rich_background_color_button(palette, context))
+            .child(self.render_note_rich_toolbar_icon(
+                "bullet-list",
+                Icon::List,
+                false,
+                palette,
+                context.listener(|view, _event: &ClickEvent, _window, context| {
+                    view.toggle_note_rich_text_list(
+                        NoteRichTextBlockKind::UnorderedListItem,
+                        context,
+                    );
+                    context.stop_propagation();
+                }),
+            ))
+            .child(self.render_note_rich_toolbar_icon(
+                "ordered-list",
+                Icon::ListOrdered,
+                false,
+                palette,
+                context.listener(|view, _event: &ClickEvent, _window, context| {
+                    view.toggle_note_rich_text_list(
+                        NoteRichTextBlockKind::OrderedListItem,
+                        context,
+                    );
+                    context.stop_propagation();
+                }),
+            ))
+    }
+
+    /// 渲染富文本工具栏浮层菜单。
+    fn render_note_rich_toolbar_menus(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let menu_open = self.notes.rich_editor.font_size_menu_open
+            || self.notes.rich_editor.color_menu_open
+            || self.notes.rich_editor.background_color_menu_open;
+        if !menu_open {
+            return div().id("note-rich-toolbar-menus-empty").hidden();
+        }
+        // 下拉菜单必须作为编辑器容器最后绘制的浮层，而不是工具栏内部子节点。
+        // GPUI 同级元素按子节点顺序绘制；如果菜单留在工具栏内，后绘制的正文滚动区会覆盖菜单。
+        div()
+            .id("note-rich-toolbar-menus")
+            .absolute()
+            .left(px(0.0))
+            .right(px(0.0))
+            .top(px(0.0))
+            .bottom(px(0.0))
+            .child(self.render_note_rich_toolbar_menu_backdrop(context))
+            .child(self.render_note_rich_font_size_menu(palette, context))
+            .child(self.render_note_rich_color_menu(palette, context))
+            .child(self.render_note_rich_background_color_menu(palette, context))
+    }
+
+    /// 渲染富文本工具栏菜单透明遮罩。
+    fn render_note_rich_toolbar_menu_backdrop(
+        &self,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("note-rich-toolbar-menu-backdrop")
+            .absolute()
+            .left(px(0.0))
+            .right(px(0.0))
+            .top(px(0.0))
+            .bottom(px(0.0))
+            .bg(rgba(0x00000000))
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|view, _event: &MouseDownEvent, _window, context| {
+                    view.close_note_rich_text_menus(context);
+                    context.stop_propagation();
+                }),
+            )
+    }
+
+    /// 渲染富文本工具栏图标按钮。
+    fn render_note_rich_toolbar_icon(
+        &self,
+        id: &'static str,
+        icon: Icon,
+        active: bool,
+        palette: AppThemePalette,
+        listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(SharedString::from(format!("note-rich-toolbar-{id}")))
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(30.0))
+            .h(px(28.0))
+            .rounded(px(6.0))
+            .bg(rgb(if active {
+                palette.selected
+            } else {
+                palette.panel
+            }))
+            .cursor_pointer()
+            .hover(move |button| button.bg(rgb(palette.hover)))
+            .child(Self::render_lucide_icon(
+                Some(icon),
+                16.0,
+                15.0,
+                if active { palette.accent } else { palette.text },
+            ))
+            .on_click(listener)
+    }
+
+    /// 渲染字号菜单按钮。
+    fn render_note_rich_font_size_button(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let size = self.notes.rich_editor.pending_style.font_size_px;
+        div()
+            .id("note-rich-font-size")
+            .flex()
+            .items_center()
+            .gap_1()
+            .h(px(28.0))
+            .px_2()
+            .rounded(px(6.0))
+            .text_sm()
+            .text_color(rgb(palette.text))
+            .cursor_pointer()
+            .hover(move |button| button.bg(rgb(palette.hover)))
+            .child(Self::render_lucide_icon(
+                Some(Icon::Type),
+                16.0,
+                15.0,
+                palette.muted_text,
+            ))
+            .child(format!("{size}px"))
+            .on_click(
+                context.listener(|view, _event: &ClickEvent, _window, context| {
+                    view.notes.rich_editor.font_size_menu_open =
+                        !view.notes.rich_editor.font_size_menu_open;
+                    view.notes.rich_editor.color_menu_open = false;
+                    view.notes.rich_editor.background_color_menu_open = false;
+                    context.stop_propagation();
+                    context.notify();
+                }),
+            )
+    }
+
+    /// 渲染字号下拉菜单。
+    fn render_note_rich_font_size_menu(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        if !self.notes.rich_editor.font_size_menu_open {
+            return div().id("note-rich-font-size-menu-empty").hidden();
+        }
+        div()
+            .id("note-rich-font-size-menu")
+            .absolute()
+            .left(px(8.0))
+            .top(px(NOTES_RICH_TEXT_TOOLBAR_HEIGHT - 2.0))
+            .w(px(94.0))
+            .py_1()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.menu))
+            .shadow_lg()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    context.stop_propagation();
+                }),
+            )
+            .children([12_u32, 14, 16, 18, 20, 24, 32].into_iter().map(|size| {
+                div()
+                    .id(SharedString::from(format!("note-rich-font-size-{size}")))
+                    .h(px(28.0))
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .text_sm()
+                    .text_color(rgb(palette.text))
+                    .cursor_pointer()
+                    .hover(move |item| item.bg(rgb(palette.hover)))
+                    .child(format!("{size}px"))
+                    .on_click(context.listener(
+                        move |view, _event: &ClickEvent, _window, context| {
+                            view.apply_note_rich_text_font_size(size, context);
+                            context.stop_propagation();
+                        },
+                    ))
+            }))
+    }
+
+    /// 渲染文字颜色按钮。
+    fn render_note_rich_color_button(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        self.render_note_rich_toolbar_icon(
+            "color",
+            Icon::Palette,
+            self.notes.rich_editor.color_menu_open,
+            palette,
+            context.listener(|view, _event: &ClickEvent, _window, context| {
+                view.notes.rich_editor.color_menu_open = !view.notes.rich_editor.color_menu_open;
+                view.notes.rich_editor.font_size_menu_open = false;
+                view.notes.rich_editor.background_color_menu_open = false;
+                context.stop_propagation();
+                context.notify();
+            }),
+        )
+    }
+
+    /// 渲染背景颜色按钮。
+    fn render_note_rich_background_color_button(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        self.render_note_rich_toolbar_icon(
+            "background-color",
+            Icon::Highlighter,
+            self.notes.rich_editor.background_color_menu_open,
+            palette,
+            context.listener(|view, _event: &ClickEvent, _window, context| {
+                view.notes.rich_editor.background_color_menu_open =
+                    !view.notes.rich_editor.background_color_menu_open;
+                view.notes.rich_editor.font_size_menu_open = false;
+                view.notes.rich_editor.color_menu_open = false;
+                context.stop_propagation();
+                context.notify();
+            }),
+        )
+    }
+
+    /// 渲染文字颜色色板。
+    fn render_note_rich_color_menu(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        if !self.notes.rich_editor.color_menu_open {
+            return div().id("note-rich-color-menu-empty").hidden();
+        }
+        let colors = [
+            ("theme", None),
+            ("red", Some(NoteRichTextColor::rgb(220, 38, 38))),
+            ("orange", Some(NoteRichTextColor::rgb(234, 88, 12))),
+            ("green", Some(NoteRichTextColor::rgb(22, 163, 74))),
+            ("blue", Some(NoteRichTextColor::rgb(37, 99, 235))),
+            ("purple", Some(NoteRichTextColor::rgb(124, 58, 237))),
+        ];
+        div()
+            .id("note-rich-color-menu")
+            .absolute()
+            .left(px(174.0))
+            .top(px(NOTES_RICH_TEXT_TOOLBAR_HEIGHT - 2.0))
+            .flex()
+            .gap_1()
+            .p_2()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.menu))
+            .shadow_lg()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    context.stop_propagation();
+                }),
+            )
+            .children(colors.into_iter().map(|(name, color)| {
+                let swatch = color
+                    .map(|color| {
+                        rgb(((color.r as u32) << 16) | ((color.g as u32) << 8) | color.b as u32)
+                    })
+                    .unwrap_or_else(|| rgb(palette.text));
+                div()
+                    .id(SharedString::from(format!("note-rich-color-{name}")))
+                    .w(px(22.0))
+                    .h(px(22.0))
+                    .rounded(px(11.0))
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .bg(swatch)
+                    .cursor_pointer()
+                    .on_click(context.listener(
+                        move |view, _event: &ClickEvent, _window, context| {
+                            view.apply_note_rich_text_color(color, context);
+                            context.stop_propagation();
+                        },
+                    ))
+            }))
+    }
+
+    /// 渲染背景颜色色板。
+    fn render_note_rich_background_color_menu(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        if !self.notes.rich_editor.background_color_menu_open {
+            return div().id("note-rich-background-color-menu-empty").hidden();
+        }
+        let colors = [
+            ("clear", None),
+            ("yellow", Some(NoteRichTextColor::rgb(254, 240, 138))),
+            ("green", Some(NoteRichTextColor::rgb(187, 247, 208))),
+            ("blue", Some(NoteRichTextColor::rgb(191, 219, 254))),
+            ("purple", Some(NoteRichTextColor::rgb(221, 214, 254))),
+            ("pink", Some(NoteRichTextColor::rgb(251, 207, 232))),
+        ];
+        div()
+            .id("note-rich-background-color-menu")
+            .absolute()
+            .left(px(212.0))
+            .top(px(NOTES_RICH_TEXT_TOOLBAR_HEIGHT - 2.0))
+            .flex()
+            .gap_1()
+            .p_2()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.menu))
+            .shadow_lg()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    context.stop_propagation();
+                }),
+            )
+            .children(colors.into_iter().map(|(name, color)| {
+                let swatch = color
+                    .map(|color| {
+                        rgb(((color.r as u32) << 16) | ((color.g as u32) << 8) | color.b as u32)
+                    })
+                    .unwrap_or_else(|| rgb(palette.input));
+                div()
+                    .id(SharedString::from(format!(
+                        "note-rich-background-color-{name}"
+                    )))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(22.0))
+                    .h(px(22.0))
+                    .rounded(px(11.0))
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .bg(swatch)
+                    .cursor_pointer()
+                    .child(div().when(color.is_none(), |marker| {
+                        marker.w(px(12.0)).h(px(1.5)).bg(rgb(palette.muted_text))
+                    }))
+                    .on_click(context.listener(
+                        move |view, _event: &ClickEvent, _window, context| {
+                            view.apply_note_rich_text_background_color(color, context);
+                            context.stop_propagation();
+                        },
+                    ))
+            }))
     }
 
     /// 渲染未保存修改确认弹窗。
@@ -1192,8 +1550,8 @@ impl MainView {
                                 label,
                                 palette,
                                 context.listener(
-                                    move |view, _event: &ClickEvent, _window, context| {
-                                        view.resolve_notes_unsaved_dialog(choice, context);
+                                    move |view, _event: &ClickEvent, window, context| {
+                                        view.resolve_notes_unsaved_dialog(choice, window, context);
                                         context.stop_propagation();
                                     },
                                 ),

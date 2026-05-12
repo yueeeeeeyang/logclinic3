@@ -4,7 +4,7 @@
 // - 该文件只承载笔记树、当前笔记、只读选区、编辑草稿、确认弹窗和输入布局等 UI 状态。
 // - 类型可见性限制在 app 模块内，避免把第一版笔记内部状态暴露成 crate 级 API。
 
-use std::{cell::RefCell, collections::HashSet, ops::Range};
+use std::{collections::HashSet, ops::Range};
 
 use super::*;
 
@@ -15,15 +15,6 @@ pub(in crate::app) struct NotesTreeSelection {
     pub(in crate::app) id: String,
     /// 节点类型。
     pub(in crate::app) kind: NoteTreeRowKind,
-}
-
-/// 笔记只读阅读模式。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::app) enum NoteReaderMode {
-    /// Markdown 预览模式；普通文本不会使用该模式。
-    Preview,
-    /// 源码只读模式；支持精确复制原始文本。
-    Source,
 }
 
 /// 笔记文本位置。
@@ -49,6 +40,7 @@ pub(in crate::app) struct NoteTextSelection {
 
 impl NoteTextSelection {
     /// 返回按文档顺序排列后的端点。
+    #[allow(dead_code)]
     pub(in crate::app) fn normalized(&self) -> (NoteTextPosition, NoteTextPosition) {
         if self.anchor <= self.focus {
             (self.anchor, self.focus)
@@ -58,39 +50,10 @@ impl NoteTextSelection {
     }
 
     /// 判断选择是否为空。
+    #[allow(dead_code)]
     pub(in crate::app) fn is_empty(&self) -> bool {
         self.anchor == self.focus
     }
-}
-
-/// 笔记编辑器中的单行排版缓存。
-pub(in crate::app) struct NoteEditorLineLayout {
-    /// 当前可视行对应的原始文本 UTF-8 字节范围。
-    pub(in crate::app) byte_range: Range<usize>,
-    /// 当前行的 GPUI 字形布局。
-    pub(in crate::app) line: ShapedLine,
-    /// 当前行在窗口中的绘制边界。
-    pub(in crate::app) bounds: Bounds<Pixels>,
-}
-
-/// 笔记编辑器绘制状态。
-pub(in crate::app) struct NoteEditorPrepaint {
-    /// 当前帧需要绘制的所有文本行。
-    pub(in crate::app) lines: Vec<NoteEditorPaintLine>,
-    /// 当前选择范围对应的高亮矩形。
-    pub(in crate::app) selections: Vec<PaintQuad>,
-    /// 当前光标矩形。
-    pub(in crate::app) cursor: Option<PaintQuad>,
-}
-
-/// 笔记编辑器单行绘制数据。
-pub(in crate::app) struct NoteEditorPaintLine {
-    /// 当前行对应的原始文本范围。
-    pub(in crate::app) byte_range: Range<usize>,
-    /// 当前行边界。
-    pub(in crate::app) bounds: Bounds<Pixels>,
-    /// 已排版的文本行。
-    pub(in crate::app) line: ShapedLine,
 }
 
 /// 未保存修改确认动作。
@@ -170,23 +133,6 @@ pub(in crate::app) enum NotesTreeContextMenuAction {
     Delete,
 }
 
-/// 笔记 Markdown 预览缓存。
-///
-/// 业务意图：
-/// - Markdown 预览会解析完整正文并对代码块做语法高亮，1 MiB 笔记在窗口重绘时重复解析会明显拖慢 UI。
-/// - 第一版只缓存当前最近预览的一篇笔记，避免无上限持有多篇大笔记的解析结果。
-#[derive(Clone)]
-pub(in crate::app) struct NoteMarkdownPreviewCacheEntry {
-    /// 缓存对应的笔记 ID。
-    pub(in crate::app) note_id: String,
-    /// 缓存对应的正文哈希；正文变化后必须重新解析。
-    pub(in crate::app) content_hash: u64,
-    /// 缓存对应的主题；主题变化后代码高亮颜色需要重新生成。
-    pub(in crate::app) theme: EffectiveTheme,
-    /// 已解析的 Markdown 展示文档。
-    pub(in crate::app) document: AppMarkdownDocument,
-}
-
 /// 笔记页面完整工作区状态。
 pub(in crate::app) struct NotesWorkspaceState {
     /// 完整笔记树行。
@@ -203,18 +149,18 @@ pub(in crate::app) struct NotesWorkspaceState {
     pub(in crate::app) tree_scroll_handle: UniformListScrollHandle,
     /// 数据库错误。
     pub(in crate::app) database_error: Option<String>,
-    /// 阅读器模式。
-    pub(in crate::app) reader_mode: NoteReaderMode,
-    /// 最近一次 Markdown 预览缓存。
-    pub(in crate::app) markdown_preview_cache: RefCell<Option<NoteMarkdownPreviewCacheEntry>>,
     /// 只读源码选择范围。
     pub(in crate::app) source_selection: Option<NoteTextSelection>,
     /// 只读源码拖拽锚点。
     pub(in crate::app) source_selection_drag_anchor: Option<NoteTextPosition>,
     /// 当前是否处于编辑状态。
     pub(in crate::app) is_editing: bool,
-    /// 编辑器正文草稿。
-    pub(in crate::app) editor_text: String,
+    /// 富文本正文编辑器状态。
+    ///
+    /// 业务意图：
+    /// - 该状态保存正文文档、线性选区、IME 组合区、待输入样式、撤销重做和排版缓存。
+    /// - 数据库仍只在保存按钮或未保存确认“保存”路径写入，避免编辑器输入过程产生隐式持久化。
+    pub(in crate::app) rich_editor: RichTextEditorState,
     /// 编辑器标题草稿；第一版标题保存时同步重命名笔记。
     pub(in crate::app) editor_title: String,
     /// 标题输入框选择范围。
@@ -227,24 +173,6 @@ pub(in crate::app) struct NotesWorkspaceState {
     pub(in crate::app) title_last_layout: Option<ShapedLine>,
     /// 标题输入框最近一次绘制边界。
     pub(in crate::app) title_last_bounds: Option<Bounds<Pixels>>,
-    /// 编辑器格式草稿。
-    pub(in crate::app) editor_format: NoteContentFormat,
-    /// 编辑器选择范围。
-    pub(in crate::app) editor_selection_range: Range<usize>,
-    /// 编辑器输入法组合文本范围。
-    pub(in crate::app) editor_marked_range: Option<Range<usize>>,
-    /// 编辑器焦点句柄。
-    pub(in crate::app) editor_focus: gpui::FocusHandle,
-    /// 编辑器最近一次绘制的逐行布局。
-    pub(in crate::app) editor_last_layouts: Vec<NoteEditorLineLayout>,
-    /// 编辑器最近一次整体绘制边界。
-    pub(in crate::app) editor_last_bounds: Option<Bounds<Pixels>>,
-    /// 编辑器拖拽选择锚点。
-    pub(in crate::app) editor_selection_drag: Option<usize>,
-    /// 编辑器撤销栈。
-    pub(in crate::app) editor_undo_stack: Vec<String>,
-    /// 编辑器重做栈。
-    pub(in crate::app) editor_redo_stack: Vec<String>,
     /// 未保存修改确认弹窗。
     pub(in crate::app) unsaved_dialog: Option<NotesUnsavedDialog>,
     /// 重命名弹窗。
@@ -277,27 +205,16 @@ impl NotesWorkspaceState {
             active_note: None,
             tree_scroll_handle: UniformListScrollHandle::new(),
             database_error,
-            reader_mode: NoteReaderMode::Preview,
-            markdown_preview_cache: RefCell::new(None),
             source_selection: None,
             source_selection_drag_anchor: None,
             is_editing: false,
-            editor_text: String::new(),
+            rich_editor: RichTextEditorState::new(context),
             editor_title: String::new(),
             title_selection_range: 0..0,
             title_marked_range: None,
             title_focus: context.focus_handle(),
             title_last_layout: None,
             title_last_bounds: None,
-            editor_format: NoteContentFormat::Markdown,
-            editor_selection_range: 0..0,
-            editor_marked_range: None,
-            editor_focus: context.focus_handle(),
-            editor_last_layouts: Vec::new(),
-            editor_last_bounds: None,
-            editor_selection_drag: None,
-            editor_undo_stack: Vec::new(),
-            editor_redo_stack: Vec::new(),
             unsaved_dialog: None,
             rename_dialog: None,
             tree_context_menu: None,
@@ -348,9 +265,30 @@ impl NotesWorkspaceState {
         let Some(note) = &self.active_note else {
             return false;
         };
-        self.is_editing
-            && (self.editor_text != note.content
-                || self.editor_title != note.title
-                || self.editor_format != note.content_format)
+        let serialized = self.rich_editor.serialized_content().unwrap_or_default();
+        Self::note_editor_has_unsaved_changes(
+            self.is_editing,
+            &self.editor_title,
+            &serialized,
+            note,
+        )
+    }
+
+    /// 判断给定笔记草稿是否需要保存。
+    ///
+    /// 业务意图：
+    /// - 笔记模块已改为富文本；旧纯文本和 Markdown 笔记进入编辑态后即使标题和正文未变，
+    ///   保存也应把格式转换为富文本 JSON，因此旧格式本身也算未保存修改。
+    /// - 抽成纯函数便于测试，不需要启动真实 GPUI 窗口或构造输入控件实体。
+    pub(in crate::app) fn note_editor_has_unsaved_changes(
+        is_editing: bool,
+        editor_title: &str,
+        serialized_rich_text: &str,
+        note: &Note,
+    ) -> bool {
+        is_editing
+            && (serialized_rich_text != note.content
+                || editor_title != note.title
+                || note.content_format != NoteContentFormat::RichText)
     }
 }

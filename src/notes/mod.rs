@@ -6,10 +6,12 @@
 
 mod constants;
 mod domain;
+mod rich_text;
 mod storage;
 
 pub(crate) use constants::*;
 pub(crate) use domain::*;
+pub(crate) use rich_text::*;
 pub(crate) use storage::*;
 
 #[cfg(test)]
@@ -40,6 +42,9 @@ mod tests {
         let child =
             create_note_directory(&path, Some(root.id.clone()), "子目录".to_string()).unwrap();
         let note = create_note(&path, Some(child.id.clone()), "新建笔记".to_string()).unwrap();
+        assert_eq!(note.content_format, NoteContentFormat::RichText);
+        let empty_document = NoteRichTextDocument::from_json(&note.content).unwrap();
+        assert!(empty_document.is_empty());
         update_note_content(&path, &note.id, "# 标题", NoteContentFormat::Markdown).unwrap();
 
         let connection = Connection::open(&path).unwrap();
@@ -203,7 +208,30 @@ mod tests {
     /// 验证未知内容格式会返回中文错误。
     #[test]
     fn 未知笔记格式会报错() {
+        assert_eq!(
+            NoteContentFormat::from_str("rich_text").unwrap(),
+            NoteContentFormat::RichText
+        );
         let error = NoteContentFormat::from_str("future").unwrap_err();
         assert!(error.contains("未知内容格式"));
+    }
+
+    /// 验证非法富文本 JSON 会返回中文错误。
+    ///
+    /// 业务意图：
+    /// - SQLite 字段仍是普通文本，用户或未来版本可能写入损坏 JSON；解析层必须返回可展示的中文错误，而不是 panic。
+    #[test]
+    fn 非法富文本_json_会报中文错误() {
+        let note = Note {
+            id: "note-broken".to_string(),
+            directory_id: None,
+            title: "损坏".to_string(),
+            content: "{broken".to_string(),
+            content_format: NoteContentFormat::RichText,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let error = rich_text_document_from_note(&note).unwrap_err();
+        assert!(error.contains("解析富文本笔记失败"));
     }
 }

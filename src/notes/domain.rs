@@ -15,13 +15,16 @@ use super::*;
 /// 笔记内容格式。
 ///
 /// 业务意图：
-/// - 普通文本和 Markdown 在保存层必须显式区分，避免 UI 只能通过标题、后缀或内容猜测展示方式。
+/// - 普通文本、旧 Markdown 和新富文本在保存层必须显式区分，避免 UI 只能通过标题、后缀或内容猜测展示方式。
+/// - 第一版富文本仍保留旧格式枚举，用于懒转换历史数据；保存后统一写回 `RichText`。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NoteContentFormat {
-    /// 普通纯文本，阅读器按源码逐行显示。
+    /// 普通纯文本，旧数据按原文懒转换为富文本。
     PlainText,
-    /// Markdown 文本，阅读器默认预览，同时允许切换到源码只读模式精确复制。
+    /// Markdown 文本，旧数据不再预览，按原始文本懒转换为富文本。
     Markdown,
+    /// 富文本 JSON v1，保存在 `notes.content` 字段。
+    RichText,
 }
 
 impl NoteContentFormat {
@@ -30,6 +33,7 @@ impl NoteContentFormat {
         match self {
             Self::PlainText => "plain_text",
             Self::Markdown => "markdown",
+            Self::RichText => "rich_text",
         }
     }
 
@@ -41,15 +45,8 @@ impl NoteContentFormat {
         match raw {
             "plain_text" => Ok(Self::PlainText),
             "markdown" => Ok(Self::Markdown),
+            "rich_text" => Ok(Self::RichText),
             other => Err(format!("笔记数据库包含未知内容格式：{other}")),
-        }
-    }
-
-    /// 返回 UI 中展示的中文名称。
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::PlainText => "文本",
-            Self::Markdown => "Markdown",
         }
     }
 }
@@ -159,14 +156,21 @@ pub(crate) fn new_note_directory(parent_id: Option<String>, title: String) -> No
 }
 
 /// 创建默认笔记模型。
+///
+/// 业务意图：
+/// - 当前笔记模块默认进入富文本编辑器，因此新建笔记直接保存空富文本 JSON，避免第一次保存前格式语义不一致。
+/// - `PlainText` 和 `Markdown` 枚举仍保留，用于兼容旧数据库；旧数据由 UI 按原始文本打开，保存后再转为富文本。
 pub(crate) fn new_note(directory_id: Option<String>, title: String) -> Note {
     let now = current_note_time_millis();
+    let content = NoteRichTextDocument::empty()
+        .to_json()
+        .unwrap_or_else(|_| String::new());
     Note {
         id: new_note_entity_id("note"),
         directory_id,
         title,
-        content: String::new(),
-        content_format: NoteContentFormat::Markdown,
+        content,
+        content_format: NoteContentFormat::RichText,
         created_at_ms: now,
         updated_at_ms: now,
     }

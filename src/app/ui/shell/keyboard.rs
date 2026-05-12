@@ -24,7 +24,13 @@ impl MainView {
         context: &mut Context<Self>,
         allow_keyboard_scroll: bool,
     ) -> bool {
-        let editable_text_input_focused = self.editable_text_input_focused(window);
+        let note_editor_input_focused = self.note_editor_input_focused(window, context);
+        if note_editor_input_focused && Self::is_save_keystroke(&keystroke) {
+            return self.save_active_note(context);
+        }
+
+        let editable_text_input_focused =
+            self.editable_text_input_focused(window, context, note_editor_input_focused);
         if editable_text_input_focused
             && (Self::is_copy_keystroke(&keystroke) || Self::is_paste_keystroke(&keystroke))
         {
@@ -121,19 +127,38 @@ impl MainView {
             || self.active_model_config_input_kind(window).is_some()
     }
 
-    /// 判断当前焦点是否位于应用内自绘的可编辑文本输入框。
+    /// 判断当前焦点是否位于笔记正文组件输入框。
     ///
     /// 业务意图：
-    /// - GPUI 的应用级快捷键拦截会早于部分元素级 `on_key_down`，因此所有可编辑文本框聚焦时都要先放行
-    ///   `Ctrl+C` / `Ctrl+V`，让对应输入框完成复制和粘贴。
-    /// - 线程日志分析过滤框位于设置窗口，但状态保存在 `MainView`，这里统一判断焦点，避免粘贴堆栈时误触发
-    ///   “粘贴到搜索框并打开搜索窗口”的只读日志兜底行为。
-    pub(in crate::app) fn editable_text_input_focused(&self, window: &Window) -> bool {
+    /// - 笔记正文使用项目内富文本编辑器，焦点状态保存在正文自己的 `FocusHandle` 上。
+    /// - 该方法只处理笔记正文，搜索框、设置框和标题框仍通过各自的 GPUI 焦点句柄判断。
+    pub(in crate::app) fn note_editor_input_focused(
+        &self,
+        window: &mut Window,
+        _context: &mut Context<Self>,
+    ) -> bool {
+        // 只读阅读器也会复用正文焦点来支持鼠标选区和复制，但它不是可编辑输入框。
+        // 如果这里不区分编辑态，全局 `Ctrl/Cmd+C` 会跳过笔记只读选区复制，
+        // `Ctrl/Cmd+S` 也可能在只读状态触发写库并把旧格式笔记静默转换为富文本。
+        self.notes.is_editing && self.notes.rich_editor.focus.is_focused(window)
+    }
+
+    /// 判断当前焦点是否位于应用内自绘或组件库提供的可编辑文本输入框。
+    ///
+    /// 业务意图：
+    /// - 笔记正文已经迁移到项目内富文本输入框，焦点由正文 `FocusHandle` 维护；搜索、设置和标题仍沿用项目内自绘输入框焦点。
+    /// - 调用方预先传入正文焦点结果，避免同一次快捷键处理重复读取窗口根状态。
+    pub(in crate::app) fn editable_text_input_focused(
+        &self,
+        window: &Window,
+        _context: &mut Context<Self>,
+        note_editor_input_focused: bool,
+    ) -> bool {
         self.search_text_input_focused(window)
             || self.settings_text_input_focused(window)
             || self.ai_chat.input_focus.is_focused(window)
             || self.notes.title_focus.is_focused(window)
-            || self.notes.editor_focus.is_focused(window)
+            || note_editor_input_focused
     }
 
     /// 延迟打开搜索对话框。

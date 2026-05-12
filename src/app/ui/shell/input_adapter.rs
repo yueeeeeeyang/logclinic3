@@ -36,13 +36,11 @@ impl EntityInputHandler for MainView {
             ));
             return Some(self.notes.editor_title[range].to_string());
         }
-        if self.notes.editor_focus.is_focused(window) {
-            let range = Self::search_input_range_from_utf16(&self.notes.editor_text, range_utf16);
-            adjusted_range.replace(Self::search_input_range_to_utf16(
-                &self.notes.editor_text,
-                range.clone(),
-            ));
-            return Some(self.notes.editor_text[range].to_string());
+        if self.notes.rich_editor.focus.is_focused(window) {
+            let text = self.notes.rich_editor.plain_text();
+            let range = Self::search_input_range_from_utf16(&text, range_utf16);
+            adjusted_range.replace(Self::search_input_range_to_utf16(&text, range.clone()));
+            return Some(text[range].to_string());
         }
         if self.ai_chat.input_focus.is_focused(window) {
             let range = Self::search_input_range_from_utf16(&self.ai_chat.input_text, range_utf16);
@@ -112,11 +110,12 @@ impl EntityInputHandler for MainView {
                 reversed: false,
             });
         }
-        if self.notes.editor_focus.is_focused(window) {
+        if self.notes.rich_editor.focus.is_focused(window) {
+            let text = self.notes.rich_editor.plain_text();
             return Some(UTF16Selection {
                 range: Self::search_input_range_to_utf16(
-                    &self.notes.editor_text,
-                    self.notes.editor_selection_range.clone(),
+                    &text,
+                    self.notes.rich_editor.clamped_selection(),
                 ),
                 reversed: false,
             });
@@ -184,12 +183,14 @@ impl EntityInputHandler for MainView {
                 .clone()
                 .map(|range| Self::search_input_range_to_utf16(&self.notes.editor_title, range));
         }
-        if self.notes.editor_focus.is_focused(window) {
+        if self.notes.rich_editor.focus.is_focused(window) {
+            let text = self.notes.rich_editor.plain_text();
             return self
                 .notes
-                .editor_marked_range
+                .rich_editor
+                .marked_range
                 .clone()
-                .map(|range| Self::search_input_range_to_utf16(&self.notes.editor_text, range));
+                .map(|range| Self::search_input_range_to_utf16(&text, range));
         }
         if self.ai_chat.input_focus.is_focused(window) {
             return self
@@ -245,8 +246,8 @@ impl EntityInputHandler for MainView {
             context.notify();
             return;
         }
-        if self.notes.editor_focus.is_focused(window) {
-            self.notes.editor_marked_range = None;
+        if self.notes.rich_editor.focus.is_focused(window) {
+            self.notes.rich_editor.marked_range = None;
             context.notify();
             return;
         }
@@ -327,23 +328,18 @@ impl EntityInputHandler for MainView {
             context.notify();
             return;
         }
-        if self.notes.editor_focus.is_focused(window) {
+        if self.notes.rich_editor.focus.is_focused(window) {
             if !self.notes.is_editing {
                 return;
             }
-            self.record_note_editor_undo_snapshot();
-            let replacement = text.replace("\r\n", "\n").replace('\r', "\n");
+            let plain_text = self.notes.rich_editor.plain_text();
             let range = range_utf16
-                .map(|range| Self::search_input_range_from_utf16(&self.notes.editor_text, range))
-                .or_else(|| self.notes.editor_marked_range.clone())
-                .unwrap_or_else(|| self.notes.editor_selection_range.clone());
-            let range = Self::clamp_search_text_range(&self.notes.editor_text, range);
+                .map(|range| Self::search_input_range_from_utf16(&plain_text, range))
+                .or_else(|| self.notes.rich_editor.marked_range.clone())
+                .unwrap_or_else(|| self.notes.rich_editor.clamped_selection());
             self.notes
-                .editor_text
-                .replace_range(range.clone(), &replacement);
-            let cursor = range.start + replacement.len();
-            self.notes.editor_selection_range = cursor..cursor;
-            self.notes.editor_marked_range = None;
+                .rich_editor
+                .replace_range_with_text(Some(range), text);
             self.touch_search_text_cursor_activity();
             context.notify();
             return;
@@ -535,27 +531,26 @@ impl EntityInputHandler for MainView {
             context.notify();
             return;
         }
-        if self.notes.editor_focus.is_focused(window) {
+        if self.notes.rich_editor.focus.is_focused(window) {
             if !self.notes.is_editing {
                 return;
             }
-            self.record_note_editor_undo_snapshot();
             let replacement = new_text.replace("\r\n", "\n").replace('\r', "\n");
+            let plain_text = self.notes.rich_editor.plain_text();
             let range = range_utf16
-                .map(|range| Self::search_input_range_from_utf16(&self.notes.editor_text, range))
-                .or_else(|| self.notes.editor_marked_range.clone())
-                .unwrap_or_else(|| self.notes.editor_selection_range.clone());
-            let range = Self::clamp_search_text_range(&self.notes.editor_text, range);
+                .map(|range| Self::search_input_range_from_utf16(&plain_text, range))
+                .or_else(|| self.notes.rich_editor.marked_range.clone())
+                .unwrap_or_else(|| self.notes.rich_editor.clamped_selection());
+            let range = clamp_note_rich_text_range(&plain_text, range);
             self.notes
-                .editor_text
-                .replace_range(range.clone(), &replacement);
-
+                .rich_editor
+                .replace_range_with_text(Some(range.clone()), &replacement);
             if replacement.is_empty() {
-                self.notes.editor_marked_range = None;
+                self.notes.rich_editor.marked_range = None;
             } else {
-                self.notes.editor_marked_range = Some(range.start..range.start + replacement.len());
+                self.notes.rich_editor.marked_range =
+                    Some(range.start..range.start + replacement.len());
             }
-
             let selected_range = new_selected_range_utf16
                 .map(|utf16_range| Self::search_input_range_from_utf16(&replacement, utf16_range))
                 .map(|relative_range| {
@@ -565,7 +560,7 @@ impl EntityInputHandler for MainView {
                     let cursor = range.start + replacement.len();
                     cursor..cursor
                 });
-            self.notes.editor_selection_range = selected_range;
+            self.notes.rich_editor.selection_range = selected_range;
             self.touch_search_text_cursor_activity();
             context.notify();
             return;
@@ -786,21 +781,14 @@ impl EntityInputHandler for MainView {
                 ),
             ));
         }
-        if self.notes.editor_focus.is_focused(window) {
-            let range = Self::search_input_range_from_utf16(&self.notes.editor_text, range_utf16);
-            let cursor = range.start;
-            for layout in &self.notes.editor_last_layouts {
-                if cursor >= layout.byte_range.start && cursor <= layout.byte_range.end {
-                    let x = layout
-                        .line
-                        .x_for_index(cursor.saturating_sub(layout.byte_range.start));
-                    return Some(Bounds::new(
-                        point(layout.bounds.left() + x, layout.bounds.top()),
-                        size(px(1.0), layout.bounds.bottom() - layout.bounds.top()),
-                    ));
-                }
-            }
-            return Some(element_bounds);
+        if self.notes.rich_editor.focus.is_focused(window) {
+            let text = self.notes.rich_editor.plain_text();
+            let range = Self::search_input_range_from_utf16(&text, range_utf16);
+            return Some(
+                self.notes
+                    .rich_editor
+                    .bounds_for_range(range, element_bounds),
+            );
         }
         if self.ai_chat.input_focus.is_focused(window) {
             let range = Self::search_input_range_from_utf16(&self.ai_chat.input_text, range_utf16);
@@ -917,12 +905,10 @@ impl EntityInputHandler for MainView {
                 utf8_index,
             ));
         }
-        if self.notes.editor_focus.is_focused(window) {
-            let utf8_index = self.note_editor_index_for_point(point);
-            return Some(Self::search_input_utf16_offset_from_byte(
-                &self.notes.editor_text,
-                utf8_index,
-            ));
+        if self.notes.rich_editor.focus.is_focused(window) {
+            let utf8_index = self.notes.rich_editor.index_for_point(point);
+            let text = self.notes.rich_editor.plain_text();
+            return Some(Self::search_input_utf16_offset_from_byte(&text, utf8_index));
         }
         if self.ai_chat.input_focus.is_focused(window) {
             let utf8_index = self.ai_chat_input_index_for_point(point);

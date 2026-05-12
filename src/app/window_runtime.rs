@@ -534,12 +534,13 @@ pub(crate) fn run() {
             KeyBinding::new("ctrl-f", OpenSearchDialog, None),
             KeyBinding::new("cmd-f", OpenSearchDialog, None),
         ]);
-        // 注册 Lucide 图标字体和内置 JetBrains Mono 正文字体，确保 macOS 和 Windows 上的图标与日志等宽字体
-        // 不依赖运行环境预装字体；如果注册失败，核心界面视觉无法可靠渲染，启动期应直接暴露错误。
+        // 注册 Lucide 图标字体和内置 JetBrains Mono 正文字体，确保 macOS 和 Windows 上的图标、日志等宽字体
+        // 与笔记富文本斜体不依赖运行环境预装字体；如果注册失败，核心界面视觉无法可靠渲染，启动期应直接暴露错误。
         app.text_system()
             .add_fonts(vec![
                 Cow::Borrowed(LUCIDE_FONT_BYTES),
                 Cow::Borrowed(JETBRAINS_MONO_REGULAR_FONT_BYTES),
+                Cow::Borrowed(JETBRAINS_MONO_ITALIC_FONT_BYTES),
             ])
             .expect("注册内置字体失败，工具栏图标或日志正文等宽字体无法可靠渲染");
         main_window_runtime.borrow_mut().remember_app(app);
