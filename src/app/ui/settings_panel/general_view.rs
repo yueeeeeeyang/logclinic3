@@ -15,6 +15,7 @@ impl SettingsWindowView {
         &self,
         theme: ThemePreference,
         log_viewer_font_size: f32,
+        shell_integration_state: &ShellIntegrationUiState,
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -54,6 +55,12 @@ impl SettingsWindowView {
                     .child(div().h(px(1.0)).mx_3().bg(rgb(palette.border)))
                     .child(self.render_log_font_size_setting(
                         log_viewer_font_size,
+                        palette,
+                        context,
+                    ))
+                    .child(div().h(px(1.0)).mx_3().bg(rgb(palette.border)))
+                    .child(self.render_shell_integration_setting(
+                        shell_integration_state,
                         palette,
                         context,
                     )),
@@ -326,4 +333,222 @@ impl SettingsWindowView {
                 }),
             )
     }
+
+    /// 渲染系统右键菜单集成设置。
+    ///
+    /// 业务意图：
+    /// - 用户需要在应用内主动注册或卸载系统右键入口，不依赖额外安装器或手工脚本。
+    /// - 该设置只触发平台集成模块，不改变日志加载、HPROF 解析或文件关联业务规则。
+    ///
+    /// 边界条件：
+    /// - 平台状态查询和注册动作在后台执行，按钮根据 `ShellIntegrationUiState` 禁用，避免重复点击产生并发注册。
+    pub(in crate::app) fn render_shell_integration_setting(
+        &self,
+        state: &ShellIntegrationUiState,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let status_icon = match state {
+            ShellIntegrationUiState::Ready(status) if status.is_registered() => Icon::Check,
+            ShellIntegrationUiState::Failed(_) => Icon::AlertCircle,
+            ShellIntegrationUiState::Checking
+            | ShellIntegrationUiState::Registering
+            | ShellIntegrationUiState::Unregistering => Icon::Loader,
+            _ => Icon::MousePointerClick,
+        };
+        let status_color = match state {
+            ShellIntegrationUiState::Ready(status) if status.is_registered() => palette.accent,
+            ShellIntegrationUiState::Failed(_) => 0xcf222e,
+            _ => palette.muted_text,
+        };
+
+        div()
+            .id("settings-shell-integration")
+            .flex()
+            .items_center()
+            .justify_between()
+            .min_h(px(82.0))
+            .px_4()
+            .py_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .min_w_0()
+                    .child(MainView::render_lucide_icon(
+                        Some(status_icon),
+                        18.0,
+                        18.0,
+                        status_color,
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(palette.text))
+                                    .child("右键菜单集成"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(palette.muted_text))
+                                    .child(Self::shell_integration_description()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(status_color))
+                                    .child(state.message().to_string()),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(self.render_shell_integration_button(
+                        "settings-shell-integration-refresh",
+                        "刷新",
+                        Icon::RefreshCw,
+                        !state.is_busy(),
+                        false,
+                        ShellIntegrationAction::Refresh,
+                        palette,
+                        context,
+                    ))
+                    .child(self.render_shell_integration_button(
+                        "settings-shell-integration-register",
+                        "注册",
+                        Icon::Plus,
+                        state.can_register(),
+                        true,
+                        ShellIntegrationAction::Register,
+                        palette,
+                        context,
+                    ))
+                    .child(self.render_shell_integration_button(
+                        "settings-shell-integration-unregister",
+                        "卸载",
+                        Icon::Trash2,
+                        state.can_unregister(),
+                        false,
+                        ShellIntegrationAction::Unregister,
+                        palette,
+                        context,
+                    )),
+            )
+    }
+
+    /// 返回当前平台右键菜单入口的说明文案。
+    fn shell_integration_description() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "注册后会出现在 Finder 右键“打开方式”菜单中"
+        } else if cfg!(target_os = "windows") {
+            "注册后会出现在资源管理器所有文件的右键菜单中"
+        } else {
+            "当前平台暂不支持系统右键菜单注册"
+        }
+    }
+
+    /// 渲染右键菜单集成操作按钮。
+    ///
+    /// 边界条件：
+    /// - 禁用按钮仍保留占位，防止后台状态变化时右侧控件宽度跳动。
+    #[allow(clippy::too_many_arguments)]
+    fn render_shell_integration_button(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        icon: Icon,
+        enabled: bool,
+        primary: bool,
+        action: ShellIntegrationAction,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let (text_color, background) = if primary && enabled {
+            (palette.on_accent, palette.accent)
+        } else {
+            (
+                if enabled {
+                    palette.text
+                } else {
+                    palette.muted_text
+                },
+                palette.panel,
+            )
+        };
+
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .h(px(28.0))
+            .px_3()
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(background))
+            .text_xs()
+            .text_color(rgb(text_color))
+            .when(enabled, |button| {
+                button.cursor_pointer().hover(move |button| {
+                    button.bg(rgb(if primary {
+                        palette.accent_hover
+                    } else {
+                        palette.hover
+                    }))
+                })
+            })
+            .when(!enabled, |button| button.opacity(0.55))
+            .child(MainView::render_lucide_icon(
+                Some(icon),
+                13.0,
+                13.0,
+                text_color,
+            ))
+            .child(label)
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, _window, context| {
+                    if !enabled {
+                        return;
+                    }
+                    match action {
+                        ShellIntegrationAction::Refresh => {
+                            view.refresh_shell_integration_status(context)
+                        }
+                        ShellIntegrationAction::Register => {
+                            view.register_shell_integration_from_settings(context)
+                        }
+                        ShellIntegrationAction::Unregister => {
+                            view.unregister_shell_integration_from_settings(context)
+                        }
+                    }
+                }),
+            )
+    }
+}
+
+/// 右键菜单集成按钮动作。
+///
+/// 业务意图：
+/// - 三个按钮共用渲染函数，用枚举比传闭包更容易保持 GPUI listener 的生命周期简单。
+#[derive(Clone, Copy)]
+enum ShellIntegrationAction {
+    /// 重新查询平台注册状态。
+    Refresh,
+    /// 注册右键菜单入口。
+    Register,
+    /// 卸载右键菜单入口。
+    Unregister,
 }

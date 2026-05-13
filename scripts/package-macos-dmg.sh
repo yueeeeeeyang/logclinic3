@@ -72,12 +72,84 @@ fi
 cp "${ICON_SOURCE_PATH}" "${APP_RESOURCES_DIR}/LogClinic.icns"
 
 # 业务意图：生成最小可用 Info.plist，让 Finder 能识别 `.app`，并把版本号写入系统显示信息。
-# 边界条件：`CFBundleIconFile` 必须对应 Resources 下的 `.icns` 文件名，否则 Finder 和 Dock 会回退到默认应用图标。
+# 边界条件：
+# - `CFBundleIconFile` 必须对应 Resources 下的 `.icns` 文件名，否则 Finder 和 Dock 会回退到默认应用图标。
+# - `CFBundleDocumentTypes` 需要同时声明常见日志/文本/配置/压缩包 UTI 和扩展名兜底；
+#   Finder 的“打开方式”不会仅凭应用被 LaunchServices 注册就展示，必须能匹配当前文件类型。
+# - `CFBundleTypeExtensions` 在同一个字典里遇到 `LSItemContentTypes` 会被系统忽略，因此拆成独立兜底字典。
+# - 真实分流仍由应用启动层按 `.hprof/.bin` 与其它文件区分，不能在 plist 中固化页面跳转规则。
 cat >"${APP_CONTENTS_DIR}/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeIconFile</key>
+      <string>LogClinic.icns</string>
+      <key>CFBundleTypeName</key>
+      <string>LogClinic Supported Documents</string>
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+      <key>LSHandlerRank</key>
+      <string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.item</string>
+        <string>public.content</string>
+        <string>public.data</string>
+        <string>public.text</string>
+        <string>public.plain-text</string>
+        <string>public.utf8-plain-text</string>
+        <string>public.xml</string>
+        <string>public.json</string>
+        <string>public.zip-archive</string>
+        <string>public.archive</string>
+        <string>public.folder</string>
+        <string>com.apple.log</string>
+      </array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeIconFile</key>
+      <string>LogClinic.icns</string>
+      <key>CFBundleTypeName</key>
+      <string>LogClinic Extension Fallbacks</string>
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+      <key>LSHandlerRank</key>
+      <string>Alternate</string>
+      <key>CFBundleTypeExtensions</key>
+      <array>
+        <string>*</string>
+        <string>log</string>
+        <string>txt</string>
+        <string>text</string>
+        <string>out</string>
+        <string>err</string>
+        <string>trace</string>
+        <string>dump</string>
+        <string>hprof</string>
+        <string>bin</string>
+        <string>zip</string>
+        <string>rar</string>
+        <string>tar</string>
+        <string>gz</string>
+        <string>tgz</string>
+        <string>7z</string>
+        <string>json</string>
+        <string>xml</string>
+        <string>yaml</string>
+        <string>yml</string>
+        <string>properties</string>
+        <string>conf</string>
+        <string>config</string>
+        <string>ini</string>
+        <string>cfg</string>
+        <string>toml</string>
+      </array>
+    </dict>
+  </array>
   <key>CFBundleDevelopmentRegion</key>
   <string>zh_CN</string>
   <key>CFBundleDisplayName</key>

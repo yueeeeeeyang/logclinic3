@@ -435,28 +435,37 @@ fn ensure_main_window(
     create_main_window(runtime, app)
 }
 
-/// 在主窗口中加载一组日志路径。
+/// 在主窗口中打开一组系统传入路径。
 ///
 /// 业务意图：
-/// - 启动参数、macOS open-url 和延迟处理的 pending URL 都应走同一条加载入口，保证文件、目录和压缩包行为一致。
+/// - 启动参数、macOS open-url 和延迟处理的 pending URL 都应走同一条入口，保证系统右键、拖拽和命令行启动行为一致。
+/// - `.hprof/.bin` 进入 HPROF 解析页，其余文件、目录和压缩包继续进入日志分析页。
 ///
 /// 边界条件：
-/// - 空路径集合不触发加载，避免覆盖用户当前工作区。
+/// - 空路径集合不触发加载或页面切换，避免覆盖用户当前工作区。
+/// - HPROF 页当前一次只解析一个 dump，分流层只会把首个 HPROF 候选放入计划。
 /// - 如果窗口在平台回调和加载之间被关闭，`update` 失败即可忽略，避免平台回调引发 panic。
-fn load_paths_in_main_window(
+fn open_paths_in_main_window(
     main_window: WindowHandle<MainView>,
     app: &mut App,
     paths: Vec<PathBuf>,
     message: &str,
 ) {
-    if paths.is_empty() {
+    let plan = classify_launch_paths(paths);
+    if plan.log_paths.is_empty() && plan.hprof_path.is_none() {
         return;
     }
 
     let message = message.to_string();
     main_window
         .update(app, |view, window, context| {
-            view.start_log_source_load(paths, message, context);
+            if !plan.log_paths.is_empty() {
+                view.navigation.active_main_feature = MainFeature::LogAnalysis;
+                view.start_log_source_load(plan.log_paths, message, context);
+            }
+            if let Some(hprof_path) = plan.hprof_path {
+                view.open_hprof_analysis_page(hprof_path, context);
+            }
             window.activate_window();
         })
         .ok();
@@ -498,7 +507,7 @@ pub(crate) fn run() {
                     main_window_runtime.borrow_mut().remember_app(app);
                     match ensure_main_window(&main_window_runtime, app) {
                         Ok(main_window) => {
-                            load_paths_in_main_window(main_window, app, paths, "正在加载拖入的日志")
+                            open_paths_in_main_window(main_window, app, paths, "正在加载拖入的日志")
                         }
                         Err(error) => {
                             eprintln!("macOS open-url 恢复 LogClinic 主窗口失败：{error}");
@@ -547,11 +556,11 @@ pub(crate) fn run() {
 
         let main_window = ensure_main_window(&main_window_runtime, app)
             .expect("创建 LogClinic 主窗口失败，应用无法继续启动");
-        load_paths_in_main_window(main_window, app, launch_paths, "正在加载启动传入的日志");
+        open_paths_in_main_window(main_window, app, launch_paths, "正在加载启动传入的日志");
 
         let pending_paths = log_source_paths_from_open_urls(pending_open_urls.take());
         if !pending_paths.is_empty() {
-            load_paths_in_main_window(main_window, app, pending_paths, "正在加载拖入的日志");
+            open_paths_in_main_window(main_window, app, pending_paths, "正在加载拖入的日志");
         }
     });
 }

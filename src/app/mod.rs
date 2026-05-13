@@ -27,7 +27,9 @@ use crate::archive::{
 };
 use crate::config::*;
 use crate::highlighting::{SyntaxTheme, highlight_line};
-use crate::launch::{log_source_paths_from_launch_arguments, log_source_paths_from_open_urls};
+use crate::launch::{
+    classify_launch_paths, log_source_paths_from_launch_arguments, log_source_paths_from_open_urls,
+};
 use crate::log_document;
 use crate::log_document::{EncodingChoice, LogContentError, LogTextEncoding, decode_log_bytes};
 use crate::log_document::{LargeLogOpenResult, LogTabDocument, open_log_source_for_tab};
@@ -40,6 +42,10 @@ use crate::search::{
 use crate::search::{
     count_query_occurrences_paged, find_paged_search_result_after_position,
     find_paged_search_result_before_position, search_paged_document,
+};
+use crate::shell_integration::{
+    ShellIntegrationStatus, query_shell_integration_status, register_shell_integration,
+    unregister_shell_integration,
 };
 use crate::theme::{AppThemePalette, EffectiveTheme, ThemePreference};
 use crate::thread_analysis::{

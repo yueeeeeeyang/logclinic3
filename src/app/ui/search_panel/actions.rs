@@ -311,28 +311,45 @@ impl MainView {
         app: &mut App,
     ) {
         main_view.update(app, |view, context| {
-            view.navigation.active_main_feature = MainFeature::HprofAnalysis;
-            view.log.tab_context_menu = None;
-            view.log.encoding_dropdown_menu = None;
-            view.search.search_results_context_menu = None;
-            view.log.log_viewer_context_menu = None;
-            view.log.log_tree_context_menu = None;
-            view.log.load_source_menu = None;
-
-            let hprof_view = if let Some(hprof_view) = view.hprof_analysis_view.clone() {
-                hprof_view
-            } else {
-                let main_view_for_hprof = context.entity();
-                let hprof_view =
-                    context.new(|context| HprofAnalysisView::new(main_view_for_hprof, context));
-                view.hprof_analysis_view = Some(hprof_view.clone());
-                hprof_view
-            };
-            hprof_view.update(context, |hprof_view, context| {
-                hprof_view.start_new_analysis(file_path, context);
-            });
-            context.notify();
+            view.open_hprof_analysis_page(file_path, context);
         });
+    }
+
+    /// 切换到 HPROF 页并启动指定 dump 的解析。
+    ///
+    /// 业务意图：
+    /// - 文件选择器、启动参数和系统右键菜单都需要复用同一条“进入 HPROF 页并解析”的状态流转。
+    /// - 该方法要求调用方已经持有 `MainView` 更新上下文，避免为了启动解析额外排队到下一帧。
+    ///
+    /// 边界条件：
+    /// - 重复打开新 dump 时复用旧 HPROF 实体，旧任务由 `HprofAnalysisView::start_new_analysis` 内部取消并用代次隔离。
+    /// - 方法内部统一通知主视图重绘，保证系统右键和启动参数这类无额外 UI 事件的入口也能立即切页。
+    pub(in crate::app) fn open_hprof_analysis_page(
+        &mut self,
+        file_path: PathBuf,
+        context: &mut Context<Self>,
+    ) {
+        self.navigation.active_main_feature = MainFeature::HprofAnalysis;
+        self.log.tab_context_menu = None;
+        self.log.encoding_dropdown_menu = None;
+        self.search.search_results_context_menu = None;
+        self.log.log_viewer_context_menu = None;
+        self.log.log_tree_context_menu = None;
+        self.log.load_source_menu = None;
+
+        let hprof_view = if let Some(hprof_view) = self.hprof_analysis_view.clone() {
+            hprof_view
+        } else {
+            let main_view_for_hprof = context.entity();
+            let hprof_view =
+                context.new(|context| HprofAnalysisView::new(main_view_for_hprof, context));
+            self.hprof_analysis_view = Some(hprof_view.clone());
+            hprof_view
+        };
+        hprof_view.update(context, |hprof_view, context| {
+            hprof_view.start_new_analysis(file_path, context);
+        });
+        context.notify();
     }
 
     /// 返回 HPROF 页的内嵌分析视图，如果尚未创建则创建空态视图。

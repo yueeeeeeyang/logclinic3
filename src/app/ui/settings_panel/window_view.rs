@@ -34,6 +34,8 @@ struct SettingsContentSnapshot {
     theme: ThemePreference,
     /// 日志正文字号。
     log_viewer_font_size: f32,
+    /// 系统右键菜单集成状态。
+    shell_integration_state: ShellIntegrationUiState,
     /// 快搜关键字是否处于编辑态。
     quick_search_keywords_is_editing: bool,
     /// 快搜关键字输入焦点。
@@ -73,10 +75,12 @@ impl SettingsWindowView {
             context.notify();
         });
 
-        Self {
+        let view = Self {
             main_view,
             _main_view_subscription: main_view_subscription,
-        }
+        };
+        view.refresh_shell_integration_status(context);
+        view
     }
 
     /// 切换设置窗口页签。
@@ -129,6 +133,101 @@ impl SettingsWindowView {
             }
         });
         context.notify();
+    }
+
+    /// 后台刷新系统右键菜单集成状态。
+    ///
+    /// 业务意图：
+    /// - 注册表和 LaunchServices 查询都可能访问系统服务，设置窗口打开时不能阻塞 UI 绘制。
+    /// - 查询结果写回主视图设置状态，独立设置窗口通过订阅自动重绘。
+    pub(in crate::app) fn refresh_shell_integration_status(&self, context: &mut Context<Self>) {
+        let main_view = self.main_view.clone();
+        self.main_view.update(context, |view, context| {
+            view.settings.shell_integration_state = ShellIntegrationUiState::Checking;
+            context.notify();
+        });
+        context
+            .spawn(async move |_settings_view, app| {
+                let status = app
+                    .background_executor()
+                    .spawn(async { query_shell_integration_status() })
+                    .await;
+                app.update(move |app| {
+                    main_view.update(app, |view, context| {
+                        view.settings.shell_integration_state =
+                            ShellIntegrationUiState::Ready(status);
+                        context.notify();
+                    });
+                })
+                .ok();
+            })
+            .detach();
+    }
+
+    /// 后台注册系统右键菜单入口。
+    ///
+    /// 业务意图：
+    /// - 用户点击注册后应立即看到执行中反馈；平台注册动作完成后再刷新为真实状态。
+    pub(in crate::app) fn register_shell_integration_from_settings(
+        &self,
+        context: &mut Context<Self>,
+    ) {
+        let main_view = self.main_view.clone();
+        self.main_view.update(context, |view, context| {
+            view.settings.shell_integration_state = ShellIntegrationUiState::Registering;
+            context.notify();
+        });
+        context
+            .spawn(async move |_settings_view, app| {
+                let result = app
+                    .background_executor()
+                    .spawn(async { register_shell_integration() })
+                    .await;
+                app.update(move |app| {
+                    main_view.update(app, |view, context| {
+                        view.settings.shell_integration_state = match result {
+                            Ok(status) => ShellIntegrationUiState::Ready(status),
+                            Err(message) => ShellIntegrationUiState::Failed(message),
+                        };
+                        context.notify();
+                    });
+                })
+                .ok();
+            })
+            .detach();
+    }
+
+    /// 后台卸载系统右键菜单入口。
+    ///
+    /// 业务意图：
+    /// - 卸载同样访问平台服务，必须和注册一样进入后台，避免设置窗口按钮卡住。
+    pub(in crate::app) fn unregister_shell_integration_from_settings(
+        &self,
+        context: &mut Context<Self>,
+    ) {
+        let main_view = self.main_view.clone();
+        self.main_view.update(context, |view, context| {
+            view.settings.shell_integration_state = ShellIntegrationUiState::Unregistering;
+            context.notify();
+        });
+        context
+            .spawn(async move |_settings_view, app| {
+                let result = app
+                    .background_executor()
+                    .spawn(async { unregister_shell_integration() })
+                    .await;
+                app.update(move |app| {
+                    main_view.update(app, |view, context| {
+                        view.settings.shell_integration_state = match result {
+                            Ok(status) => ShellIntegrationUiState::Ready(status),
+                            Err(message) => ShellIntegrationUiState::Failed(message),
+                        };
+                        context.notify();
+                    });
+                })
+                .ok();
+            })
+            .detach();
     }
 
     /// 处理线程日志分析过滤输入区键盘编辑。
@@ -419,6 +518,7 @@ impl SettingsWindowView {
             active_tab,
             theme,
             log_viewer_font_size,
+            shell_integration_state,
             quick_search_keywords_is_editing,
             quick_search_keywords_focus,
             thread_analysis_filter_is_editing,
@@ -426,9 +526,13 @@ impl SettingsWindowView {
             palette,
         } = snapshot;
         match active_tab {
-            SettingsTab::General => {
-                self.render_general_tab(theme, log_viewer_font_size, palette, context)
-            }
+            SettingsTab::General => self.render_general_tab(
+                theme,
+                log_viewer_font_size,
+                &shell_integration_state,
+                palette,
+                context,
+            ),
             SettingsTab::Log => self.render_log_tab(
                 quick_search_keywords_is_editing,
                 quick_search_keywords_focus,
@@ -453,6 +557,7 @@ impl Render for SettingsWindowView {
             active_tab,
             theme,
             log_viewer_font_size,
+            shell_integration_state,
             quick_search_keywords_is_editing,
             quick_search_keywords_focus,
             thread_analysis_filter_is_editing,
@@ -464,6 +569,7 @@ impl Render for SettingsWindowView {
                 main_view.settings.settings_active_tab,
                 main_view.settings.theme_preference,
                 main_view.settings.log_viewer_font_size,
+                main_view.settings.shell_integration_state.clone(),
                 main_view.settings.quick_search_keywords_is_editing,
                 main_view.settings.quick_search_keywords_focus.clone(),
                 main_view.settings.thread_analysis_filter_is_editing,
@@ -489,6 +595,7 @@ impl Render for SettingsWindowView {
                             active_tab,
                             theme,
                             log_viewer_font_size,
+                            shell_integration_state,
                             quick_search_keywords_is_editing,
                             quick_search_keywords_focus,
                             thread_analysis_filter_is_editing,

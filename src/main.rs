@@ -26,6 +26,7 @@ mod log_loader;
 mod log_source;
 mod notes;
 mod search;
+mod shell_integration;
 mod theme;
 mod thread_analysis;
 

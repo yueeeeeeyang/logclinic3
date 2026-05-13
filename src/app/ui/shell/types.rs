@@ -923,6 +923,63 @@ pub(in crate::app) struct ThreadAnalysisFilterLineLayout {
     pub(in crate::app) bounds: Bounds<Pixels>,
 }
 
+/// 系统右键菜单集成在设置页中的异步状态。
+///
+/// 业务意图：
+/// - 查询、注册和卸载都会触发平台命令或注册表访问，不能阻塞 GPUI 渲染线程。
+/// - UI 状态显式区分“正在查询”和“正在注册/卸载”，让按钮禁用和状态文案可预测。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::app) enum ShellIntegrationUiState {
+    /// 尚未查询过当前平台状态。
+    Unknown,
+    /// 正在后台查询当前平台注册状态。
+    Checking,
+    /// 已拿到平台模块返回的稳定状态。
+    Ready(ShellIntegrationStatus),
+    /// 正在后台注册右键菜单。
+    Registering,
+    /// 正在后台卸载右键菜单。
+    Unregistering,
+    /// 最近一次查询、注册或卸载失败。
+    Failed(String),
+}
+
+impl ShellIntegrationUiState {
+    /// 当前是否有后台任务正在执行。
+    pub(in crate::app) fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            Self::Checking | Self::Registering | Self::Unregistering
+        )
+    }
+
+    /// 返回设置页可展示的状态文本。
+    pub(in crate::app) fn message(&self) -> &str {
+        match self {
+            Self::Unknown => "尚未检查右键菜单状态",
+            Self::Checking => "正在检查右键菜单状态...",
+            Self::Ready(status) => status.message(),
+            Self::Registering => "正在注册右键菜单...",
+            Self::Unregistering => "正在卸载右键菜单...",
+            Self::Failed(message) => message,
+        }
+    }
+
+    /// 返回当前状态是否可以点击注册按钮。
+    pub(in crate::app) fn can_register(&self) -> bool {
+        match self {
+            Self::Ready(status) => status.is_available() && !status.is_registered(),
+            Self::Unknown | Self::Failed(_) => true,
+            Self::Checking | Self::Registering | Self::Unregistering => false,
+        }
+    }
+
+    /// 返回当前状态是否可以点击卸载按钮。
+    pub(in crate::app) fn can_unregister(&self) -> bool {
+        matches!(self, Self::Ready(status) if status.is_available() && status.is_registered())
+    }
+}
+
 /// 主窗口当前展示的大功能页。
 ///
 /// 业务意图：

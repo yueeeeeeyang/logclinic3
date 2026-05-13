@@ -200,6 +200,12 @@ pub(in crate::app) struct SettingsState {
     pub(in crate::app) theme_preference: ThemePreference,
     /// 日志正文显示字号。
     pub(in crate::app) log_viewer_font_size: f32,
+    /// 系统右键菜单集成状态。
+    ///
+    /// 业务意图：
+    /// - 注册和卸载右键菜单是跨会话平台副作用，设置页需要明确展示当前状态和执行中反馈。
+    /// - 状态只存在于当前 UI 会话，不写入配置文件；真实来源始终是平台注册表或 LaunchServices 查询结果。
+    pub(in crate::app) shell_integration_state: ShellIntegrationUiState,
     /// 线程日志分析过滤配置原文。
     pub(in crate::app) thread_analysis_filter_text: String,
     /// 线程日志分析过滤输入区是否处于编辑状态。
@@ -246,6 +252,7 @@ impl SettingsState {
             settings_active_tab: SettingsTab::General,
             theme_preference: load_theme_preference(),
             log_viewer_font_size: load_log_viewer_font_size_preference(),
+            shell_integration_state: ShellIntegrationUiState::Unknown,
             thread_analysis_filter_text: load_thread_analysis_filter_preference(),
             thread_analysis_filter_is_editing: false,
             thread_analysis_filter_saved_text_before_edit: None,
