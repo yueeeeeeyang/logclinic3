@@ -1050,6 +1050,7 @@ mod state_tests {
             case_sensitive: false,
             match_mode: SearchMatchMode::Literal,
             current_file_match_count: Some(7),
+            current_file_navigation_match: None,
             is_searching: false,
             progress: SearchProgress::default(),
             message: String::new(),
@@ -1072,6 +1073,39 @@ mod state_tests {
         assert_eq!(dialog.message, "已选择历史关键字，按 Enter 或点击搜索");
     }
 
+    /// 验证激活搜索输入框会全选现有关键字。
+    ///
+    /// 业务意图：
+    /// - 用户打开或重新激活搜索框时通常要替换关键字；全选行为必须直接体现在自绘输入框状态中。
+    #[test]
+    fn 激活搜索输入框会全选关键字并清理组合文本() {
+        let mut dialog = SearchDialogState {
+            query_input: SingleLineTextInputState {
+                text: "error日志".to_string(),
+                selection_range: 5..5,
+                marked_range: Some(0..5),
+                horizontal_scroll_px: 18.0,
+            },
+            query_history_menu_open: false,
+            scope: SearchScope::CurrentFile,
+            directory_input: SingleLineTextInputState::empty(),
+            case_sensitive: false,
+            match_mode: SearchMatchMode::Literal,
+            current_file_match_count: None,
+            current_file_navigation_match: None,
+            is_searching: false,
+            progress: SearchProgress::default(),
+            message: String::new(),
+            job_id: 0,
+        };
+
+        MainView::select_all_search_query(&mut dialog);
+
+        assert_eq!(dialog.query_input.selection_range, 0.."error日志".len());
+        assert!(dialog.query_input.marked_range.is_none());
+        assert_eq!(dialog.query_input.horizontal_scroll_px, 0.0);
+    }
+
     /// 验证切换正则模式会清空依赖旧匹配条件的当前文件计数缓存。
     ///
     /// 业务意图：
@@ -1091,6 +1125,7 @@ mod state_tests {
             case_sensitive: true,
             match_mode: SearchMatchMode::Literal,
             current_file_match_count: Some(12),
+            current_file_navigation_match: None,
             is_searching: false,
             progress: SearchProgress::default(),
             message: String::new(),
@@ -1124,6 +1159,7 @@ mod state_tests {
             case_sensitive: true,
             match_mode: SearchMatchMode::Literal,
             current_file_match_count: Some(3),
+            current_file_navigation_match: None,
             is_searching: true,
             progress: SearchProgress {
                 searched_files: 2,
@@ -1271,6 +1307,7 @@ mod state_tests {
             case_sensitive: false,
             match_mode: SearchMatchMode::Literal,
             current_file_match_count: Some(3),
+            current_file_navigation_match: None,
             is_searching: false,
             progress: SearchProgress::default(),
             message: String::new(),
@@ -2632,6 +2669,7 @@ mod state_tests {
             paged_scroll: PagedLogScrollState::default(),
             pending_scroll_to_line: None,
             highlighted_search_line: None,
+            highlighted_search_match: None,
             marked_lines: BTreeSet::new(),
             last_marker_jump_line: None,
             text_selection: None,
@@ -2724,6 +2762,7 @@ mod state_tests {
                 paged_scroll: PagedLogScrollState::default(),
                 pending_scroll_to_line: None,
                 highlighted_search_line: None,
+                highlighted_search_match: None,
                 marked_lines: BTreeSet::new(),
                 last_marker_jump_line: None,
                 text_selection: None,
@@ -2744,6 +2783,7 @@ mod state_tests {
                 paged_scroll: PagedLogScrollState::default(),
                 pending_scroll_to_line: None,
                 highlighted_search_line: None,
+                highlighted_search_match: None,
                 marked_lines: BTreeSet::new(),
                 last_marker_jump_line: None,
                 text_selection: None,
@@ -2758,6 +2798,82 @@ mod state_tests {
         assert_eq!(
             MainView::log_viewer_save_source_for_tab_from_tabs(&tabs, 99),
             None
+        );
+    }
+
+    /// 验证搜索条件变化只清理当前激活 tab 的片段高亮。
+    ///
+    /// 业务意图：
+    /// - 用户修改搜索框关键字后，当前正文中的旧关键字高亮必须立即失效，避免“未找到”时仍显示旧命中。
+    /// - 其它 tab 的高亮属于各自历史定位上下文，切换过去前不应被当前 tab 的输入动作误清。
+    #[test]
+    fn 搜索条件变化只清理当前_tab_片段高亮() {
+        let first_source = LogFileSource::LocalFile {
+            path: PathBuf::from("first.log"),
+        };
+        let second_source = LogFileSource::LocalFile {
+            path: PathBuf::from("second.log"),
+        };
+        let mut tabs = vec![
+            OpenLogTab {
+                id: 10,
+                source: first_source,
+                source_key: "local:first.log".to_string(),
+                title: "first.log".to_string(),
+                encoding_choice: EncodingChoice::Auto,
+                raw_bytes: None,
+                state: LogTabState::Loading {
+                    message: "测试加载中".to_string(),
+                },
+                scroll_handle: UniformListScrollHandle::new(),
+                paged_viewport_handle: ScrollHandle::new(),
+                paged_scroll: PagedLogScrollState::default(),
+                pending_scroll_to_line: None,
+                highlighted_search_line: None,
+                highlighted_search_match: Some(LogSearchMatchHighlight {
+                    line_index: 1,
+                    match_range: 0..5,
+                }),
+                marked_lines: BTreeSet::new(),
+                last_marker_jump_line: None,
+                text_selection: None,
+                selection_drag_anchor: None,
+            },
+            OpenLogTab {
+                id: 20,
+                source: second_source,
+                source_key: "local:second.log".to_string(),
+                title: "second.log".to_string(),
+                encoding_choice: EncodingChoice::Auto,
+                raw_bytes: None,
+                state: LogTabState::Loading {
+                    message: "测试加载中".to_string(),
+                },
+                scroll_handle: UniformListScrollHandle::new(),
+                paged_viewport_handle: ScrollHandle::new(),
+                paged_scroll: PagedLogScrollState::default(),
+                pending_scroll_to_line: None,
+                highlighted_search_line: None,
+                highlighted_search_match: Some(LogSearchMatchHighlight {
+                    line_index: 2,
+                    match_range: 6..11,
+                }),
+                marked_lines: BTreeSet::new(),
+                last_marker_jump_line: None,
+                text_selection: None,
+                selection_drag_anchor: None,
+            },
+        ];
+
+        MainView::clear_log_tab_search_match_highlight_for_active(&mut tabs, Some(10));
+
+        assert!(tabs[0].highlighted_search_match.is_none());
+        assert_eq!(
+            tabs[1].highlighted_search_match,
+            Some(LogSearchMatchHighlight {
+                line_index: 2,
+                match_range: 6..11,
+            })
         );
     }
 

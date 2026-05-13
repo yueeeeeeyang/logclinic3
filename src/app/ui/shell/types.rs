@@ -368,12 +368,21 @@ pub(in crate::app) struct OpenLogTab {
     /// - 搜索结果点击可能打开一个尚未读取完成的新 tab，目标行必须暂存到 tab 上，等后台解码成功后再滚动。
     /// - 使用 0 基行号与 `DecodedLogDocument.lines` 下标保持一致，避免 UI 展示行号和数据下标混用。
     pub(in crate::app) pending_scroll_to_line: Option<usize>,
-    /// 最近一次通过搜索结果跳转的命中行。
+    /// 最近一次需要整行提示的跳转目标行。
     ///
     /// 业务意图：
-    /// - 点击搜索结果后不仅要滚动到目标位置，还要用背景色标记命中行，避免用户在密集日志中丢失上下文。
+    /// - 行标记跳转仍需要用整行背景提示目标行，避免用户在密集日志中丢失上下文。
     /// - 该状态只属于当前 tab 的临时视觉反馈，不持久化，也不影响日志语法高亮。
     pub(in crate::app) highlighted_search_line: Option<usize>,
+    /// 最近一次搜索关键字跳转的命中片段。
+    ///
+    /// 业务意图：
+    /// - 搜索结果点击以及搜索窗口“上一个/下一个”跳转只高亮关键字本身，不再铺满整行背景。
+    /// - 命中范围使用原始日志行内的 UTF-8 字节下标，渲染阶段会映射到展开 `\t` 后的显示文本。
+    ///
+    /// 边界条件：
+    /// - 文件重新解码、关闭 tab 或行标记跳转时必须清空，避免旧范围套到新文本上。
+    pub(in crate::app) highlighted_search_match: Option<LogSearchMatchHighlight>,
     /// 当前 tab 内由用户手动打标的日志行。
     ///
     /// 业务意图：
@@ -406,6 +415,19 @@ pub(in crate::app) struct OpenLogTab {
     /// - 鼠标按下确定锚点，后续移动只更新焦点，才能正确支持从下往上或从右往左反向选择。
     /// - 鼠标释放后清空该临时字段，但保留 `text_selection` 供复制和搜索预填使用。
     pub(in crate::app) selection_drag_anchor: Option<LogTextPosition>,
+}
+
+/// 日志正文中的搜索命中片段高亮。
+///
+/// 业务意图：
+/// - 搜索任务结果使用 `SearchResultItem` 描述跨文件命中；打开到具体 tab 后只需要保存行号和原始行内范围，
+///   让日志渲染层在当前文本中绘制关键字背景。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::app) struct LogSearchMatchHighlight {
+    /// 0 基日志行号。
+    pub(in crate::app) line_index: usize,
+    /// 原始日志行内的 UTF-8 字节范围。
+    pub(in crate::app) match_range: Range<usize>,
 }
 
 /// 分页日志的逻辑滚动位置。
@@ -1221,6 +1243,16 @@ pub(in crate::app) struct SearchDialogState {
     /// 边界条件：
     /// - `None` 表示没有关键字、没有当前文件、当前文件仍在加载或打开失败；UI 应展示占位而不是误报 0。
     pub(in crate::app) current_file_match_count: Option<usize>,
+    /// 当前搜索框轻量导航最近定位到的当前文件命中片段。
+    ///
+    /// 业务意图：
+    /// - 用户在搜索框输入关键字后应自动从文件顶部定位第一处命中，“下一个/上一个”按钮再从该片段继续查找。
+    /// - 记录命中范围而不是只记录行号，是为了支持同一行内多个关键字逐个跳转。
+    /// - 该字段只服务搜索窗口内的当前文件导航，不写入结果面板，也不持久化到搜索历史。
+    ///
+    /// 边界条件：
+    /// - 查询词、匹配模式、大小写或当前 tab 变化后必须清空，避免“下一个”沿用旧条件的命中范围。
+    pub(in crate::app) current_file_navigation_match: Option<LogSearchMatchHighlight>,
     /// 当前是否有后台搜索任务仍在运行。
     pub(in crate::app) is_searching: bool,
     /// 当前搜索任务的进度快照。

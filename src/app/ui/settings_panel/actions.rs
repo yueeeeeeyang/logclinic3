@@ -6,6 +6,21 @@
 
 use super::*;
 
+/// 搜索框当前文件轻量导航方向。
+///
+/// 业务意图：
+/// - 输入关键字自动从顶部定位第一条命中，“上一个/下一个”则基于上一次命中行继续前后跳转。
+/// - 用显式枚举避免多个布尔参数组合后难以判断“从顶部搜索”和“反向搜索”的真实含义。
+#[derive(Clone, Copy)]
+enum CurrentFileSearchNavigation {
+    /// 从文件顶部开始查找第一条命中。
+    FirstFromTop,
+    /// 从上一次命中之后继续向后查找。
+    Next,
+    /// 从上一次命中之前继续向前查找。
+    Previous,
+}
+
 impl MainView {
     /// 读取搜索输入框当前文本、选择范围和组合文本范围的快照。
     ///
@@ -1449,6 +1464,7 @@ impl MainView {
             if let Some(text) = clipboard_text {
                 let text_is_not_empty = !text.is_empty();
                 if text_is_not_empty {
+                    let mut should_jump_from_top = false;
                     if let Some(dialog) = self.search.search_dialog.as_mut() {
                         if input_kind == SearchTextInputKind::Query {
                             dialog.query_history_menu_open = false;
@@ -1463,9 +1479,14 @@ impl MainView {
                         );
                         if input_kind == SearchTextInputKind::Query {
                             dialog.current_file_match_count = None;
+                            dialog.current_file_navigation_match = None;
+                            should_jump_from_top = true;
                         }
                     }
                     self.touch_search_text_cursor_activity();
+                    if should_jump_from_top {
+                        self.jump_search_query_in_current_file(true, context);
+                    }
                     context.stop_propagation();
                     context.notify();
                     return;
@@ -1565,6 +1586,7 @@ impl MainView {
                 }
                 if input_kind == SearchTextInputKind::Query {
                     self.clear_search_current_file_match_count();
+                    self.jump_search_query_in_current_file(true, context);
                 }
                 self.touch_search_text_cursor_activity();
                 context.stop_propagation();
@@ -1586,6 +1608,7 @@ impl MainView {
                 }
                 if input_kind == SearchTextInputKind::Query {
                     self.clear_search_current_file_match_count();
+                    self.jump_search_query_in_current_file(true, context);
                 }
                 self.touch_search_text_cursor_activity();
                 context.stop_propagation();
@@ -2241,6 +2264,7 @@ impl MainView {
         dialog.query_input.horizontal_scroll_px = 0.0;
         dialog.query_history_menu_open = false;
         dialog.current_file_match_count = None;
+        dialog.current_file_navigation_match = None;
         dialog.message = "已粘贴剪贴板文本，按 Enter 或点击搜索".to_string();
     }
 
@@ -2476,14 +2500,83 @@ impl MainView {
         }
     }
 
+    /// 返回当前激活 tab 的来源和文档。
+    ///
+    /// 业务意图：
+    /// - 搜索框的“输入即定位”和“下一个”需要构造可复用的 `SearchResultItem`，其中既包含当前文档正文，
+    ///   也包含文件来源、展示名称和稳定键。
+    ///
+    /// 边界条件：
+    /// - 没有活动 tab、tab 仍在加载或打开失败时返回 `None`；调用方应保持按钮不可用或展示中文提示。
+    pub(in crate::app) fn active_log_tab_source_and_document(
+        &self,
+    ) -> Option<(LogFileSource, LogTabDocument)> {
+        let active_tab_id = self.log.active_tab_id?;
+        let active_tab = self
+            .log
+            .open_tabs
+            .iter()
+            .find(|tab| tab.id == active_tab_id)?;
+        match &active_tab.state {
+            LogTabState::Ready { document } => {
+                Some((active_tab.source.clone(), document.as_ref().clone()))
+            }
+            LogTabState::Loading { .. } | LogTabState::Failed { .. } => None,
+        }
+    }
+
+    /// 清理当前激活 tab 的搜索片段高亮。
+    ///
+    /// 业务意图：
+    /// - 搜索框关键字、大小写、正则模式或当前文件变化后，旧片段高亮不再代表当前搜索条件。
+    /// - 该清理只影响搜索关键字片段，不清行标记跳转的整行提示，避免破坏用户手动标记工作流。
+    pub(in crate::app) fn clear_active_log_tab_search_match_highlight(&mut self) {
+        Self::clear_log_tab_search_match_highlight_for_active(
+            &mut self.log.open_tabs,
+            self.log.active_tab_id,
+        );
+    }
+
+    /// 按活动 tab ID 清理搜索片段高亮。
+    ///
+    /// 实现原因：
+    /// - 将纯状态变更拆成静态 helper，测试无需构造完整 GPUI `MainView` 也能覆盖“只清当前 tab”的边界。
+    pub(in crate::app) fn clear_log_tab_search_match_highlight_for_active(
+        open_tabs: &mut [OpenLogTab],
+        active_tab_id: Option<usize>,
+    ) {
+        let Some(active_tab_id) = active_tab_id else {
+            return;
+        };
+        if let Some(tab) = open_tabs.iter_mut().find(|tab| tab.id == active_tab_id) {
+            tab.highlighted_search_match = None;
+        }
+    }
+
+    /// 将 UI 层高亮状态转换为搜索核心使用的轻量导航位置。
+    ///
+    /// 业务意图：
+    /// - UI 渲染状态和搜索核心类型保持边界分离；跳转前只提取行号与 UTF-8 字节范围。
+    fn search_match_position_from_highlight(
+        highlight: &LogSearchMatchHighlight,
+    ) -> SearchMatchPosition {
+        SearchMatchPosition {
+            line_index: highlight.line_index,
+            match_range: highlight.match_range.clone(),
+        }
+    }
+
     /// 清空当前文件计数缓存。
     ///
     /// 业务意图：
-    /// - 查询词、大小写选项、活动 tab 或解码内容变化后，旧计数不再代表当前条件，必须清空。
+    /// - 查询词、大小写选项、活动 tab 或解码内容变化后，旧计数和“下一个”起点不再代表当前条件，必须清空。
     pub(in crate::app) fn clear_search_current_file_match_count(&mut self) {
+        self.search.current_file_navigation_request_id += 1;
         if let Some(dialog) = self.search.search_dialog.as_mut() {
             dialog.current_file_match_count = None;
+            dialog.current_file_navigation_match = None;
         }
+        self.clear_active_log_tab_search_match_highlight();
     }
 
     /// 设置搜索对话框匹配模式并清理依赖旧条件的临时状态。
@@ -2503,10 +2596,225 @@ impl MainView {
         dialog.match_mode = match_mode;
         dialog.query_history_menu_open = false;
         dialog.current_file_match_count = None;
+        dialog.current_file_navigation_match = None;
         dialog.message = match match_mode {
             SearchMatchMode::Literal => "已切换为普通文本搜索".to_string(),
             SearchMatchMode::Regex => "已切换为正则搜索，大小写由表达式控制".to_string(),
         };
+    }
+
+    /// 判断“下一个”按钮是否具备当前文件内跳转条件。
+    ///
+    /// 业务意图：
+    /// - “下一个”是轻量当前文件导航，不启动后台搜索任务；只要查询词非空且当前文件已打开完成即可尝试定位。
+    pub(in crate::app) fn search_can_jump_next_current_file(
+        &self,
+        dialog: &SearchDialogState,
+    ) -> bool {
+        !dialog.query_input.text.trim().is_empty() && self.active_log_tab_document().is_some()
+    }
+
+    /// 从当前搜索框条件生成当前文件导航选项。
+    ///
+    /// 实现原因：
+    /// - 输入即定位、下一个和计数都必须共享大小写、正则模式和空查询校验，避免同一个搜索框出现三套匹配语义。
+    fn current_file_navigation_options(
+        &self,
+    ) -> Option<(SearchOptions, Option<LogSearchMatchHighlight>, bool)> {
+        let dialog = self.search.search_dialog.as_ref()?;
+        let options = SearchOptions::single_with_mode(
+            dialog.query_input.text.trim().to_string(),
+            dialog.case_sensitive,
+            dialog.match_mode,
+        );
+        let previous_match = dialog.current_file_navigation_match.clone();
+        Some((options, previous_match, dialog.is_searching))
+    }
+
+    /// 根据当前搜索框条件定位当前文件中的命中行。
+    ///
+    /// 业务意图：
+    /// - 输入关键字后从文件顶部定位第一条命中；点击“下一个”从上一次定位行之后继续查找，并在末尾自动绕回顶部。
+    /// - 该路径只滚动当前已打开文件，不创建底部搜索结果记录，也不扫描当前目录。
+    ///
+    /// 边界条件：
+    /// - 正则表达式无效时展示中文错误并清空轻量导航起点。
+    /// - 当前文件尚未打开完成时展示提示，不触发文件读取。
+    pub(in crate::app) fn jump_search_query_in_current_file(
+        &mut self,
+        start_from_top: bool,
+        context: &mut Context<Self>,
+    ) {
+        let navigation = if start_from_top {
+            CurrentFileSearchNavigation::FirstFromTop
+        } else {
+            CurrentFileSearchNavigation::Next
+        };
+        self.jump_search_query_in_current_file_with_direction(navigation, context);
+    }
+
+    /// 定位当前文件中的上一个搜索命中。
+    ///
+    /// 业务意图：
+    /// - 搜索窗口上箭头按钮需要从当前命中向文件头方向查找，并在到达顶部后从文件末尾绕回。
+    pub(in crate::app) fn jump_previous_search_query_in_current_file(
+        &mut self,
+        context: &mut Context<Self>,
+    ) {
+        self.jump_search_query_in_current_file_with_direction(
+            CurrentFileSearchNavigation::Previous,
+            context,
+        );
+    }
+
+    /// 根据指定方向定位当前文件中的搜索命中。
+    ///
+    /// 业务意图：
+    /// - 输入即定位、上一个和下一个共享同一套校验、分页后台执行和过期请求丢弃逻辑。
+    fn jump_search_query_in_current_file_with_direction(
+        &mut self,
+        navigation: CurrentFileSearchNavigation,
+        context: &mut Context<Self>,
+    ) {
+        let Some((options, previous_match, is_searching)) = self.current_file_navigation_options()
+        else {
+            return;
+        };
+        if is_searching {
+            return;
+        }
+        if options.is_empty_query() {
+            self.clear_search_current_file_match_count();
+            context.notify();
+            return;
+        }
+        if let Err(error) = options.validate() {
+            self.clear_search_current_file_match_count();
+            self.update_search_dialog_message(error.to_string(), context);
+            return;
+        }
+        let Some((source, document)) = self.active_log_tab_source_and_document() else {
+            self.update_search_dialog_message("当前文件未打开完成，无法定位", context);
+            return;
+        };
+
+        let previous_position = previous_match
+            .as_ref()
+            .map(Self::search_match_position_from_highlight);
+        let wrap = match navigation {
+            CurrentFileSearchNavigation::FirstFromTop => false,
+            CurrentFileSearchNavigation::Next | CurrentFileSearchNavigation::Previous => {
+                previous_position.is_some()
+            }
+        };
+        self.search.current_file_navigation_request_id += 1;
+        let request_id = self.search.current_file_navigation_request_id;
+        match document {
+            LogTabDocument::InMemory(document) => {
+                let result = match navigation {
+                    CurrentFileSearchNavigation::FirstFromTop => find_search_result_after_position(
+                        &source,
+                        document.lines.as_ref(),
+                        &options,
+                        None,
+                        false,
+                    ),
+                    CurrentFileSearchNavigation::Next => find_search_result_after_position(
+                        &source,
+                        document.lines.as_ref(),
+                        &options,
+                        previous_position.as_ref(),
+                        wrap,
+                    ),
+                    CurrentFileSearchNavigation::Previous => find_search_result_before_position(
+                        &source,
+                        document.lines.as_ref(),
+                        &options,
+                        previous_position.as_ref(),
+                        wrap,
+                    ),
+                };
+                self.apply_current_file_navigation_result(request_id, result, context);
+            }
+            LogTabDocument::Paged(document) => {
+                if let Some(dialog) = self.search.search_dialog.as_mut() {
+                    dialog.message = "正在定位当前文件...".to_string();
+                }
+                context
+                    .spawn(async move |view, app| {
+                        let result = app
+                            .background_executor()
+                            .spawn(async move {
+                                match navigation {
+                                    CurrentFileSearchNavigation::FirstFromTop => {
+                                        find_paged_search_result_after_position(
+                                            &document, &options, None, false,
+                                        )
+                                    }
+                                    CurrentFileSearchNavigation::Next => {
+                                        find_paged_search_result_after_position(
+                                            &document,
+                                            &options,
+                                            previous_position.as_ref(),
+                                            wrap,
+                                        )
+                                    }
+                                    CurrentFileSearchNavigation::Previous => {
+                                        find_paged_search_result_before_position(
+                                            &document,
+                                            &options,
+                                            previous_position.as_ref(),
+                                            wrap,
+                                        )
+                                    }
+                                }
+                            })
+                            .await;
+                        view.update(app, move |view, context| {
+                            view.apply_current_file_navigation_result(request_id, result, context);
+                        })
+                        .ok();
+                    })
+                    .detach();
+                context.notify();
+            }
+        }
+    }
+
+    /// 应用当前文件轻量定位结果。
+    ///
+    /// 业务意图：
+    /// - 内存日志会同步返回定位结果，分页日志会从后台线程回调；两条路径必须统一检查请求 ID、
+    ///   更新搜索窗口提示，并复用搜索结果跳转逻辑滚动到命中行。
+    ///
+    /// 边界条件：
+    /// - 如果用户继续输入、切换 tab、关闭搜索窗口或重新加载日志，请求 ID 会变化，旧结果必须直接丢弃。
+    fn apply_current_file_navigation_result(
+        &mut self,
+        request_id: usize,
+        result: Option<SearchResultItem>,
+        context: &mut Context<Self>,
+    ) {
+        if self.search.current_file_navigation_request_id != request_id {
+            return;
+        }
+        if let Some(result) = result {
+            let line_index = result.line_index;
+            let navigation_match = LogSearchMatchHighlight {
+                line_index,
+                match_range: result.match_range.clone(),
+            };
+            self.open_search_result(result, context);
+            if let Some(dialog) = self.search.search_dialog.as_mut() {
+                dialog.current_file_navigation_match = Some(navigation_match);
+                dialog.message = format!("已定位到第 {} 行", line_index + 1);
+            }
+        } else if let Some(dialog) = self.search.search_dialog.as_mut() {
+            dialog.current_file_navigation_match = None;
+            dialog.message = "当前文件未找到匹配项".to_string();
+            self.clear_active_log_tab_search_match_highlight();
+        }
+        context.notify();
     }
 
     /// 统计搜索关键字在当前文件中的出现次数。

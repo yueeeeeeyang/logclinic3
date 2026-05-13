@@ -131,6 +131,12 @@ pub(in crate::app) struct SearchWorkspaceState {
     pub(in crate::app) search_results_context_menu: Option<SearchResultsContextMenu>,
     /// 下一个搜索任务 ID。
     pub(in crate::app) next_search_job_id: usize,
+    /// 当前文件轻量定位请求 ID。
+    ///
+    /// 业务意图：
+    /// - 搜索输入框会在用户输入后自动定位当前文件第一处命中；分页大日志定位在后台线程执行，
+    ///   需要用请求 ID 丢弃旧输入产生的过期回调，避免把界面滚回旧关键字。
+    pub(in crate::app) current_file_navigation_request_id: usize,
     /// 搜索输入框焦点句柄。
     pub(in crate::app) search_input_focus: gpui::FocusHandle,
     /// 当前目录搜索目标输入框焦点句柄。
@@ -165,6 +171,7 @@ impl SearchWorkspaceState {
             search_results_scrollbar_drag: None,
             search_results_context_menu: None,
             next_search_job_id: 1,
+            current_file_navigation_request_id: 0,
             search_input_focus: context.focus_handle(),
             search_directory_focus: context.focus_handle(),
             search_query_last_layout: None,

@@ -141,6 +141,7 @@ impl SearchDialogWindowView {
     /// 切换大小写匹配选项。
     pub(in crate::app) fn toggle_case_sensitive(&mut self, context: &mut Context<Self>) {
         self.main_view.update(context, |view, context| {
+            let mut changed = false;
             if let Some(dialog) = view.search.search_dialog.as_mut() {
                 if dialog.match_mode == SearchMatchMode::Regex {
                     dialog.query_history_menu_open = false;
@@ -150,6 +151,12 @@ impl SearchDialogWindowView {
                 dialog.case_sensitive = !dialog.case_sensitive;
                 dialog.query_history_menu_open = false;
                 dialog.current_file_match_count = None;
+                dialog.current_file_navigation_match = None;
+                changed = true;
+            }
+            if changed {
+                view.search.current_file_navigation_request_id += 1;
+                view.clear_active_log_tab_search_match_highlight();
             }
             context.notify();
         });
@@ -162,8 +169,15 @@ impl SearchDialogWindowView {
     /// - 正则开关只影响普通搜索和当前文件计数，不影响快搜；状态仍保存在主窗口搜索对话框里。
     pub(in crate::app) fn toggle_regex_mode(&mut self, context: &mut Context<Self>) {
         self.main_view.update(context, |view, context| {
+            let mut changed = false;
             if let Some(dialog) = view.search.search_dialog.as_mut() {
+                let before = dialog.match_mode;
                 MainView::set_search_dialog_match_mode(dialog, dialog.match_mode.toggled());
+                changed = dialog.match_mode != before;
+            }
+            if changed {
+                view.search.current_file_navigation_request_id += 1;
+                view.clear_active_log_tab_search_match_highlight();
             }
             context.notify();
         });
@@ -177,6 +191,34 @@ impl SearchDialogWindowView {
                 dialog.query_history_menu_open = false;
             }
             view.count_search_query_in_current_file(context);
+        });
+        context.notify();
+    }
+
+    /// 跳转到当前文件中搜索关键字的下一条命中。
+    ///
+    /// 业务意图：
+    /// - “下一个”按钮只服务当前文件快速定位，不启动完整搜索任务，也不关闭搜索窗口。
+    pub(in crate::app) fn jump_next_current_file_match(&mut self, context: &mut Context<Self>) {
+        self.main_view.update(context, |view, context| {
+            if let Some(dialog) = view.search.search_dialog.as_mut() {
+                dialog.query_history_menu_open = false;
+            }
+            view.jump_search_query_in_current_file(false, context);
+        });
+        context.notify();
+    }
+
+    /// 跳转到当前文件中搜索关键字的上一条命中。
+    ///
+    /// 业务意图：
+    /// - 上箭头按钮与“下一个”共享当前文件轻量导航，只改变查找方向，不启动完整搜索任务。
+    pub(in crate::app) fn jump_previous_current_file_match(&mut self, context: &mut Context<Self>) {
+        self.main_view.update(context, |view, context| {
+            if let Some(dialog) = view.search.search_dialog.as_mut() {
+                dialog.query_history_menu_open = false;
+            }
+            view.jump_previous_search_query_in_current_file(context);
         });
         context.notify();
     }
@@ -212,15 +254,27 @@ impl SearchDialogWindowView {
     ///
     /// 业务意图：
     /// - GPUI 当前版本的文本输入能力通过自定义元素注册到平台输入协议；鼠标事件仍需要回写到业务状态。
-    /// - 单击定位光标，双击选中当前词，三连击选中整段输入，符合常见系统文本框习惯。
+    /// - 首次激活搜索框时全选关键字，方便直接替换；已聚焦状态下继续保留单击定位、双击选词、三击全选的常见习惯。
     pub(in crate::app) fn handle_query_input_mouse_down(
         &mut self,
         event: &MouseDownEvent,
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
+        let search_was_focused = self
+            .main_view
+            .read(context)
+            .search
+            .search_input_focus
+            .is_focused(window);
         let focus_handle = self.main_view.update(context, |view, context| {
-            view.start_search_text_mouse_selection(SearchTextInputKind::Query, event, context);
+            if search_was_focused {
+                view.start_search_text_mouse_selection(SearchTextInputKind::Query, event, context);
+            } else if let Some(dialog) = view.search.search_dialog.as_mut() {
+                MainView::select_all_search_query(dialog);
+                view.touch_search_text_cursor_activity();
+                context.notify();
+            }
             view.search.search_input_focus.clone()
         });
         window.focus(&focus_handle);
@@ -315,8 +369,14 @@ impl SearchDialogWindowView {
         context: &mut Context<Self>,
     ) {
         let focus_handle = self.main_view.update(context, |view, context| {
+            let mut applied = false;
             if let Some(dialog) = view.search.search_dialog.as_mut() {
                 MainView::apply_search_history_query(dialog, &item);
+                applied = true;
+            }
+            if applied {
+                view.search.current_file_navigation_request_id += 1;
+                view.clear_active_log_tab_search_match_highlight();
             }
             context.notify();
             view.search.search_input_focus.clone()
@@ -842,16 +902,17 @@ impl SearchDialogWindowView {
             )
     }
 
-    /// 渲染搜索窗口右下角操作按钮。
+    /// 渲染搜索窗口底部操作按钮。
     ///
     /// 业务意图：
-    /// - 计数和搜索都是执行类动作，放到窗口右下角更符合常见对话框布局。
+    /// - 快搜是独立快捷入口，固定在左下角；计数、下一个和搜索属于当前关键字动作，集中在右下角。
     /// - 计数按钮文案固定为“计数”，计数结果只写入状态提示，避免按钮宽度随结果变化导致布局跳动。
     fn render_action_buttons(
         &self,
         can_search: bool,
         can_quick_search: bool,
         can_count: bool,
+        can_jump_next: bool,
         is_searching: bool,
         palette: AppThemePalette,
         context: &mut Context<Self>,
@@ -877,53 +938,8 @@ impl SearchDialogWindowView {
         div()
             .flex()
             .items_center()
-            .justify_end()
-            .gap_2()
-            .child(
-                div()
-                    .id("search-dialog-window-count-current-file")
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap_1()
-                    .h(px(28.0))
-                    .px_3()
-                    .rounded(px(5.0))
-                    .text_xs()
-                    .text_color(rgb(if can_count {
-                        palette.accent
-                    } else {
-                        palette.muted_text
-                    }))
-                    .border_1()
-                    .border_color(rgb(palette.border))
-                    .bg(rgb(palette.panel))
-                    .when(can_count, |button| {
-                        button
-                            .cursor_pointer()
-                            .hover(move |button| button.bg(rgb(palette.hover)))
-                    })
-                    .when(!can_count, |button| button.opacity(0.72))
-                    .child(MainView::render_lucide_icon(
-                        Some(Icon::Search),
-                        12.0,
-                        12.0,
-                        if can_count {
-                            palette.accent
-                        } else {
-                            palette.muted_text
-                        },
-                    ))
-                    .child("计数")
-                    .on_click(context.listener(
-                        move |view, _event: &ClickEvent, _window, context| {
-                            if can_count {
-                                view.count_current_file_matches(context);
-                            }
-                            context.stop_propagation();
-                        },
-                    )),
-            )
+            .justify_between()
+            .gap_3()
             .child(
                 div()
                     .id("search-dialog-window-quick-search")
@@ -971,40 +987,179 @@ impl SearchDialogWindowView {
             )
             .child(
                 div()
-                    .id("search-dialog-window-submit")
                     .flex()
                     .items_center()
-                    .justify_center()
-                    .gap_1()
-                    .h(px(28.0))
-                    .px_3()
-                    .rounded(px(5.0))
-                    .text_xs()
-                    .text_color(rgb(palette.on_accent))
-                    .bg(rgb(submit_background))
-                    .when(submit_enabled, |button| {
-                        button
-                            .cursor_pointer()
-                            .hover(move |button| button.bg(rgb(submit_hover_background)))
-                    })
-                    .when(!submit_enabled, |button| button.opacity(0.72))
-                    .child(MainView::render_lucide_icon(
-                        Some(submit_icon),
-                        12.0,
-                        12.0,
-                        palette.on_accent,
-                    ))
-                    .child(submit_label)
-                    .on_click(context.listener(
-                        move |view, _event: &ClickEvent, _window, context| {
-                            if is_searching {
-                                view.stop_search(context);
-                            } else if can_search {
-                                view.start_search(context);
-                            }
-                            context.stop_propagation();
-                        },
-                    )),
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("search-dialog-window-count-current-file")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap_1()
+                            .h(px(28.0))
+                            .px_3()
+                            .rounded(px(5.0))
+                            .text_xs()
+                            .text_color(rgb(if can_count {
+                                palette.accent
+                            } else {
+                                palette.muted_text
+                            }))
+                            .border_1()
+                            .border_color(rgb(palette.border))
+                            .bg(rgb(palette.panel))
+                            .when(can_count, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .hover(move |button| button.bg(rgb(palette.hover)))
+                            })
+                            .when(!can_count, |button| button.opacity(0.72))
+                            .child(MainView::render_lucide_icon(
+                                Some(Icon::Search),
+                                12.0,
+                                12.0,
+                                if can_count {
+                                    palette.accent
+                                } else {
+                                    palette.muted_text
+                                },
+                            ))
+                            .child("计数")
+                            .on_click(context.listener(
+                                move |view, _event: &ClickEvent, _window, context| {
+                                    if can_count {
+                                        view.count_current_file_matches(context);
+                                    }
+                                    context.stop_propagation();
+                                },
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("search-dialog-window-previous-current-file")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(28.0))
+                            .w(px(30.0))
+                            .rounded(px(5.0))
+                            .text_color(rgb(if can_jump_next {
+                                palette.accent
+                            } else {
+                                palette.muted_text
+                            }))
+                            .border_1()
+                            .border_color(rgb(palette.border))
+                            .bg(rgb(palette.panel))
+                            .when(can_jump_next, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .hover(move |button| button.bg(rgb(palette.hover)))
+                            })
+                            .when(!can_jump_next, |button| button.opacity(0.72))
+                            .child(MainView::render_lucide_icon(
+                                Some(Icon::ChevronUp),
+                                13.0,
+                                13.0,
+                                if can_jump_next {
+                                    palette.accent
+                                } else {
+                                    palette.muted_text
+                                },
+                            ))
+                            .on_click(context.listener(
+                                move |view, _event: &ClickEvent, _window, context| {
+                                    if can_jump_next {
+                                        view.jump_previous_current_file_match(context);
+                                    }
+                                    context.stop_propagation();
+                                },
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("search-dialog-window-next-current-file")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap_1()
+                            .h(px(28.0))
+                            .px_3()
+                            .rounded(px(5.0))
+                            .text_xs()
+                            .text_color(rgb(if can_jump_next {
+                                palette.accent
+                            } else {
+                                palette.muted_text
+                            }))
+                            .border_1()
+                            .border_color(rgb(palette.border))
+                            .bg(rgb(palette.panel))
+                            .when(can_jump_next, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .hover(move |button| button.bg(rgb(palette.hover)))
+                            })
+                            .when(!can_jump_next, |button| button.opacity(0.72))
+                            .child(MainView::render_lucide_icon(
+                                Some(Icon::ChevronDown),
+                                12.0,
+                                12.0,
+                                if can_jump_next {
+                                    palette.accent
+                                } else {
+                                    palette.muted_text
+                                },
+                            ))
+                            .child("下一个")
+                            .on_click(context.listener(
+                                move |view, _event: &ClickEvent, _window, context| {
+                                    if can_jump_next {
+                                        view.jump_next_current_file_match(context);
+                                    }
+                                    context.stop_propagation();
+                                },
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("search-dialog-window-submit")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap_1()
+                            .h(px(28.0))
+                            .px_3()
+                            .rounded(px(5.0))
+                            .text_xs()
+                            .text_color(rgb(palette.on_accent))
+                            .bg(rgb(submit_background))
+                            .when(submit_enabled, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .hover(move |button| button.bg(rgb(submit_hover_background)))
+                            })
+                            .when(!submit_enabled, |button| button.opacity(0.72))
+                            .child(MainView::render_lucide_icon(
+                                Some(submit_icon),
+                                12.0,
+                                12.0,
+                                palette.on_accent,
+                            ))
+                            .child(submit_label)
+                            .on_click(context.listener(
+                                move |view, _event: &ClickEvent, _window, context| {
+                                    if is_searching {
+                                        view.stop_search(context);
+                                    } else if can_search {
+                                        view.start_search(context);
+                                    }
+                                    context.stop_propagation();
+                                },
+                            )),
+                    ),
             )
     }
 }
@@ -1021,6 +1176,7 @@ impl Render for SearchDialogWindowView {
             can_search,
             can_quick_search,
             can_count,
+            can_jump_next,
             search_query_history,
             search_focus,
             directory_focus,
@@ -1039,6 +1195,7 @@ impl Render for SearchDialogWindowView {
                 main_view.search_can_start(&dialog),
                 main_view.quick_search_can_start(&dialog),
                 main_view.search_can_count_current_file(&dialog) && !dialog.is_searching,
+                main_view.search_can_jump_next_current_file(&dialog) && !dialog.is_searching,
                 main_view.search.search_query_history.clone(),
                 main_view.search.search_input_focus.clone(),
                 main_view.search.search_directory_focus.clone(),
@@ -1147,6 +1304,7 @@ impl Render for SearchDialogWindowView {
                         can_search,
                         can_quick_search,
                         can_count,
+                        can_jump_next,
                         dialog.is_searching,
                         palette,
                         context,

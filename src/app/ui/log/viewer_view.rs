@@ -80,6 +80,35 @@ impl MainView {
             .children((0..3).map(move |index| Self::render_loading_dot(index, icon_color)))
     }
 
+    /// 返回指定日志行上的搜索命中片段高亮。
+    ///
+    /// 业务意图：
+    /// - 搜索结果跳转和“上一个/下一个”只应突出关键字本身，不能再给整行铺背景。
+    /// - 命中范围来自搜索时的原始日志行，因此这里在渲染前夹紧到当前行的 UTF-8 边界，避免文件重载或编码切换后旧范围越界。
+    fn log_search_match_highlight_for_line(
+        highlight: Option<&LogSearchMatchHighlight>,
+        line_index: usize,
+        line: &str,
+        palette: AppThemePalette,
+    ) -> Option<(Range<usize>, gpui::HighlightStyle)> {
+        let highlight = highlight?;
+        if highlight.line_index != line_index {
+            return None;
+        }
+        let range = Self::clamp_search_text_range(line, highlight.match_range.clone());
+        if range.start >= range.end {
+            return None;
+        }
+        Some((
+            range,
+            gpui::HighlightStyle {
+                background_color: Some(rgb(palette.search_highlight).into()),
+                font_weight: Some(FontWeight::SEMIBOLD),
+                ..Default::default()
+            },
+        ))
+    }
+
     /// 渲染单个加载脉冲点。
     ///
     /// 业务意图：
@@ -269,6 +298,7 @@ impl MainView {
                         line_count,
                         context.processor(
                             move |view, range: std::ops::Range<usize>, _window, context| {
+                                let palette = view.palette();
                                 let log_snapshot = view
                                     .log
                                     .open_tabs
@@ -278,6 +308,7 @@ impl MainView {
                                         LogTabState::Ready { document } => Some((
                                             document,
                                             tab.highlighted_search_line,
+                                            tab.highlighted_search_match.clone(),
                                             tab.text_selection.clone(),
                                             tab.marked_lines.clone(),
                                         )),
@@ -287,6 +318,7 @@ impl MainView {
                                 let lines = if let Some((
                                     document,
                                     highlighted_search_line,
+                                    highlighted_search_match,
                                     text_selection,
                                     marked_lines,
                                 )) = log_snapshot
@@ -334,6 +366,21 @@ impl MainView {
                                                 precomputed,
                                                 syntax_theme,
                                             );
+                                            if let Some((range, style)) =
+                                                Self::log_search_match_highlight_for_line(
+                                                    highlighted_search_match.as_ref(),
+                                                    index,
+                                                    &line,
+                                                    palette,
+                                                )
+                                            {
+                                                // 搜索命中片段是定位反馈，只给关键字本身增加背景；后续选区高亮仍可覆盖它。
+                                                line_highlights = gpui::combine_highlights(
+                                                    line_highlights,
+                                                    [(range, style)],
+                                                )
+                                                .collect();
+                                            }
                                             if let Some(selection) = &text_selection
                                                 && let Some(range) =
                                                     Self::selected_byte_range_for_line(
@@ -466,6 +513,7 @@ impl MainView {
         let horizontal_content_offset = px(-(tab.paged_scroll.left_px as f32));
         let text_selection = tab.text_selection.clone();
         let highlighted_search_line = tab.highlighted_search_line;
+        let highlighted_search_match = tab.highlighted_search_match.clone();
         let marked_lines = tab.marked_lines.clone();
 
         let rows = (0..visible_rows)
@@ -477,6 +525,16 @@ impl MainView {
                 let line = document.read_line(line_index).ok().flatten()?.text;
                 let mut line_highlights =
                     highlight_line(document.highlight_mode, &line, None, syntax_theme);
+                if let Some((range, style)) = Self::log_search_match_highlight_for_line(
+                    highlighted_search_match.as_ref(),
+                    line_index,
+                    &line,
+                    palette,
+                ) {
+                    // 分页模式和内存模式保持一致：搜索跳转只强调命中关键字，不改变整行背景。
+                    line_highlights =
+                        gpui::combine_highlights(line_highlights, [(range, style)]).collect();
+                }
                 if let Some(selection) = &text_selection
                     && let Some(range) =
                         Self::selected_byte_range_for_line(selection, line_index, &line)

@@ -32,11 +32,15 @@ use crate::log_document;
 use crate::log_document::{EncodingChoice, LogContentError, LogTextEncoding, decode_log_bytes};
 use crate::log_document::{LargeLogOpenResult, LogTabDocument, open_log_source_for_tab};
 use crate::search::{
-    SearchFileError, SearchMatchMode, SearchOptions, SearchProgress, SearchResultItem, SearchScope,
-    collect_current_directory_sources, count_query_occurrences, search_lines,
+    SearchFileError, SearchMatchMode, SearchMatchPosition, SearchOptions, SearchProgress,
+    SearchResultItem, SearchScope, collect_current_directory_sources, count_query_occurrences,
+    find_search_result_after_position, find_search_result_before_position, search_lines,
     source_location_label,
 };
-use crate::search::{count_query_occurrences_paged, search_paged_document};
+use crate::search::{
+    count_query_occurrences_paged, find_paged_search_result_after_position,
+    find_paged_search_result_before_position, search_paged_document,
+};
 use crate::theme::{AppThemePalette, EffectiveTheme, ThemePreference};
 use crate::thread_analysis::{
     ThreadAnalysisData, ThreadAnalysisFilterRule, ThreadStateKind, ThreadTimelineCell,

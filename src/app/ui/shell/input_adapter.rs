@@ -451,6 +451,9 @@ impl EntityInputHandler for MainView {
             self.clear_search_current_file_match_count();
         }
         self.touch_search_text_cursor_activity();
+        if input_kind == SearchTextInputKind::Query {
+            self.jump_search_query_in_current_file(true, context);
+        }
         context.notify();
     }
 

@@ -16,7 +16,10 @@ use std::{
 
 use crate::{
     log_document::{LineIndexEntry, PagedLogDocument, decode_lossy},
-    search::{SearchMatcher, SearchOptions, SearchResultItem, source_location_label},
+    log_source::LogFileSource,
+    search::{
+        SearchMatchPosition, SearchMatcher, SearchOptions, SearchResultItem, source_location_label,
+    },
 };
 
 /// 单次搜索最多保留的结果行数。
@@ -84,6 +87,409 @@ pub fn search_paged_document(
 
     let truncated = results.len() >= STREAM_SEARCH_RESULT_LIMIT;
     StreamSearchOutcome { results, truncated }
+}
+
+/// 从分页日志指定命中位置之后查找下一处命中。
+///
+/// 业务意图：
+/// - 分页日志可能非常大，但搜索窗口“下一个”仍需要和内存日志保持片段级导航语义。
+/// - 如果当前行还有更靠后的命中，优先复用当前行；只有当前行没有后续命中时才继续读取后续行。
+///
+/// 边界条件：
+/// - `previous` 为 `None` 时从文件顶部开始。
+/// - `wrap` 为 true 时会在文件末尾后绕回文件顶部；只有一处命中时允许回到自身。
+pub fn find_paged_search_result_after_position(
+    document: &PagedLogDocument,
+    options: &SearchOptions,
+    previous: Option<&SearchMatchPosition>,
+    wrap: bool,
+) -> Option<SearchResultItem> {
+    if options.is_empty_query() {
+        return None;
+    }
+    let Ok(matcher) = SearchMatcher::new(options) else {
+        return None;
+    };
+    let Ok(mut file) = File::open(&document.path) else {
+        return None;
+    };
+
+    let source = document.source.clone();
+    let file_name = source.display_name();
+    let source_key = source.stable_key();
+    let location = source_location_label(&source);
+    let line_count = document.line_index.len();
+    let Some(previous) = previous.filter(|previous| previous.line_index < line_count) else {
+        return find_paged_search_result_in_range(
+            &mut file,
+            document,
+            &matcher,
+            &source,
+            &file_name,
+            &source_key,
+            &location,
+            0..line_count,
+        );
+    };
+
+    find_paged_search_result_in_line_after(
+        &mut file,
+        document,
+        &matcher,
+        &source,
+        &file_name,
+        &source_key,
+        &location,
+        previous.line_index,
+        &previous.match_range,
+    )
+    .or_else(|| {
+        find_paged_search_result_in_range(
+            &mut file,
+            document,
+            &matcher,
+            &source,
+            &file_name,
+            &source_key,
+            &location,
+            previous.line_index.saturating_add(1)..line_count,
+        )
+    })
+    .or_else(|| {
+        wrap.then(|| {
+            find_paged_search_result_in_range(
+                &mut file,
+                document,
+                &matcher,
+                &source,
+                &file_name,
+                &source_key,
+                &location,
+                0..previous.line_index,
+            )
+            .or_else(|| {
+                find_paged_search_result_in_line_first(
+                    &mut file,
+                    document,
+                    &matcher,
+                    &source,
+                    &file_name,
+                    &source_key,
+                    &location,
+                    previous.line_index,
+                )
+            })
+        })
+        .flatten()
+    })
+}
+
+/// 从分页日志指定命中位置之前查找上一处命中。
+///
+/// 业务意图：
+/// - “上一个”必须能在同一行的多个命中之间反向移动，避免只按行号跳转导致部分关键字永远无法定位。
+pub fn find_paged_search_result_before_position(
+    document: &PagedLogDocument,
+    options: &SearchOptions,
+    previous: Option<&SearchMatchPosition>,
+    wrap: bool,
+) -> Option<SearchResultItem> {
+    if options.is_empty_query() {
+        return None;
+    }
+    let Ok(matcher) = SearchMatcher::new(options) else {
+        return None;
+    };
+    let Ok(mut file) = File::open(&document.path) else {
+        return None;
+    };
+
+    let source = document.source.clone();
+    let file_name = source.display_name();
+    let source_key = source.stable_key();
+    let location = source_location_label(&source);
+    let line_count = document.line_index.len();
+    let Some(previous) = previous.filter(|previous| previous.line_index < line_count) else {
+        return find_paged_search_result_in_range_rev(
+            &mut file,
+            document,
+            &matcher,
+            &source,
+            &file_name,
+            &source_key,
+            &location,
+            0..line_count,
+        );
+    };
+
+    find_paged_search_result_in_line_before(
+        &mut file,
+        document,
+        &matcher,
+        &source,
+        &file_name,
+        &source_key,
+        &location,
+        previous.line_index,
+        &previous.match_range,
+    )
+    .or_else(|| {
+        find_paged_search_result_in_range_rev(
+            &mut file,
+            document,
+            &matcher,
+            &source,
+            &file_name,
+            &source_key,
+            &location,
+            0..previous.line_index,
+        )
+    })
+    .or_else(|| {
+        wrap.then(|| {
+            find_paged_search_result_in_range_rev(
+                &mut file,
+                document,
+                &matcher,
+                &source,
+                &file_name,
+                &source_key,
+                &location,
+                previous.line_index.saturating_add(1)..line_count,
+            )
+            .or_else(|| {
+                find_paged_search_result_in_line_last(
+                    &mut file,
+                    document,
+                    &matcher,
+                    &source,
+                    &file_name,
+                    &source_key,
+                    &location,
+                    previous.line_index,
+                )
+            })
+        })
+        .flatten()
+    })
+}
+
+/// 在分页日志的指定行范围内查找第一条命中。
+///
+/// 实现原因：
+/// - 分页行索引支持按行号读取单行，范围查找可以避免为了“下一个”从头重复扫描已经经过的行。
+fn find_paged_search_result_in_range(
+    file: &mut File,
+    document: &PagedLogDocument,
+    matcher: &SearchMatcher,
+    source: &LogFileSource,
+    file_name: &str,
+    source_key: &str,
+    location: &str,
+    line_range: std::ops::Range<usize>,
+) -> Option<SearchResultItem> {
+    for line_index in line_range {
+        let entry = document.line_index.get(line_index)?;
+        let Some(line_text) = read_line_text(file, document, entry) else {
+            continue;
+        };
+        if let Some(match_range) = matcher.best_range(&line_text) {
+            return Some(SearchResultItem {
+                source: source.clone(),
+                source_key: source_key.to_string(),
+                file_name: file_name.to_string(),
+                location: location.to_string(),
+                line_index,
+                line_text,
+                match_range,
+            });
+        }
+    }
+    None
+}
+
+/// 在分页日志指定行中查找锚点之后的第一处命中。
+fn find_paged_search_result_in_line_after(
+    file: &mut File,
+    document: &PagedLogDocument,
+    matcher: &SearchMatcher,
+    source: &LogFileSource,
+    file_name: &str,
+    source_key: &str,
+    location: &str,
+    line_index: usize,
+    previous_range: &std::ops::Range<usize>,
+) -> Option<SearchResultItem> {
+    let line_text = read_paged_line_text(file, document, line_index)?;
+    matcher
+        .ranges(&line_text)
+        .into_iter()
+        .find(|range| (range.start, range.end) > (previous_range.start, previous_range.end))
+        .map(|match_range| {
+            search_result_item(
+                source,
+                file_name,
+                source_key,
+                location,
+                line_index,
+                &line_text,
+                match_range,
+            )
+        })
+}
+
+/// 在分页日志指定行中查找锚点之前的最后一处命中。
+fn find_paged_search_result_in_line_before(
+    file: &mut File,
+    document: &PagedLogDocument,
+    matcher: &SearchMatcher,
+    source: &LogFileSource,
+    file_name: &str,
+    source_key: &str,
+    location: &str,
+    line_index: usize,
+    previous_range: &std::ops::Range<usize>,
+) -> Option<SearchResultItem> {
+    let line_text = read_paged_line_text(file, document, line_index)?;
+    matcher
+        .ranges(&line_text)
+        .into_iter()
+        .rev()
+        .find(|range| (range.start, range.end) < (previous_range.start, previous_range.end))
+        .map(|match_range| {
+            search_result_item(
+                source,
+                file_name,
+                source_key,
+                location,
+                line_index,
+                &line_text,
+                match_range,
+            )
+        })
+}
+
+/// 在分页日志指定行中查找第一处命中。
+fn find_paged_search_result_in_line_first(
+    file: &mut File,
+    document: &PagedLogDocument,
+    matcher: &SearchMatcher,
+    source: &LogFileSource,
+    file_name: &str,
+    source_key: &str,
+    location: &str,
+    line_index: usize,
+) -> Option<SearchResultItem> {
+    let line_text = read_paged_line_text(file, document, line_index)?;
+    matcher
+        .ranges(&line_text)
+        .into_iter()
+        .next()
+        .map(|match_range| {
+            search_result_item(
+                source,
+                file_name,
+                source_key,
+                location,
+                line_index,
+                &line_text,
+                match_range,
+            )
+        })
+}
+
+/// 在分页日志指定行中查找最后一处命中。
+fn find_paged_search_result_in_line_last(
+    file: &mut File,
+    document: &PagedLogDocument,
+    matcher: &SearchMatcher,
+    source: &LogFileSource,
+    file_name: &str,
+    source_key: &str,
+    location: &str,
+    line_index: usize,
+) -> Option<SearchResultItem> {
+    let line_text = read_paged_line_text(file, document, line_index)?;
+    matcher
+        .ranges(&line_text)
+        .into_iter()
+        .last()
+        .map(|match_range| {
+            search_result_item(
+                source,
+                file_name,
+                source_key,
+                location,
+                line_index,
+                &line_text,
+                match_range,
+            )
+        })
+}
+
+/// 按行号读取分页日志单行文本。
+fn read_paged_line_text(
+    file: &mut File,
+    document: &PagedLogDocument,
+    line_index: usize,
+) -> Option<String> {
+    let entry = document.line_index.get(line_index)?;
+    read_line_text(file, document, entry)
+}
+
+/// 构造分页搜索结果，集中维护跨路径一致的展示字段。
+fn search_result_item(
+    source: &LogFileSource,
+    file_name: &str,
+    source_key: &str,
+    location: &str,
+    line_index: usize,
+    line_text: &str,
+    match_range: std::ops::Range<usize>,
+) -> SearchResultItem {
+    SearchResultItem {
+        source: source.clone(),
+        source_key: source_key.to_string(),
+        file_name: file_name.to_string(),
+        location: location.to_string(),
+        line_index,
+        line_text: line_text.to_string(),
+        match_range,
+    }
+}
+
+/// 在分页日志的指定行范围内反向查找第一条命中。
+///
+/// 实现原因：
+/// - 分页索引支持随机读取任意行，反向查找可以让“上一个”从当前位置向文件头定位，同时保持内存占用固定。
+fn find_paged_search_result_in_range_rev(
+    file: &mut File,
+    document: &PagedLogDocument,
+    matcher: &SearchMatcher,
+    source: &LogFileSource,
+    file_name: &str,
+    source_key: &str,
+    location: &str,
+    line_range: std::ops::Range<usize>,
+) -> Option<SearchResultItem> {
+    for line_index in line_range.rev() {
+        let entry = document.line_index.get(line_index)?;
+        let Some(line_text) = read_line_text(file, document, entry) else {
+            continue;
+        };
+        if let Some(match_range) = matcher.best_range(&line_text) {
+            return Some(SearchResultItem {
+                source: source.clone(),
+                source_key: source_key.to_string(),
+                file_name: file_name.to_string(),
+                location: location.to_string(),
+                line_index,
+                line_text,
+                match_range,
+            });
+        }
+    }
+    None
 }
 
 /// 统计分页文档中查询词出现次数。

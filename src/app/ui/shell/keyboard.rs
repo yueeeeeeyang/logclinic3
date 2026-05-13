@@ -406,6 +406,7 @@ impl MainView {
         if let Some(tab) = self.log.open_tabs.get_mut(tab_index) {
             tab.last_marker_jump_line = Some(target_line);
             tab.highlighted_search_line = Some(target_line);
+            tab.highlighted_search_match = None;
         }
         self.log.log_viewer_context_menu = None;
         self.log.tab_context_menu = None;

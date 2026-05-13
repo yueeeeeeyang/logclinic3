@@ -92,6 +92,20 @@ impl MainView {
         self.search.search_query_history.first().cloned()
     }
 
+    /// 全选搜索关键字输入框内容。
+    ///
+    /// 业务意图：
+    /// - 用户通过工具栏、快捷键或点击重新激活搜索框时，通常是在替换关键字而不是追加文本。
+    /// - 独立搜索窗口使用自绘输入框，因此需要在业务状态中显式维护 UTF-8 选区。
+    ///
+    /// 边界条件：
+    /// - 空关键字会得到 `0..0` 选区；组合输入范围必须清空，避免激活后继续提交旧 IME 组合文本。
+    pub(in crate::app) fn select_all_search_query(dialog: &mut SearchDialogState) {
+        dialog.query_input.marked_range = None;
+        dialog.query_input.selection_range = 0..dialog.query_input.text.len();
+        dialog.query_input.horizontal_scroll_px = 0.0;
+    }
+
     /// 把用户选择的历史关键字填入搜索对话框。
     ///
     /// 业务意图：
@@ -117,6 +131,7 @@ impl MainView {
         dialog.query_input.marked_range = None;
         dialog.query_history_menu_open = false;
         dialog.current_file_match_count = None;
+        dialog.current_file_navigation_match = None;
         dialog.message = "已选择历史关键字，按 Enter 或点击搜索".to_string();
     }
 
@@ -348,6 +363,7 @@ impl MainView {
     /// - 这样可以避免搜索窗口根视图初始化或渲染时读取 `MainView`，和当前 `MainView` 更新租借发生重叠。
     pub(in crate::app) fn prepare_search_dialog_state(&mut self) {
         let selected_query = self.selected_log_text_for_search_query();
+        let mut query_replaced = false;
         if self.search.search_dialog.is_none() {
             let directory_target = self.active_search_directory_label().unwrap_or_default();
             let last_query = self.last_search_query();
@@ -359,14 +375,17 @@ impl MainView {
             } else {
                 (String::new(), SearchMatchMode::Literal)
             };
+            let mut query_input = SingleLineTextInputState::from_text(query);
+            query_input.selection_range = 0..query_input.text.len();
             self.search.search_dialog = Some(SearchDialogState {
-                query_input: SingleLineTextInputState::from_text(query),
+                query_input,
                 query_history_menu_open: false,
                 scope: SearchScope::CurrentFile,
                 directory_input: SingleLineTextInputState::from_text(directory_target),
                 case_sensitive: false,
                 match_mode,
                 current_file_match_count: None,
+                current_file_navigation_match: None,
                 is_searching: false,
                 progress: SearchProgress::default(),
                 message: if selected_query.is_some() {
@@ -387,20 +406,28 @@ impl MainView {
             dialog.query_input.marked_range = None;
             dialog.query_history_menu_open = false;
             dialog.current_file_match_count = None;
+            dialog.current_file_navigation_match = None;
             dialog.match_mode = SearchMatchMode::Literal;
+            Self::select_all_search_query(dialog);
             dialog.message = "已填入选中文本，按 Enter 或点击搜索".to_string();
+            query_replaced = true;
         } else if let Some(last_query) = self.last_search_query()
             && let Some(dialog) = self.search.search_dialog.as_mut()
             && dialog.query_input.text.trim().is_empty()
         {
-            let cursor = last_query.query.len();
             dialog.query_input.text = last_query.query;
             dialog.match_mode = last_query.match_mode;
-            dialog.query_input.selection_range = cursor..cursor;
             dialog.query_input.marked_range = None;
             dialog.query_history_menu_open = false;
             dialog.current_file_match_count = None;
+            dialog.current_file_navigation_match = None;
+            Self::select_all_search_query(dialog);
             dialog.message = "已填入上次搜索关键字，按 Enter 或点击搜索".to_string();
+            query_replaced = true;
+        }
+        if query_replaced {
+            self.search.current_file_navigation_request_id += 1;
+            self.clear_active_log_tab_search_match_highlight();
         }
         self.log.tab_context_menu = None;
         self.log.encoding_dropdown_menu = None;
@@ -424,6 +451,9 @@ impl MainView {
             main_view.update(app, |view, context| {
                 view.search.search_dialog_open_pending = false;
                 view.prepare_search_dialog_state();
+                if let Some(dialog) = view.search.search_dialog.as_mut() {
+                    Self::select_all_search_query(dialog);
+                }
                 context.notify();
                 (
                     view.search.search_input_focus.clone(),
@@ -525,8 +555,8 @@ impl MainView {
     /// 清理搜索对话框状态。
     ///
     /// 业务意图：
-    /// - 关闭搜索窗口、搜索完成自动收起和系统窗口关闭都需要同一套状态清理规则。
-    /// - 取消关闭时需要标记正在运行的记录为已取消；正常完成时只清空对话框，不改变结果记录终态。
+    /// - 主动关闭搜索窗口和系统窗口关闭都需要同一套状态清理规则；搜索完成后不再调用该函数，窗口应继续保留。
+    /// - 关闭时需要标记正在运行的记录为已取消，避免底部结果面板长期显示“搜索中”。
     pub(in crate::app) fn clear_search_dialog_state(
         &mut self,
         cancel_running: bool,
@@ -543,6 +573,7 @@ impl MainView {
         }
         self.search.search_dialog = None;
         self.search.next_search_job_id += 1;
+        self.search.current_file_navigation_request_id += 1;
         if let Some(job_id) = running_job_id {
             self.mark_search_record_canceled(job_id);
         }
@@ -1084,12 +1115,17 @@ impl MainView {
         true
     }
 
-    /// 标记搜索任务完成并关闭搜索对话框。
+    /// 标记搜索任务完成并保留搜索对话框。
     ///
     /// 业务意图：
-    /// - 搜索对话框只负责输入条件和展示进行中进度；任务完成后应自动收起，把空间让给正文和底部结果面板。
+    /// - 搜索对话框既负责输入条件，也负责展示本次搜索的完成状态；任务完成后继续保留窗口，
+    ///   方便用户调整关键字、点击“下一个”或再次搜索。
     /// - 结果面板保留历史记录和明细，用户可以继续查看、展开和点击定位。
-    pub(in crate::app) fn finish_search_job(&mut self, job_id: usize, context: &mut Context<Self>) {
+    pub(in crate::app) fn finish_search_job(
+        &mut self,
+        job_id: usize,
+        _context: &mut Context<Self>,
+    ) {
         if !self.is_current_search_job(job_id) {
             return;
         }
@@ -1102,11 +1138,9 @@ impl MainView {
         {
             record.canceled = false;
         }
-        self.search.search_dialog = None;
-        if let Some(search_window) = self.search.search_dialog_window.take() {
-            let _ = search_window.update(context, |_, window, _| {
-                window.remove_window();
-            });
+        if let Some(dialog) = self.search.search_dialog.as_mut() {
+            dialog.is_searching = false;
+            dialog.message = format!("搜索完成，共命中 {} 行", dialog.progress.matched_lines);
         }
     }
 
@@ -1130,6 +1164,7 @@ impl MainView {
     ) {
         let source_key = result.source_key.clone();
         let line_index = result.line_index;
+        let match_range = result.match_range.clone();
 
         if !self
             .log
@@ -1154,7 +1189,11 @@ impl MainView {
             LogTabState::Ready { .. }
         );
         self.log.open_tabs[tab_index].pending_scroll_to_line = Some(line_index);
-        self.log.open_tabs[tab_index].highlighted_search_line = Some(line_index);
+        self.log.open_tabs[tab_index].highlighted_search_line = None;
+        self.log.open_tabs[tab_index].highlighted_search_match = Some(LogSearchMatchHighlight {
+            line_index,
+            match_range,
+        });
         self.activate_tab(tab_id);
         if ready {
             self.log.open_tabs[tab_index].pending_scroll_to_line = None;

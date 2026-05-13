@@ -274,6 +274,33 @@ impl SearchMatcher {
         best.map(|(_, range)| range)
     }
 
+    /// 返回单行中的全部命中范围。
+    ///
+    /// 业务意图：
+    /// - 搜索窗口“上一个/下一个”以关键字片段为单位跳转；同一行里多次出现同一关键字时，
+    ///   不能像结果面板那样只保留第一处，否则计数和跳转反馈会不一致。
+    /// - 多关键字场景保留按位置排序的确定性结果；当前 UI 只用单关键字，但核心能力保持通用。
+    ///
+    /// 边界条件：
+    /// - 返回的范围全部是原始行文本内的 UTF-8 字节边界，可直接用于渲染层片段高亮。
+    /// - 完全相同的范围只保留一次，避免重复关键字配置让“下一个”停在同一位置。
+    pub(crate) fn ranges(&self, line_text: &str) -> Vec<Range<usize>> {
+        let mut ranges = self
+            .terms
+            .iter()
+            .enumerate()
+            .flat_map(|(query_index, term)| {
+                term.ranges_in_line(line_text, self.case_sensitive)
+                    .into_iter()
+                    .map(move |range| (range.start, range.end, query_index, range))
+            })
+            .collect::<Vec<_>>();
+
+        ranges.sort_by_key(|(start, end, query_index, _)| (*start, *end, *query_index));
+        ranges.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1);
+        ranges.into_iter().map(|(_, _, _, range)| range).collect()
+    }
+
     /// 统计单行中的非重叠命中次数。
     ///
     /// 业务意图：
@@ -295,6 +322,20 @@ impl SearchMatcherTerm {
             Self::Regex(regex) => regex
                 .find(line_text)
                 .map(|matched| matched.start()..matched.end()),
+        }
+    }
+
+    /// 返回当前查询词在单行中的全部命中范围。
+    ///
+    /// 业务意图：
+    /// - 当前文件轻量导航需要在同一行内继续定位下一处或上一处命中，而不是只能跳到其它行。
+    fn ranges_in_line(&self, line_text: &str, case_sensitive: bool) -> Vec<Range<usize>> {
+        match self {
+            Self::Literal(query) => find_literal_query_ranges(line_text, query, case_sensitive),
+            Self::Regex(regex) => regex
+                .find_iter(line_text)
+                .map(|matched| matched.start()..matched.end())
+                .collect(),
         }
     }
 
@@ -345,6 +386,30 @@ pub struct SearchResultItem {
     pub line_text: String,
     /// 命中片段在 `line_text` 中的 UTF-8 字节范围。
     pub match_range: Range<usize>,
+}
+
+/// 搜索命中在单个文件中的位置。
+///
+/// 业务意图：
+/// - 当前文件搜索框的“上一个/下一个”需要以片段为单位记住当前位置，而不仅是行号。
+/// - 该类型不携带文件来源和预览文本，便于 UI 在搜索条件变化时只保存轻量导航锚点。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchMatchPosition {
+    /// 0 基日志行号。
+    pub line_index: usize,
+    /// 命中片段在原始行文本内的 UTF-8 字节范围。
+    pub match_range: Range<usize>,
+}
+
+impl SearchMatchPosition {
+    /// 从完整搜索结果提取轻量位置。
+    #[cfg(test)]
+    pub fn from_result(result: &SearchResultItem) -> Self {
+        Self {
+            line_index: result.line_index,
+            match_range: result.match_range.clone(),
+        }
+    }
 }
 
 /// 单个文件搜索失败信息。
@@ -402,6 +467,373 @@ pub fn search_lines(
                 })
         })
         .collect()
+}
+
+/// 从指定命中位置之后查找当前文件内的下一处命中。
+///
+/// 业务意图：
+/// - 搜索窗口的“下一个”应按关键字片段推进；如果同一行存在多个命中，必须先在当前行内继续查找，
+///   再跳到后续行，保证 UI 上的“当前文件命中 N 次”和实际可跳转次数一致。
+///
+/// 边界条件：
+/// - `previous` 为 `None` 时从文件顶部查找第一处命中。
+/// - `wrap` 为 true 时会在文件末尾后回到顶部；如果整份文件只有当前一处命中，会重新返回自身。
+pub fn find_search_result_after_position(
+    source: &LogFileSource,
+    lines: &[String],
+    options: &SearchOptions,
+    previous: Option<&SearchMatchPosition>,
+    wrap: bool,
+) -> Option<SearchResultItem> {
+    if options.is_empty_query() || lines.is_empty() {
+        return None;
+    }
+    let Ok(matcher) = SearchMatcher::new(options) else {
+        return None;
+    };
+
+    let file_name = source.display_name();
+    let source_key = source.stable_key();
+    let location = source_location_label(source);
+    let line_count = lines.len();
+    let Some(previous) = previous.filter(|previous| previous.line_index < line_count) else {
+        return find_search_result_in_memory_range(
+            source,
+            &file_name,
+            &source_key,
+            &location,
+            lines,
+            &matcher,
+            0..line_count,
+        );
+    };
+
+    find_search_result_in_line_after(
+        source,
+        &file_name,
+        &source_key,
+        &location,
+        lines,
+        &matcher,
+        previous.line_index,
+        &previous.match_range,
+    )
+    .or_else(|| {
+        find_search_result_in_memory_range(
+            source,
+            &file_name,
+            &source_key,
+            &location,
+            lines,
+            &matcher,
+            previous.line_index.saturating_add(1)..line_count,
+        )
+    })
+    .or_else(|| {
+        wrap.then(|| {
+            find_search_result_in_memory_range(
+                source,
+                &file_name,
+                &source_key,
+                &location,
+                lines,
+                &matcher,
+                0..previous.line_index,
+            )
+            .or_else(|| {
+                find_search_result_in_line_first(
+                    source,
+                    &file_name,
+                    &source_key,
+                    &location,
+                    lines,
+                    &matcher,
+                    previous.line_index,
+                )
+            })
+        })
+        .flatten()
+    })
+}
+
+/// 从指定命中位置之前反向查找当前文件内的上一处命中。
+///
+/// 业务意图：
+/// - 搜索窗口的“上一个”应和“下一个”保持片段级语义；同一行中存在多个命中时，先返回当前行内更靠前的命中。
+///
+/// 边界条件：
+/// - `previous` 为 `None` 时从文件底部查找最后一处命中，符合用户首次点击上箭头的直觉。
+/// - `wrap` 为 true 时会在文件头之前绕回到文件末尾；只有一处命中时允许重新定位到自身。
+pub fn find_search_result_before_position(
+    source: &LogFileSource,
+    lines: &[String],
+    options: &SearchOptions,
+    previous: Option<&SearchMatchPosition>,
+    wrap: bool,
+) -> Option<SearchResultItem> {
+    if options.is_empty_query() || lines.is_empty() {
+        return None;
+    }
+    let Ok(matcher) = SearchMatcher::new(options) else {
+        return None;
+    };
+
+    let file_name = source.display_name();
+    let source_key = source.stable_key();
+    let location = source_location_label(source);
+    let line_count = lines.len();
+    let Some(previous) = previous.filter(|previous| previous.line_index < line_count) else {
+        return find_search_result_in_memory_range_rev(
+            source,
+            &file_name,
+            &source_key,
+            &location,
+            lines,
+            &matcher,
+            0..line_count,
+        );
+    };
+
+    find_search_result_in_line_before(
+        source,
+        &file_name,
+        &source_key,
+        &location,
+        lines,
+        &matcher,
+        previous.line_index,
+        &previous.match_range,
+    )
+    .or_else(|| {
+        find_search_result_in_memory_range_rev(
+            source,
+            &file_name,
+            &source_key,
+            &location,
+            lines,
+            &matcher,
+            0..previous.line_index,
+        )
+    })
+    .or_else(|| {
+        wrap.then(|| {
+            find_search_result_in_memory_range_rev(
+                source,
+                &file_name,
+                &source_key,
+                &location,
+                lines,
+                &matcher,
+                previous.line_index.saturating_add(1)..line_count,
+            )
+            .or_else(|| {
+                find_search_result_in_line_last(
+                    source,
+                    &file_name,
+                    &source_key,
+                    &location,
+                    lines,
+                    &matcher,
+                    previous.line_index,
+                )
+            })
+        })
+        .flatten()
+    })
+}
+
+/// 在内存日志的指定行范围内查找第一条命中。
+///
+/// 实现原因：
+/// - 当前文件“下一个”需要先查找当前位置之后的内容，必要时再从顶部绕回；拆出范围函数可以避免复制结果构造逻辑。
+fn find_search_result_in_memory_range(
+    source: &LogFileSource,
+    file_name: &str,
+    source_key: &str,
+    location: &str,
+    lines: &[String],
+    matcher: &SearchMatcher,
+    line_range: Range<usize>,
+) -> Option<SearchResultItem> {
+    line_range.into_iter().find_map(|line_index| {
+        let line_text = lines.get(line_index)?;
+        matcher
+            .best_range(line_text)
+            .map(|match_range| SearchResultItem {
+                source: source.clone(),
+                source_key: source_key.to_string(),
+                file_name: file_name.to_string(),
+                location: location.to_string(),
+                line_index,
+                line_text: line_text.clone(),
+                match_range,
+            })
+    })
+}
+
+/// 在内存日志的指定行内查找锚点之后的第一处命中。
+fn find_search_result_in_line_after(
+    source: &LogFileSource,
+    file_name: &str,
+    source_key: &str,
+    location: &str,
+    lines: &[String],
+    matcher: &SearchMatcher,
+    line_index: usize,
+    previous_range: &Range<usize>,
+) -> Option<SearchResultItem> {
+    let line_text = lines.get(line_index)?;
+    matcher
+        .ranges(line_text)
+        .into_iter()
+        .find(|range| (range.start, range.end) > (previous_range.start, previous_range.end))
+        .map(|match_range| {
+            search_result_item(
+                source,
+                file_name,
+                source_key,
+                location,
+                line_index,
+                line_text,
+                match_range,
+            )
+        })
+}
+
+/// 在内存日志的指定行内查找锚点之前的最后一处命中。
+fn find_search_result_in_line_before(
+    source: &LogFileSource,
+    file_name: &str,
+    source_key: &str,
+    location: &str,
+    lines: &[String],
+    matcher: &SearchMatcher,
+    line_index: usize,
+    previous_range: &Range<usize>,
+) -> Option<SearchResultItem> {
+    let line_text = lines.get(line_index)?;
+    matcher
+        .ranges(line_text)
+        .into_iter()
+        .rev()
+        .find(|range| (range.start, range.end) < (previous_range.start, previous_range.end))
+        .map(|match_range| {
+            search_result_item(
+                source,
+                file_name,
+                source_key,
+                location,
+                line_index,
+                line_text,
+                match_range,
+            )
+        })
+}
+
+/// 在内存日志的指定行内查找第一处命中。
+fn find_search_result_in_line_first(
+    source: &LogFileSource,
+    file_name: &str,
+    source_key: &str,
+    location: &str,
+    lines: &[String],
+    matcher: &SearchMatcher,
+    line_index: usize,
+) -> Option<SearchResultItem> {
+    let line_text = lines.get(line_index)?;
+    matcher
+        .ranges(line_text)
+        .into_iter()
+        .next()
+        .map(|match_range| {
+            search_result_item(
+                source,
+                file_name,
+                source_key,
+                location,
+                line_index,
+                line_text,
+                match_range,
+            )
+        })
+}
+
+/// 在内存日志的指定行内查找最后一处命中。
+fn find_search_result_in_line_last(
+    source: &LogFileSource,
+    file_name: &str,
+    source_key: &str,
+    location: &str,
+    lines: &[String],
+    matcher: &SearchMatcher,
+    line_index: usize,
+) -> Option<SearchResultItem> {
+    let line_text = lines.get(line_index)?;
+    matcher
+        .ranges(line_text)
+        .into_iter()
+        .last()
+        .map(|match_range| {
+            search_result_item(
+                source,
+                file_name,
+                source_key,
+                location,
+                line_index,
+                line_text,
+                match_range,
+            )
+        })
+}
+
+/// 构造搜索命中结果，集中维护来源和展示字段。
+fn search_result_item(
+    source: &LogFileSource,
+    file_name: &str,
+    source_key: &str,
+    location: &str,
+    line_index: usize,
+    line_text: &str,
+    match_range: Range<usize>,
+) -> SearchResultItem {
+    SearchResultItem {
+        source: source.clone(),
+        source_key: source_key.to_string(),
+        file_name: file_name.to_string(),
+        location: location.to_string(),
+        line_index,
+        line_text: line_text.to_string(),
+        match_range,
+    }
+}
+
+/// 在内存日志的指定行范围内反向查找第一条命中。
+///
+/// 实现原因：
+/// - “上一个”与“下一个”只差遍历方向，单独拆出反向范围函数可以让边界和结果构造保持可测试。
+fn find_search_result_in_memory_range_rev(
+    source: &LogFileSource,
+    file_name: &str,
+    source_key: &str,
+    location: &str,
+    lines: &[String],
+    matcher: &SearchMatcher,
+    line_range: Range<usize>,
+) -> Option<SearchResultItem> {
+    line_range.rev().find_map(|line_index| {
+        let line_text = lines.get(line_index)?;
+        matcher
+            .best_range(line_text)
+            .map(|match_range| SearchResultItem {
+                source: source.clone(),
+                source_key: source_key.to_string(),
+                file_name: file_name.to_string(),
+                location: location.to_string(),
+                line_index,
+                line_text: line_text.clone(),
+                match_range,
+            })
+    })
 }
 
 /// 统计已解码行集合中查询词的总出现次数。
@@ -474,6 +906,49 @@ fn find_literal_query_range(
 
     (start <= end && line_text.is_char_boundary(start) && line_text.is_char_boundary(end))
         .then_some(start..end)
+}
+
+/// 在单行文本中查找普通文本查询词的全部范围。
+///
+/// 业务意图：
+/// - 当前文件跳转按“关键字出现次数”前后移动，必须得到同一行里的全部非重叠范围。
+///
+/// 边界条件：
+/// - 不区分大小写时先在折叠文本中查找，再映射回原始 UTF-8 边界，避免中文或特殊 Unicode 字符被截断。
+fn find_literal_query_ranges(
+    line_text: &str,
+    query: &str,
+    case_sensitive: bool,
+) -> Vec<Range<usize>> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+
+    if case_sensitive {
+        return line_text
+            .match_indices(query)
+            .map(|(start, matched)| start..start + matched.len())
+            .collect();
+    }
+
+    let folded_line = line_text.to_lowercase();
+    let folded_query = query.to_lowercase();
+    let mut ranges = Vec::new();
+    let mut search_start = 0usize;
+    while search_start <= folded_line.len() {
+        let Some(relative_start) = folded_line[search_start..].find(&folded_query) else {
+            break;
+        };
+        let folded_start = search_start + relative_start;
+        let folded_end = folded_start + folded_query.len();
+        let start = byte_index_from_folded_offset(line_text, folded_start);
+        let end = byte_index_from_folded_offset(line_text, folded_end);
+        if start <= end && line_text.is_char_boundary(start) && line_text.is_char_boundary(end) {
+            ranges.push(start..end);
+        }
+        search_start = folded_end;
+    }
+    ranges
 }
 
 /// 将 `to_lowercase` 后的字节偏移映射回原始字符串的字节偏移。
@@ -808,6 +1283,138 @@ mod tests {
             count_query_occurrences(&lines, &SearchOptions::single("error", true),),
             2
         );
+    }
+
+    /// 当前文件轻量导航从上一次命中后查找，末尾可绕回顶部。
+    ///
+    /// 业务意图：
+    /// - 搜索窗口“下一个”不能每次都跳回第一条命中；它应从上一次定位片段之后继续查找，并在末尾回到顶部。
+    #[test]
+    fn 当前文件轻量导航支持片段起点和绕回() {
+        let source = local("/tmp/app/access.log");
+        let lines = vec![
+            "INFO start".to_string(),
+            "WARN retry".to_string(),
+            "ERROR failed".to_string(),
+        ];
+        let options = SearchOptions::single("warn", false);
+
+        let first = find_search_result_after_position(&source, &lines, &options, None, false)
+            .expect("应从顶部找到 warn");
+        assert_eq!(first.line_index, 1);
+
+        let first_position = SearchMatchPosition::from_result(&first);
+        let wrapped = find_search_result_after_position(
+            &source,
+            &lines,
+            &options,
+            Some(&first_position),
+            true,
+        )
+        .expect("超过唯一命中后应绕回自身");
+        assert_eq!(wrapped.line_index, 1);
+
+        assert!(
+            find_search_result_after_position(
+                &source,
+                &lines,
+                &options,
+                Some(&first_position),
+                false,
+            )
+            .is_none()
+        );
+    }
+
+    /// 当前文件轻量导航支持反向查找上一条命中。
+    ///
+    /// 业务意图：
+    /// - 搜索窗口“上一个”应从当前命中行之前查找，并在到达文件头后从文件尾绕回。
+    #[test]
+    fn 当前文件轻量导航支持反向查找和绕回() {
+        let source = local("/tmp/app/access.log");
+        let lines = vec![
+            "ERROR first".to_string(),
+            "INFO middle".to_string(),
+            "ERROR second".to_string(),
+        ];
+        let options = SearchOptions::single("error", false);
+
+        let last = find_search_result_before_position(&source, &lines, &options, None, false)
+            .expect("首次点击上一个应从文件底部找到最后一条 error");
+        assert_eq!(last.line_index, 2);
+
+        let last_position = SearchMatchPosition::from_result(&last);
+        let previous = find_search_result_before_position(
+            &source,
+            &lines,
+            &options,
+            Some(&last_position),
+            false,
+        )
+        .expect("第 2 行之前应找到第一条 error");
+        assert_eq!(previous.line_index, 0);
+
+        let previous_position = SearchMatchPosition::from_result(&previous);
+        let wrapped = find_search_result_before_position(
+            &source,
+            &lines,
+            &options,
+            Some(&previous_position),
+            true,
+        )
+        .expect("文件头前继续查找应绕回最后一条 error");
+        assert_eq!(wrapped.line_index, 2);
+    }
+
+    /// 当前文件轻量导航会逐个访问同一行内的多个命中。
+    ///
+    /// 业务意图：
+    /// - 搜索窗口计数以关键字片段为单位；“上一个/下一个”也必须访问同一行内的每个片段，
+    ///   否则用户看到 3 次命中却只能跳到其中一处。
+    #[test]
+    fn 当前文件轻量导航访问同一行多个命中() {
+        let source = local("/tmp/app/access.log");
+        let lines = vec!["error ok error".to_string()];
+        let options = SearchOptions::single("error", false);
+
+        let first = find_search_result_after_position(&source, &lines, &options, None, false)
+            .expect("应从顶部找到第一处 error");
+        assert_eq!(first.line_index, 0);
+        assert_eq!(first.match_range, 0..5);
+
+        let first_position = SearchMatchPosition::from_result(&first);
+        let second = find_search_result_after_position(
+            &source,
+            &lines,
+            &options,
+            Some(&first_position),
+            true,
+        )
+        .expect("同一行内应继续找到第二处 error");
+        assert_eq!(second.line_index, 0);
+        assert_eq!(second.match_range, 9..14);
+
+        let second_position = SearchMatchPosition::from_result(&second);
+        let back_to_first = find_search_result_after_position(
+            &source,
+            &lines,
+            &options,
+            Some(&second_position),
+            true,
+        )
+        .expect("到达最后一处后应绕回同一行第一处 error");
+        assert_eq!(back_to_first.match_range, 0..5);
+
+        let previous = find_search_result_before_position(
+            &source,
+            &lines,
+            &options,
+            Some(&second_position),
+            false,
+        )
+        .expect("上一个应返回同一行内更靠前的 error");
+        assert_eq!(previous.match_range, 0..5);
     }
 
     /// 正则搜索按单行返回第一个命中范围，并使用 UTF-8 原始字节下标供 UI 高亮。

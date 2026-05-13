@@ -811,6 +811,7 @@ impl MainView {
         self.search.next_search_job_id += 1;
         if let Some(dialog) = self.search.search_dialog.as_mut() {
             dialog.current_file_match_count = None;
+            dialog.current_file_navigation_match = None;
             dialog.is_searching = false;
             dialog.progress = SearchProgress::default();
             dialog.message = "日志已重新加载，请重新打开文件后搜索".to_string();

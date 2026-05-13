@@ -254,6 +254,7 @@ impl MainView {
             paged_scroll: PagedLogScrollState::default(),
             pending_scroll_to_line: None,
             highlighted_search_line: None,
+            highlighted_search_match: None,
             marked_lines: BTreeSet::new(),
             last_marker_jump_line: None,
             text_selection: None,
@@ -523,6 +524,7 @@ impl MainView {
         tab.scroll_handle = UniformListScrollHandle::new();
         tab.pending_scroll_to_line = None;
         tab.highlighted_search_line = None;
+        tab.highlighted_search_match = None;
         tab.last_marker_jump_line = None;
         tab.text_selection = None;
         tab.selection_drag_anchor = None;
