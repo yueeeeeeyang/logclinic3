@@ -1150,6 +1150,35 @@ impl MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
+        if self.notes.is_editing
+            && self
+                .notes
+                .rich_editor
+                .start_code_language_selection(event.position)
+        {
+            window.focus(&self.notes.rich_editor.focus);
+            context.notify();
+            return;
+        }
+        if self
+            .notes
+            .rich_editor
+            .start_code_block_scroll_drag(event.position)
+        {
+            context.notify();
+            return;
+        }
+        if self.notes.is_editing
+            && self
+                .notes
+                .rich_editor
+                .place_cursor_after_code_block_at_point(event.position)
+        {
+            window.focus(&self.notes.rich_editor.focus);
+            self.touch_search_text_cursor_activity();
+            context.notify();
+            return;
+        }
         let index = self.notes.rich_editor.index_for_point(event.position);
         window.focus(&self.notes.rich_editor.focus);
         match event.click_count {
@@ -1178,6 +1207,14 @@ impl MainView {
         event: &MouseMoveEvent,
         context: &mut Context<Self>,
     ) {
+        if self
+            .notes
+            .rich_editor
+            .update_code_block_scroll_drag(event.position)
+        {
+            context.notify();
+            return;
+        }
         if !event.dragging() {
             self.finish_note_rich_text_selection(context);
             return;
@@ -1192,6 +1229,10 @@ impl MainView {
 
     /// 完成富文本鼠标拖选。
     pub(in crate::app) fn finish_note_rich_text_selection(&mut self, context: &mut Context<Self>) {
+        if self.notes.rich_editor.finish_code_block_scroll_drag() {
+            context.notify();
+            return;
+        }
         if self.notes.rich_editor.drag_anchor.take().is_some() {
             context.notify();
         }
@@ -1253,6 +1294,28 @@ impl MainView {
         true
     }
 
+    /// 处理富文本代码块的横向滚轮。
+    ///
+    /// 业务意图：
+    /// - 只在指针位于代码块且产生横向滚动时消费事件，普通纵向滚动继续交给外层 GPUI 滚动容器。
+    /// - 这样编辑态和只读态都能滚动整篇笔记，同时代码块超宽内容不会把普通段落变成横向滚动区域。
+    pub(in crate::app) fn handle_note_rich_text_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        context: &mut Context<Self>,
+    ) -> bool {
+        let pixel_delta = event.delta.pixel_delta(px(20.0));
+        let scrolled = self.notes.rich_editor.scroll_code_block_at_point(
+            event.position,
+            pixel_delta,
+            event.modifiers.shift,
+        );
+        if scrolled {
+            context.notify();
+        }
+        scrolled
+    }
+
     /// 对富文本当前选区设置字号。
     pub(in crate::app) fn apply_note_rich_text_font_size(
         &mut self,
@@ -1262,6 +1325,8 @@ impl MainView {
         self.notes.rich_editor.font_size_menu_open = false;
         self.notes.rich_editor.color_menu_open = false;
         self.notes.rich_editor.background_color_menu_open = false;
+        self.notes.rich_editor.code_language_menu_open = false;
+        self.notes.rich_editor.code_language_menu_anchor = None;
         self.notes
             .rich_editor
             .apply_style_patch(NoteRichTextStylePatch {
@@ -1290,6 +1355,8 @@ impl MainView {
         self.notes.rich_editor.color_menu_open = false;
         self.notes.rich_editor.font_size_menu_open = false;
         self.notes.rich_editor.background_color_menu_open = false;
+        self.notes.rich_editor.code_language_menu_open = false;
+        self.notes.rich_editor.code_language_menu_anchor = None;
         self.notes
             .rich_editor
             .apply_style_patch(NoteRichTextStylePatch {
@@ -1308,6 +1375,8 @@ impl MainView {
         self.notes.rich_editor.background_color_menu_open = false;
         self.notes.rich_editor.font_size_menu_open = false;
         self.notes.rich_editor.color_menu_open = false;
+        self.notes.rich_editor.code_language_menu_open = false;
+        self.notes.rich_editor.code_language_menu_anchor = None;
         self.notes
             .rich_editor
             .apply_style_patch(NoteRichTextStylePatch {
@@ -1322,6 +1391,8 @@ impl MainView {
         self.notes.rich_editor.font_size_menu_open = false;
         self.notes.rich_editor.color_menu_open = false;
         self.notes.rich_editor.background_color_menu_open = false;
+        self.notes.rich_editor.code_language_menu_open = false;
+        self.notes.rich_editor.code_language_menu_anchor = None;
         context.notify();
     }
 
@@ -1332,6 +1403,24 @@ impl MainView {
         context: &mut Context<Self>,
     ) {
         self.notes.rich_editor.toggle_list_kind(kind);
+        context.notify();
+    }
+
+    /// 切换富文本代码块。
+    pub(in crate::app) fn toggle_note_rich_text_code_block(&mut self, context: &mut Context<Self>) {
+        self.notes.rich_editor.toggle_code_block();
+        context.notify();
+    }
+
+    /// 设置当前代码块语言。
+    pub(in crate::app) fn apply_note_rich_text_code_language(
+        &mut self,
+        language: &'static str,
+        context: &mut Context<Self>,
+    ) {
+        self.notes.rich_editor.code_language_menu_open = false;
+        self.notes.rich_editor.code_language_menu_anchor = None;
+        self.notes.rich_editor.set_code_language(language);
         context.notify();
     }
 

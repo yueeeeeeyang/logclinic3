@@ -39,6 +39,12 @@ pub(crate) enum NoteRichTextBlockKind {
     UnorderedListItem,
     /// 有序列表项。
     OrderedListItem,
+    /// 代码块。
+    ///
+    /// 业务意图：
+    /// - 代码块以块级语义保存，编辑和查看时使用等宽字体、语法高亮和独立横向滚动。
+    /// - 代码块内部不解析 Markdown，也不支持局部富文本样式，避免代码内容被普通正文工具栏改坏。
+    CodeBlock,
 }
 
 /// 富文本颜色。
@@ -166,6 +172,13 @@ pub(crate) struct NoteRichTextRun {
 pub(crate) struct NoteRichTextBlock {
     /// 块类型。
     pub(crate) kind: NoteRichTextBlockKind,
+    /// 代码块语言标识。
+    ///
+    /// 边界条件：
+    /// - 该字段只对 `CodeBlock` 生效；普通段落和列表会在 `normalize` 中清空，保证旧 JSON 缺失字段也能读取。
+    /// - 第一版语言来自 UI 常用下拉，未知语言由高亮层降级为纯文本。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) code_language: Option<String>,
     /// 块内样式 run。
     pub(crate) runs: Vec<NoteRichTextRun>,
 }
@@ -194,9 +207,12 @@ enum RichTextUnit {
     Text {
         character: char,
         style: NoteRichTextStyle,
+        block_kind: NoteRichTextBlockKind,
+        code_language: Option<String>,
     },
     Break {
         next_kind: NoteRichTextBlockKind,
+        next_code_language: Option<String>,
     },
 }
 
@@ -207,6 +223,7 @@ impl NoteRichTextDocument {
             version: NOTE_RICH_TEXT_JSON_VERSION,
             blocks: vec![NoteRichTextBlock {
                 kind: NoteRichTextBlockKind::Paragraph,
+                code_language: None,
                 runs: Vec::new(),
             }],
         }
@@ -219,10 +236,32 @@ impl NoteRichTextDocument {
 
     /// 按指定样式把普通文本转换成富文本文档。
     pub(crate) fn from_plain_text_with_style(text: &str, style: NoteRichTextStyle) -> Self {
+        Self::from_plain_text_with_style_and_block(
+            text,
+            style,
+            NoteRichTextBlockKind::Paragraph,
+            None,
+        )
+    }
+
+    /// 按指定样式和块类型把普通文本转换成富文本文档。
+    ///
+    /// 业务意图：
+    /// - 编辑器在列表项或代码块中按 Enter / 粘贴多行文本时，新产生的块应继承当前位置的块语义。
+    /// - 代码块语言也需要继承，否则在代码块中插入换行会丢失语法高亮上下文。
+    fn from_plain_text_with_style_and_block(
+        text: &str,
+        style: NoteRichTextStyle,
+        kind: NoteRichTextBlockKind,
+        code_language: Option<String>,
+    ) -> Self {
         let mut blocks = text
             .split('\n')
             .map(|line| NoteRichTextBlock {
-                kind: NoteRichTextBlockKind::Paragraph,
+                kind,
+                code_language: (kind == NoteRichTextBlockKind::CodeBlock)
+                    .then(|| code_language.clone())
+                    .flatten(),
                 runs: if line.is_empty() {
                     Vec::new()
                 } else {
@@ -235,7 +274,10 @@ impl NoteRichTextDocument {
             .collect::<Vec<_>>();
         if blocks.is_empty() {
             blocks.push(NoteRichTextBlock {
-                kind: NoteRichTextBlockKind::Paragraph,
+                kind,
+                code_language: (kind == NoteRichTextBlockKind::CodeBlock)
+                    .then_some(code_language)
+                    .flatten(),
                 runs: Vec::new(),
             });
         }
@@ -310,10 +352,20 @@ impl NoteRichTextDocument {
                 merged.push(run);
             }
             block.runs = merged;
+            if block.kind != NoteRichTextBlockKind::CodeBlock {
+                block.code_language = None;
+            } else if block
+                .code_language
+                .as_ref()
+                .is_some_and(|language| language.trim().is_empty())
+            {
+                block.code_language = None;
+            }
         }
         if self.blocks.is_empty() {
             self.blocks.push(NoteRichTextBlock {
                 kind: NoteRichTextBlockKind::Paragraph,
+                code_language: None,
                 runs: Vec::new(),
             });
         }
@@ -330,14 +382,16 @@ impl NoteRichTextDocument {
     ) {
         let text = self.plain_text();
         let range = clamp_note_rich_text_range(&text, range);
+        let (kind, code_language) = self.block_meta_at_position(range.start);
         let units = self.units();
         let fragment_units = fragment.units();
         let mut next_units = Vec::new();
         append_units_in_range(&units, 0..range.start, &mut next_units);
         next_units.extend(fragment_units.into_iter().map(|(_, unit)| unit));
         append_units_in_range(&units, range.end..text.len(), &mut next_units);
-        let first_kind = first_kind_for_rebuild(&self.blocks, &next_units);
-        *self = Self::from_units(first_kind, next_units);
+        let (first_kind, first_code_language) =
+            first_meta_for_rebuild(&self.blocks, &next_units).unwrap_or((kind, code_language));
+        *self = Self::from_units(first_kind, first_code_language, next_units);
     }
 
     /// 使用普通文本替换指定范围，插入文本继承调用方传入的样式。
@@ -347,7 +401,10 @@ impl NoteRichTextDocument {
         text: &str,
         style: NoteRichTextStyle,
     ) {
-        let fragment = Self::from_plain_text_with_style(text, style);
+        let current = self.plain_text();
+        let range = clamp_note_rich_text_range(&current, range);
+        let (kind, code_language) = self.block_meta_at_position(range.start);
+        let fragment = Self::from_plain_text_with_style_and_block(text, style, kind, code_language);
         self.replace_range_with_document(range, &fragment);
     }
 
@@ -364,7 +421,8 @@ impl NoteRichTextDocument {
         let mut selected_units = Vec::new();
         append_units_in_range(&units, range.clone(), &mut selected_units);
         let first_kind = self.kind_at_position(range.start);
-        Self::from_units(first_kind, selected_units)
+        let (_, first_code_language) = self.block_meta_at_position(range.start);
+        Self::from_units(first_kind, first_code_language, selected_units)
     }
 
     /// 对选区应用内联样式。
@@ -384,19 +442,25 @@ impl NoteRichTextDocument {
                 RichTextUnit::Text {
                     character,
                     mut style,
-                } if ranges_intersect(&unit_range, &range) => {
+                    block_kind,
+                    code_language,
+                } if block_kind != NoteRichTextBlockKind::CodeBlock
+                    && ranges_intersect(&unit_range, &range) =>
+                {
                     style.apply_patch(patch);
-                    next_units.push(RichTextUnit::Text { character, style });
+                    next_units.push(RichTextUnit::Text {
+                        character,
+                        style,
+                        block_kind,
+                        code_language,
+                    });
                 }
                 other => next_units.push(other),
             }
         }
-        let first_kind = self
-            .blocks
-            .first()
-            .map(|block| block.kind)
-            .unwrap_or(NoteRichTextBlockKind::Paragraph);
-        *self = Self::from_units(first_kind, next_units);
+        let (first_kind, first_code_language) = first_meta_for_rebuild(&self.blocks, &next_units)
+            .unwrap_or((NoteRichTextBlockKind::Paragraph, None));
+        *self = Self::from_units(first_kind, first_code_language, next_units);
     }
 
     /// 切换选区覆盖块的列表类型。
@@ -418,7 +482,91 @@ impl NoteRichTextDocument {
             } else {
                 target_kind
             };
+            if self.blocks[index].kind != NoteRichTextBlockKind::CodeBlock {
+                self.blocks[index].code_language = None;
+            } else if self.blocks[index].code_language.is_none() {
+                self.blocks[index].code_language = Some("text".to_string());
+            }
         }
+    }
+
+    /// 设置选区覆盖代码块的语言。
+    ///
+    /// 业务意图：
+    /// - 语言下拉只影响代码块，普通正文选择时不应该悄悄写入无效字段。
+    pub(crate) fn set_code_language_for_range(&mut self, range: Range<usize>, language: &str) {
+        let covered = self.block_indices_for_range(range);
+        for index in covered {
+            if self.blocks[index].kind == NoteRichTextBlockKind::CodeBlock {
+                self.blocks[index].code_language = Some(language.to_string());
+            }
+        }
+        self.normalize();
+    }
+
+    /// 确保指定代码块组后面存在普通段落，并返回段落起始光标位置。
+    ///
+    /// 业务意图：
+    /// - 代码块是块级编辑区域，用户点击代码块下方空白处时应能把光标移出代码块继续输入普通正文。
+    /// - 如果代码块已经后接普通段落，直接定位到后续段落开头；如果代码块位于文档末尾或后面仍是代码块，
+    ///   则插入一个空普通段落作为可编辑落点，避免后续输入继续落在代码块语义里。
+    ///
+    /// 边界条件：
+    /// - `position` 使用线性 UTF-8 字节下标，方法内部会按当前文档纯文本长度夹紧。
+    /// - 连续同语言代码行在 UI 中作为同一个视觉代码块组处理，因此插入位置必须落在整组代码块之后。
+    /// - 返回值中的布尔值表示是否实际修改了文档，调用方据此决定是否压入撤销栈。
+    pub(crate) fn ensure_paragraph_after_code_block_at_position(
+        &mut self,
+        position: usize,
+    ) -> Option<(usize, bool)> {
+        let text = self.plain_text();
+        let position = clamp_note_rich_text_boundary(&text, position);
+        let mut offset = 0;
+        let mut block_index = 0;
+        while block_index < self.blocks.len() {
+            let block = &self.blocks[block_index];
+            let block_len = block.plain_text().len();
+            let block_start = offset;
+            let block_end = block_start + block_len;
+            let next_offset = block_end + usize::from(block_index + 1 < self.blocks.len());
+            if position >= block_start
+                && position <= block_end
+                && block.kind == NoteRichTextBlockKind::CodeBlock
+            {
+                let language = block.code_language.clone();
+                let mut group_end_index = block_index;
+                let mut group_end_offset = block_end;
+                while let Some(next) = self.blocks.get(group_end_index + 1) {
+                    if next.kind != NoteRichTextBlockKind::CodeBlock
+                        || next.code_language != language
+                    {
+                        break;
+                    }
+                    let next_start = group_end_offset + 1;
+                    group_end_offset = next_start + next.plain_text().len();
+                    group_end_index += 1;
+                }
+                let cursor_after_group = group_end_offset + 1;
+                if let Some(next) = self.blocks.get(group_end_index + 1)
+                    && next.kind != NoteRichTextBlockKind::CodeBlock
+                {
+                    return Some((cursor_after_group, false));
+                }
+                self.blocks.insert(
+                    group_end_index + 1,
+                    NoteRichTextBlock {
+                        kind: NoteRichTextBlockKind::Paragraph,
+                        code_language: None,
+                        runs: Vec::new(),
+                    },
+                );
+                self.normalize();
+                return Some((cursor_after_group, true));
+            }
+            offset = next_offset;
+            block_index += 1;
+        }
+        None
     }
 
     /// 返回光标所在或选区覆盖的块下标。
@@ -469,21 +617,31 @@ impl NoteRichTextDocument {
     }
 
     /// 返回指定位置所在块类型。
+    pub(crate) fn block_kind_at_position(&self, position: usize) -> NoteRichTextBlockKind {
+        self.block_meta_at_position(position).0
+    }
+
+    /// 返回指定位置所在块类型。
     fn kind_at_position(&self, position: usize) -> NoteRichTextBlockKind {
+        self.block_meta_at_position(position).0
+    }
+
+    /// 返回指定位置所在块的类型和代码语言。
+    fn block_meta_at_position(&self, position: usize) -> (NoteRichTextBlockKind, Option<String>) {
         let text = self.plain_text();
         let position = clamp_note_rich_text_boundary(&text, position);
         let mut offset = 0;
         for (index, block) in self.blocks.iter().enumerate() {
             let end = offset + block.plain_text().len();
             if position <= end {
-                return block.kind;
+                return (block.kind, block.code_language.clone());
             }
             offset = end + usize::from(index + 1 < self.blocks.len());
         }
         self.blocks
             .last()
-            .map(|block| block.kind)
-            .unwrap_or(NoteRichTextBlockKind::Paragraph)
+            .map(|block| (block.kind, block.code_language.clone()))
+            .unwrap_or((NoteRichTextBlockKind::Paragraph, None))
     }
 
     /// 将文档转换成带字节范围的线性单元。
@@ -499,6 +657,8 @@ impl NoteRichTextDocument {
                         RichTextUnit::Text {
                             character,
                             style: run.style.clone(),
+                            block_kind: block.kind,
+                            code_language: block.code_language.clone(),
                         },
                     ));
                     offset += len;
@@ -509,6 +669,7 @@ impl NoteRichTextDocument {
                     offset..offset + 1,
                     RichTextUnit::Break {
                         next_kind: next_block.kind,
+                        next_code_language: next_block.code_language.clone(),
                     },
                 ));
                 offset += 1;
@@ -518,15 +679,22 @@ impl NoteRichTextDocument {
     }
 
     /// 从线性单元重建文档。
-    fn from_units(first_kind: NoteRichTextBlockKind, units: Vec<RichTextUnit>) -> Self {
+    fn from_units(
+        first_kind: NoteRichTextBlockKind,
+        first_code_language: Option<String>,
+        units: Vec<RichTextUnit>,
+    ) -> Self {
         let mut blocks = Vec::new();
         let mut current = NoteRichTextBlock {
             kind: first_kind,
+            code_language: first_code_language,
             runs: Vec::new(),
         };
         for unit in units {
             match unit {
-                RichTextUnit::Text { character, style } => {
+                RichTextUnit::Text {
+                    character, style, ..
+                } => {
                     if let Some(previous) = current.runs.last_mut()
                         && previous.style == style
                     {
@@ -538,10 +706,14 @@ impl NoteRichTextDocument {
                         style,
                     });
                 }
-                RichTextUnit::Break { next_kind } => {
+                RichTextUnit::Break {
+                    next_kind,
+                    next_code_language,
+                } => {
                     blocks.push(current);
                     current = NoteRichTextBlock {
                         kind: next_kind,
+                        code_language: next_code_language,
                         runs: Vec::new(),
                     };
                 }
@@ -622,14 +794,26 @@ fn append_units_in_range(
     }
 }
 
-fn first_kind_for_rebuild(
+fn first_meta_for_rebuild(
     blocks: &[NoteRichTextBlock],
-    _units: &[RichTextUnit],
-) -> NoteRichTextBlockKind {
+    units: &[RichTextUnit],
+) -> Option<(NoteRichTextBlockKind, Option<String>)> {
+    if units.is_empty() {
+        return blocks
+            .first()
+            .map(|block| (block.kind, block.code_language.clone()));
+    }
+    if let Some(RichTextUnit::Text {
+        block_kind,
+        code_language,
+        ..
+    }) = units.first()
+    {
+        return Some((*block_kind, code_language.clone()));
+    }
     blocks
         .first()
-        .map(|block| block.kind)
-        .unwrap_or(NoteRichTextBlockKind::Paragraph)
+        .map(|block| (block.kind, block.code_language.clone()))
 }
 
 fn ranges_intersect(left: &Range<usize>, right: &Range<usize>) -> bool {
@@ -739,5 +923,144 @@ mod tests {
                 .iter()
                 .all(|block| block.kind == NoteRichTextBlockKind::Paragraph)
         );
+    }
+
+    /// 验证代码块 JSON 能往返，并保留语言字段。
+    ///
+    /// 业务意图：
+    /// - 笔记代码块只扩展富文本 JSON，不提升 SQLite schema；该测试锁定旧字段兼容和新语言字段的保存语义。
+    #[test]
+    fn 富文本代码块_json_保留语言字段() {
+        let mut document = NoteRichTextDocument::from_plain_text("fn main() {}\nprintln!();");
+        document.toggle_blocks_kind(0..document.len(), NoteRichTextBlockKind::CodeBlock);
+        document.set_code_language_for_range(0..document.len(), "rust");
+
+        let restored = NoteRichTextDocument::from_json(&document.to_json().unwrap()).unwrap();
+        assert_eq!(restored.blocks[0].kind, NoteRichTextBlockKind::CodeBlock);
+        assert_eq!(restored.blocks[0].code_language.as_deref(), Some("rust"));
+        assert_eq!(restored.blocks[1].code_language.as_deref(), Some("rust"));
+    }
+
+    /// 验证旧富文本 JSON 缺少代码语言字段时仍可读取。
+    #[test]
+    fn 富文本旧_json_缺少代码语言字段可读取() {
+        let json = r#"{"version":1,"blocks":[{"kind":"paragraph","runs":[{"text":"旧笔记","style":{"font_size_px":14,"bold":false,"italic":false,"underline":false,"strikethrough":false,"color":null}}]}]}"#;
+        let restored = NoteRichTextDocument::from_json(json).unwrap();
+        assert_eq!(restored.blocks[0].kind, NoteRichTextBlockKind::Paragraph);
+        assert_eq!(restored.blocks[0].code_language, None);
+    }
+
+    /// 验证代码块中插入换行会继承代码块类型和语言。
+    ///
+    /// 业务意图：
+    /// - 编辑器按 Enter 会调用普通文本替换路径；如果这里不继承块语义，代码块会被拆成普通段落。
+    #[test]
+    fn 富文本代码块插入换行会继承语言() {
+        let mut document = NoteRichTextDocument::from_plain_text("let a = 1;");
+        document.toggle_blocks_kind(0..document.len(), NoteRichTextBlockKind::CodeBlock);
+        document.set_code_language_for_range(0..document.len(), "rust");
+
+        document.replace_range_with_text(4..4, "\n", NoteRichTextStyle::default());
+
+        assert_eq!(document.blocks.len(), 2);
+        assert!(
+            document
+                .blocks
+                .iter()
+                .all(|block| block.kind == NoteRichTextBlockKind::CodeBlock)
+        );
+        assert!(
+            document
+                .blocks
+                .iter()
+                .all(|block| block.code_language.as_deref() == Some("rust"))
+        );
+    }
+
+    /// 验证代码块不写入普通富文本样式。
+    ///
+    /// 业务意图：
+    /// - 代码块渲染固定使用等宽字体和语法高亮，不读取 run 上的字号、颜色、粗斜体等富文本样式。
+    /// - 如果模型层仍保存这些隐藏样式，代码块切回普通段落或复制到正文后会出现用户不可预期的样式。
+    #[test]
+    fn 富文本代码块忽略内联样式补丁() {
+        let mut document = NoteRichTextDocument::from_plain_text("let a = 1;");
+        document.toggle_blocks_kind(0..document.len(), NoteRichTextBlockKind::CodeBlock);
+        document.apply_style_patch(
+            0..document.len(),
+            &NoteRichTextStylePatch {
+                bold: Some(true),
+                color: Some(Some(NoteRichTextColor::rgb(220, 38, 38))),
+                font_size_px: Some(24),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            document.blocks[0].runs[0].style,
+            NoteRichTextStyle::default()
+        );
+    }
+
+    /// 验证点击代码块下方时可懒创建普通段落作为光标落点。
+    ///
+    /// 业务意图：
+    /// - 用户需要在代码块后继续输入正文；如果最后一个块仍是代码块，必须能创建一个普通段落脱离代码编辑语义。
+    #[test]
+    fn 富文本代码块后可创建普通段落落点() {
+        let mut document = NoteRichTextDocument::from_plain_text("let a = 1;");
+        document.toggle_blocks_kind(0..document.len(), NoteRichTextBlockKind::CodeBlock);
+        document.set_code_language_for_range(0..document.len(), "rust");
+
+        let (cursor, changed) = document
+            .ensure_paragraph_after_code_block_at_position(document.len())
+            .unwrap();
+
+        assert!(changed);
+        assert_eq!(cursor, "let a = 1;\n".len());
+        assert_eq!(
+            document.blocks.last().map(|block| block.kind),
+            Some(NoteRichTextBlockKind::Paragraph)
+        );
+        assert_eq!(
+            document.block_kind_at_position(cursor),
+            NoteRichTextBlockKind::Paragraph
+        );
+    }
+
+    /// 验证代码块后已有普通正文时仅移动光标，不产生内容修改。
+    #[test]
+    fn 富文本代码块后已有段落时不重复创建段落() {
+        let mut document = NoteRichTextDocument::from_plain_text("code\n正文");
+        document.toggle_blocks_kind(0..4, NoteRichTextBlockKind::CodeBlock);
+        document.set_code_language_for_range(0..4, "rust");
+
+        let (cursor, changed) = document
+            .ensure_paragraph_after_code_block_at_position(2)
+            .unwrap();
+
+        assert!(!changed);
+        assert_eq!(cursor, "code\n".len());
+        assert_eq!(document.blocks.len(), 2);
+        assert_eq!(
+            document.block_kind_at_position(cursor),
+            NoteRichTextBlockKind::Paragraph
+        );
+    }
+
+    /// 验证复制粘贴代码块片段时保留首行代码块类型。
+    #[test]
+    fn 富文本代码块片段保留首行类型() {
+        let mut document = NoteRichTextDocument::from_plain_text("a\nb");
+        document.toggle_blocks_kind(0..document.len(), NoteRichTextBlockKind::CodeBlock);
+        document.set_code_language_for_range(0..document.len(), "rust");
+        let fragment = document.fragment_for_range(0..document.len());
+
+        let mut target = NoteRichTextDocument::empty();
+        target.replace_range_with_document(0..0, &fragment);
+
+        assert_eq!(target.blocks[0].kind, NoteRichTextBlockKind::CodeBlock);
+        assert_eq!(target.blocks[0].code_language.as_deref(), Some("rust"));
+        assert_eq!(target.plain_text(), "a\nb");
     }
 }

@@ -676,10 +676,18 @@ impl MainView {
                     view.finish_note_rich_text_selection(context);
                 }),
             )
+            .on_scroll_wheel(context.listener(
+                |view, event: &ScrollWheelEvent, _window, context| {
+                    if view.handle_note_rich_text_scroll_wheel(event, context) {
+                        context.stop_propagation();
+                    }
+                },
+            ))
             .child(NoteRichTextElement {
                 view: context.entity(),
                 editable: false,
                 palette,
+                theme: self.effective_theme(),
             })
     }
 
@@ -779,10 +787,18 @@ impl MainView {
                             .overflow_scroll()
                             .scrollbar_width(px(6.0))
                             .text_color(rgb(palette.text))
+                            .on_scroll_wheel(context.listener(
+                                |view, event: &ScrollWheelEvent, _window, context| {
+                                    if view.handle_note_rich_text_scroll_wheel(event, context) {
+                                        context.stop_propagation();
+                                    }
+                                },
+                            ))
                             .child(NoteRichTextElement {
                                 view: context.entity(),
                                 editable: true,
                                 palette,
+                                theme: self.effective_theme(),
                             }),
                     )
                     .child(self.render_note_rich_toolbar_menus(palette, context)),
@@ -888,6 +904,16 @@ impl MainView {
             .child(self.render_note_rich_color_button(palette, context))
             .child(self.render_note_rich_background_color_button(palette, context))
             .child(self.render_note_rich_toolbar_icon(
+                "code-block",
+                Icon::Code,
+                self.notes.rich_editor.current_block_is_code(),
+                palette,
+                context.listener(|view, _event: &ClickEvent, _window, context| {
+                    view.toggle_note_rich_text_code_block(context);
+                    context.stop_propagation();
+                }),
+            ))
+            .child(self.render_note_rich_toolbar_icon(
                 "bullet-list",
                 Icon::List,
                 false,
@@ -923,7 +949,8 @@ impl MainView {
     ) -> gpui::Stateful<gpui::Div> {
         let menu_open = self.notes.rich_editor.font_size_menu_open
             || self.notes.rich_editor.color_menu_open
-            || self.notes.rich_editor.background_color_menu_open;
+            || self.notes.rich_editor.background_color_menu_open
+            || self.notes.rich_editor.code_language_menu_open;
         if !menu_open {
             return div().id("note-rich-toolbar-menus-empty").hidden();
         }
@@ -940,6 +967,7 @@ impl MainView {
             .child(self.render_note_rich_font_size_menu(palette, context))
             .child(self.render_note_rich_color_menu(palette, context))
             .child(self.render_note_rich_background_color_menu(palette, context))
+            .child(self.render_note_rich_code_language_menu(palette, context))
     }
 
     /// 渲染富文本工具栏菜单透明遮罩。
@@ -1029,6 +1057,8 @@ impl MainView {
                         !view.notes.rich_editor.font_size_menu_open;
                     view.notes.rich_editor.color_menu_open = false;
                     view.notes.rich_editor.background_color_menu_open = false;
+                    view.notes.rich_editor.code_language_menu_open = false;
+                    view.notes.rich_editor.code_language_menu_anchor = None;
                     context.stop_propagation();
                     context.notify();
                 }),
@@ -1098,6 +1128,8 @@ impl MainView {
                 view.notes.rich_editor.color_menu_open = !view.notes.rich_editor.color_menu_open;
                 view.notes.rich_editor.font_size_menu_open = false;
                 view.notes.rich_editor.background_color_menu_open = false;
+                view.notes.rich_editor.code_language_menu_open = false;
+                view.notes.rich_editor.code_language_menu_anchor = None;
                 context.stop_propagation();
                 context.notify();
             }),
@@ -1120,6 +1152,8 @@ impl MainView {
                     !view.notes.rich_editor.background_color_menu_open;
                 view.notes.rich_editor.font_size_menu_open = false;
                 view.notes.rich_editor.color_menu_open = false;
+                view.notes.rich_editor.code_language_menu_open = false;
+                view.notes.rich_editor.code_language_menu_anchor = None;
                 context.stop_propagation();
                 context.notify();
             }),
@@ -1248,6 +1282,57 @@ impl MainView {
                     .on_click(context.listener(
                         move |view, _event: &ClickEvent, _window, context| {
                             view.apply_note_rich_text_background_color(color, context);
+                            context.stop_propagation();
+                        },
+                    ))
+            }))
+    }
+
+    /// 渲染代码块语言下拉菜单。
+    fn render_note_rich_code_language_menu(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        if !self.notes.rich_editor.code_language_menu_open {
+            return div().id("note-rich-code-language-menu-empty").hidden();
+        }
+        let (left, top) = self.notes.rich_editor.code_language_menu_position();
+        div()
+            .id("note-rich-code-language-menu")
+            .absolute()
+            .left(left)
+            .top(top)
+            .w(px(132.0))
+            .py_1()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.menu))
+            .shadow_lg()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    context.stop_propagation();
+                }),
+            )
+            .children(NOTES_CODE_BLOCK_LANGUAGES.iter().copied().map(|language| {
+                div()
+                    .id(SharedString::from(format!(
+                        "note-rich-code-language-{language}"
+                    )))
+                    .h(px(28.0))
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .text_sm()
+                    .text_color(rgb(palette.text))
+                    .cursor_pointer()
+                    .hover(move |item| item.bg(rgb(palette.hover)))
+                    .child(language.to_string())
+                    .on_click(context.listener(
+                        move |view, _event: &ClickEvent, _window, context| {
+                            view.apply_note_rich_text_code_language(language, context);
                             context.stop_propagation();
                         },
                     ))

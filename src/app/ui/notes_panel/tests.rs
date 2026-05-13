@@ -89,3 +89,35 @@ fn markdown_笔记编辑后会按富文本保存() {
         &rich_note
     ));
 }
+
+/// 验证普通正文自动换行优先在英文空白处断行。
+///
+/// 业务意图：
+/// - 长英文段落默认换行时应尽量保留单词完整性，避免阅读器把单词中间切开。
+#[test]
+fn 笔记正文自动换行优先英文空白() {
+    let text = "hello world again";
+    let end = preferred_soft_wrap_end(text, 0, "hello wor".len());
+    assert_eq!(end, "hello ".len());
+}
+
+/// 验证中文自动换行只使用合法 UTF-8 字符边界。
+///
+/// 边界条件：
+/// - GPUI 命中和富文本存储都使用 UTF-8 字节下标，换行断点不能落在中文字符内部。
+#[test]
+fn 笔记正文自动换行保持中文字符边界() {
+    let text = "你好世界";
+    let inside_character = "你好".len() + 1;
+    let end = preferred_soft_wrap_end(text, 0, inside_character);
+    assert_eq!(end, "你好".len());
+    assert!(text.is_char_boundary(end));
+}
+
+/// 验证超长单词没有空白时会按字符边界强制换行。
+#[test]
+fn 笔记正文自动换行支持超长单词强制断行() {
+    let text = "superlongword";
+    let end = preferred_soft_wrap_end(text, 0, "super".len());
+    assert_eq!(end, "super".len());
+}

@@ -39,3 +39,41 @@ pub(in crate::app) const NOTES_RICH_TEXT_VERTICAL_PADDING: f32 = 14.0;
 
 /// 富文本工具栏高度。
 pub(in crate::app) const NOTES_RICH_TEXT_TOOLBAR_HEIGHT: f32 = 40.0;
+
+/// 代码块横向内边距。
+pub(in crate::app) const NOTES_CODE_BLOCK_HORIZONTAL_PADDING: f32 = 12.0;
+
+/// 代码块纵向内边距。
+pub(in crate::app) const NOTES_CODE_BLOCK_VERTICAL_PADDING: f32 = 10.0;
+
+/// 代码块语言标签所在的顶部区域高度。
+pub(in crate::app) const NOTES_CODE_BLOCK_HEADER_HEIGHT: f32 = 24.0;
+
+/// 代码块每行高度。
+pub(in crate::app) const NOTES_CODE_BLOCK_LINE_HEIGHT: f32 = 21.0;
+
+/// 代码块底部横向滚动条高度。
+pub(in crate::app) const NOTES_CODE_BLOCK_SCROLLBAR_HEIGHT: f32 = 8.0;
+
+/// 代码块与相邻正文之间的垂直间距。
+pub(in crate::app) const NOTES_CODE_BLOCK_VERTICAL_GAP: f32 = 8.0;
+
+/// 代码块语言下拉支持的常用语言。
+///
+/// 业务意图：
+/// - 第一版不提供自由输入，避免用户输入任意值后高亮表现不可预期；未知旧数据仍由高亮层降级为纯文本。
+pub(in crate::app) const NOTES_CODE_BLOCK_LANGUAGES: &[&str] = &[
+    "text",
+    "rust",
+    "java",
+    "kotlin",
+    "javascript",
+    "typescript",
+    "json",
+    "xml",
+    "yaml",
+    "toml",
+    "sql",
+    "shell",
+    "python",
+];

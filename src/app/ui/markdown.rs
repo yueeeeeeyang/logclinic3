@@ -501,7 +501,7 @@ where
         }
     }
     AppMarkdownBlock::CodeBlock {
-        lines: highlight_ai_chat_code_block_with_language(&code, language.as_deref(), theme),
+        lines: highlight_app_code_block_with_language(&code, language.as_deref(), theme),
         language,
     }
 }
@@ -1046,8 +1046,12 @@ fn ai_chat_markdown_highlight_style(
     Some(highlight)
 }
 
-/// 根据语言名称高亮代码块。
-fn highlight_ai_chat_code_block_with_language(
+/// 根据语言名称高亮应用内代码块。
+///
+/// 业务意图：
+/// - AI 对话 Markdown 和笔记富文本代码块都需要语法高亮，复用同一套 syntect 适配可保证主题颜色和未知语言降级行为一致。
+/// - 该函数不执行代码、不解析 HTML，只把纯文本按语言 token 转换为 GPUI 高亮范围。
+pub(in crate::app) fn highlight_app_code_block_with_language(
     code: &str,
     language: Option<&str>,
     theme: EffectiveTheme,
