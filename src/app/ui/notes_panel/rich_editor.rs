@@ -1455,9 +1455,28 @@ fn layout_code_block_group(
         point(group_left, group_top),
         size(group_width, group_height),
     );
+    // 代码块作为纸张内的二级内容，需要用圆角卡片和轻边框建立层级；
+    // 背景保留轻灰而不是纯白，避免和 A4 纸面融合在一起。
     let mut code_background = rgb(palette.panel);
-    code_background.a = 0.92;
-    background_quads.push(fill(group_bounds, code_background));
+    code_background.a = 0.96;
+    background_quads.push(
+        fill(group_bounds, code_background)
+            .corner_radii(px(8.0))
+            .border_widths(px(1.0))
+            .border_color(rgb(palette.border)),
+    );
+
+    // 顶部区域只承载语言标签和分隔线，不再让标签漂浮在代码内容中间。
+    let header_bottom = group_top + px(NOTES_CODE_BLOCK_HEADER_HEIGHT);
+    let mut header_separator = rgb(palette.border);
+    header_separator.a = 0.62;
+    background_quads.push(fill(
+        Bounds::new(
+            point(group_left + px(1.0), header_bottom - px(1.0)),
+            size(group_width - px(2.0), px(1.0)),
+        ),
+        header_separator,
+    ));
 
     let label_text = if language.is_empty() {
         "text"
@@ -1467,25 +1486,32 @@ fn layout_code_block_group(
     let label_line = shape_code_label(label_text, palette, window);
     let language_label_bounds = Bounds::new(
         point(
-            group_left + px(NOTES_CODE_BLOCK_HORIZONTAL_PADDING * 0.5),
-            group_top + px(4.0),
+            group_left + px(NOTES_CODE_BLOCK_HORIZONTAL_PADDING),
+            group_top + px(7.0),
         ),
         size(
-            label_line.width + px(NOTES_CODE_BLOCK_HORIZONTAL_PADDING),
-            px(NOTES_CODE_BLOCK_HEADER_HEIGHT - 6.0),
+            label_line.width + px(18.0),
+            px(NOTES_CODE_BLOCK_HEADER_HEIGHT - 14.0),
         ),
     );
-    background_quads.push(fill(language_label_bounds, rgb(palette.surface)));
+    let mut label_background = rgb(palette.selected);
+    label_background.a = 0.82;
+    let mut label_border = rgb(palette.accent);
+    label_border.a = 0.28;
+    background_quads.push(
+        fill(language_label_bounds, label_background)
+            .corner_radii(px(10.0))
+            .border_widths(px(1.0))
+            .border_color(label_border),
+    );
     decorations.push(NoteRichTextDecorationFragment {
-        x: language_label_bounds.left() + px(NOTES_CODE_BLOCK_HORIZONTAL_PADDING * 0.5),
-        y: group_top + px(4.0),
-        line_height: px(NOTES_CODE_BLOCK_HEADER_HEIGHT - 4.0),
+        x: language_label_bounds.left() + px(9.0),
+        y: language_label_bounds.top() + px(1.0),
+        line_height: language_label_bounds.size.height,
         line: label_line,
     });
 
-    let mut line_top = group_top
-        + px(NOTES_CODE_BLOCK_HEADER_HEIGHT)
-        + px(NOTES_CODE_BLOCK_VERTICAL_PADDING * 0.4);
+    let mut line_top = header_bottom + px(NOTES_CODE_BLOCK_VERTICAL_PADDING);
     for (line_index, (highlighted, full_line)) in full_lines.into_iter().enumerate() {
         let range = line_ranges
             .get(line_index)
@@ -1569,7 +1595,7 @@ fn layout_code_block_group(
 
     let (scrollbar_track, scrollbar_thumb) = if has_horizontal_scroll {
         let track_left = content_left;
-        let track_top = content_bottom + px(4.0);
+        let track_top = content_bottom + px(6.0);
         let track_width = viewport_width;
         let track_bounds = Bounds::new(
             point(track_left, track_top),
@@ -1589,9 +1615,11 @@ fn layout_code_block_group(
             size(thumb_width, px(NOTES_CODE_BLOCK_SCROLLBAR_HEIGHT - 4.0)),
         );
         let mut track_color = rgb(palette.border);
-        track_color.a = 0.5;
-        background_quads.push(fill(track_bounds, track_color));
-        background_quads.push(fill(thumb_bounds, rgb(palette.muted_text)));
+        track_color.a = 0.42;
+        let mut thumb_color = rgb(palette.muted_text);
+        thumb_color.a = 0.78;
+        background_quads.push(fill(track_bounds, track_color).corner_radii(px(4.0)));
+        background_quads.push(fill(thumb_bounds, thumb_color).corner_radii(px(3.0)));
         (Some(track_bounds), Some(thumb_bounds))
     } else {
         (None, None)
@@ -1740,7 +1768,7 @@ fn shape_code_line(
     }
     window.text_system().shape_line(
         SharedString::from(visible.to_string()),
-        px(NOTE_RICH_TEXT_DEFAULT_FONT_SIZE_PX as f32),
+        px(NOTES_CODE_BLOCK_FONT_SIZE),
         &runs,
         None,
     )
@@ -1765,7 +1793,7 @@ fn code_text_run(len: usize, color: gpui::Hsla, window: &mut Window) -> TextRun 
 fn shape_code_label(text: &str, palette: AppThemePalette, window: &mut Window) -> ShapedLine {
     let mut style = NoteRichTextStyle::default();
     style.font_size_px = 12;
-    shape_rich_text_fragment(text, &style, rgb(palette.muted_text).into(), window)
+    shape_rich_text_fragment(text, &style, rgb(palette.accent).into(), window)
 }
 
 fn shape_rich_text_fragment(
@@ -1842,12 +1870,12 @@ pub(in crate::app) fn code_block_visual_height(line_count: usize) -> f32 {
 /// - 只有内容真正超宽时才预留横向滚动条高度，避免普通短代码块底部出现大块空白。
 fn code_block_container_height(line_count: usize, has_horizontal_scroll: bool) -> f32 {
     let scrollbar_height = if has_horizontal_scroll {
-        NOTES_CODE_BLOCK_SCROLLBAR_HEIGHT + 10.0
+        NOTES_CODE_BLOCK_SCROLLBAR_HEIGHT + NOTES_CODE_BLOCK_VERTICAL_PADDING + 2.0
     } else {
-        6.0
+        NOTES_CODE_BLOCK_VERTICAL_PADDING
     };
     NOTES_CODE_BLOCK_HEADER_HEIGHT
-        + NOTES_CODE_BLOCK_VERTICAL_PADDING * 0.4
+        + NOTES_CODE_BLOCK_VERTICAL_PADDING
         + NOTES_CODE_BLOCK_LINE_HEIGHT * line_count.max(1) as f32
         + scrollbar_height
 }

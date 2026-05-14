@@ -45,6 +45,19 @@ pub(in crate::app) struct AiChatInputResizeDrag {
     pub(in crate::app) start_height: f32,
 }
 
+/// AI 对话左侧会话栏宽度拖拽状态。
+///
+/// 业务意图：
+/// - 用户按住会话栏右侧边界拖动时，需要记录按下时的窗口横坐标和起始宽度，确保宽度变化与鼠标位移线性一致。
+/// - 宽度只保存在当前主窗口状态中，不写入配置文件，避免一次临时查看长标题影响下一次打开应用。
+#[derive(Clone, Copy, Debug)]
+pub(in crate::app) struct AiChatConversationListResizeDrag {
+    /// 鼠标按下时的窗口横坐标。
+    pub(in crate::app) start_x: Pixels,
+    /// 鼠标按下时的会话栏宽度。
+    pub(in crate::app) start_width: f32,
+}
+
 /// AI 对话历史数据加载状态。
 ///
 /// 业务意图：
@@ -136,6 +149,17 @@ pub(in crate::app) struct AiChatWorkspaceState {
     pub(in crate::app) conversation_list_state: ListState,
     /// AI 对话右侧消息流虚拟列表状态。
     pub(in crate::app) message_list_state: ListState,
+    /// AI 对话左侧会话栏当前宽度。
+    ///
+    /// 业务意图：
+    /// - 默认值保持 260px，和笔记页左侧树一致；拖拽后只在当前会话内即时生效。
+    /// - 当前不持久化宽度，避免临时布局偏好污染标准启动布局。
+    pub(in crate::app) conversation_list_width: f32,
+    /// AI 对话左侧会话栏宽度拖拽状态。
+    ///
+    /// 边界条件：
+    /// - `None` 表示普通鼠标移动不会改变布局；只有从右侧拖拽命中区按下后才进入拖拽模式。
+    pub(in crate::app) conversation_list_resize_drag: Option<AiChatConversationListResizeDrag>,
     /// AI 对话列表滚动条拖动状态。
     pub(in crate::app) scrollbar_drag: Option<AiChatScrollbarDrag>,
     /// AI 对话数据库错误。
@@ -190,6 +214,8 @@ impl AiChatWorkspaceState {
             conversations: Vec::new(),
             active_conversation_id: None,
             messages: Vec::new(),
+            conversation_list_width: AI_CHAT_CONVERSATION_LIST_WIDTH,
+            conversation_list_resize_drag: None,
             scrollbar_drag: None,
             database_error: None,
             model_menu_open: false,
@@ -350,6 +376,32 @@ pub(in crate::app) fn clamp_ai_chat_input_height(
         .min(viewport_cap)
         .max(AI_CHAT_INPUT_MIN_HEIGHT);
     requested_height.clamp(AI_CHAT_INPUT_MIN_HEIGHT, max_height)
+}
+
+/// 约束 AI 对话左侧会话栏拖拽后的宽度。
+///
+/// 业务意图：
+/// - 会话栏宽度要允许用户临时放大以阅读长标题，但不能挤掉右侧消息和输入区。
+///
+/// 边界条件：
+/// - 如果窗口极窄导致右侧工作区最小宽度无法满足，仍优先保证左侧栏不低于最小可用宽度。
+/// - 非有限宽度通常来自异常测试输入或窗口系统临时无效尺寸，直接回退默认宽度，避免布局写入 NaN。
+pub(in crate::app) fn clamp_ai_chat_conversation_list_width(
+    requested_width: f32,
+    window_width: f32,
+) -> f32 {
+    if !requested_width.is_finite() {
+        return AI_CHAT_CONVERSATION_LIST_WIDTH;
+    }
+    let feature_width = if window_width.is_finite() {
+        (window_width - MAIN_NAV_WIDTH).max(0.0)
+    } else {
+        AI_CHAT_CONVERSATION_LIST_WIDTH + AI_CHAT_WORKSPACE_MIN_WIDTH
+    };
+    let max_list_width = (feature_width - AI_CHAT_WORKSPACE_MIN_WIDTH)
+        .max(AI_CHAT_CONVERSATION_LIST_MIN_WIDTH)
+        .min(AI_CHAT_CONVERSATION_LIST_MAX_WIDTH);
+    requested_width.clamp(AI_CHAT_CONVERSATION_LIST_MIN_WIDTH, max_list_width)
 }
 
 /// 判断 AI 流式消息是否需要显式触发虚拟列表行高失效。

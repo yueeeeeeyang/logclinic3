@@ -95,6 +95,7 @@ impl MainView {
         context: &mut Context<Self>,
     ) {
         self.notes.tree_context_menu = None;
+        self.notes.tree_create_menu_open = false;
         if event.click_count == 1 {
             self.select_note_tree_row(selection, context);
         } else {
@@ -115,6 +116,7 @@ impl MainView {
         self.notes.unsaved_dialog = None;
         self.notes.rename_dialog = None;
         self.notes.tree_context_menu = None;
+        self.notes.tree_create_menu_open = false;
         self.notes.delete_confirm_dialog = None;
 
         match selection.kind {
@@ -219,6 +221,37 @@ impl MainView {
     ) {
         let parent_id = self.selected_directory_id_for_new_directory();
         self.request_create_note_directory(parent_id, context);
+    }
+
+    /// 切换笔记树顶部新增菜单。
+    ///
+    /// 业务意图：
+    /// - 工具栏只暴露一个新增入口，点击后再通过菜单区分新建目录或笔记。
+    /// - 打开新增菜单时需要关闭右键菜单，避免两个浮层同时存在并争抢点击遮罩。
+    pub(in crate::app) fn toggle_notes_tree_create_menu(&mut self, context: &mut Context<Self>) {
+        self.notes.tree_create_menu_open = !self.notes.tree_create_menu_open;
+        self.notes.tree_context_menu = None;
+        context.notify();
+    }
+
+    /// 执行笔记树顶部新增菜单命令。
+    pub(in crate::app) fn handle_notes_tree_create_menu_action(
+        &mut self,
+        action: NotesTreeContextMenuAction,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.notes.tree_create_menu_open = false;
+        match action {
+            NotesTreeContextMenuAction::NewDirectory => {
+                self.create_note_directory_from_toolbar(context);
+            }
+            NotesTreeContextMenuAction::NewNote => {
+                self.create_note_in_selected_directory(window, context);
+            }
+            NotesTreeContextMenuAction::Rename | NotesTreeContextMenuAction::Delete => {}
+        }
+        context.stop_propagation();
     }
 
     /// 请求创建目录，必要时先处理未保存编辑草稿。
@@ -385,6 +418,7 @@ impl MainView {
             original_title,
         });
         self.notes.tree_context_menu = None;
+        self.notes.tree_create_menu_open = false;
         if let Some(window) = window {
             window.focus(&self.notes.title_focus);
         }
@@ -720,14 +754,122 @@ impl MainView {
         }
     }
 
+    /// 开始拖拽调整笔记树宽度。
+    ///
+    /// 业务意图：
+    /// - 用户可以像日志页分栏一样临时调整笔记树宽度，用于查看较长目录名或给右侧 A4 纸张留出更多空间。
+    ///
+    /// 边界条件：
+    /// - 只记录拖拽起点和起始宽度，实际宽度在鼠标移动时统一经过边界约束。
+    /// - 开始拖拽时关闭笔记树浮层菜单，避免拖动过程中菜单遮挡或消费鼠标释放事件。
+    pub(in crate::app) fn start_notes_tree_resize(
+        &mut self,
+        event: &MouseDownEvent,
+        context: &mut Context<Self>,
+    ) {
+        self.notes.tree_resize_drag = Some(NotesTreeResizeDrag {
+            start_x: event.position.x,
+            start_width: self.notes.tree_width,
+        });
+        self.notes.tree_context_menu = None;
+        self.notes.tree_create_menu_open = false;
+        context.notify();
+    }
+
+    /// 根据鼠标移动更新笔记树宽度。
+    ///
+    /// 边界条件：
+    /// - 拖拽可能跨过右侧编辑区，因此移动事件由笔记页根节点接管。
+    /// - 宽度同时受固定最小值、固定最大值和当前窗口内右侧工作区最小可用宽度约束。
+    pub(in crate::app) fn update_notes_tree_resize_drag(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.notes.tree_resize_drag else {
+            return;
+        };
+        if !event.dragging() {
+            self.stop_notes_tree_resize_drag(context);
+            return;
+        }
+        let delta = f32::from(event.position.x - drag.start_x);
+        let window_width = f32::from(window.viewport_size().width);
+        self.notes.tree_width =
+            Self::clamp_notes_tree_width(drag.start_width + delta, window_width);
+        context.notify();
+    }
+
+    /// 结束笔记树宽度拖拽。
+    ///
+    /// 边界条件：
+    /// - 当前不做宽度持久化，因此释放鼠标只清理内存拖拽状态。
+    pub(in crate::app) fn stop_notes_tree_resize_drag(&mut self, context: &mut Context<Self>) {
+        if self.notes.tree_resize_drag.take().is_some() {
+            context.notify();
+        }
+    }
+
+    /// 处理笔记页鼠标移动事件。
+    pub(in crate::app) fn handle_notes_page_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let was_resizing = self.notes.tree_resize_drag.is_some();
+        self.update_notes_tree_resize_drag(event, window, context);
+        if was_resizing {
+            context.stop_propagation();
+        }
+    }
+
+    /// 处理笔记页鼠标左键释放事件。
+    pub(in crate::app) fn handle_notes_page_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let was_resizing = self.notes.tree_resize_drag.is_some();
+        self.stop_notes_tree_resize_drag(context);
+        if was_resizing {
+            context.stop_propagation();
+        }
+    }
+
+    /// 将笔记树宽度限制在当前窗口可用范围内。
+    ///
+    /// 业务意图：
+    /// - 拖拽宽度必须保留笔记树本身的可读性，也必须保留右侧编辑区的基本操作空间。
+    ///
+    /// 边界条件：
+    /// - 如果窗口极窄导致右侧工作区最小宽度无法满足，仍优先保证笔记树不低于最小可用宽度。
+    /// - 非有限数通常来自异常测试输入或平台窗口尺寸不可用，直接回退到默认宽度，避免布局写入 NaN。
+    pub(in crate::app) fn clamp_notes_tree_width(requested_width: f32, window_width: f32) -> f32 {
+        if !requested_width.is_finite() {
+            return NOTES_TREE_DEFAULT_WIDTH;
+        }
+        let feature_width = if window_width.is_finite() {
+            (window_width - MAIN_NAV_WIDTH).max(0.0)
+        } else {
+            NOTES_TREE_DEFAULT_WIDTH + NOTES_WORKSPACE_MIN_WIDTH
+        };
+        let max_tree_width = (feature_width - NOTES_WORKSPACE_MIN_WIDTH)
+            .max(NOTES_TREE_MIN_WIDTH)
+            .min(NOTES_TREE_MAX_WIDTH);
+        requested_width.clamp(NOTES_TREE_MIN_WIDTH, max_tree_width)
+    }
+
     /// 计算笔记树右键菜单横坐标。
     ///
     /// 业务意图：
     /// - 笔记页和日志页一样位于固定主导航右侧，窗口坐标进入笔记树面板前必须扣除主导航宽度。
-    pub(in crate::app) fn notes_tree_context_menu_x(window_x: f32) -> f32 {
+    pub(in crate::app) fn notes_tree_context_menu_x(window_x: f32, tree_width: f32) -> f32 {
         (window_x - MAIN_NAV_WIDTH)
             .max(0.0)
-            .clamp(0.0, NOTES_TREE_WIDTH - LOG_TREE_CONTEXT_MENU_WIDTH)
+            .clamp(0.0, (tree_width - LOG_TREE_CONTEXT_MENU_WIDTH).max(0.0))
     }
 
     /// 打开笔记树右键菜单。
@@ -740,18 +882,23 @@ impl MainView {
         self.notes.selected = Some(target.clone());
         self.notes.tree_context_menu = Some(NotesTreeContextMenu {
             target,
-            x: Self::notes_tree_context_menu_x(f32::from(event.position.x)),
+            x: Self::notes_tree_context_menu_x(f32::from(event.position.x), self.notes.tree_width),
             y: f32::from(event.position.y).max(0.0),
         });
         self.notes.rename_dialog = None;
         self.notes.delete_confirm_dialog = None;
+        self.notes.tree_create_menu_open = false;
         context.notify();
         context.stop_propagation();
     }
 
-    /// 关闭笔记树右键菜单。
-    pub(in crate::app) fn close_notes_tree_context_menu(&mut self, context: &mut Context<Self>) {
+    /// 关闭笔记树所有浮层菜单。
+    ///
+    /// 业务意图：
+    /// - 右键菜单和顶部新增菜单共享同一层透明遮罩，外部点击时必须一起关闭，避免隐藏菜单残留状态。
+    pub(in crate::app) fn close_notes_tree_menus(&mut self, context: &mut Context<Self>) {
         self.notes.tree_context_menu = None;
+        self.notes.tree_create_menu_open = false;
         context.notify();
     }
 

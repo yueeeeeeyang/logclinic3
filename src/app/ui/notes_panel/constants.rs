@@ -4,8 +4,32 @@
 // - 常量集中放置，保证渲染、状态和测试使用同一组 UI 数值，避免笔记页面布局约束散落在多个文件。
 // - 所有尺寸值使用 GPUI 逻辑像素，由框架处理 macOS 和 Windows 的缩放差异。
 
-/// 笔记页左侧树宽度。
-pub(in crate::app) const NOTES_TREE_WIDTH: f32 = 280.0;
+use crate::app::ui::AI_CHAT_CONVERSATION_LIST_WIDTH;
+
+/// 笔记页左侧树默认宽度。
+///
+/// UI 约束：
+/// - 默认值和 AI 对话左侧会话栏保持一致，让应用内“左侧资源列表”在不同功能页之间有稳定的视觉宽度。
+/// - 用户拖拽后的宽度只保存在当前会话状态中，不写入配置，避免临时调整影响后续启动默认布局。
+pub(in crate::app) const NOTES_TREE_DEFAULT_WIDTH: f32 = AI_CHAT_CONVERSATION_LIST_WIDTH;
+
+/// 笔记页左侧树允许拖拽到的最小宽度。
+///
+/// 边界条件：
+/// - 该宽度需要容纳展开箭头、文件图标和短标题，避免拖得过窄后树行只剩不可识别的图标。
+pub(in crate::app) const NOTES_TREE_MIN_WIDTH: f32 = 220.0;
+
+/// 笔记页左侧树允许拖拽到的最大宽度。
+///
+/// 边界条件：
+/// - 固定最大值避免树面板吞掉 A4 编辑纸张的主要阅读区域；极窄窗口下仍会再受工作区最小宽度约束。
+pub(in crate::app) const NOTES_TREE_MAX_WIDTH: f32 = 420.0;
+
+/// 笔记工作区拖拽时需要保留的最小宽度。
+///
+/// UI 约束：
+/// - 右侧需要容纳顶部操作区和 A4 纸张滚动容器；窗口较窄时优先保证工作区仍可操作。
+pub(in crate::app) const NOTES_WORKSPACE_MIN_WIDTH: f32 = 420.0;
 
 /// 笔记树默认展开深度。
 pub(in crate::app) const NOTES_TREE_DEFAULT_EXPANDED_DEPTH: usize = 2;
@@ -60,16 +84,22 @@ pub(in crate::app) const NOTES_RICH_TEXT_VERTICAL_PADDING: f32 = 14.0;
 pub(in crate::app) const NOTES_RICH_TEXT_TOOLBAR_HEIGHT: f32 = 40.0;
 
 /// 代码块横向内边距。
-pub(in crate::app) const NOTES_CODE_BLOCK_HORIZONTAL_PADDING: f32 = 12.0;
+pub(in crate::app) const NOTES_CODE_BLOCK_HORIZONTAL_PADDING: f32 = 16.0;
 
 /// 代码块纵向内边距。
-pub(in crate::app) const NOTES_CODE_BLOCK_VERTICAL_PADDING: f32 = 10.0;
+pub(in crate::app) const NOTES_CODE_BLOCK_VERTICAL_PADDING: f32 = 12.0;
 
 /// 代码块语言标签所在的顶部区域高度。
-pub(in crate::app) const NOTES_CODE_BLOCK_HEADER_HEIGHT: f32 = 24.0;
+pub(in crate::app) const NOTES_CODE_BLOCK_HEADER_HEIGHT: f32 = 34.0;
 
 /// 代码块每行高度。
-pub(in crate::app) const NOTES_CODE_BLOCK_LINE_HEIGHT: f32 = 21.0;
+pub(in crate::app) const NOTES_CODE_BLOCK_LINE_HEIGHT: f32 = 22.0;
+
+/// 代码块文本字号。
+///
+/// 业务意图：
+/// - 代码块需要比正文稍紧凑，配合卡片内边距展示更多参数和命令；仍保持足够高度避免中英文混排时压线。
+pub(in crate::app) const NOTES_CODE_BLOCK_FONT_SIZE: f32 = 13.0;
 
 /// 代码块底部横向滚动条高度。
 pub(in crate::app) const NOTES_CODE_BLOCK_SCROLLBAR_HEIGHT: f32 = 8.0;

@@ -19,8 +19,38 @@ impl MainView {
             .flex()
             .size_full()
             .bg(rgb(palette.background))
+            .on_mouse_move(context.listener(Self::handle_notes_page_mouse_move))
+            .on_mouse_up(
+                MouseButton::Left,
+                context.listener(Self::handle_notes_page_mouse_up),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                context.listener(Self::handle_notes_page_mouse_up),
+            )
             .child(self.render_notes_tree_panel(palette, context))
             .child(self.render_notes_workspace(palette, context))
+            .when(self.notes.tree_resize_drag.is_some(), |page| {
+                page.child(
+                    div()
+                        .id("notes-tree-resize-cursor-overlay")
+                        .absolute()
+                        .left(px(0.0))
+                        .right(px(0.0))
+                        .top(px(0.0))
+                        .bottom(px(0.0))
+                        .cursor_col_resize()
+                        .on_mouse_move(context.listener(Self::handle_notes_page_mouse_move))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            context.listener(Self::handle_notes_page_mouse_up),
+                        )
+                        .on_mouse_up_out(
+                            MouseButton::Left,
+                            context.listener(Self::handle_notes_page_mouse_up),
+                        ),
+                )
+            })
             .child(self.render_notes_unsaved_dialog(palette, context))
             .child(self.render_notes_rename_dialog(palette, context))
             .child(self.render_notes_delete_confirm_dialog(palette, context))
@@ -32,21 +62,54 @@ impl MainView {
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        let border_color = if self.notes.tree_resize_drag.is_some() {
+            0x94a3b8
+        } else {
+            palette.border
+        };
         div()
             .id("notes-tree-panel")
             .relative()
             .flex()
             .flex_col()
-            .w(px(NOTES_TREE_WIDTH))
+            .w(px(self.notes.tree_width))
             .h_full()
             .flex_none()
             .border_r_1()
-            .border_color(rgb(palette.border))
+            .border_color(rgb(border_color))
             .bg(rgb(palette.panel))
             .child(self.render_notes_tree_toolbar(palette, context))
             .child(self.render_notes_tree_body(palette, context))
+            .child(self.render_notes_tree_resize_handle(context))
             .child(self.render_notes_tree_context_menu_dismiss_overlay(context))
+            .child(self.render_notes_tree_create_menu(palette, context))
             .child(self.render_notes_tree_context_menu(palette, context))
+    }
+
+    /// 渲染笔记树右侧宽度拖拽命中区。
+    ///
+    /// UI 约束：
+    /// - 可见边界仍复用树面板右边框，命中区透明覆盖在边界附近，避免新增粗分隔条挤占右侧 A4 页面空间。
+    /// - 命中区从面板右侧略微外扩，保证用户在边线附近移动鼠标时更容易抓住。
+    fn render_notes_tree_resize_handle(
+        &self,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("notes-tree-resize-handle")
+            .absolute()
+            .right(px(-(SPLITTER_HIT_WIDTH / 2.0)))
+            .top(px(0.0))
+            .bottom(px(0.0))
+            .w(px(SPLITTER_HIT_WIDTH))
+            .cursor_col_resize()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|view, event: &MouseDownEvent, _window, context| {
+                    view.start_notes_tree_resize(event, context);
+                    context.stop_propagation();
+                }),
+            )
     }
 
     /// 渲染笔记树工具栏。
@@ -85,20 +148,11 @@ impl MainView {
                     .items_center()
                     .gap_1()
                     .child(self.render_notes_toolbar_button(
-                        "notes-new-directory",
-                        Icon::FolderPlus,
+                        "notes-create-menu",
+                        Icon::Plus,
                         palette,
                         context.listener(|view, _event: &ClickEvent, _window, context| {
-                            view.create_note_directory_from_toolbar(context);
-                            context.stop_propagation();
-                        }),
-                    ))
-                    .child(self.render_notes_toolbar_button(
-                        "notes-new-note",
-                        Icon::FilePlus,
-                        palette,
-                        context.listener(|view, _event: &ClickEvent, window, context| {
-                            view.create_note_in_selected_directory(window, context);
+                            view.toggle_notes_tree_create_menu(context);
                             context.stop_propagation();
                         }),
                     )),
@@ -300,7 +354,7 @@ impl MainView {
         &self,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        if self.notes.tree_context_menu.is_none() {
+        if self.notes.tree_context_menu.is_none() && !self.notes.tree_create_menu_open {
             return div()
                 .id("notes-tree-context-menu-dismiss-overlay-empty")
                 .hidden();
@@ -321,14 +375,102 @@ impl MainView {
             .on_mouse_down(
                 MouseButton::Right,
                 context.listener(|view, _event: &MouseDownEvent, _window, context| {
-                    view.close_notes_tree_context_menu(context);
+                    view.close_notes_tree_menus(context);
                     context.stop_propagation();
                 }),
             )
             .on_click(
                 context.listener(|view, _event: &ClickEvent, _window, context| {
-                    view.close_notes_tree_context_menu(context);
+                    view.close_notes_tree_menus(context);
                     context.stop_propagation();
+                }),
+            )
+    }
+
+    /// 渲染笔记树工具栏新增下拉菜单。
+    ///
+    /// 业务意图：
+    /// - 顶部只保留一个新增图标，具体创建目录或笔记交给菜单选择，避免两个相近图标造成误点。
+    /// - 菜单作为笔记树面板内的浮层绘制，配合透明遮罩消费外部点击，避免点击穿透到树行。
+    fn render_notes_tree_create_menu(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        if !self.notes.tree_create_menu_open {
+            return div().id("notes-tree-create-menu-empty").hidden();
+        }
+        div()
+            .id("notes-tree-create-menu")
+            .absolute()
+            .right(px(LOG_TREE_ROW_HORIZONTAL_PADDING))
+            .top(px(LOG_TREE_HEADER_HEIGHT - 2.0))
+            .w(px(LOG_TREE_CONTEXT_MENU_WIDTH))
+            .py_1()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.menu))
+            .shadow_lg()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    context.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    context.stop_propagation();
+                }),
+            )
+            .child(self.render_notes_tree_create_menu_item(
+                NotesTreeContextMenuAction::NewDirectory,
+                "新增目录",
+                Icon::FolderPlus,
+                palette,
+                context,
+            ))
+            .child(self.render_notes_tree_create_menu_item(
+                NotesTreeContextMenuAction::NewNote,
+                "新增文件",
+                Icon::FilePlus,
+                palette,
+                context,
+            ))
+    }
+
+    /// 渲染笔记树新增菜单单项。
+    fn render_notes_tree_create_menu_item(
+        &self,
+        action: NotesTreeContextMenuAction,
+        label: &'static str,
+        icon: Icon,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(SharedString::from(format!("notes-tree-create-{label}")))
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(LOG_TREE_CONTEXT_MENU_ITEM_HEIGHT))
+            .px_3()
+            .text_sm()
+            .text_color(rgb(palette.text))
+            .cursor_pointer()
+            .hover(move |item| item.bg(rgb(palette.hover)))
+            .child(Self::render_lucide_icon(
+                Some(icon),
+                16.0,
+                15.0,
+                palette.muted_text,
+            ))
+            .child(label)
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(move |view, _event: &MouseDownEvent, window, context| {
+                    view.handle_notes_tree_create_menu_action(action, window, context);
                 }),
             )
     }
@@ -698,43 +840,6 @@ impl MainView {
             .flex_col()
             .size_full()
             .p(px(NOTES_EDITOR_PADDING))
-            .gap_3()
-            .child(
-                div()
-                    .id("note-editor-title")
-                    .h(px(34.0))
-                    .flex()
-                    .items_center()
-                    .px_3()
-                    .rounded(px(6.0))
-                    .border_1()
-                    .border_color(rgb(palette.border))
-                    .bg(rgb(palette.panel))
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(palette.text))
-                    .track_focus(&self.notes.title_focus)
-                    .key_context("note-title")
-                    .on_key_down(context.listener(
-                        |view, event: &KeyDownEvent, _window, context| {
-                            view.handle_note_title_key_down(event, context);
-                        },
-                    ))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        context.listener(|view, event: &MouseDownEvent, window, context| {
-                            view.start_note_title_mouse_selection(event, context);
-                            window.focus(&view.notes.title_focus);
-                            context.stop_propagation();
-                        }),
-                    )
-                    .child(NoteTitleElement {
-                        view: context.entity(),
-                        focus_handle: self.notes.title_focus.clone(),
-                        palette,
-                        placeholder: "未命名笔记",
-                    }),
-            )
             .child(
                 div()
                     .id("note-editor-content")

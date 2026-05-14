@@ -71,6 +71,30 @@ impl MainView {
                         ),
                 )
             })
+            .when(
+                self.ai_chat.conversation_list_resize_drag.is_some(),
+                |page| {
+                    page.child(
+                        div()
+                            .id("ai-chat-sidebar-resize-cursor-overlay")
+                            .absolute()
+                            .left(px(0.0))
+                            .right(px(0.0))
+                            .top(px(0.0))
+                            .bottom(px(0.0))
+                            .cursor_col_resize()
+                            .on_mouse_move(context.listener(Self::handle_ai_chat_mouse_move))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                context.listener(Self::handle_ai_chat_mouse_up),
+                            )
+                            .on_mouse_up_out(
+                                MouseButton::Left,
+                                context.listener(Self::handle_ai_chat_mouse_up),
+                            ),
+                    )
+                },
+            )
     }
 
     /// 渲染 AI 对话左侧会话栏。
@@ -107,15 +131,21 @@ impl MainView {
                 ))
                 .into_any_element()
         };
+        let border_color = if self.ai_chat.conversation_list_resize_drag.is_some() {
+            0x94a3b8
+        } else {
+            palette.border
+        };
         div()
             .id("ai-chat-sidebar")
+            .relative()
             .flex()
             .flex_col()
-            .w(px(AI_CHAT_CONVERSATION_LIST_WIDTH))
+            .w(px(self.ai_chat.conversation_list_width))
             .h_full()
             .flex_none()
             .border_r_1()
-            .border_color(rgb(palette.border))
+            .border_color(rgb(border_color))
             .bg(rgb(palette.panel))
             .child(
                 div()
@@ -175,6 +205,34 @@ impl MainView {
                     .min_h_0()
                     .overflow_hidden()
                     .child(conversation_list_content),
+            )
+            .child(self.render_ai_chat_sidebar_resize_handle(context))
+    }
+
+    /// 渲染 AI 对话左侧会话栏右侧宽度拖拽命中区。
+    ///
+    /// UI 约束：
+    /// - 可见边界仍复用会话栏右边框，透明命中区覆盖在边界附近，避免新增粗分隔条影响整体布局。
+    /// - 命中区略宽于视觉线条，保证高 DPI 鼠标和触控板都容易抓住。
+    pub(in crate::app) fn render_ai_chat_sidebar_resize_handle(
+        &self,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("ai-chat-sidebar-resize-handle")
+            .absolute()
+            .right(px(-(SPLITTER_HIT_WIDTH / 2.0)))
+            .top(px(0.0))
+            .bottom(px(0.0))
+            .w(px(SPLITTER_HIT_WIDTH))
+            .cursor_col_resize()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|view, event: &MouseDownEvent, _window, context| {
+                    view.start_ai_chat_conversation_list_resize(event);
+                    context.notify();
+                    context.stop_propagation();
+                }),
             )
     }
 

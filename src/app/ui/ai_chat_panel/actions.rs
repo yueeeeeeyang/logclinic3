@@ -595,6 +595,7 @@ impl MainView {
             start_y: event.position.y,
             start_height: self.ai_chat.input_height,
         });
+        self.ai_chat.conversation_list_resize_drag = None;
         self.ai_chat.input_selection_drag = None;
         self.ai_chat.scrollbar_drag = None;
         self.ai_chat.model_menu_open = false;
@@ -632,6 +633,63 @@ impl MainView {
         }
     }
 
+    /// 开始拖拽调整 AI 对话左侧会话栏宽度。
+    ///
+    /// 业务意图：
+    /// - 会话标题较长时，用户可以临时放宽左侧栏；需要更多消息阅读空间时也可以收窄左侧栏。
+    ///
+    /// 边界条件：
+    /// - 按下瞬间只记录起点和宽度，实际宽度更新统一在鼠标移动路径中完成。
+    /// - 开始拖拽时关闭模型菜单、停止滚动条拖拽和输入区高度拖拽，避免多个拖拽交互同时争抢鼠标事件。
+    pub(in crate::app) fn start_ai_chat_conversation_list_resize(
+        &mut self,
+        event: &MouseDownEvent,
+    ) {
+        self.ai_chat.conversation_list_resize_drag = Some(AiChatConversationListResizeDrag {
+            start_x: event.position.x,
+            start_width: self.ai_chat.conversation_list_width,
+        });
+        self.ai_chat.input_resize_drag = None;
+        self.ai_chat.input_selection_drag = None;
+        self.ai_chat.scrollbar_drag = None;
+        self.ai_chat.model_menu_open = false;
+    }
+
+    /// 根据鼠标移动更新 AI 对话左侧会话栏宽度。
+    ///
+    /// 边界条件：
+    /// - 拖拽可能跨过消息区或窗口外侧，因此在 AI 页面根节点统一接管鼠标移动。
+    /// - 宽度同时受左侧最小宽度、左侧最大宽度和右侧工作区最小可用宽度约束。
+    pub(in crate::app) fn update_ai_chat_conversation_list_resize_drag(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.ai_chat.conversation_list_resize_drag else {
+            return;
+        };
+        if !event.dragging() {
+            self.stop_ai_chat_conversation_list_resize_drag(context);
+            return;
+        }
+        let delta = f32::from(event.position.x - drag.start_x);
+        let window_width = f32::from(window.viewport_size().width);
+        self.ai_chat.conversation_list_width =
+            clamp_ai_chat_conversation_list_width(drag.start_width + delta, window_width);
+        context.notify();
+    }
+
+    /// 结束 AI 对话左侧会话栏宽度拖拽。
+    pub(in crate::app) fn stop_ai_chat_conversation_list_resize_drag(
+        &mut self,
+        context: &mut Context<Self>,
+    ) {
+        if self.ai_chat.conversation_list_resize_drag.take().is_some() {
+            context.notify();
+        }
+    }
+
     /// 处理 AI 对话页鼠标移动事件。
     pub(in crate::app) fn handle_ai_chat_mouse_move(
         &mut self,
@@ -639,8 +697,13 @@ impl MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
+        let was_resizing_conversation_list = self.ai_chat.conversation_list_resize_drag.is_some();
         self.update_ai_chat_scrollbar_drag(event, context);
         self.update_ai_chat_input_resize_drag(event, window, context);
+        self.update_ai_chat_conversation_list_resize_drag(event, window, context);
+        if was_resizing_conversation_list {
+            context.stop_propagation();
+        }
     }
 
     /// 处理 AI 对话页鼠标释放事件。
@@ -650,8 +713,13 @@ impl MainView {
         _window: &mut Window,
         context: &mut Context<Self>,
     ) {
+        let was_resizing_conversation_list = self.ai_chat.conversation_list_resize_drag.is_some();
         self.stop_ai_chat_scrollbar_drag(context);
         self.stop_ai_chat_input_resize_drag(context);
+        self.stop_ai_chat_conversation_list_resize_drag(context);
+        if was_resizing_conversation_list {
+            context.stop_propagation();
+        }
     }
 
     /// 读取 AI 对话输入区当前文本、选择范围和组合文本范围的快照。

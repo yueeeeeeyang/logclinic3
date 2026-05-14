@@ -343,6 +343,34 @@ fn ai_对话输入区高度拖拽会被限制() {
     );
 }
 
+/// 验证 AI 对话左侧会话栏拖拽宽度会被限制在安全范围内。
+///
+/// UI 约束：
+/// - 会话栏不能小到标题和新增按钮不可识别，也不能大到挤掉右侧消息和输入区。
+#[test]
+fn ai_对话左侧会话栏宽度拖拽会被限制() {
+    let wide_window =
+        MAIN_NAV_WIDTH + AI_CHAT_WORKSPACE_MIN_WIDTH + AI_CHAT_CONVERSATION_LIST_MAX_WIDTH + 120.0;
+    assert_eq!(
+        clamp_ai_chat_conversation_list_width(10.0, wide_window),
+        AI_CHAT_CONVERSATION_LIST_MIN_WIDTH
+    );
+    assert_eq!(
+        clamp_ai_chat_conversation_list_width(10_000.0, wide_window),
+        AI_CHAT_CONVERSATION_LIST_MAX_WIDTH
+    );
+
+    let narrow_window = MAIN_NAV_WIDTH + AI_CHAT_WORKSPACE_MIN_WIDTH + 260.0;
+    assert_eq!(
+        clamp_ai_chat_conversation_list_width(10_000.0, narrow_window),
+        260.0
+    );
+    assert_eq!(
+        clamp_ai_chat_conversation_list_width(f32::NAN, wide_window),
+        AI_CHAT_CONVERSATION_LIST_WIDTH
+    );
+}
+
 /// 验证流式消息行高失效会按批次触发。
 ///
 /// 业务意图：

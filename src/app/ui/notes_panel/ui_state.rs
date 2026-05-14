@@ -120,6 +120,19 @@ pub(in crate::app) struct NotesTreeContextMenu {
     pub(in crate::app) y: f32,
 }
 
+/// 笔记树宽度拖拽状态。
+///
+/// 业务意图：
+/// - 用户按住笔记树右侧边界拖动时，需要记录按下时的窗口横坐标和起始宽度，确保宽度变化与鼠标位移线性一致。
+/// - 状态只在当前主窗口生命周期内有效，不写入磁盘，避免临时排版调整影响下一次打开应用。
+#[derive(Clone, Copy, Debug)]
+pub(in crate::app) struct NotesTreeResizeDrag {
+    /// 鼠标按下时的窗口横坐标。
+    pub(in crate::app) start_x: Pixels,
+    /// 鼠标按下时的笔记树宽度。
+    pub(in crate::app) start_width: f32,
+}
+
 /// 笔记树右键菜单命令。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::app) enum NotesTreeContextMenuAction {
@@ -145,6 +158,17 @@ pub(in crate::app) struct NotesWorkspaceState {
     pub(in crate::app) selected: Option<NotesTreeSelection>,
     /// 当前右侧打开的笔记。
     pub(in crate::app) active_note: Option<Note>,
+    /// 笔记树当前宽度。
+    ///
+    /// 业务意图：
+    /// - 默认值和 AI 对话左侧栏一致，拖拽后在当前会话内即时生效。
+    /// - 宽度不持久化，避免用户一次临时查看长目录名后影响后续启动的标准布局。
+    pub(in crate::app) tree_width: f32,
+    /// 笔记树宽度拖拽状态。
+    ///
+    /// 边界条件：
+    /// - `None` 表示普通鼠标移动不会改变布局；只有从右侧拖拽命中区按下后才进入拖拽模式。
+    pub(in crate::app) tree_resize_drag: Option<NotesTreeResizeDrag>,
     /// 笔记树虚拟列表滚动句柄。
     pub(in crate::app) tree_scroll_handle: UniformListScrollHandle,
     /// 数据库错误。
@@ -179,6 +203,12 @@ pub(in crate::app) struct NotesWorkspaceState {
     pub(in crate::app) rename_dialog: Option<NotesRenameDialog>,
     /// 笔记树右键菜单。
     pub(in crate::app) tree_context_menu: Option<NotesTreeContextMenu>,
+    /// 笔记树顶部新增菜单是否打开。
+    ///
+    /// 业务意图：
+    /// - 左侧工具栏只保留一个“新增”入口，点击后再选择新建目录或新建笔记，降低工具栏图标密度。
+    /// - 菜单是临时 UI 状态，不能影响树选择、编辑草稿和持久化数据。
+    pub(in crate::app) tree_create_menu_open: bool,
     /// 删除确认弹窗。
     pub(in crate::app) delete_confirm_dialog: Option<NotesDeleteConfirmDialog>,
 }
@@ -203,6 +233,8 @@ impl NotesWorkspaceState {
             expanded_directory_ids: HashSet::new(),
             selected: None,
             active_note: None,
+            tree_width: NOTES_TREE_DEFAULT_WIDTH,
+            tree_resize_drag: None,
             tree_scroll_handle: UniformListScrollHandle::new(),
             database_error,
             source_selection: None,
@@ -218,6 +250,7 @@ impl NotesWorkspaceState {
             unsaved_dialog: None,
             rename_dialog: None,
             tree_context_menu: None,
+            tree_create_menu_open: false,
             delete_confirm_dialog: None,
         };
         state.initialize_expanded_directories();

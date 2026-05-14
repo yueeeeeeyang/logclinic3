@@ -135,3 +135,20 @@ fn 笔记_a4_纸张比例稳定() {
     assert!(NOTES_A4_PAGE_HEIGHT > NOTES_A4_PAGE_WIDTH);
     assert!(NOTES_A4_PAGE_GUTTER >= 24.0);
 }
+
+/// 验证代码块视觉高度包含卡片头部、正文和留白。
+///
+/// 业务意图：
+/// - 代码块改为带头部的卡片后，布局预估高度必须覆盖语言标签、代码行和横向滚动条预留空间。
+/// - 如果高度不足，滚动容器会裁掉底部圆角或滚动条，预览和编辑态都会出现视觉压缩。
+#[test]
+fn 笔记代码块视觉高度包含卡片结构() {
+    let height = code_block_visual_height(1);
+    assert!(
+        height
+            > NOTES_CODE_BLOCK_VERTICAL_GAP
+                + NOTES_CODE_BLOCK_HEADER_HEIGHT
+                + NOTES_CODE_BLOCK_VERTICAL_PADDING
+                + NOTES_CODE_BLOCK_LINE_HEIGHT
+    );
+}

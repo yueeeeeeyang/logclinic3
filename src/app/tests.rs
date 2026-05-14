@@ -490,14 +490,55 @@ mod state_tests {
     /// 验证笔记树右键菜单坐标同样扣除固定大导航宽度并限制在笔记树面板内。
     #[test]
     fn 笔记树菜单横坐标包含主导航宽度() {
-        assert_eq!(MainView::notes_tree_context_menu_x(24.0), 0.0);
         assert_eq!(
-            MainView::notes_tree_context_menu_x(MAIN_NAV_WIDTH + 72.0),
+            MainView::notes_tree_context_menu_x(24.0, NOTES_TREE_DEFAULT_WIDTH),
+            0.0
+        );
+        assert_eq!(
+            MainView::notes_tree_context_menu_x(MAIN_NAV_WIDTH + 72.0, NOTES_TREE_DEFAULT_WIDTH),
             72.0
         );
         assert_eq!(
-            MainView::notes_tree_context_menu_x(MAIN_NAV_WIDTH + 270.0),
-            NOTES_TREE_WIDTH - LOG_TREE_CONTEXT_MENU_WIDTH
+            MainView::notes_tree_context_menu_x(MAIN_NAV_WIDTH + 270.0, NOTES_TREE_DEFAULT_WIDTH),
+            NOTES_TREE_DEFAULT_WIDTH - LOG_TREE_CONTEXT_MENU_WIDTH
+        );
+    }
+
+    /// 验证笔记树默认宽度与 AI 对话左侧栏保持一致。
+    ///
+    /// 业务意图：
+    /// - 两个功能页左侧都承载资源列表，默认宽度一致可以避免用户在导航切换时感知到不必要的布局跳动。
+    #[test]
+    fn 笔记树默认宽度与_ai_侧栏一致() {
+        assert_eq!(NOTES_TREE_DEFAULT_WIDTH, AI_CHAT_CONVERSATION_LIST_WIDTH);
+    }
+
+    /// 验证笔记树拖拽宽度会被限制在可用范围内。
+    ///
+    /// 边界条件：
+    /// - 拖得过窄时仍保留树行图标和短标题空间。
+    /// - 拖得过宽时不能吞掉右侧笔记工作区。
+    /// - 异常非有限数不应写入布局状态。
+    #[test]
+    fn 笔记树拖拽宽度限制在可用范围内() {
+        let wide_window = MAIN_NAV_WIDTH + NOTES_WORKSPACE_MIN_WIDTH + NOTES_TREE_MAX_WIDTH + 120.0;
+        assert_eq!(
+            MainView::clamp_notes_tree_width(10.0, wide_window),
+            NOTES_TREE_MIN_WIDTH
+        );
+        assert_eq!(
+            MainView::clamp_notes_tree_width(10_000.0, wide_window),
+            NOTES_TREE_MAX_WIDTH
+        );
+
+        let narrow_window = MAIN_NAV_WIDTH + NOTES_WORKSPACE_MIN_WIDTH + 260.0;
+        assert_eq!(
+            MainView::clamp_notes_tree_width(10_000.0, narrow_window),
+            260.0
+        );
+        assert_eq!(
+            MainView::clamp_notes_tree_width(f32::NAN, wide_window),
+            NOTES_TREE_DEFAULT_WIDTH
         );
     }
 
