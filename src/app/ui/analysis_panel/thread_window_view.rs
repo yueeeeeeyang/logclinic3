@@ -25,6 +25,7 @@ pub(in crate::app) struct SearchResultsResizeDrag {
 ///
 /// 业务意图：
 /// - 当前文件搜索复用已解码行；当前目录搜索复用加载树中收集到的文件来源。
+/// - 选中文件搜索复用左侧树右键时固定下来的来源快照，不依赖当前打开 tab。
 /// - 使用枚举可以在启动任务前完成所有 UI 状态校验，后台逻辑只处理明确输入。
 /// - 当前文件分支携带已解码文档的堆分配指针，既避免重新读取日志，也避免单个枚举因文档 payload 过大影响任务传递成本。
 pub(in crate::app) enum SearchTarget {
@@ -41,6 +42,11 @@ pub(in crate::app) enum SearchTarget {
     /// 搜索当前目录递归来源。
     CurrentDirectory {
         /// 当前目录下所有可打开文件来源。
+        sources: Vec<LogFileSource>,
+    },
+    /// 搜索左侧目录树选中文件快照。
+    SelectedFiles {
+        /// 右键打开搜索对话框时选中的可打开文件来源。
         sources: Vec<LogFileSource>,
     },
 }

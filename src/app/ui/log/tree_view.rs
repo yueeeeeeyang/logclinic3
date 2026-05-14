@@ -9,6 +9,18 @@
 
 use super::*;
 
+/// 左侧目录树搜索输入框删除方向。
+///
+/// 业务意图：
+/// - Backspace 和 Delete 都要复用同一套 UTF-8 安全删除逻辑，只在相邻字符方向上不同。
+#[derive(Clone, Copy)]
+enum LogTreeSearchDeleteDirection {
+    /// 删除光标左侧字符。
+    Backward,
+    /// 删除光标右侧字符。
+    Forward,
+}
+
 impl MainView {
     pub(in crate::app) fn render_log_tree_panel(
         &self,
@@ -23,6 +35,7 @@ impl MainView {
             .size_full()
             .bg(rgb(palette.panel))
             .child(self.render_log_tree_header())
+            .child(self.render_log_tree_search_bar(context))
             .child(self.render_log_tree_body(context))
             .child(self.render_log_tree_context_menu_dismiss_overlay(context))
             .child(self.render_log_tree_context_menu(context))
@@ -74,6 +87,237 @@ impl MainView {
                     .truncate()
                     .child(summary),
             )
+    }
+
+    /// 渲染左侧目录树文件名搜索栏。
+    ///
+    /// 业务意图：
+    /// - 用户需要在大目录或压缩包树中快速定位文件，搜索栏直接嵌入左侧树，避免和右侧全文搜索窗口混淆。
+    /// - 输入关键字后只过滤目录树文件名，显示命中文件及其父级上下文，不读取日志正文。
+    ///
+    /// 边界条件：
+    /// - 搜索栏位于虚拟列表之外，点击、拖拽和键盘事件仍显式消费，避免未来布局调整成覆盖层时误触发下方树行。
+    /// - 空输入时隐藏计数和上下导航占位，让搜索框撑满左侧容器；输入关键字后把计数和按钮组合成紧凑导航组。
+    /// - 非空搜索但无命中时按钮保持禁用视觉并不执行滚动。
+    pub(in crate::app) fn render_log_tree_search_bar(
+        &self,
+        context: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let palette = self.palette();
+        let focus_handle = self.log.log_tree_search.focus.clone();
+        let has_query = self.log.log_tree_search.is_active();
+        let has_matches = !self.log.log_tree_search.match_node_ids.is_empty();
+        let summary = self.log_tree_search_summary_label();
+
+        div()
+            .id("log-tree-search-bar")
+            .flex()
+            .items_center()
+            .gap(px(LOG_TREE_SEARCH_BAR_ITEM_GAP))
+            .h(px(LOG_TREE_SEARCH_BAR_HEIGHT))
+            .px(px(LOG_TREE_ROW_HORIZONTAL_PADDING))
+            .border_b_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.panel))
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    context.stop_propagation();
+                }),
+            )
+            .child(
+                div()
+                    .id("log-tree-search-input")
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(LOG_TREE_SEARCH_INPUT_HEIGHT))
+                    .px_2()
+                    .rounded(px(5.0))
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.input))
+                    .track_focus(&focus_handle)
+                    .key_context("log-tree-search-input")
+                    .on_key_down(context.listener(Self::handle_log_tree_search_key_down))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        context.listener(|view, event: &MouseDownEvent, window, context| {
+                            view.handle_log_tree_search_mouse_down(event, window, context);
+                        }),
+                    )
+                    .on_mouse_move(context.listener(
+                        |view, event: &MouseMoveEvent, _window, context| {
+                            view.handle_log_tree_search_mouse_move(event, context);
+                        },
+                    ))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        context.listener(|view, _event: &MouseUpEvent, _window, context| {
+                            view.finish_log_tree_search_mouse_selection(context);
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        context.listener(|view, _event: &MouseUpEvent, _window, context| {
+                            view.finish_log_tree_search_mouse_selection(context);
+                        }),
+                    )
+                    .child(Self::render_lucide_icon(
+                        Some(Icon::Search),
+                        LOG_TREE_ITEM_ICON_WIDTH,
+                        LOG_TREE_ITEM_ICON_SIZE,
+                        palette.muted_text,
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .line_height(px(18.0))
+                            .text_size(px(LOG_TREE_FONT_SIZE))
+                            .text_color(rgb(palette.text))
+                            .child(LogTreeSearchInputElement {
+                                view: context.entity(),
+                                focus_handle: focus_handle.clone(),
+                                placeholder: "搜索文件名",
+                                palette,
+                            }),
+                    )
+                    .when(has_query, |input| {
+                        input.child(self.render_log_tree_search_icon_button(
+                            "log-tree-search-clear",
+                            Icon::X,
+                            true,
+                            palette,
+                            context,
+                            |view, context| view.clear_log_tree_search(context),
+                        ))
+                    }),
+            )
+            .when(has_query, |bar| {
+                bar.child(
+                    div()
+                        .id("log-tree-search-nav")
+                        .flex()
+                        .items_center()
+                        .gap(px(LOG_TREE_SEARCH_NAV_GROUP_GAP))
+                        .flex_none()
+                        .child(
+                            div()
+                                .min_w(px(LOG_TREE_SEARCH_MATCH_COUNT_MIN_WIDTH))
+                                .text_size(px(LOG_TREE_FONT_SIZE))
+                                .text_color(rgb(palette.muted_text))
+                                .text_center()
+                                .whitespace_nowrap()
+                                .child(summary),
+                        )
+                        .child(self.render_log_tree_search_icon_button(
+                            "log-tree-search-previous",
+                            Icon::ChevronUp,
+                            has_matches,
+                            palette,
+                            context,
+                            |view, context| {
+                                view.navigate_log_tree_search_match(
+                                    LogTreeSearchNavigation::Previous,
+                                    context,
+                                )
+                            },
+                        ))
+                        .child(self.render_log_tree_search_icon_button(
+                            "log-tree-search-next",
+                            Icon::ChevronDown,
+                            has_matches,
+                            palette,
+                            context,
+                            |view, context| {
+                                view.navigate_log_tree_search_match(
+                                    LogTreeSearchNavigation::Next,
+                                    context,
+                                )
+                            },
+                        )),
+                )
+            })
+    }
+
+    /// 渲染左侧目录树搜索栏内的图标按钮。
+    ///
+    /// 业务意图：
+    /// - 清空、上一个和下一个都使用图标按钮，减少左侧窄面板中的文字占用。
+    /// - 禁用态仍保留固定尺寸，避免命中数量变化时搜索栏布局抖动。
+    pub(in crate::app) fn render_log_tree_search_icon_button(
+        &self,
+        element_id: &'static str,
+        icon: Icon,
+        enabled: bool,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+        handler: fn(&mut MainView, &mut Context<MainView>),
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(element_id)
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_none()
+            .w(px(LOG_TREE_SEARCH_BUTTON_SIZE))
+            .h(px(LOG_TREE_SEARCH_BUTTON_SIZE))
+            .rounded(px(5.0))
+            .text_color(rgb(if enabled {
+                palette.text
+            } else {
+                palette.muted_text
+            }))
+            .when(enabled, |button| {
+                button
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(rgb(palette.hover)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        context.listener(move |view, _event: &MouseDownEvent, _window, context| {
+                            handler(view, context);
+                            context.stop_propagation();
+                        }),
+                    )
+            })
+            .when(!enabled, |button| button.opacity(0.42))
+            .child(Self::render_lucide_icon(
+                Some(icon),
+                LOG_TREE_SEARCH_BUTTON_SIZE,
+                LOG_TREE_CHEVRON_SIZE,
+                if enabled {
+                    palette.muted_text
+                } else {
+                    palette.border
+                },
+            ))
+    }
+
+    /// 返回目录树搜索栏的命中计数文本。
+    ///
+    /// 业务意图：
+    /// - 计数格式使用“当前/总数”，让用户知道上下一个按钮会在多少个文件之间循环。
+    /// - 空搜索时不显示计数，避免把完整目录树文件数误解为搜索结果数。
+    pub(in crate::app) fn log_tree_search_summary_label(&self) -> String {
+        if !self.log.log_tree_search.is_active() {
+            return String::new();
+        }
+        let total = self.log.log_tree_search.match_node_ids.len();
+        if total == 0 {
+            return "0/0".to_string();
+        }
+        let current = self
+            .log
+            .log_tree_search
+            .current_match_index
+            .filter(|index| *index < total)
+            .map(|index| index + 1)
+            .unwrap_or(1);
+        format!("{current}/{total}")
     }
 
     /// 渲染左侧日志目录树主体区域。
@@ -247,16 +491,31 @@ impl MainView {
             None
         };
         let row_source = row.source.clone().or(direct_archive_source);
-        let can_toggle = row.has_children && row_source.is_none();
+        let search_active = self.log.log_tree_search.is_active();
+        let can_toggle = row.has_children && row_source.is_none() && !search_active;
         let is_expanded = self.is_log_tree_node_expanded(row.id);
-        let expand_icon = if can_toggle {
-            Some(if is_expanded {
+        let expand_icon = if row.has_children && row_source.is_none() {
+            Some(if search_active || is_expanded {
                 Icon::ChevronDown
             } else {
                 Icon::ChevronRight
             })
         } else {
             None
+        };
+        let search_match = self.log.log_tree_search.match_node_ids.contains(&row.id);
+        let current_search_match = self
+            .log
+            .log_tree_search
+            .current_match_node_id()
+            .is_some_and(|node_id| node_id == row.id);
+        let search_match_ranges = if search_match {
+            LoadedLogTreeState::file_name_search_match_ranges(
+                &row.label,
+                &self.log.log_tree_search.input.text,
+            )
+        } else {
+            Vec::new()
         };
         let palette = self.palette();
         let (item_icon, icon_color) = Self::loaded_log_tree_icon(row.kind, palette);
@@ -272,6 +531,9 @@ impl MainView {
                 source: row_source,
                 visible_index,
                 selected: self.log.log_tree_selected_node_ids.contains(&row.id),
+                search_match,
+                current_search_match,
+                search_match_ranges,
                 label: row.label.clone(),
                 meta: row.meta.clone(),
             },
@@ -306,18 +568,30 @@ impl MainView {
             source,
             visible_index,
             selected,
+            search_match,
+            current_search_match,
+            search_match_ranges,
             label,
             meta,
         } = row_data;
         let left_padding = LOG_TREE_ROW_HORIZONTAL_PADDING + depth as f32 * LOG_TREE_ROW_INDENT;
         let source_for_left_click = source.clone();
         let source_for_right_click = source.clone();
-        let background = if selected {
+        // 视觉约束：文件树搜索结果只在文件名关键字上做高亮；命中行即使被搜索导航写入选择集合，也不再使用整行选中底色。
+        // 选择集合仍保留，用于 Enter 打开、右键菜单和后续文件操作，不改变业务状态语义。
+        let visually_selected = selected && !search_match;
+        let background = if visually_selected {
             palette.selected
         } else {
             palette.panel
         };
-        let hover_background = Self::log_tree_row_hover_background(selected, theme);
+        let hover_background = Self::log_tree_row_hover_background(visually_selected, theme);
+        let label_highlights = Self::log_tree_search_label_highlights(
+            search_match_ranges,
+            current_search_match,
+            palette,
+            theme,
+        );
 
         div()
             .id(SharedString::from(format!("log-tree-row-{}", node_id)))
@@ -330,7 +604,7 @@ impl MainView {
             .pl(px(left_padding))
             .pr(px(LOG_TREE_ROW_HORIZONTAL_PADDING))
             .text_size(px(LOG_TREE_FONT_SIZE))
-            .text_color(rgb(if selected {
+            .text_color(rgb(if visually_selected {
                 palette.accent
             } else {
                 palette.text
@@ -357,7 +631,12 @@ impl MainView {
                     .gap_1()
                     .flex_1()
                     .min_w_0()
-                    .child(div().min_w_0().truncate().child(label))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .child(StyledText::new(label).with_highlights(label_highlights)),
+                    )
                     .child(Self::render_log_tree_meta(meta.as_deref(), palette)),
             )
             .on_mouse_down(
@@ -407,6 +686,42 @@ impl MainView {
             (EffectiveTheme::Dark, false) => 0x262d35,
             (EffectiveTheme::Dark, true) => 0x1e4562,
         }
+    }
+
+    /// 构建文件树搜索命中文件名的行内高亮样式。
+    ///
+    /// 业务意图：
+    /// - 搜索过滤视图会显示命中文件和父级上下文，真实命中应体现在文件名关键字片段上，而不是整行背景上。
+    /// - 当前命中是上下一个按钮和 Enter 打开的目标，使用更强的关键字片段样式区分，但仍不改变整行底色。
+    ///
+    /// 边界条件：
+    /// - 范围必须来自原始文件名 UTF-8 字节下标；若调用方传入空范围，`StyledText` 会按普通文本渲染。
+    pub(in crate::app) fn log_tree_search_label_highlights(
+        ranges: Vec<Range<usize>>,
+        current_search_match: bool,
+        palette: AppThemePalette,
+        _theme: EffectiveTheme,
+    ) -> Vec<(Range<usize>, gpui::HighlightStyle)> {
+        let style = if current_search_match {
+            gpui::HighlightStyle {
+                color: Some(rgb(palette.on_accent).into()),
+                font_weight: Some(FontWeight::SEMIBOLD),
+                background_color: Some(rgb(palette.accent).into()),
+                ..Default::default()
+            }
+        } else {
+            gpui::HighlightStyle {
+                color: Some(rgb(palette.text).into()),
+                font_weight: Some(FontWeight::SEMIBOLD),
+                background_color: Some(rgb(palette.search_highlight).into()),
+                ..Default::default()
+            }
+        };
+
+        ranges
+            .into_iter()
+            .map(|range| (range, style.clone()))
+            .collect()
     }
 
     /// 处理左侧目录树左键按下。
@@ -570,6 +885,484 @@ impl MainView {
         }
     }
 
+    /// 返回左侧目录树搜索输入框的绘制快照。
+    ///
+    /// 业务意图：
+    /// - 自绘输入元素在 GPUI 绘制阶段只短暂读取主视图，使用快照可以避免长期借用 UI 状态。
+    pub(in crate::app) fn log_tree_search_text_snapshot(&self) -> SingleLineTextInputSnapshot {
+        SingleLineTextInputSnapshot {
+            text: self.log.log_tree_search.input.text.clone(),
+            selection_range: self.log.log_tree_search.input.selection_range.clone(),
+            marked_range: self.log.log_tree_search.input.marked_range.clone(),
+            horizontal_scroll_px: self.log.log_tree_search.input.horizontal_scroll_px,
+        }
+    }
+
+    /// 保存左侧目录树搜索框最近一次 GPUI 文本排版结果。
+    ///
+    /// 业务意图：
+    /// - 鼠标点击、拖拽和 IME 候选窗口定位都必须基于真实字形宽度，不能用估算字符宽度处理中文路径名。
+    pub(in crate::app) fn store_log_tree_search_layout(
+        &mut self,
+        line: ShapedLine,
+        bounds: Bounds<Pixels>,
+        horizontal_scroll_px: f32,
+    ) {
+        self.log.log_tree_search.last_layout = Some(line);
+        self.log.log_tree_search.last_bounds = Some(bounds);
+        self.log.log_tree_search.input.horizontal_scroll_px = horizontal_scroll_px;
+    }
+
+    /// 根据鼠标窗口坐标返回左侧目录树搜索框中的 UTF-8 字节下标。
+    ///
+    /// 边界条件：
+    /// - 首次绘制前布局不存在时回退到文本末尾，避免点击搜索框造成越界。
+    /// - 点击在输入框上下之外时分别夹到开头和末尾，符合单行输入框常见行为。
+    pub(in crate::app) fn log_tree_search_index_for_point(&self, position: Point<Pixels>) -> usize {
+        let snapshot = self.log_tree_search_text_snapshot();
+        let text = snapshot.text;
+        let Some(layout) = self.log.log_tree_search.last_layout.as_ref() else {
+            return text.len();
+        };
+        let Some(bounds) = self.log.log_tree_search.last_bounds.as_ref() else {
+            return text.len();
+        };
+
+        if position.y < bounds.top() {
+            return 0;
+        }
+        if position.y > bounds.bottom() {
+            return text.len();
+        }
+        layout
+            .closest_index_for_x(position.x - bounds.left() + px(snapshot.horizontal_scroll_px))
+            .min(text.len())
+    }
+
+    /// 处理左侧目录树搜索框鼠标按下。
+    ///
+    /// 业务意图：
+    /// - 搜索框位于目录树面板内，鼠标按下需要先聚焦输入框并更新光标/选区，不能继续触发下方文件树选择。
+    pub(in crate::app) fn handle_log_tree_search_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.start_log_tree_search_mouse_selection(event, context);
+        let focus_handle = self.log.log_tree_search.focus.clone();
+        window.focus(&focus_handle);
+        context.stop_propagation();
+        context.notify();
+    }
+
+    /// 开始左侧目录树搜索框的鼠标选择。
+    ///
+    /// 业务意图：
+    /// - 单击定位光标，Shift+单击扩展选择，双击选择词，三击选中整段输入，保持和现有搜索窗口输入框一致。
+    pub(in crate::app) fn start_log_tree_search_mouse_selection(
+        &mut self,
+        event: &MouseDownEvent,
+        context: &mut Context<Self>,
+    ) {
+        let index = self.log_tree_search_index_for_point(event.position);
+        let text = &mut self.log.log_tree_search.input.text;
+        let selection_range = &mut self.log.log_tree_search.input.selection_range;
+        self.log.log_tree_search.input.marked_range = None;
+
+        match event.click_count {
+            0 | 1 => {
+                if event.modifiers.shift {
+                    selection_range.end = index;
+                    *selection_range = Self::clamp_search_text_range(text, selection_range.clone());
+                } else {
+                    *selection_range = index..index;
+                }
+                self.log.log_tree_search.selection_drag = Some(selection_range.start);
+            }
+            2 => {
+                let range = Self::search_text_word_range_for_index(text, index);
+                *selection_range = range.clone();
+                self.log.log_tree_search.selection_drag = Some(range.start);
+            }
+            _ => {
+                *selection_range = 0..text.len();
+                self.log.log_tree_search.selection_drag = Some(0);
+            }
+        }
+        self.touch_search_text_cursor_activity();
+        context.notify();
+    }
+
+    /// 拖动扩展左侧目录树搜索框选择范围。
+    pub(in crate::app) fn handle_log_tree_search_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        context: &mut Context<Self>,
+    ) {
+        let Some(anchor) = self.log.log_tree_search.selection_drag else {
+            return;
+        };
+        let index = self.log_tree_search_index_for_point(event.position);
+        self.log.log_tree_search.input.marked_range = None;
+        self.log.log_tree_search.input.selection_range =
+            Self::clamp_search_text_range(&self.log.log_tree_search.input.text, anchor..index);
+        self.touch_search_text_cursor_activity();
+        context.notify();
+    }
+
+    /// 结束左侧目录树搜索框鼠标拖拽选择。
+    pub(in crate::app) fn finish_log_tree_search_mouse_selection(
+        &mut self,
+        context: &mut Context<Self>,
+    ) {
+        if self.log.log_tree_search.selection_drag.take().is_some() {
+            context.notify();
+        }
+    }
+
+    /// 处理左侧目录树搜索框的基础编辑和提交按键。
+    ///
+    /// 业务意图：
+    /// - 普通字符输入由 GPUI 平台输入协议提交，这里只处理复制粘贴、删除、方向键和 Enter 打开当前命中。
+    /// - 每次文本变更后只重建左侧树可见行，不读取日志正文、不启动全文搜索任务。
+    pub(in crate::app) fn handle_log_tree_search_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if Self::is_paste_keystroke(&event.keystroke) {
+            if let Some(text) = context.read_from_clipboard().and_then(|item| item.text()) {
+                let replacement = Self::sanitize_search_input_text(&text);
+                if !replacement.is_empty() {
+                    self.replace_log_tree_search_selection(&replacement);
+                    self.refresh_log_tree_search_results(true, context);
+                }
+            }
+            self.touch_search_text_cursor_activity();
+            context.stop_propagation();
+            context.notify();
+            return;
+        }
+
+        if Self::is_copy_keystroke(&event.keystroke) {
+            if let Some(text) = self.selected_log_tree_search_text() {
+                context.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            context.stop_propagation();
+            return;
+        }
+
+        if Self::is_cut_keystroke(&event.keystroke) {
+            if let Some(text) = self.selected_log_tree_search_text() {
+                context.write_to_clipboard(ClipboardItem::new_string(text));
+                self.replace_log_tree_search_selection("");
+                self.refresh_log_tree_search_results(true, context);
+                self.touch_search_text_cursor_activity();
+                context.notify();
+            }
+            context.stop_propagation();
+            return;
+        }
+
+        if Self::is_select_all_keystroke(&event.keystroke) {
+            self.log.log_tree_search.input.marked_range = None;
+            self.log.log_tree_search.input.selection_range =
+                0..self.log.log_tree_search.input.text.len();
+            self.touch_search_text_cursor_activity();
+            context.stop_propagation();
+            context.notify();
+            return;
+        }
+
+        match event.keystroke.key.as_str() {
+            "left" => {
+                self.move_log_tree_search_cursor_left(event.keystroke.modifiers.shift);
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "right" => {
+                self.move_log_tree_search_cursor_right(event.keystroke.modifiers.shift);
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "up" => {
+                self.log.log_tree_search.input.marked_range = None;
+                self.log.log_tree_search.input.selection_range = 0..0;
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "down" => {
+                self.log.log_tree_search.input.marked_range = None;
+                let cursor = self.log.log_tree_search.input.text.len();
+                self.log.log_tree_search.input.selection_range = cursor..cursor;
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "backspace" => {
+                self.delete_from_log_tree_search_input(LogTreeSearchDeleteDirection::Backward);
+                self.refresh_log_tree_search_results(true, context);
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "delete" => {
+                self.delete_from_log_tree_search_input(LogTreeSearchDeleteDirection::Forward);
+                self.refresh_log_tree_search_results(true, context);
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "enter" => {
+                self.open_current_log_tree_search_match(context);
+                context.stop_propagation();
+            }
+            "escape" => {
+                context.stop_propagation();
+            }
+            _ => {}
+        }
+    }
+
+    /// 返回左侧目录树搜索框当前选中文本。
+    pub(in crate::app) fn selected_log_tree_search_text(&self) -> Option<String> {
+        let input = &self.log.log_tree_search.input;
+        let range = Self::clamp_search_text_range(&input.text, input.selection_range.clone());
+        (range.start < range.end).then(|| input.text[range].to_string())
+    }
+
+    /// 用给定文本替换左侧目录树搜索框当前选区或组合文本。
+    ///
+    /// 业务意图：
+    /// - 快捷键粘贴、剪切、IME 提交和组合文本更新都需要同一套替换规则，保证中文文件名输入稳定。
+    pub(in crate::app) fn replace_log_tree_search_selection(&mut self, replacement: &str) {
+        let replacement = Self::sanitize_search_input_text(replacement);
+        let input = &mut self.log.log_tree_search.input;
+        let range = input.marked_range.take().unwrap_or_else(|| {
+            Self::clamp_search_text_range(&input.text, input.selection_range.clone())
+        });
+        input.text.replace_range(range.clone(), &replacement);
+        let cursor = range.start + replacement.len();
+        input.selection_range = cursor..cursor;
+        input.horizontal_scroll_px = 0.0;
+        self.log.log_tree_search.clear_layout();
+    }
+
+    /// 向左移动左侧目录树搜索框光标或扩展选择。
+    fn move_log_tree_search_cursor_left(&mut self, extend_selection: bool) {
+        let input = &mut self.log.log_tree_search.input;
+        input.marked_range = None;
+        if extend_selection {
+            input.selection_range.end =
+                Self::previous_search_text_boundary(&input.text, input.selection_range.end);
+            input.selection_range =
+                Self::clamp_search_text_range(&input.text, input.selection_range.clone());
+        } else if input.selection_range.start != input.selection_range.end {
+            input.selection_range = input.selection_range.start..input.selection_range.start;
+        } else {
+            let cursor =
+                Self::previous_search_text_boundary(&input.text, input.selection_range.end);
+            input.selection_range = cursor..cursor;
+        }
+    }
+
+    /// 向右移动左侧目录树搜索框光标或扩展选择。
+    fn move_log_tree_search_cursor_right(&mut self, extend_selection: bool) {
+        let input = &mut self.log.log_tree_search.input;
+        input.marked_range = None;
+        if extend_selection {
+            input.selection_range.end =
+                Self::next_search_text_boundary(&input.text, input.selection_range.end);
+            input.selection_range =
+                Self::clamp_search_text_range(&input.text, input.selection_range.clone());
+        } else if input.selection_range.start != input.selection_range.end {
+            input.selection_range = input.selection_range.end..input.selection_range.end;
+        } else {
+            let cursor = Self::next_search_text_boundary(&input.text, input.selection_range.end);
+            input.selection_range = cursor..cursor;
+        }
+    }
+
+    /// 删除左侧目录树搜索框中的选区或相邻字符。
+    ///
+    /// 边界条件：
+    /// - 删除必须按 UTF-8 字符边界处理，避免中文和 emoji 文件名关键字被切坏。
+    fn delete_from_log_tree_search_input(&mut self, direction: LogTreeSearchDeleteDirection) {
+        let input = &mut self.log.log_tree_search.input;
+        if let Some(range) = input.marked_range.take().or_else(|| {
+            (input.selection_range.start != input.selection_range.end)
+                .then(|| input.selection_range.clone())
+        }) {
+            input.text.replace_range(range.clone(), "");
+            input.selection_range = range.start..range.start;
+            input.horizontal_scroll_px = 0.0;
+            input.marked_range = None;
+            self.log.log_tree_search.clear_layout();
+            return;
+        }
+
+        match direction {
+            LogTreeSearchDeleteDirection::Backward => {
+                if let Some((previous_index, _)) = input.text[..input.selection_range.end]
+                    .char_indices()
+                    .next_back()
+                {
+                    let cursor = input.selection_range.end;
+                    input.text.replace_range(previous_index..cursor, "");
+                    input.selection_range = previous_index..previous_index;
+                }
+            }
+            LogTreeSearchDeleteDirection::Forward => {
+                if let Some((next_index, next_character)) = input.text[input.selection_range.end..]
+                    .char_indices()
+                    .next()
+                {
+                    let start = input.selection_range.end + next_index;
+                    let end = start + next_character.len_utf8();
+                    input.text.replace_range(start..end, "");
+                    input.selection_range = start..start;
+                }
+            }
+        }
+        input.horizontal_scroll_px = 0.0;
+        input.marked_range = None;
+        self.log.log_tree_search.clear_layout();
+    }
+
+    /// 根据当前搜索文本刷新过滤后的目录树和命中集合。
+    ///
+    /// 业务意图：
+    /// - 搜索过滤只改 UI 可见行缓存，不修改加载层完整树，也不持久化展开状态。
+    /// - 刷新后尽量保留当前命中节点；如果旧命中不再存在，则回到第一条命中。
+    pub(in crate::app) fn refresh_log_tree_search_results(
+        &mut self,
+        reveal_current: bool,
+        context: &mut Context<Self>,
+    ) {
+        let query = self.log.log_tree_search.input.text.clone();
+        let previous_match_node_id = self.log.log_tree_search.current_match_node_id();
+        let match_node_ids = match &mut self.log.load_state {
+            LogTreeLoadState::Loaded(tree_state) => {
+                tree_state.rebuild_visible_rows_for_file_name_search(&query)
+            }
+            LogTreeLoadState::Empty
+            | LogTreeLoadState::Loading { .. }
+            | LogTreeLoadState::Failed { .. } => Vec::new(),
+        };
+
+        let next_match_index = previous_match_node_id
+            .and_then(|node_id| match_node_ids.iter().position(|id| *id == node_id))
+            .or_else(|| (!match_node_ids.is_empty()).then_some(0));
+        self.log.log_tree_search.match_node_ids = match_node_ids;
+        self.log.log_tree_search.current_match_index = next_match_index;
+        self.select_current_log_tree_search_match();
+        if reveal_current {
+            self.reveal_current_log_tree_search_match();
+        }
+        context.notify();
+    }
+
+    /// 选中当前目录树搜索命中文件。
+    ///
+    /// 业务意图：
+    /// - 上一个/下一个和输入后自动定位都应同步左侧树选择集合，让后续右键菜单、另存为或线程分析作用于当前文件。
+    pub(in crate::app) fn select_current_log_tree_search_match(&mut self) {
+        let Some(node_id) = self.log.log_tree_search.current_match_node_id() else {
+            return;
+        };
+        self.log.log_tree_selected_node_ids.clear();
+        self.log.log_tree_selected_node_ids.insert(node_id);
+        self.log.log_tree_selection_anchor = Some(node_id);
+    }
+
+    /// 滚动左侧目录树到当前搜索命中。
+    pub(in crate::app) fn reveal_current_log_tree_search_match(&self) {
+        let Some(node_id) = self.log.log_tree_search.current_match_node_id() else {
+            return;
+        };
+        let LogTreeLoadState::Loaded(tree_state) = &self.log.load_state else {
+            return;
+        };
+        let Some(visible_index) = tree_state
+            .visible_rows
+            .iter()
+            .position(|row| row.id == node_id)
+        else {
+            return;
+        };
+        self.log
+            .log_tree_scroll_handle
+            .scroll_to_item_strict(visible_index, ScrollStrategy::Center);
+    }
+
+    /// 清空左侧目录树搜索并恢复普通展开/收起视图。
+    pub(in crate::app) fn clear_log_tree_search(&mut self, context: &mut Context<Self>) {
+        self.log.log_tree_search.input.set_text(String::new());
+        self.log.log_tree_search.match_node_ids.clear();
+        self.log.log_tree_search.current_match_index = None;
+        self.log.log_tree_search.selection_drag = None;
+        self.log.log_tree_search.clear_layout();
+        if let LogTreeLoadState::Loaded(tree_state) = &mut self.log.load_state {
+            tree_state.rebuild_visible_rows();
+        }
+        context.notify();
+    }
+
+    /// 跳转到上一个或下一个文件名搜索命中。
+    pub(in crate::app) fn navigate_log_tree_search_match(
+        &mut self,
+        navigation: LogTreeSearchNavigation,
+        context: &mut Context<Self>,
+    ) {
+        let match_count = self.log.log_tree_search.match_node_ids.len();
+        self.log.log_tree_search.current_match_index =
+            LoadedLogTreeState::next_file_name_search_match_index(
+                self.log.log_tree_search.current_match_index,
+                match_count,
+                navigation,
+            );
+        self.select_current_log_tree_search_match();
+        self.reveal_current_log_tree_search_match();
+        context.notify();
+    }
+
+    /// 打开当前文件名搜索命中的日志文件。
+    ///
+    /// 边界条件：
+    /// - 只有真实可打开文件节点才会进入命中集合；这里仍做来源校验，避免旧状态或异步重绘导致空来源打开。
+    pub(in crate::app) fn open_current_log_tree_search_match(
+        &mut self,
+        context: &mut Context<Self>,
+    ) {
+        let Some(node_id) = self.log.log_tree_search.current_match_node_id() else {
+            return;
+        };
+        let Some(source) = self.log_tree_source_for_node(node_id) else {
+            return;
+        };
+        self.open_log_file(source, context);
+    }
+
+    /// 返回完整加载树中指定节点的日志来源。
+    pub(in crate::app) fn log_tree_source_for_node(&self, node_id: usize) -> Option<LogFileSource> {
+        match &self.log.load_state {
+            LogTreeLoadState::Loaded(tree_state) => tree_state
+                .tree
+                .rows
+                .iter()
+                .find(|row| row.id == node_id)
+                .and_then(|row| row.source.clone()),
+            LogTreeLoadState::Empty
+            | LogTreeLoadState::Loading { .. }
+            | LogTreeLoadState::Failed { .. } => None,
+        }
+    }
+
     /// 打开左侧目录树右键菜单。
     ///
     /// 业务意图：
@@ -665,6 +1458,18 @@ impl MainView {
                     action: LogTreeContextMenuAction::SaveAs,
                     label: "另存为...",
                     icon: Icon::Save,
+                    enabled: file_action_enabled,
+                    palette,
+                },
+                context,
+            ))
+            .child(self.render_log_tree_context_menu_item(
+                LogTreeContextMenuItemRequest {
+                    node_id,
+                    fallback_source: fallback_source.clone(),
+                    action: LogTreeContextMenuAction::SearchSelected,
+                    label: "选中搜索",
+                    icon: Icon::Search,
                     enabled: file_action_enabled,
                     palette,
                 },
@@ -822,12 +1627,10 @@ impl MainView {
         context: &mut Context<Self>,
     ) {
         let fallback_for_action = fallback_source.clone();
-        let mut sources = self.selected_log_tree_file_sources();
-        if sources.is_empty()
-            && let Some(fallback_source) = fallback_source
-        {
-            sources.push(fallback_source);
-        }
+        let sources = Self::log_tree_menu_action_sources(
+            self.selected_log_tree_file_sources(),
+            fallback_source,
+        );
         self.log.log_tree_context_menu = None;
         self.log.tab_context_menu = None;
         self.log.encoding_dropdown_menu = None;
@@ -836,6 +1639,13 @@ impl MainView {
         match action {
             LogTreeContextMenuAction::SaveAs => {
                 self.save_selected_log_tree_sources_as(sources, context);
+            }
+            LogTreeContextMenuAction::SearchSelected => {
+                self.schedule_open_search_dialog_with_preset(
+                    SearchDialogOpenPreset::SelectedFiles { sources },
+                    window,
+                    context,
+                );
             }
             LogTreeContextMenuAction::AnalyzeThreads => {
                 self.open_thread_analysis_for_sources(sources, window, context);
@@ -889,19 +1699,27 @@ impl MainView {
         let LogTreeLoadState::Loaded(tree_state) = &self.log.load_state else {
             return Vec::new();
         };
-        tree_state
-            .tree
-            .rows
-            .iter()
-            .filter(|row| self.log.log_tree_selected_node_ids.contains(&row.id))
-            .filter_map(|row| {
-                row.source.clone().or_else(|| {
-                    (row.kind == LogTreeEntryKind::Archive)
-                        .then(|| tree_state.single_file_source_for_archive(row.id))
-                        .flatten()
-                })
-            })
-            .collect()
+        tree_state.file_sources_for_node_ids(&self.log.log_tree_selected_node_ids)
+    }
+
+    /// 合并左侧树菜单命令的选中来源和右键兜底来源。
+    ///
+    /// 业务意图：
+    /// - 右键未选中文件时会先把右键行设为选择；但旧事件或特殊节点仍可能让当前选择没有可读来源。
+    /// - 菜单命令在这种情况下使用右键落点来源兜底，保证用户右键单个文件时菜单可直接执行。
+    ///
+    /// 边界条件：
+    /// - 只有当前选择没有任何可读来源时才使用兜底，避免右键点到多选集合中的某个文件时丢掉其它已选文件。
+    pub(in crate::app) fn log_tree_menu_action_sources(
+        mut selected_sources: Vec<LogFileSource>,
+        fallback_source: Option<LogFileSource>,
+    ) -> Vec<LogFileSource> {
+        if selected_sources.is_empty()
+            && let Some(fallback_source) = fallback_source
+        {
+            selected_sources.push(fallback_source);
+        }
+        selected_sources
     }
 
     /// 返回当前目录树选择中用于智能分析的递归日志来源。

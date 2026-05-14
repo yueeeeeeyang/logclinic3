@@ -155,6 +155,7 @@ impl MainView {
         note_editor_input_focused: bool,
     ) -> bool {
         self.search_text_input_focused(window)
+            || self.log.log_tree_search.focus.is_focused(window)
             || self.settings_text_input_focused(window)
             || self.ai_chat.input_focus.is_focused(window)
             || self.notes.title_focus.is_focused(window)
@@ -177,11 +178,33 @@ impl MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
+        self.schedule_open_search_dialog_with_preset(
+            SearchDialogOpenPreset::Default,
+            window,
+            context,
+        );
+    }
+
+    /// 按指定预设延迟打开搜索对话框。
+    ///
+    /// 业务意图：
+    /// - 左侧目录树“选中搜索”需要把右键时的文件集合传递到下一帧创建的搜索窗口。
+    /// - 默认工具栏和快捷键入口继续使用默认预设，保持原有当前文件搜索行为。
+    pub(in crate::app) fn schedule_open_search_dialog_with_preset(
+        &mut self,
+        preset: SearchDialogOpenPreset,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
         if self.search.search_dialog_open_pending {
+            if !matches!(preset, SearchDialogOpenPreset::Default) {
+                self.search.search_dialog_open_preset = preset;
+            }
             return;
         }
 
         self.search.search_dialog_open_pending = true;
+        self.search.search_dialog_open_preset = preset;
         let main_view = context.entity();
         window.defer(context, move |window, app| {
             Self::open_search_dialog_after_main_update(main_view, window, app);

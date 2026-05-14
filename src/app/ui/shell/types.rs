@@ -92,6 +92,117 @@ pub(in crate::app) struct LoadedLogTreeState {
     pub(in crate::app) single_log_source: Option<LogFileSource>,
 }
 
+/// 左侧目录树文件名搜索状态。
+///
+/// 业务意图：
+/// - 该状态只描述“在当前目录树中按文件名过滤和定位”的 UI 会话，不读取日志正文、不复用全文搜索窗口任务。
+/// - 搜索命中只包含可打开的文件节点；目录和压缩包节点只作为过滤后的上下文展示。
+///
+/// 边界条件：
+/// - 输入文本、选区和 IME 组合范围只在当前进程内有效，不写入配置，避免把日志文件名关键字持久化。
+/// - `match_node_ids` 的节点 ID 只对当前 `LoadedLogTree` 有意义，重新加载日志后必须重置。
+pub(in crate::app) struct LogTreeSearchState {
+    /// 搜索框单行输入状态。
+    ///
+    /// 业务意图：
+    /// - 复用项目内自绘单行输入模型，保证中文 IME、复制粘贴、选区和光标滚动行为与现有搜索窗口一致。
+    pub(in crate::app) input: SingleLineTextInputState,
+    /// 搜索框焦点句柄，用于 GPUI 平台输入路由。
+    pub(in crate::app) focus: gpui::FocusHandle,
+    /// 最近一次搜索框文本排版结果，用于鼠标点击反推 UTF-8 字节下标。
+    pub(in crate::app) last_layout: Option<ShapedLine>,
+    /// 最近一次搜索框绘制边界，用于鼠标命中和 IME 候选窗口定位。
+    pub(in crate::app) last_bounds: Option<Bounds<Pixels>>,
+    /// 鼠标拖拽选择时的固定锚点，释放鼠标后清空。
+    pub(in crate::app) selection_drag: Option<usize>,
+    /// 当前搜索关键字命中的可打开文件节点 ID，顺序与目录树展示顺序一致。
+    pub(in crate::app) match_node_ids: Vec<usize>,
+    /// 当前定位到的命中下标。
+    ///
+    /// 边界条件：
+    /// - 没有搜索关键字或没有命中时为 `None`；有命中时必须小于 `match_node_ids.len()`。
+    pub(in crate::app) current_match_index: Option<usize>,
+}
+
+impl LogTreeSearchState {
+    /// 创建左侧目录树搜索初始状态。
+    ///
+    /// 边界条件：
+    /// - 焦点句柄必须来自当前 `Context<MainView>`，否则 GPUI 无法把平台输入法事件投递到主视图。
+    pub(in crate::app) fn new(context: &mut Context<MainView>) -> Self {
+        Self {
+            input: SingleLineTextInputState::empty(),
+            focus: context.focus_handle(),
+            last_layout: None,
+            last_bounds: None,
+            selection_drag: None,
+            match_node_ids: Vec::new(),
+            current_match_index: None,
+        }
+    }
+
+    /// 当前搜索文本去掉首尾空白后是否真实生效。
+    pub(in crate::app) fn is_active(&self) -> bool {
+        !self.input.text.trim().is_empty()
+    }
+
+    /// 返回当前定位命中的节点 ID。
+    pub(in crate::app) fn current_match_node_id(&self) -> Option<usize> {
+        let index = self.current_match_index?;
+        self.match_node_ids.get(index).copied()
+    }
+
+    /// 清空搜索框布局缓存。
+    ///
+    /// 业务意图：
+    /// - 文本、窗口尺寸或水平滚动变化后，旧布局不再代表当前可见文本；清空后鼠标命中会安全退回到文本末尾。
+    pub(in crate::app) fn clear_layout(&mut self) {
+        self.last_layout = None;
+        self.last_bounds = None;
+    }
+
+    /// 清空搜索文本、命中和布局缓存。
+    ///
+    /// 业务意图：
+    /// - 重新加载日志后，旧节点 ID 和旧文件名关键字都不能继续作用到新目录树。
+    /// - 保留焦点句柄本身，避免重建日志工作区时破坏 GPUI 输入路由。
+    pub(in crate::app) fn reset_for_new_tree(&mut self) {
+        self.input.set_text(String::new());
+        self.selection_drag = None;
+        self.match_node_ids.clear();
+        self.current_match_index = None;
+        self.clear_layout();
+    }
+}
+
+/// 左侧目录树搜索命中导航方向。
+///
+/// 业务意图：
+/// - 上一个/下一个命中都复用同一套循环下标计算，使用枚举可以避免布尔参数含义不清。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::app) enum LogTreeSearchNavigation {
+    /// 跳到上一个命中文件。
+    Previous,
+    /// 跳到下一个命中文件。
+    Next,
+}
+
+/// 文件名搜索大小写折叠后的字节范围映射。
+///
+/// 业务意图：
+/// - 文件树搜索按不区分大小写匹配，但最终高亮必须落回原始文件名里的 UTF-8 字节范围。
+/// - `char::to_lowercase` 在少数 Unicode 字符上可能展开成多个字符，因此不能直接把小写字符串的下标当作原文件名下标。
+///
+/// 边界条件：
+/// - `folded_range` 指向折叠后字符串中的字节范围，`original_range` 指向原始文件名中对应的完整字符范围。
+/// - 命中范围即使只覆盖折叠后展开字符的一部分，也会高亮原始完整字符，保证 `StyledText` 收到的范围始终位于 UTF-8 边界。
+struct FileNameSearchFoldedSegment {
+    /// 折叠后文件名中的字节范围。
+    folded_range: Range<usize>,
+    /// 原始文件名中的完整字符字节范围。
+    original_range: Range<usize>,
+}
+
 impl LoadedLogTreeState {
     /// 根据完整加载结果创建 UI 交互状态。
     ///
@@ -228,6 +339,46 @@ impl LoadedLogTreeState {
         single_source
     }
 
+    /// 返回指定目录树节点集合中的可读取日志来源。
+    ///
+    /// 业务意图：
+    /// - 左侧树多选允许同时包含目录、错误节点和文件节点；文件操作只应处理真实可读文件。
+    /// - “另存为”“线程日志分析”和“选中搜索”需要共享同一套来源筛选规则，避免同一批选择在不同菜单项下行为不一致。
+    ///
+    /// 边界条件：
+    /// - 按加载树原始顺序返回，保证批量操作和搜索结果顺序稳定。
+    /// - 单文件压缩包节点本身可映射为内部唯一文件来源；普通目录即使只有一个文件也不映射，保持展开语义。
+    pub(in crate::app) fn file_sources_for_node_ids(
+        &self,
+        node_ids: &HashSet<usize>,
+    ) -> Vec<LogFileSource> {
+        let mut seen_keys = HashSet::new();
+        let mut sources = Vec::new();
+
+        for row in self
+            .tree
+            .rows
+            .iter()
+            .filter(|row| node_ids.contains(&row.id))
+        {
+            let Some(source) = row.source.clone().or_else(|| {
+                (row.kind == LogTreeEntryKind::Archive)
+                    .then(|| self.single_file_source_for_archive(row.id))
+                    .flatten()
+            }) else {
+                continue;
+            };
+
+            // 单文件压缩包根节点会映射到唯一成员来源；如果用户同时选中了根节点和子文件，
+            // 必须按稳定来源去重，否则“选中搜索”和批量操作会重复处理同一个日志。
+            if seen_keys.insert(source.stable_key()) {
+                sources.push(source);
+            }
+        }
+
+        sources
+    }
+
     /// 切换某个可展开节点的展开状态。
     ///
     /// 业务意图：
@@ -280,6 +431,202 @@ impl LoadedLogTreeState {
                 collapsed_depth = Some(row.depth);
             }
         }
+    }
+
+    /// 按文件名搜索关键字重建可见行，并返回命中的可打开文件节点。
+    ///
+    /// 业务意图：
+    /// - 文件树搜索只定位左侧树中的文件名，不读取日志正文，也不改变现有全文搜索窗口语义。
+    /// - 有关键字时只显示命中文件及其父级目录/压缩包上下文，帮助用户在大目录中快速收敛目标。
+    ///
+    /// 边界条件：
+    /// - 空关键字完全回到普通展开/收起规则，不修改 `expanded_node_ids`，因此不会固化搜索期间的临时展开路径。
+    /// - 目录、压缩包和错误节点名称不参与命中；它们仅在作为命中文件祖先时显示。
+    pub(in crate::app) fn rebuild_visible_rows_for_file_name_search(
+        &mut self,
+        query: &str,
+    ) -> Vec<usize> {
+        let query = query.trim();
+        if query.is_empty() {
+            self.rebuild_visible_rows();
+            return Vec::new();
+        }
+
+        let (visible_node_ids, match_node_ids) =
+            Self::file_name_search_visible_and_match_ids(&self.tree, query);
+        self.visible_rows = self
+            .tree
+            .rows
+            .iter()
+            .filter(|row| visible_node_ids.contains(&row.id))
+            .cloned()
+            .collect();
+        match_node_ids
+    }
+
+    /// 计算文件名搜索需要显示的节点和真实命中文件节点。
+    ///
+    /// 业务意图：
+    /// - 该函数保持纯数据计算，便于单元测试锁定过滤规则，不依赖 GPUI 渲染或滚动状态。
+    /// - 完整树是前序扁平结构，扫描时维护祖先栈即可在发现文件命中后补齐上下文节点。
+    pub(in crate::app) fn file_name_search_visible_and_match_ids(
+        tree: &LoadedLogTree,
+        query: &str,
+    ) -> (HashSet<usize>, Vec<usize>) {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() {
+            return (HashSet::new(), Vec::new());
+        }
+
+        let mut visible_node_ids = HashSet::new();
+        let mut match_node_ids = Vec::new();
+        let mut ancestors: Vec<(usize, usize)> = Vec::new();
+
+        for row in &tree.rows {
+            while ancestors
+                .last()
+                .is_some_and(|(depth, _)| *depth >= row.depth)
+            {
+                ancestors.pop();
+            }
+
+            let is_openable_file = row.kind == LogTreeEntryKind::File && row.source.is_some();
+            if is_openable_file && row.label.to_lowercase().contains(&query) {
+                for (_, ancestor_id) in &ancestors {
+                    visible_node_ids.insert(*ancestor_id);
+                }
+                visible_node_ids.insert(row.id);
+                match_node_ids.push(row.id);
+            }
+
+            if row.has_children {
+                ancestors.push((row.depth, row.id));
+            }
+        }
+
+        (visible_node_ids, match_node_ids)
+    }
+
+    /// 返回文件名中所有匹配搜索关键字的原始 UTF-8 字节范围。
+    ///
+    /// 业务意图：
+    /// - 左侧文件树搜索结果只应高亮文件名中的命中关键字，不能再用整行背景表达搜索命中。
+    /// - 匹配规则与文件树过滤一致：去掉关键字首尾空白、普通子串匹配、不区分大小写、不支持正则。
+    ///
+    /// 边界条件：
+    /// - 返回范围基于原始 `label`，可直接传给 GPUI `StyledText`。
+    /// - 空关键字返回空列表；多次出现时返回非重叠范围，避免高亮范围互相覆盖。
+    /// - Unicode 大小写折叠可能改变字节长度，因此通过折叠段映射回原始字符范围，避免中文、emoji 或特殊拉丁字符越界。
+    pub(in crate::app) fn file_name_search_match_ranges(
+        label: &str,
+        query: &str,
+    ) -> Vec<Range<usize>> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() {
+            return Vec::new();
+        }
+
+        let (folded_label, folded_segments) = Self::fold_file_name_for_search(label);
+        if folded_label.is_empty() {
+            return Vec::new();
+        }
+
+        let mut ranges = Vec::new();
+        let mut search_from = 0;
+        while search_from <= folded_label.len() {
+            let Some(relative_start) = folded_label[search_from..].find(&query) else {
+                break;
+            };
+            let folded_start = search_from + relative_start;
+            let folded_end = folded_start + query.len();
+            if let Some(original_range) =
+                Self::folded_file_name_range_to_original(&folded_segments, folded_start..folded_end)
+            {
+                if original_range.start < original_range.end {
+                    ranges.push(original_range);
+                }
+            }
+
+            search_from = folded_end;
+        }
+
+        ranges
+    }
+
+    /// 构建用于文件名搜索的不区分大小写文本和原始范围映射。
+    ///
+    /// 业务意图：
+    /// - 搜索关键字命中判断使用折叠后文本，高亮绘制仍使用原始文件名，二者需要稳定映射。
+    ///
+    /// 边界条件：
+    /// - 按字符处理而不是按字节处理，确保中文、组合字符和 emoji 不会被切断。
+    fn fold_file_name_for_search(label: &str) -> (String, Vec<FileNameSearchFoldedSegment>) {
+        let mut folded_label = String::new();
+        let mut folded_segments = Vec::new();
+
+        for (original_start, character) in label.char_indices() {
+            let original_end = original_start + character.len_utf8();
+            let folded_start = folded_label.len();
+            folded_label.extend(character.to_lowercase());
+            let folded_end = folded_label.len();
+            folded_segments.push(FileNameSearchFoldedSegment {
+                folded_range: folded_start..folded_end,
+                original_range: original_start..original_end,
+            });
+        }
+
+        (folded_label, folded_segments)
+    }
+
+    /// 将折叠后文件名里的命中范围映射回原始文件名范围。
+    ///
+    /// 业务意图：
+    /// - GPUI `StyledText` 只接受原文本内的 UTF-8 范围；搜索时生成的折叠范围不能直接用于绘制。
+    ///
+    /// 边界条件：
+    /// - 命中范围为空或落不到任何折叠段时返回 `None`，调用方会跳过该异常命中，避免渲染 panic。
+    fn folded_file_name_range_to_original(
+        folded_segments: &[FileNameSearchFoldedSegment],
+        folded_range: Range<usize>,
+    ) -> Option<Range<usize>> {
+        let end_lookup = folded_range.end.checked_sub(1)?;
+        let start_segment = folded_segments.iter().find(|segment| {
+            segment.folded_range.start <= folded_range.start
+                && folded_range.start < segment.folded_range.end
+        })?;
+        let end_segment = folded_segments.iter().find(|segment| {
+            segment.folded_range.start <= end_lookup && end_lookup < segment.folded_range.end
+        })?;
+
+        Some(start_segment.original_range.start..end_segment.original_range.end)
+    }
+
+    /// 在当前搜索命中集合中按方向循环计算下一下标。
+    ///
+    /// 边界条件：
+    /// - 没有命中时返回 `None`；当前下标缺失或越界时从第一个命中开始，避免旧状态导致 panic。
+    pub(in crate::app) fn next_file_name_search_match_index(
+        current_index: Option<usize>,
+        match_count: usize,
+        navigation: LogTreeSearchNavigation,
+    ) -> Option<usize> {
+        if match_count == 0 {
+            return None;
+        }
+
+        let Some(current_index) = current_index.filter(|index| *index < match_count) else {
+            return Some(0);
+        };
+        Some(match navigation {
+            LogTreeSearchNavigation::Previous => {
+                if current_index == 0 {
+                    match_count - 1
+                } else {
+                    current_index - 1
+                }
+            }
+            LogTreeSearchNavigation::Next => (current_index + 1) % match_count,
+        })
     }
 }
 
@@ -1229,6 +1576,31 @@ impl SearchQueryHistoryItem {
     }
 }
 
+/// 搜索对话框打开时的来源预设。
+///
+/// 业务意图：
+/// - 工具栏、快捷键和正文选区打开搜索窗口时使用默认行为。
+/// - 左侧目录树“选中搜索”需要把右键时的文件来源快照传入搜索窗口，避免窗口打开后再读取已经变化的树选择。
+///
+/// 边界条件：
+/// - 该预设只在搜索窗口打开请求排队到下一帧期间存在，不写入配置，也不作为搜索历史的一部分。
+#[derive(Clone)]
+pub(in crate::app) enum SearchDialogOpenPreset {
+    /// 保持现有搜索窗口打开规则。
+    Default,
+    /// 按左侧树当前选择的日志来源快照初始化为“选中文件”范围。
+    SelectedFiles {
+        /// 右键触发时收集到的可搜索日志来源。
+        sources: Vec<LogFileSource>,
+    },
+}
+
+impl Default for SearchDialogOpenPreset {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
 /// 一次搜索任务启动时从 UI 表单快照得到的参数对象。
 ///
 /// 业务意图：
@@ -1247,6 +1619,11 @@ pub(in crate::app) struct SearchJobRequest {
     pub(in crate::app) match_mode: SearchMatchMode,
     /// 当前目录搜索时的目录输入框快照。
     pub(in crate::app) directory_target: String,
+    /// 选中文件搜索时的来源快照。
+    ///
+    /// 业务意图：
+    /// - `SearchScope::SelectedFiles` 不应在启动搜索时重新读取左侧树选择，而是使用打开搜索对话框时固定下来的文件集合。
+    pub(in crate::app) selected_file_sources: Vec<LogFileSource>,
     /// 启动新任务前仍在运行的旧任务 ID。
     pub(in crate::app) previous_running_job_id: Option<usize>,
 }
@@ -1277,6 +1654,12 @@ pub(in crate::app) struct SearchDialogState {
     pub(in crate::app) query_history_menu_open: bool,
     /// 搜索范围。
     pub(in crate::app) scope: SearchScope,
+    /// “选中文件”搜索范围使用的文件来源快照。
+    ///
+    /// 业务意图：
+    /// - 左侧树选择可能在搜索窗口打开后继续变化，本字段固定保存右键打开窗口那一刻的可读日志来源。
+    /// - 当前文件和当前目录搜索不会读取该字段；保留它只是为了用户切回“选中文件”范围时仍能使用同一快照。
+    pub(in crate::app) selected_file_sources: Vec<LogFileSource>,
     /// 当前目录搜索的目标目录输入框状态。
     ///
     /// 业务意图：
@@ -1674,6 +2057,22 @@ pub(in crate::app) struct LogTreeRowRenderData {
     /// 业务意图：
     /// - 单击、多选和右键菜单都依赖可见选中态，渲染层需要用该字段决定背景和文字强调。
     pub(in crate::app) selected: bool,
+    /// 当前行是否是文件名搜索命中的可打开文件。
+    ///
+    /// 业务意图：
+    /// - 过滤视图中仍需要区分父级上下文和真实命中文件，便于用户快速扫描结果。
+    pub(in crate::app) search_match: bool,
+    /// 当前行是否是文件名搜索正在定位的命中。
+    ///
+    /// 业务意图：
+    /// - 上一个/下一个命中会滚动到该行，渲染层需要额外强调当前定位目标。
+    pub(in crate::app) current_search_match: bool,
+    /// 文件名中需要高亮的搜索关键字范围。
+    ///
+    /// 业务意图：
+    /// - 搜索结果只高亮文件名里的关键字片段，不再把整行作为搜索命中背景。
+    /// - 范围由纯状态层按原始文件名 UTF-8 字节计算，渲染层只负责转换为 `StyledText` 样式。
+    pub(in crate::app) search_match_ranges: Vec<Range<usize>>,
     /// 当前行展示文本。
     pub(in crate::app) label: String,
     /// 当前行右侧短元信息。
@@ -1740,6 +2139,8 @@ pub(in crate::app) struct LogTreeContextMenuRequest {
 pub(in crate::app) enum LogTreeContextMenuAction {
     /// 把当前多选日志文件保存到用户指定目录。
     SaveAs,
+    /// 使用当前多选日志文件快照打开搜索窗口。
+    SearchSelected,
     /// 对当前多选日志文件执行 Java thread dump 时间线分析。
     AnalyzeThreads,
     /// 调用已配置模型对选中日志执行性能和异常智能分析。

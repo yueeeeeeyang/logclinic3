@@ -188,6 +188,138 @@ impl PagedLogDocument {
         Ok(Some(line))
     }
 
+    /// 批量读取一段连续可见行。
+    ///
+    /// 业务意图：
+    /// - 分页日志正文渲染每一帧只需要当前视口附近几十行，如果逐行 `seek + read`，大文件滚动时 UI 主线程会被大量同步
+    ///   I/O 放大拖慢。
+    /// - 本方法先复用已解码缓存，再把未缓存的连续可见区间合并成一次文件读取，降低系统调用次数和文件句柄锁竞争。
+    ///
+    /// 边界条件：
+    /// - `start_line` 越界或 `max_lines` 为 0 时返回空集合，调用方可以直接渲染空行列表。
+    /// - 读取范围按当前行索引裁剪到文件内；如果极端超长行导致单次可见区间无法放入内存，返回中文错误而不是 panic。
+    /// - 该方法只服务 UI 可见窗口读取，不会预读取整份日志正文，避免 3GB+ 文件在加载完成后被重新装入内存。
+    pub fn read_visible_lines(
+        &self,
+        start_line: usize,
+        max_lines: usize,
+    ) -> Result<Vec<PagedLine>, LogContentError> {
+        if max_lines == 0 || start_line >= self.line_index.len() {
+            return Ok(Vec::new());
+        }
+
+        let end_line = start_line
+            .saturating_add(max_lines)
+            .min(self.line_index.len());
+        let line_count = end_line.saturating_sub(start_line);
+        let mut ordered_lines = Vec::with_capacity(line_count);
+        let mut missing_line_numbers = Vec::new();
+
+        if let Ok(cache) = self.cache.lock() {
+            for line_number in start_line..end_line {
+                if let Some(line) = cache.lines.get(&line_number) {
+                    ordered_lines.push(Some(line.clone()));
+                } else {
+                    ordered_lines.push(None);
+                    missing_line_numbers.push(line_number);
+                }
+            }
+        } else {
+            for line_number in start_line..end_line {
+                ordered_lines.push(None);
+                missing_line_numbers.push(line_number);
+            }
+        }
+
+        if missing_line_numbers.is_empty() {
+            return Ok(ordered_lines.into_iter().flatten().collect());
+        }
+
+        let first_missing_line = missing_line_numbers[0];
+        let last_missing_line = *missing_line_numbers
+            .last()
+            .ok_or_else(|| LogContentError::new("超大日志可见行读取范围为空"))?;
+        let first_entry = self.line_index.get(first_missing_line).ok_or_else(|| {
+            LogContentError::new(format!(
+                "超大日志行 {} 已不在当前索引中",
+                first_missing_line + 1
+            ))
+        })?;
+        let last_entry = self.line_index.get(last_missing_line).ok_or_else(|| {
+            LogContentError::new(format!(
+                "超大日志行 {} 已不在当前索引中",
+                last_missing_line + 1
+            ))
+        })?;
+        let span_end = last_entry
+            .offset
+            .checked_add(u64::from(last_entry.byte_len))
+            .ok_or_else(|| LogContentError::new("超大日志可见行字节范围溢出"))?;
+        let span_len = span_end
+            .checked_sub(first_entry.offset)
+            .ok_or_else(|| LogContentError::new("超大日志可见行字节范围无效"))?;
+        let span = self.read_byte_span_with_shared_handle(
+            first_missing_line,
+            first_entry.offset,
+            span_len,
+        )?;
+
+        let mut decoded_missing = Vec::with_capacity(missing_line_numbers.len());
+        for line_number in missing_line_numbers {
+            let entry = self.line_index.get(line_number).ok_or_else(|| {
+                LogContentError::new(format!("超大日志行 {} 已不在当前索引中", line_number + 1))
+            })?;
+            let relative_offset =
+                entry
+                    .offset
+                    .checked_sub(first_entry.offset)
+                    .ok_or_else(|| {
+                        LogContentError::new(format!(
+                            "超大日志行 {} 的可见区间偏移无效",
+                            line_number + 1
+                        ))
+                    })?;
+            let relative_start = usize::try_from(relative_offset).map_err(|_| {
+                LogContentError::new(format!(
+                    "超大日志行 {} 的可见区间偏移过大，无法读取",
+                    line_number + 1
+                ))
+            })?;
+            let byte_len = entry.byte_len as usize;
+            let relative_end = relative_start.checked_add(byte_len).ok_or_else(|| {
+                LogContentError::new(format!("超大日志行 {} 的可见区间长度溢出", line_number + 1))
+            })?;
+            let Some(bytes) = span.get(relative_start..relative_end) else {
+                return Err(LogContentError::new(format!(
+                    "超大日志行 {} 的可见区间超出读取结果",
+                    line_number + 1
+                )));
+            };
+            let decoded = decode_lossy(bytes, self.encoding)?;
+            decoded_missing.push(PagedLine {
+                line_number,
+                text: decoded.text,
+                byte_offset: entry.offset,
+                had_replacements: decoded.had_errors,
+            });
+        }
+
+        if let Ok(mut cache) = self.cache.lock() {
+            for line in &decoded_missing {
+                cache.insert(line.line_number, line.clone());
+            }
+        }
+
+        let mut decoded_iter = decoded_missing.into_iter();
+        for line_slot in &mut ordered_lines {
+            if line_slot.is_none() {
+                *line_slot = decoded_iter.next();
+            }
+        }
+
+        Ok(ordered_lines.into_iter().flatten().collect())
+    }
+
     /// 按已知索引条目读取单行文本。
     ///
     /// 业务意图：
@@ -238,6 +370,65 @@ impl PagedLogDocument {
         let mut bytes = vec![0_u8; entry.byte_len as usize];
         file.read_exact(&mut bytes).map_err(|error| {
             LogContentError::new(format!("无法读取超大日志行 {}：{}", line_number + 1, error))
+        })?;
+        Ok(bytes)
+    }
+
+    /// 使用分页文档共享文件句柄读取连续字节区间。
+    ///
+    /// 业务意图：
+    /// - 可见行批量渲染时，多行在文件中天然相邻，一次读取区间再按索引切片比逐行随机 seek 更适合大文件滚动。
+    /// - 仍然复用同一个文件句柄和锁，避免与单行读取、后台搜索之间出现跨平台句柄语义差异。
+    ///
+    /// 边界条件：
+    /// - 空区间直接返回空字节数组，覆盖空文件、连续空行和文件末尾空行。
+    /// - 区间长度必须能放入当前平台 `usize`，否则返回可理解错误，避免 32 位或异常超长行上发生隐式截断。
+    fn read_byte_span_with_shared_handle(
+        &self,
+        start_line_number: usize,
+        offset: u64,
+        byte_len: u64,
+    ) -> Result<Vec<u8>, LogContentError> {
+        if byte_len == 0 {
+            return Ok(Vec::new());
+        }
+
+        let byte_len = usize::try_from(byte_len).map_err(|_| {
+            LogContentError::new(format!(
+                "超大日志行 {} 附近的可见区间过大，无法一次读取",
+                start_line_number + 1
+            ))
+        })?;
+        let mut handle_guard = self
+            .file_handle
+            .lock()
+            .map_err(|_| LogContentError::new("超大日志文件句柄被其它任务占用，暂时无法读取"))?;
+        if handle_guard.is_none() {
+            *handle_guard = Some(File::open(&self.path).map_err(|error| {
+                LogContentError::new(format!(
+                    "无法读取超大日志 {}：{}",
+                    self.path.display(),
+                    error
+                ))
+            })?);
+        }
+        let file = handle_guard
+            .as_mut()
+            .ok_or_else(|| LogContentError::new("超大日志文件句柄初始化失败"))?;
+        file.seek(SeekFrom::Start(offset)).map_err(|error| {
+            LogContentError::new(format!(
+                "无法定位超大日志行 {} 附近的可见区间：{}",
+                start_line_number + 1,
+                error
+            ))
+        })?;
+        let mut bytes = vec![0_u8; byte_len];
+        file.read_exact(&mut bytes).map_err(|error| {
+            LogContentError::new(format!(
+                "无法读取超大日志行 {} 附近的可见区间：{}",
+                start_line_number + 1,
+                error
+            ))
         })?;
         Ok(bytes)
     }
@@ -388,6 +579,59 @@ mod tests {
             .expect("读取行不应失败")
             .expect("第二行应存在");
         assert_eq!(line.text, "second");
+        let _ = fs::remove_file(path);
+    }
+
+    /// 验证分页可见窗口批量读取会按真实行号顺序返回，并在越界时裁剪范围。
+    ///
+    /// 业务意图：
+    /// - 大文件渲染路径依赖 `read_visible_lines` 减少 UI 主线程上的逐行随机读取。
+    /// - 该测试锁定“只读取当前视口范围、不越界、不改变行号”的核心行为，避免后续优化破坏跳转和高亮定位。
+    #[test]
+    fn reads_visible_line_window_in_order() {
+        let content = b"zero\none\ntwo\nthree";
+        let path = write_temp_log(content);
+        let source = LogFileSource::LocalFile { path: path.clone() };
+        let materialized = MaterializedLogSource {
+            original_source: source,
+            temp_path: path.clone(),
+            byte_len: content.len() as u64,
+        };
+        let document = PagedLogDocument::open(
+            materialized,
+            EncodingChoice::Manual(LogTextEncoding::Utf8),
+            "sample.log",
+        )
+        .expect("分页文档应能打开");
+
+        let lines = document
+            .read_visible_lines(1, 2)
+            .expect("可见窗口批量读取不应失败");
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| (line.line_number, line.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "one"), (2, "two")]
+        );
+
+        let tail_lines = document
+            .read_visible_lines(3, 10)
+            .expect("越界可见窗口应被裁剪到文件尾");
+        assert_eq!(
+            tail_lines
+                .iter()
+                .map(|line| (line.line_number, line.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(3, "three")]
+        );
+        assert!(
+            document
+                .read_visible_lines(10, 1)
+                .expect("起始行越界应返回空集合")
+                .is_empty()
+        );
+
         let _ = fs::remove_file(path);
     }
 

@@ -2460,7 +2460,15 @@ impl MainView {
 
     /// 判断搜索按钮是否具备基本启动条件。
     pub(in crate::app) fn search_can_start(&self, dialog: &SearchDialogState) -> bool {
-        !dialog.query_input.text.trim().is_empty() && self.log.active_tab_id.is_some()
+        if dialog.query_input.text.trim().is_empty() {
+            return false;
+        }
+        match dialog.scope {
+            SearchScope::SelectedFiles => !dialog.selected_file_sources.is_empty(),
+            SearchScope::CurrentFile | SearchScope::CurrentDirectory => {
+                self.log.active_tab_id.is_some()
+            }
+        }
     }
 
     /// 判断快搜按钮是否具备基本启动条件。
@@ -2470,8 +2478,23 @@ impl MainView {
     /// - 当前 tab 的加载状态仍在启动时给出具体提示，按钮这里只做轻量可用性判断。
     pub(in crate::app) fn quick_search_can_start(&self, dialog: &SearchDialogState) -> bool {
         !dialog.is_searching
-            && self.log.active_tab_id.is_some()
+            && match dialog.scope {
+                SearchScope::SelectedFiles => !dialog.selected_file_sources.is_empty(),
+                SearchScope::CurrentFile | SearchScope::CurrentDirectory => {
+                    self.log.active_tab_id.is_some()
+                }
+            }
             && !self.effective_quick_search_keywords().is_empty()
+    }
+
+    /// 判断搜索范围是否允许使用当前文件快捷动作。
+    ///
+    /// 业务意图：
+    /// - “计数 / 上一个 / 下一个”只针对当前已打开文件，不能在“选中文件”集合范围下启用，
+    ///   否则用户会误以为这些按钮会对选中的多个文件做聚合计数或跨文件跳转。
+    /// - 抽成纯函数后，按钮可用性和键盘导航入口可以共享同一条规则，测试也不需要构造 GPUI 主窗口。
+    pub(in crate::app) fn search_scope_allows_current_file_shortcuts(scope: SearchScope) -> bool {
+        scope != SearchScope::SelectedFiles
     }
 
     /// 判断当前文件计数按钮是否可用。
@@ -2480,7 +2503,9 @@ impl MainView {
     /// - 计数按钮只统计当前已经打开并成功解码的活动文件，不触发后台读取，也不扫描当前目录。
     /// - 空关键字没有统计意义；加载中或失败 tab 也不能提供可靠计数。
     pub(in crate::app) fn search_can_count_current_file(&self, dialog: &SearchDialogState) -> bool {
-        !dialog.query_input.text.trim().is_empty() && self.active_log_tab_document().is_some()
+        Self::search_scope_allows_current_file_shortcuts(dialog.scope)
+            && !dialog.query_input.text.trim().is_empty()
+            && self.active_log_tab_document().is_some()
     }
 
     /// 返回当前激活 tab 的文档。
@@ -2570,12 +2595,22 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 查询词、大小写选项、活动 tab 或解码内容变化后，旧计数和“下一个”起点不再代表当前条件，必须清空。
-    pub(in crate::app) fn clear_search_current_file_match_count(&mut self) {
+    /// - 只清理搜索窗口中的计数和导航状态，不触碰正文里的搜索结果高亮；用于日志加载完成这类内容状态刷新场景。
+    pub(in crate::app) fn clear_search_current_file_match_count_state(&mut self) {
         self.search.current_file_navigation_request_id += 1;
         if let Some(dialog) = self.search.search_dialog.as_mut() {
             dialog.current_file_match_count = None;
             dialog.current_file_navigation_match = None;
         }
+    }
+
+    /// 清空当前文件计数缓存并移除活动 tab 的搜索片段高亮。
+    ///
+    /// 业务意图：
+    /// - 查询词、大小写选项、活动 tab 或解码内容变化后，旧计数和“下一个”起点不再代表当前条件，必须清空。
+    /// - 用户主动改变当前文件搜索条件时，正文里的旧关键字片段也应失效；搜索结果跳转会在清理之后重新写入新高亮。
+    pub(in crate::app) fn clear_search_current_file_match_count(&mut self) {
+        self.clear_search_current_file_match_count_state();
         self.clear_active_log_tab_search_match_highlight();
     }
 
@@ -2611,7 +2646,9 @@ impl MainView {
         &self,
         dialog: &SearchDialogState,
     ) -> bool {
-        !dialog.query_input.text.trim().is_empty() && self.active_log_tab_document().is_some()
+        Self::search_scope_allows_current_file_shortcuts(dialog.scope)
+            && !dialog.query_input.text.trim().is_empty()
+            && self.active_log_tab_document().is_some()
     }
 
     /// 从当前搜索框条件生成当前文件导航选项。
@@ -2622,6 +2659,9 @@ impl MainView {
         &self,
     ) -> Option<(SearchOptions, Option<LogSearchMatchHighlight>, bool)> {
         let dialog = self.search.search_dialog.as_ref()?;
+        if !Self::search_scope_allows_current_file_shortcuts(dialog.scope) {
+            return None;
+        }
         let options = SearchOptions::single_with_mode(
             dialog.query_input.text.trim().to_string(),
             dialog.case_sensitive,

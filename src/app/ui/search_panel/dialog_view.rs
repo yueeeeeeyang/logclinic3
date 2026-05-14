@@ -125,7 +125,18 @@ impl SearchDialogWindowView {
                     dialog.directory_input.selection_range = cursor..cursor;
                     dialog.directory_input.marked_range = None;
                 }
-                dialog.message = "输入关键字后按 Enter 或点击搜索".to_string();
+                dialog.message = match scope {
+                    SearchScope::SelectedFiles if dialog.selected_file_sources.is_empty() => {
+                        "请先在左侧选择要搜索的日志文件".to_string()
+                    }
+                    SearchScope::SelectedFiles => format!(
+                        "已选择 {} 个文件，输入关键字后按 Enter 或点击搜索",
+                        dialog.selected_file_sources.len()
+                    ),
+                    SearchScope::CurrentFile | SearchScope::CurrentDirectory => {
+                        "输入关键字后按 Enter 或点击搜索".to_string()
+                    }
+                };
             }
             context.notify();
             if scope == SearchScope::CurrentDirectory {
@@ -712,6 +723,12 @@ impl SearchDialogWindowView {
                 palette,
                 context,
             ))
+            .child(self.render_scope_button(
+                SearchScope::SelectedFiles,
+                selected_scope,
+                palette,
+                context,
+            ))
     }
 
     /// 渲染单个搜索范围按钮。
@@ -758,12 +775,44 @@ impl SearchDialogWindowView {
     /// 渲染当前目录搜索目标输入区域。
     fn render_directory_target(
         &self,
-        _dialog: &SearchDialogState,
+        dialog: &SearchDialogState,
         focus_handle: gpui::FocusHandle,
         _window: &Window,
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        if dialog.scope == SearchScope::SelectedFiles {
+            return div()
+                .id("search-dialog-window-selected-files")
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(palette.muted_text))
+                        .child("搜索范围"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .h(px(SEARCH_INPUT_HEIGHT))
+                        .w_full()
+                        .px_2()
+                        .rounded(px(5.0))
+                        .border_1()
+                        .border_color(rgb(palette.border))
+                        .bg(rgb(palette.panel))
+                        .text_size(px(12.0))
+                        .text_color(rgb(palette.text))
+                        .child(format!(
+                            "已选择 {} 个文件",
+                            dialog.selected_file_sources.len()
+                        )),
+                );
+        }
+
         div()
             .id("search-dialog-window-directory")
             .flex()

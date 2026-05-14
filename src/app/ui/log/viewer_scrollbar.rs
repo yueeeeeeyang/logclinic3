@@ -382,29 +382,23 @@ impl MainView {
     /// 估算分页日志横向内容宽度。
     ///
     /// 业务意图：
-    /// - 分页模式不能再让 GPUI 测量完整最长行，因为那会重新创建超大虚拟列表。
-    /// - 这里读取行索引记录的最长候选行并按等宽字体估算宽度，足够驱动横向滚动条范围；鼠标选区仍使用真实 shaping。
+    /// - 分页模式不能在布局或滚轮处理中同步读取最长行；3GB 日志里只要存在一条超长行，解码、制表符展开和字符计数
+    ///   都会阻塞 GPUI 主线程，表现为加载完成后窗口几乎卡死。
+    /// - 行索引已经记录了最长候选行的原始字节长度，这里只用字节长度按等宽字体估算横向范围，避免为了滚动条重新读取正文。
+    ///
+    /// 边界条件：
+    /// - UTF-8 中文等多字节字符会让字节数大于显示列数，制表符则可能让显示列数大于字节数；分页模式优先保证大文件
+    ///   交互不卡顿，精确列宽由当前可见行真实渲染承担。
     pub(in crate::app) fn paged_log_estimated_content_width(
         document: &log_document::PagedLogDocument,
         line_number_width: f32,
         font_size: f32,
     ) -> f64 {
-        let fallback_columns = document
+        let display_columns = document
             .line_index
             .get(document.longest_line_index)
             .map(|entry| entry.byte_len as usize)
             .unwrap_or(0);
-        let display_columns = document
-            .read_line(document.longest_line_index)
-            .ok()
-            .flatten()
-            .map(|line| {
-                Self::expanded_log_line_for_display(&line.text)
-                    .text
-                    .chars()
-                    .count()
-            })
-            .unwrap_or(fallback_columns);
         let char_width = (font_size * PAGED_LOG_MONOSPACE_WIDTH_RATIO).max(1.0);
         f64::from(
             line_number_width

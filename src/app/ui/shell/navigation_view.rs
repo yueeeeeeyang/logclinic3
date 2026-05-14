@@ -799,6 +799,7 @@ impl MainView {
         self.log.log_tree_context_menu = None;
         self.log.save_overwrite_confirm_dialog = None;
         self.log.log_tree_selected_node_ids.clear();
+        self.log.log_tree_search.reset_for_new_tree();
         self.log.log_tree_selection_anchor = None;
         self.log.log_scrollbar_drag = None;
         self.log.log_tree_scrollbar_drag = None;
@@ -810,11 +811,7 @@ impl MainView {
         self.search.search_results_context_menu = None;
         self.search.next_search_job_id += 1;
         if let Some(dialog) = self.search.search_dialog.as_mut() {
-            dialog.current_file_match_count = None;
-            dialog.current_file_navigation_match = None;
-            dialog.is_searching = false;
-            dialog.progress = SearchProgress::default();
-            dialog.message = "日志已重新加载，请重新打开文件后搜索".to_string();
+            Self::reset_search_dialog_for_log_reload(dialog);
         }
     }
 

@@ -175,7 +175,7 @@ impl MainView {
             main_window: None,
             is_resizing_splitter: false,
             navigation: NavigationState::new(),
-            log: LogWorkspaceState::new(),
+            log: LogWorkspaceState::new(context),
             search: SearchWorkspaceState::new(context),
             settings: SettingsState::new(context),
             model_config,

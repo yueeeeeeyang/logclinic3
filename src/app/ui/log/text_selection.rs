@@ -135,7 +135,7 @@ impl MainView {
             return false;
         };
 
-        self.prepare_search_dialog_state();
+        self.prepare_search_dialog_state(SearchDialogOpenPreset::Default);
         if let Some(dialog) = self.search.search_dialog.as_mut() {
             Self::replace_search_query_with_clipboard_text(dialog, text);
         }

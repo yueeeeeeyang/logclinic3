@@ -83,7 +83,8 @@ impl MainView {
     /// 返回指定日志行上的搜索命中片段高亮。
     ///
     /// 业务意图：
-    /// - 搜索结果跳转和“上一个/下一个”只应突出关键字本身，不能再给整行铺背景。
+    /// - 搜索结果跳转和“上一个/下一个”会在行容器上绘制整行定位背景；
+    ///   这里额外只返回关键字片段背景，让用户同时知道命中行和命中列。
     /// - 命中范围来自搜索时的原始日志行，因此这里在渲染前夹紧到当前行的 UTF-8 边界，避免文件重载或编码切换后旧范围越界。
     fn log_search_match_highlight_for_line(
         highlight: Option<&LogSearchMatchHighlight>,
@@ -515,14 +516,31 @@ impl MainView {
         let highlighted_search_line = tab.highlighted_search_line;
         let highlighted_search_match = tab.highlighted_search_match.clone();
         let marked_lines = tab.marked_lines.clone();
+        // 分页日志加载完成后仍然不能在渲染循环中逐行随机读取文件。
+        // 这里把当前视口的连续行合并读取，减少大文件滚动时 UI 主线程上的 seek/read 次数；失败时再退回逐行读取，
+        // 保持已有“坏行不影响其它可读行”的容错行为。
+        let visible_lines = document
+            .read_visible_lines(first_line_index, visible_rows)
+            .unwrap_or_else(|_| {
+                (0..visible_rows)
+                    .filter_map(|row_offset| {
+                        let line_index = first_line_index.checked_add(row_offset)?;
+                        if line_index >= line_count {
+                            return None;
+                        }
+                        document.read_line(line_index).ok().flatten()
+                    })
+                    .collect::<Vec<_>>()
+            });
 
-        let rows = (0..visible_rows)
-            .filter_map(|row_offset| {
-                let line_index = first_line_index.checked_add(row_offset)?;
+        let rows = visible_lines
+            .into_iter()
+            .filter_map(|paged_line| {
+                let line_index = paged_line.line_number;
                 if line_index >= line_count {
                     return None;
                 }
-                let line = document.read_line(line_index).ok().flatten()?.text;
+                let line = paged_line.text;
                 let mut line_highlights =
                     highlight_line(document.highlight_mode, &line, None, syntax_theme);
                 if let Some((range, style)) = Self::log_search_match_highlight_for_line(
@@ -531,7 +549,7 @@ impl MainView {
                     &line,
                     palette,
                 ) {
-                    // 分页模式和内存模式保持一致：搜索跳转只强调命中关键字，不改变整行背景。
+                    // 分页模式和内存模式保持一致：行容器负责整行定位背景，文本高亮只覆盖命中关键字片段。
                     line_highlights =
                         gpui::combine_highlights(line_highlights, [(range, style)]).collect();
                 }
@@ -549,6 +567,7 @@ impl MainView {
                 let expanded_line = Self::expanded_log_line_for_display(&line);
                 let display_highlights =
                     Self::map_log_highlights_to_display(line_highlights, &expanded_line);
+                let row_offset = line_index.saturating_sub(first_line_index);
                 let row_top = row_offset as f32 * LOG_VIEWER_ROW_HEIGHT - fractional_top;
 
                 Some(

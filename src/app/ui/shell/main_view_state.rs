@@ -51,6 +51,12 @@ pub(in crate::app) struct LogWorkspaceState {
     pub(in crate::app) log_tree_scroll_handle: UniformListScrollHandle,
     /// 左侧目录树当前选中的节点 ID 集合。
     pub(in crate::app) log_tree_selected_node_ids: HashSet<usize>,
+    /// 左侧目录树文件名搜索状态。
+    ///
+    /// 业务意图：
+    /// - 搜索只服务当前已加载目录树，用于按文件名快速过滤并定位可打开日志文件。
+    /// - 状态放在日志工作区内，重新加载日志时可以和选择、右键菜单、滚动句柄一起重置，避免旧关键字作用到新树。
+    pub(in crate::app) log_tree_search: LogTreeSearchState,
     /// Shift 多选的锚点节点 ID。
     pub(in crate::app) log_tree_selection_anchor: Option<usize>,
     /// 当前打开的左侧目录树右键菜单。
@@ -85,11 +91,12 @@ impl LogWorkspaceState {
     /// 边界条件：
     /// - `next_tab_id` 从 1 开始，继续保持现有后台任务定位和测试语义。
     /// - 各滚动句柄必须在构造时创建，不能在渲染路径临时创建，否则滚动位置会丢失。
-    pub(in crate::app) fn new() -> Self {
+    pub(in crate::app) fn new(context: &mut Context<MainView>) -> Self {
         Self {
             load_state: LogTreeLoadState::Empty,
             log_tree_scroll_handle: UniformListScrollHandle::new(),
             log_tree_selected_node_ids: HashSet::new(),
+            log_tree_search: LogTreeSearchState::new(context),
             log_tree_selection_anchor: None,
             log_tree_context_menu: None,
             tab_bar_scroll_handle: ScrollHandle::new(),
@@ -121,6 +128,11 @@ pub(in crate::app) struct SearchWorkspaceState {
     pub(in crate::app) search_dialog_window: Option<WindowHandle<SearchDialogWindowView>>,
     /// 搜索对话框打开请求是否已经排队到下一帧。
     pub(in crate::app) search_dialog_open_pending: bool,
+    /// 搜索对话框打开时需要应用的范围预设。
+    ///
+    /// 业务意图：
+    /// - 搜索窗口创建被延迟到下一帧；左侧树“选中搜索”必须把当时的文件快照暂存在这里，避免延迟期间用户改变选择后影响搜索范围。
+    pub(in crate::app) search_dialog_open_preset: SearchDialogOpenPreset,
     /// 搜索结果底部面板状态。
     pub(in crate::app) search_results_panel: Option<SearchResultsPanelState>,
     /// 搜索结果面板高度拖动状态。
@@ -166,6 +178,7 @@ impl SearchWorkspaceState {
             search_query_history: Vec::new(),
             search_dialog_window: None,
             search_dialog_open_pending: false,
+            search_dialog_open_preset: SearchDialogOpenPreset::Default,
             search_results_panel: None,
             search_results_resize_drag: None,
             search_results_scrollbar_drag: None,

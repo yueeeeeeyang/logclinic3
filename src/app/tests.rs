@@ -1087,6 +1087,7 @@ mod state_tests {
             },
             query_history_menu_open: true,
             scope: SearchScope::CurrentFile,
+            selected_file_sources: Vec::new(),
             directory_input: SingleLineTextInputState::empty(),
             case_sensitive: false,
             match_mode: SearchMatchMode::Literal,
@@ -1129,6 +1130,7 @@ mod state_tests {
             },
             query_history_menu_open: false,
             scope: SearchScope::CurrentFile,
+            selected_file_sources: Vec::new(),
             directory_input: SingleLineTextInputState::empty(),
             case_sensitive: false,
             match_mode: SearchMatchMode::Literal,
@@ -1162,6 +1164,7 @@ mod state_tests {
             },
             query_history_menu_open: true,
             scope: SearchScope::CurrentFile,
+            selected_file_sources: Vec::new(),
             directory_input: SingleLineTextInputState::empty(),
             case_sensitive: true,
             match_mode: SearchMatchMode::Literal,
@@ -1191,6 +1194,7 @@ mod state_tests {
             query_input: SingleLineTextInputState::from_text("Exception".to_string()),
             query_history_menu_open: true,
             scope: SearchScope::CurrentDirectory,
+            selected_file_sources: Vec::new(),
             directory_input: SingleLineTextInputState {
                 text: "monitorThread".to_string(),
                 selection_range: 0.."monitorThread".len(),
@@ -1221,6 +1225,100 @@ mod state_tests {
         assert!(!dialog.is_searching);
         assert!(!dialog.query_history_menu_open);
         assert_eq!(dialog.message, "搜索已停止，可修改条件后重新搜索");
+    }
+
+    /// 验证“选中文件”搜索范围的中文标签稳定。
+    ///
+    /// 业务意图：
+    /// - 搜索对话框范围按钮和底部结果历史都读取同一个 `label`，这里锁定文案，避免后续改动导致 UI 展示不一致。
+    #[test]
+    fn 选中文件搜索范围标签为选中文件() {
+        assert_eq!(SearchScope::SelectedFiles.label(), "选中文件");
+    }
+
+    /// 验证“选中文件”打开预设会写入固定来源快照。
+    ///
+    /// 业务意图：
+    /// - 右键菜单打开搜索窗口时，搜索范围必须固定为当时选中的日志来源；后续左侧树选择变化不能修改当前窗口会话。
+    /// - 预设还需要清空当前文件计数和导航缓存，避免跨范围后继续展示旧的当前文件状态。
+    #[test]
+    fn 选中搜索预设会固定来源快照并切换范围() {
+        let first = test_local_file("/tmp/first.log");
+        let second = test_local_file("/tmp/second.log");
+        let mut external_sources = vec![first.clone()];
+        let mut dialog = test_search_dialog_state("error");
+        dialog.current_file_match_count = Some(8);
+        dialog.current_file_navigation_match = Some(LogSearchMatchHighlight {
+            line_index: 3,
+            match_range: 0..5,
+        });
+
+        MainView::apply_search_dialog_open_preset_to_dialog(
+            &mut dialog,
+            SearchDialogOpenPreset::SelectedFiles {
+                sources: external_sources.clone(),
+            },
+        );
+        external_sources.push(second);
+
+        assert_eq!(dialog.scope, SearchScope::SelectedFiles);
+        assert_eq!(dialog.selected_file_sources, vec![first]);
+        assert!(dialog.current_file_match_count.is_none());
+        assert!(dialog.current_file_navigation_match.is_none());
+        assert_eq!(
+            dialog.message,
+            "已选择 1 个文件，输入关键字后按 Enter 或点击搜索"
+        );
+    }
+
+    /// 验证重新加载日志会清空“选中文件”搜索快照。
+    ///
+    /// 业务意图：
+    /// - 搜索窗口允许跨重新加载保持打开，但旧目录树的选中文件快照不能继续参与搜索。
+    /// - 如果当前范围是“选中文件”，重新加载后必须切回“当前文件”，避免用户在新工作区误搜旧日志。
+    #[test]
+    fn 重新加载日志会清空选中文件搜索快照并切回当前文件() {
+        let mut dialog = test_search_dialog_state("error");
+        dialog.scope = SearchScope::SelectedFiles;
+        dialog.selected_file_sources = vec![test_local_file("/tmp/old.log")];
+        dialog.current_file_match_count = Some(3);
+        dialog.current_file_navigation_match = Some(LogSearchMatchHighlight {
+            line_index: 1,
+            match_range: 0..5,
+        });
+        dialog.is_searching = true;
+        dialog.progress = SearchProgress {
+            searched_files: 1,
+            total_files: 1,
+            matched_lines: 2,
+        };
+
+        MainView::reset_search_dialog_for_log_reload(&mut dialog);
+
+        assert_eq!(dialog.scope, SearchScope::CurrentFile);
+        assert!(dialog.selected_file_sources.is_empty());
+        assert!(dialog.current_file_match_count.is_none());
+        assert!(dialog.current_file_navigation_match.is_none());
+        assert!(!dialog.is_searching);
+        assert_eq!(dialog.progress, SearchProgress::default());
+        assert_eq!(dialog.message, "日志已重新加载，请重新打开文件后搜索");
+    }
+
+    /// 验证“选中文件”范围禁用当前文件快捷按钮。
+    ///
+    /// 业务意图：
+    /// - “计数 / 上一个 / 下一个”只面向当前文件；选中文件集合搜索下必须禁用，避免被误解为跨文件聚合快捷操作。
+    #[test]
+    fn 选中文件范围禁用当前文件快捷动作() {
+        assert!(MainView::search_scope_allows_current_file_shortcuts(
+            SearchScope::CurrentFile
+        ));
+        assert!(MainView::search_scope_allows_current_file_shortcuts(
+            SearchScope::CurrentDirectory
+        ));
+        assert!(!MainView::search_scope_allows_current_file_shortcuts(
+            SearchScope::SelectedFiles
+        ));
     }
 
     /// 验证取消中的搜索记录优先展示取消状态。
@@ -1344,6 +1442,7 @@ mod state_tests {
             query_input: SingleLineTextInputState::from_text("日志选中文本".to_string()),
             query_history_menu_open: false,
             scope: SearchScope::CurrentFile,
+            selected_file_sources: Vec::new(),
             directory_input: SingleLineTextInputState::empty(),
             case_sensitive: false,
             match_mode: SearchMatchMode::Literal,
@@ -1862,6 +1961,29 @@ mod state_tests {
     fn test_local_file(path: &str) -> LogFileSource {
         LogFileSource::LocalFile {
             path: PathBuf::from(path),
+        }
+    }
+
+    /// 构造测试用搜索对话框状态。
+    ///
+    /// 业务意图：
+    /// - 多个测试只关心搜索范围、来源快照或高亮副作用，统一构造可以避免重复填充进度、历史菜单和输入框等无关字段。
+    /// - 默认范围使用“当前文件”，选中文件来源为空，确保测试必须显式设置自己关心的业务状态。
+    fn test_search_dialog_state(query: &str) -> SearchDialogState {
+        SearchDialogState {
+            query_input: SingleLineTextInputState::from_text(query.to_string()),
+            query_history_menu_open: false,
+            scope: SearchScope::CurrentFile,
+            selected_file_sources: Vec::new(),
+            directory_input: SingleLineTextInputState::empty(),
+            case_sensitive: false,
+            match_mode: SearchMatchMode::Literal,
+            current_file_match_count: None,
+            current_file_navigation_match: None,
+            is_searching: false,
+            progress: SearchProgress::default(),
+            message: String::new(),
+            job_id: 0,
         }
     }
 
@@ -2842,6 +2964,49 @@ mod state_tests {
         );
     }
 
+    /// 验证搜索结果定位同时保留整行高亮和关键字片段高亮。
+    ///
+    /// 业务意图：
+    /// - 点击底部搜索结果后，正文需要通过整行背景提示“当前定位行”，并通过片段背景提示“命中关键字列”。
+    /// - 左侧文件树搜索改为只高亮文件名关键字后，不能误把日志正文搜索结果的整行定位反馈清掉。
+    #[test]
+    fn 搜索结果定位会同时设置行高亮和片段高亮() {
+        let source = test_local_file("/tmp/search.log");
+        let mut tab = OpenLogTab {
+            id: 30,
+            source,
+            source_key: "local:search.log".to_string(),
+            title: "search.log".to_string(),
+            encoding_choice: EncodingChoice::Auto,
+            raw_bytes: None,
+            state: LogTabState::Loading {
+                message: "测试加载中".to_string(),
+            },
+            scroll_handle: UniformListScrollHandle::new(),
+            paged_viewport_handle: ScrollHandle::new(),
+            paged_scroll: PagedLogScrollState::default(),
+            pending_scroll_to_line: None,
+            highlighted_search_line: None,
+            highlighted_search_match: None,
+            marked_lines: BTreeSet::new(),
+            last_marker_jump_line: None,
+            text_selection: None,
+            selection_drag_anchor: None,
+        };
+
+        MainView::apply_search_result_highlight_to_tab(&mut tab, 12, 4..9);
+
+        assert_eq!(tab.pending_scroll_to_line, Some(12));
+        assert_eq!(tab.highlighted_search_line, Some(12));
+        assert_eq!(
+            tab.highlighted_search_match,
+            Some(LogSearchMatchHighlight {
+                line_index: 12,
+                match_range: 4..9,
+            })
+        );
+    }
+
     /// 验证搜索条件变化只清理当前激活 tab 的片段高亮。
     ///
     /// 业务意图：
@@ -3041,6 +3206,336 @@ mod state_tests {
         let state = LoadedLogTreeState::new(tree);
 
         assert_eq!(state.single_file_source_for_archive(0), None);
+    }
+
+    /// 验证左侧树选中文件来源按加载树顺序过滤。
+    ///
+    /// 业务意图：
+    /// - “选中搜索”与另存为、线程分析共用同一套来源收集规则，目录和错误节点不能进入搜索范围。
+    /// - 用户多选顺序可能与树顺序不同，但后台搜索应按加载树顺序稳定执行，方便结果面板排序可预测。
+    #[test]
+    fn 左侧树选中文件来源按树顺序过滤不可读节点() {
+        let first = test_local_file("/tmp/first.log");
+        let second = test_local_file("/tmp/second.log");
+        let tree = LoadedLogTree {
+            summary: "5 个节点".to_string(),
+            rows: vec![
+                test_tree_row(0, 0, LogTreeEntryKind::Directory, true, None),
+                test_tree_row(1, 1, LogTreeEntryKind::File, false, Some(first.clone())),
+                test_tree_row(2, 1, LogTreeEntryKind::Directory, true, None),
+                test_tree_row(3, 2, LogTreeEntryKind::File, false, Some(second.clone())),
+                test_tree_row(4, 1, LogTreeEntryKind::Error, false, None),
+            ],
+            error_count: 1,
+            temporary_paths: Vec::new(),
+        };
+        let state = LoadedLogTreeState::new(tree);
+        let mut selected = HashSet::new();
+        selected.insert(4);
+        selected.insert(3);
+        selected.insert(2);
+        selected.insert(1);
+
+        assert_eq!(
+            state.file_sources_for_node_ids(&selected),
+            vec![first, second]
+        );
+    }
+
+    /// 验证单文件压缩包根节点可作为“选中搜索”来源。
+    ///
+    /// 业务意图：
+    /// - 左侧树中只有一个成员的压缩包会支持点击根节点直接打开；右键“选中搜索”也应使用同一来源映射。
+    /// - 多文件压缩包仍不会映射，避免用户选择压缩包根节点时误以为搜索了全部成员。
+    #[test]
+    fn 左侧树选中文件来源支持单文件压缩包节点() {
+        let member = test_archive_member("access.log");
+        let tree = LoadedLogTree {
+            summary: "2 个节点".to_string(),
+            rows: vec![
+                test_tree_row(10, 0, LogTreeEntryKind::Archive, true, None),
+                test_tree_row(11, 1, LogTreeEntryKind::File, false, Some(member.clone())),
+            ],
+            error_count: 0,
+            temporary_paths: Vec::new(),
+        };
+        let state = LoadedLogTreeState::new(tree);
+        let mut selected = HashSet::new();
+        selected.insert(10);
+
+        assert_eq!(state.file_sources_for_node_ids(&selected), vec![member]);
+    }
+
+    /// 验证单文件压缩包根节点和子文件同时选中时不会重复返回来源。
+    ///
+    /// 业务意图：
+    /// - 单文件压缩包根节点会映射到唯一成员来源；用户 Shift 多选时可能同时包含根节点和子文件节点。
+    /// - “选中搜索”必须只搜索一次该成员，否则结果面板会重复展示同一个日志的命中。
+    #[test]
+    fn 左侧树选中文件来源会去重单文件压缩包根节点和子文件() {
+        let member = test_archive_member("access.log");
+        let tree = LoadedLogTree {
+            summary: "2 个节点".to_string(),
+            rows: vec![
+                test_tree_row(10, 0, LogTreeEntryKind::Archive, true, None),
+                test_tree_row(11, 1, LogTreeEntryKind::File, false, Some(member.clone())),
+            ],
+            error_count: 0,
+            temporary_paths: Vec::new(),
+        };
+        let state = LoadedLogTreeState::new(tree);
+        let mut selected = HashSet::new();
+        selected.insert(10);
+        selected.insert(11);
+
+        assert_eq!(state.file_sources_for_node_ids(&selected), vec![member]);
+    }
+
+    /// 验证左侧树菜单来源为空时使用右键落点兜底。
+    ///
+    /// 业务意图：
+    /// - 如果用户没有形成有效多选，但右键落在可读文件上，“选中搜索”仍应搜索该文件。
+    /// - 一旦已有有效选中文件，就必须保留完整多选集合，不能被右键落点覆盖。
+    #[test]
+    fn 左侧树菜单来源为空时使用右键兜底来源() {
+        let fallback = test_local_file("/tmp/fallback.log");
+        let selected = test_local_file("/tmp/selected.log");
+
+        assert_eq!(
+            MainView::log_tree_menu_action_sources(Vec::new(), Some(fallback.clone())),
+            vec![fallback.clone()]
+        );
+        assert_eq!(
+            MainView::log_tree_menu_action_sources(vec![selected.clone()], Some(fallback)),
+            vec![selected]
+        );
+    }
+
+    /// 验证空文件名搜索保持普通展开/折叠可见行规则。
+    ///
+    /// 业务意图：
+    /// - 清空搜索后必须回到用户原本的目录树展开状态，不能把搜索期间的临时路径展开固化到 UI 状态。
+    #[test]
+    fn 文件树空搜索保持普通可见行规则() {
+        let tree = LoadedLogTree {
+            summary: "3 个节点".to_string(),
+            rows: vec![
+                test_tree_row(0, 0, LogTreeEntryKind::Directory, true, None),
+                test_tree_row(1, 1, LogTreeEntryKind::Directory, true, None),
+                {
+                    let mut row = test_tree_row(
+                        2,
+                        2,
+                        LogTreeEntryKind::File,
+                        false,
+                        Some(test_local_file("/tmp/nested/app.log")),
+                    );
+                    row.label = "app.log".to_string();
+                    row
+                },
+            ],
+            error_count: 0,
+            temporary_paths: Vec::new(),
+        };
+        let mut state = LoadedLogTreeState::new(tree);
+        state.expanded_node_ids.clear();
+        state.rebuild_visible_rows();
+
+        let visible_before_search: Vec<_> = state.visible_rows.iter().map(|row| row.id).collect();
+        let matches = state.rebuild_visible_rows_for_file_name_search("   ");
+        let visible_after_search: Vec<_> = state.visible_rows.iter().map(|row| row.id).collect();
+
+        assert!(matches.is_empty());
+        assert_eq!(visible_before_search, vec![0]);
+        assert_eq!(visible_after_search, visible_before_search);
+    }
+
+    /// 验证文件名搜索只把可打开文件作为命中，目录名称只作为上下文展示。
+    ///
+    /// 业务意图：
+    /// - 左侧搜索用于定位具体日志文件；目录、压缩包和错误节点不应因为名称匹配而进入命中计数。
+    #[test]
+    fn 文件树搜索只命中文件节点并展示父级上下文() {
+        let mut root = test_tree_row(0, 0, LogTreeEntryKind::Directory, true, None);
+        root.label = "error-root".to_string();
+        let mut nested = test_tree_row(1, 1, LogTreeEntryKind::Directory, true, None);
+        nested.label = "service".to_string();
+        let mut matched_file = test_tree_row(
+            2,
+            2,
+            LogTreeEntryKind::File,
+            false,
+            Some(test_local_file("/tmp/service/error.log")),
+        );
+        matched_file.label = "error.log".to_string();
+        let mut other_file = test_tree_row(
+            3,
+            2,
+            LogTreeEntryKind::File,
+            false,
+            Some(test_local_file("/tmp/service/access.log")),
+        );
+        other_file.label = "access.log".to_string();
+        let mut directory_only_match =
+            test_tree_row(4, 1, LogTreeEntryKind::Directory, false, None);
+        directory_only_match.label = "error-directory".to_string();
+        let mut unopened_file_match = test_tree_row(5, 1, LogTreeEntryKind::File, false, None);
+        unopened_file_match.label = "error-without-source.log".to_string();
+        let tree = LoadedLogTree {
+            summary: "6 个节点".to_string(),
+            rows: vec![
+                root,
+                nested,
+                matched_file,
+                other_file,
+                directory_only_match,
+                unopened_file_match,
+            ],
+            error_count: 0,
+            temporary_paths: Vec::new(),
+        };
+        let mut state = LoadedLogTreeState::new(tree);
+
+        let matches = state.rebuild_visible_rows_for_file_name_search("ERROR");
+        let visible_ids: Vec<_> = state.visible_rows.iter().map(|row| row.id).collect();
+
+        assert_eq!(matches, vec![2]);
+        assert_eq!(visible_ids, vec![0, 1, 2]);
+    }
+
+    /// 验证清空文件名搜索后恢复用户原有展开状态。
+    ///
+    /// 业务意图：
+    /// - 搜索过滤需要临时显示命中路径，但用户手动收起的目录不能因为搜索结束而被意外展开。
+    #[test]
+    fn 文件树搜索清空后恢复原展开状态() {
+        let mut root = test_tree_row(0, 0, LogTreeEntryKind::Directory, true, None);
+        root.label = "root".to_string();
+        let mut nested = test_tree_row(1, 1, LogTreeEntryKind::Directory, true, None);
+        nested.label = "nested".to_string();
+        let mut matched_file = test_tree_row(
+            2,
+            2,
+            LogTreeEntryKind::File,
+            false,
+            Some(test_local_file("/tmp/nested/error.log")),
+        );
+        matched_file.label = "error.log".to_string();
+        let tree = LoadedLogTree {
+            summary: "3 个节点".to_string(),
+            rows: vec![root, nested, matched_file],
+            error_count: 0,
+            temporary_paths: Vec::new(),
+        };
+        let mut state = LoadedLogTreeState::new(tree);
+        state.expanded_node_ids.clear();
+        state.rebuild_visible_rows();
+        assert_eq!(
+            state
+                .visible_rows
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+
+        let matches = state.rebuild_visible_rows_for_file_name_search("error");
+        assert_eq!(matches, vec![2]);
+        assert_eq!(
+            state
+                .visible_rows
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+
+        let cleared_matches = state.rebuild_visible_rows_for_file_name_search("");
+        assert!(cleared_matches.is_empty());
+        assert_eq!(
+            state
+                .visible_rows
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+    }
+
+    /// 验证文件树搜索命中导航采用循环定位。
+    ///
+    /// 业务意图：
+    /// - 上一个/下一个按钮在多命中之间循环，用户不需要在首尾额外判断方向。
+    #[test]
+    fn 文件树搜索命中导航循环定位() {
+        assert_eq!(
+            LoadedLogTreeState::next_file_name_search_match_index(
+                None,
+                3,
+                LogTreeSearchNavigation::Next,
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            LoadedLogTreeState::next_file_name_search_match_index(
+                Some(2),
+                3,
+                LogTreeSearchNavigation::Next,
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            LoadedLogTreeState::next_file_name_search_match_index(
+                Some(0),
+                3,
+                LogTreeSearchNavigation::Previous,
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            LoadedLogTreeState::next_file_name_search_match_index(
+                Some(4),
+                3,
+                LogTreeSearchNavigation::Previous,
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            LoadedLogTreeState::next_file_name_search_match_index(
+                None,
+                0,
+                LogTreeSearchNavigation::Next,
+            ),
+            None
+        );
+    }
+
+    /// 验证文件树搜索关键字高亮范围使用原始文件名下标。
+    ///
+    /// 业务意图：
+    /// - 左侧树搜索结果需要只高亮文件名里的关键字，不应再把整行作为搜索命中背景。
+    /// - 搜索匹配不区分大小写，多次出现时每个命中片段都应能被渲染层单独高亮。
+    #[test]
+    fn 文件树搜索关键字高亮范围支持大小写和多次命中() {
+        let ranges =
+            LoadedLogTreeState::file_name_search_match_ranges("Error.ERROR.log", " error ");
+
+        assert_eq!(ranges, vec![0..5, 6..11]);
+    }
+
+    /// 验证文件树搜索关键字高亮范围不会切断中文字符。
+    ///
+    /// 业务意图：
+    /// - 文件名可能包含中文，传给 `StyledText` 的高亮范围必须保持 UTF-8 边界，否则渲染会 panic 或高亮错位。
+    #[test]
+    fn 文件树搜索关键字高亮范围支持中文文件名() {
+        let label = "服务日志.log";
+        let expected_start = label.find("日志").expect("测试文件名必须包含日志关键字");
+        let expected_end = expected_start + "日志".len();
+
+        let ranges = LoadedLogTreeState::file_name_search_match_ranges(label, "日志");
+
+        assert_eq!(ranges, vec![expected_start..expected_end]);
     }
 
     /// 验证平台传入的 file URL 会解析成本地路径。

@@ -6,6 +6,30 @@
 
 use super::*;
 
+/// 启动搜索时需要的活动 tab 快照。
+///
+/// 业务意图：
+/// - 当前文件和当前目录搜索需要活动 tab 的来源与正文状态；提取成快照后，错误提示可以在不持有 `open_tabs` 借用的情况下更新 UI 状态。
+struct SearchActiveTabSnapshot {
+    /// 活动 tab 的日志来源。
+    source: LogFileSource,
+    /// 活动 tab 的正文状态。
+    state: SearchActiveTabState,
+}
+
+/// 启动搜索时关心的活动 tab 状态。
+///
+/// 业务意图：
+/// - 搜索启动只需要区分已就绪、加载中和失败三种状态，不需要复制整个 tab UI 状态。
+enum SearchActiveTabState {
+    /// 已打开完成，可以直接搜索当前文档。
+    Ready(Box<LogTabDocument>),
+    /// 仍在加载，用户需要稍后重试。
+    Loading,
+    /// 打开失败，无法搜索正文。
+    Failed,
+}
+
 impl MainView {
     /// 返回当前激活文件所在目录的展示标签。
     ///
@@ -378,7 +402,7 @@ impl MainView {
     /// 实现原因：
     /// - 这里只修改 `MainView` 自身状态，不创建窗口；独立搜索窗口会在 `MainView::update` 返回后再创建。
     /// - 这样可以避免搜索窗口根视图初始化或渲染时读取 `MainView`，和当前 `MainView` 更新租借发生重叠。
-    pub(in crate::app) fn prepare_search_dialog_state(&mut self) {
+    pub(in crate::app) fn prepare_search_dialog_state(&mut self, preset: SearchDialogOpenPreset) {
         let selected_query = self.selected_log_text_for_search_query();
         let mut query_replaced = false;
         if self.search.search_dialog.is_none() {
@@ -398,6 +422,7 @@ impl MainView {
                 query_input,
                 query_history_menu_open: false,
                 scope: SearchScope::CurrentFile,
+                selected_file_sources: Vec::new(),
                 directory_input: SingleLineTextInputState::from_text(directory_target),
                 case_sensitive: false,
                 match_mode,
@@ -446,8 +471,85 @@ impl MainView {
             self.search.current_file_navigation_request_id += 1;
             self.clear_active_log_tab_search_match_highlight();
         }
+        if let Some(dialog) = self.search.search_dialog.as_mut() {
+            Self::apply_search_dialog_open_preset_to_dialog(dialog, preset);
+        }
         self.log.tab_context_menu = None;
         self.log.encoding_dropdown_menu = None;
+    }
+
+    /// 应用搜索对话框打开预设。
+    ///
+    /// 业务意图：
+    /// - “选中搜索”使用右键当刻的文件来源快照初始化搜索范围，后续左侧树选择变化不能影响本次搜索对话框。
+    /// - 默认入口不改变已存在搜索窗口的范围和来源，保持工具栏、快捷键的既有行为。
+    pub(in crate::app) fn apply_search_dialog_open_preset_to_dialog(
+        dialog: &mut SearchDialogState,
+        preset: SearchDialogOpenPreset,
+    ) {
+        match preset {
+            SearchDialogOpenPreset::Default => {}
+            SearchDialogOpenPreset::SelectedFiles { sources } => {
+                dialog.scope = SearchScope::SelectedFiles;
+                dialog.selected_file_sources = sources;
+                dialog.query_history_menu_open = false;
+                dialog.current_file_match_count = None;
+                dialog.current_file_navigation_match = None;
+                dialog.message = if dialog.selected_file_sources.is_empty() {
+                    "请先在左侧选择要搜索的日志文件".to_string()
+                } else {
+                    format!(
+                        "已选择 {} 个文件，输入关键字后按 Enter 或点击搜索",
+                        dialog.selected_file_sources.len()
+                    )
+                };
+            }
+        }
+    }
+
+    /// 重新加载日志时清理搜索对话框中依赖旧日志来源的状态。
+    ///
+    /// 业务意图：
+    /// - 搜索窗口可以在重新加载日志时保持打开，方便用户继续使用原关键字。
+    /// - 但“选中文件”范围保存的是旧目录树右键当刻的文件来源快照；重新加载后必须丢弃，
+    ///   否则用户会在新工作区下误搜索旧日志文件。
+    ///
+    /// 边界条件：
+    /// - 当前文件和当前目录也依赖活动 tab，重新加载后没有活动 tab，因此统一清空当前文件计数和导航状态。
+    /// - 如果当前范围正是“选中文件”，切回“当前文件”，让按钮可用性自然受 active tab 为空约束。
+    pub(in crate::app) fn reset_search_dialog_for_log_reload(dialog: &mut SearchDialogState) {
+        dialog.current_file_match_count = None;
+        dialog.current_file_navigation_match = None;
+        dialog.selected_file_sources.clear();
+        if dialog.scope == SearchScope::SelectedFiles {
+            dialog.scope = SearchScope::CurrentFile;
+        }
+        dialog.is_searching = false;
+        dialog.progress = SearchProgress::default();
+        dialog.message = "日志已重新加载，请重新打开文件后搜索".to_string();
+    }
+
+    /// 把搜索结果定位状态写入日志 tab。
+    ///
+    /// 业务意图：
+    /// - 点击底部搜索结果后，正文区域需要同时展示“当前定位行”和“命中关键字片段”两层反馈：
+    ///   整行背景帮助用户在长日志中快速找到行位置，片段背景帮助用户确认关键字所在列。
+    /// - 左侧目录树搜索只高亮文件名关键字，不应影响日志正文搜索结果的整行定位反馈。
+    ///
+    /// 边界条件：
+    /// - `match_range` 来自搜索任务时的原始行文本；真正绘制前仍会在渲染层按当前行内容夹紧，
+    ///   避免文件重新加载或编码切换后旧范围越界。
+    pub(in crate::app) fn apply_search_result_highlight_to_tab(
+        tab: &mut OpenLogTab,
+        line_index: usize,
+        match_range: Range<usize>,
+    ) {
+        tab.pending_scroll_to_line = Some(line_index);
+        tab.highlighted_search_line = Some(line_index);
+        tab.highlighted_search_match = Some(LogSearchMatchHighlight {
+            line_index,
+            match_range,
+        });
     }
 
     /// 在 `MainView` 更新租借结束后打开搜索对话框。
@@ -467,7 +569,8 @@ impl MainView {
         let (search_input_focus, existing_search_window) =
             main_view.update(app, |view, context| {
                 view.search.search_dialog_open_pending = false;
-                view.prepare_search_dialog_state();
+                let preset = std::mem::take(&mut view.search.search_dialog_open_preset);
+                view.prepare_search_dialog_state(preset);
                 if let Some(dialog) = view.search.search_dialog.as_mut() {
                     Self::select_all_search_query(dialog);
                 }
@@ -634,6 +737,7 @@ impl MainView {
             case_sensitive,
             match_mode,
             directory_target,
+            selected_file_sources,
             previous_running_job_id,
         )) = ({
             self.search.search_dialog.as_ref().map(|dialog| {
@@ -643,6 +747,7 @@ impl MainView {
                     dialog.case_sensitive,
                     dialog.match_mode,
                     dialog.directory_input.text.trim().to_string(),
+                    dialog.selected_file_sources.clone(),
                     dialog.is_searching.then_some(dialog.job_id),
                 )
             })
@@ -677,6 +782,7 @@ impl MainView {
                 case_sensitive,
                 match_mode,
                 directory_target,
+                selected_file_sources,
                 previous_running_job_id,
             },
             context,
@@ -706,16 +812,24 @@ impl MainView {
             );
             return;
         }
-        let Some((scope, case_sensitive, directory_target, previous_running_job_id)) = ({
+        let Some((
+            scope,
+            case_sensitive,
+            directory_target,
+            selected_file_sources,
+            previous_running_job_id,
+        )) = ({
             self.search.search_dialog.as_ref().map(|dialog| {
                 (
                     dialog.scope,
                     dialog.case_sensitive,
                     dialog.directory_input.text.trim().to_string(),
+                    dialog.selected_file_sources.clone(),
                     dialog.is_searching.then_some(dialog.job_id),
                 )
             })
-        }) else {
+        })
+        else {
             return;
         };
         let record_query = format!("快搜：{}", keywords.join(", "));
@@ -729,6 +843,7 @@ impl MainView {
                 case_sensitive,
                 match_mode: SearchMatchMode::Literal,
                 directory_target,
+                selected_file_sources,
                 previous_running_job_id,
             },
             context,
@@ -752,6 +867,7 @@ impl MainView {
             case_sensitive,
             match_mode,
             directory_target,
+            selected_file_sources,
             previous_running_job_id,
         } = request;
 
@@ -772,52 +888,42 @@ impl MainView {
             return;
         }
 
-        let Some(active_tab_id) = self.log.active_tab_id else {
-            self.update_search_start_failure_message(
-                previous_running_job_id,
-                "请先从左侧打开一个日志文件",
-                context,
-            );
-            return;
-        };
-        let Some(active_tab) = self
-            .log
-            .open_tabs
-            .iter()
-            .find(|tab| tab.id == active_tab_id)
-        else {
-            self.update_search_start_failure_message(
-                previous_running_job_id,
-                "当前日志 tab 不存在，请重新选择文件",
-                context,
-            );
-            return;
-        };
-
         let search_target = match scope {
-            SearchScope::CurrentFile => match &active_tab.state {
-                LogTabState::Ready { document } => SearchTarget::CurrentFile {
-                    source: active_tab.source.clone(),
-                    document: document.clone(),
-                },
-                LogTabState::Loading { .. } => {
-                    self.update_search_start_failure_message(
-                        previous_running_job_id,
-                        "当前文件仍在加载，完成后再搜索",
-                        context,
-                    );
+            SearchScope::CurrentFile => {
+                let Some(active_tab) =
+                    self.active_search_tab_for_start(previous_running_job_id, context)
+                else {
                     return;
+                };
+                match active_tab.state {
+                    SearchActiveTabState::Ready(document) => SearchTarget::CurrentFile {
+                        source: active_tab.source.clone(),
+                        document,
+                    },
+                    SearchActiveTabState::Loading => {
+                        self.update_search_start_failure_message(
+                            previous_running_job_id,
+                            "当前文件仍在加载，完成后再搜索",
+                            context,
+                        );
+                        return;
+                    }
+                    SearchActiveTabState::Failed => {
+                        self.update_search_start_failure_message(
+                            previous_running_job_id,
+                            "当前文件打开失败，无法搜索正文",
+                            context,
+                        );
+                        return;
+                    }
                 }
-                LogTabState::Failed { .. } => {
-                    self.update_search_start_failure_message(
-                        previous_running_job_id,
-                        "当前文件打开失败，无法搜索正文",
-                        context,
-                    );
-                    return;
-                }
-            },
+            }
             SearchScope::CurrentDirectory => {
+                let Some(active_tab) =
+                    self.active_search_tab_for_start(previous_running_job_id, context)
+                else {
+                    return;
+                };
                 let LogTreeLoadState::Loaded(tree_state) = &self.log.load_state else {
                     self.update_search_start_failure_message(
                         previous_running_job_id,
@@ -844,6 +950,19 @@ impl MainView {
                 }
                 SearchTarget::CurrentDirectory { sources }
             }
+            SearchScope::SelectedFiles => {
+                if selected_file_sources.is_empty() {
+                    self.update_search_start_failure_message(
+                        previous_running_job_id,
+                        "请先在左侧选择要搜索的日志文件",
+                        context,
+                    );
+                    return;
+                }
+                SearchTarget::SelectedFiles {
+                    sources: selected_file_sources,
+                }
+            }
         };
 
         let job_id = self.search.next_search_job_id;
@@ -852,6 +971,7 @@ impl MainView {
         let total_files = match &search_target {
             SearchTarget::CurrentFile { .. } => 1,
             SearchTarget::CurrentDirectory { sources } => sources.len(),
+            SearchTarget::SelectedFiles { sources } => sources.len(),
         };
         let panel_height = self
             .search
@@ -915,10 +1035,52 @@ impl MainView {
             SearchTarget::CurrentFile { source, document } => {
                 self.spawn_current_file_search(job_id, source, *document, options, context);
             }
-            SearchTarget::CurrentDirectory { sources } => {
+            SearchTarget::CurrentDirectory { sources }
+            | SearchTarget::SelectedFiles { sources } => {
                 self.spawn_current_directory_search(job_id, sources, options, context);
             }
         }
+    }
+
+    /// 返回启动“当前文件/当前目录”搜索所需的活动 tab。
+    ///
+    /// 业务意图：
+    /// - “选中文件”搜索不依赖当前打开 tab，但另外两个范围仍需要明确的活动日志上下文。
+    fn active_search_tab_for_start(
+        &mut self,
+        previous_running_job_id: Option<usize>,
+        context: &mut Context<Self>,
+    ) -> Option<SearchActiveTabSnapshot> {
+        let Some(active_tab_id) = self.log.active_tab_id else {
+            self.update_search_start_failure_message(
+                previous_running_job_id,
+                "请先从左侧打开一个日志文件",
+                context,
+            );
+            return None;
+        };
+        let Some(active_tab) = self
+            .log
+            .open_tabs
+            .iter()
+            .find(|tab| tab.id == active_tab_id)
+        else {
+            self.update_search_start_failure_message(
+                previous_running_job_id,
+                "当前日志 tab 不存在，请重新选择文件",
+                context,
+            );
+            return None;
+        };
+        let state = match &active_tab.state {
+            LogTabState::Ready { document } => SearchActiveTabState::Ready(document.clone()),
+            LogTabState::Loading { .. } => SearchActiveTabState::Loading,
+            LogTabState::Failed { .. } => SearchActiveTabState::Failed,
+        };
+        Some(SearchActiveTabSnapshot {
+            source: active_tab.source.clone(),
+            state,
+        })
     }
 
     /// 处理新搜索启动失败时的旧任务收尾。
@@ -1205,13 +1367,12 @@ impl MainView {
             self.log.open_tabs[tab_index].state,
             LogTabState::Ready { .. }
         );
-        self.log.open_tabs[tab_index].pending_scroll_to_line = Some(line_index);
-        self.log.open_tabs[tab_index].highlighted_search_line = None;
-        self.log.open_tabs[tab_index].highlighted_search_match = Some(LogSearchMatchHighlight {
+        self.activate_tab(tab_id);
+        Self::apply_search_result_highlight_to_tab(
+            &mut self.log.open_tabs[tab_index],
             line_index,
             match_range,
-        });
-        self.activate_tab(tab_id);
+        );
         if ready {
             self.log.open_tabs[tab_index].pending_scroll_to_line = None;
             self.scroll_log_tab_to_line(tab_id, line_index);

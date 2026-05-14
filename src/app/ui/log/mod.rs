@@ -18,6 +18,8 @@ mod tab_menu;
 mod text_selection;
 /// 日志正文鼠标选区行为。
 mod text_selection_actions;
+/// 左侧日志树搜索输入元素。
+mod tree_search_input;
 /// 左侧日志树视图。
 mod tree_view;
 /// 日志正文右键菜单。
@@ -26,3 +28,5 @@ mod viewer_menu;
 mod viewer_scrollbar;
 /// 日志正文视图。
 mod viewer_view;
+
+use tree_search_input::*;

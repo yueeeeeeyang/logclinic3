@@ -25,6 +25,7 @@ pub(crate) use stream::*;
 ///
 /// 业务意图：
 /// - 用户可以在当前 tab 已打开的文件中搜索，也可以在该文件所在目录及子目录中搜索。
+/// - 左侧目录树还可以把当前选中的若干文件作为一次固定快照搜索，不依赖当前打开 tab。
 /// - 枚举让 UI 状态、后台任务和测试共享同一套范围语义。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchScope {
@@ -32,6 +33,8 @@ pub enum SearchScope {
     CurrentFile,
     /// 搜索当前文件所在目录及全部子目录中的可打开文件。
     CurrentDirectory,
+    /// 搜索左侧目录树右键打开搜索窗口时选中的文件快照。
+    SelectedFiles,
 }
 
 impl SearchScope {
@@ -43,6 +46,7 @@ impl SearchScope {
         match self {
             Self::CurrentFile => "当前文件",
             Self::CurrentDirectory => "当前目录",
+            Self::SelectedFiles => "选中文件",
         }
     }
 }

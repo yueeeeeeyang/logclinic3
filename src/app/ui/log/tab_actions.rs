@@ -605,7 +605,9 @@ impl MainView {
 
         if self.log.active_tab_id == Some(tab_id) {
             self.scroll_tab_bar_to_tab(tab_id);
-            self.clear_search_current_file_match_count();
+            // 日志加载完成会让搜索窗口里的当前文件计数和“上一个/下一个”起点失效；
+            // 但如果该 tab 是从搜索结果打开的，正文高亮已经在加载前写入，不能在这里清掉。
+            self.clear_search_current_file_match_count_state();
         }
         if let Some(line_index) = pending_scroll_to_line {
             self.scroll_log_tab_to_line(tab_id, line_index);
