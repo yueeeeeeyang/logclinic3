@@ -13,11 +13,11 @@ use std::sync::atomic::AtomicU64;
 /// - 文件仍放在现有应用配置目录下，沿用 macOS/Windows 已确认的配置目录策略。
 pub(crate) const AI_CHAT_DATABASE_FILE_NAME: &str = "ai-chat.db";
 
-/// AI 对话数据库首版 schema 版本。
+/// AI 对话数据库 schema 版本。
 ///
 /// 业务意图：
-/// - SQLite `PRAGMA user_version` 用于后续迁移判断；首版固定为 1，避免未来新增列时无法区分历史数据库。
-pub(crate) const AI_CHAT_DATABASE_SCHEMA_VERSION: i64 = 1;
+/// - SQLite `PRAGMA user_version` 用于迁移判断；版本 2 增加助手推理内容字段，用于区分“思考过程”和正式回复。
+pub(crate) const AI_CHAT_DATABASE_SCHEMA_VERSION: i64 = 2;
 
 /// AI 对话实体 ID 的进程内单调序号。
 ///

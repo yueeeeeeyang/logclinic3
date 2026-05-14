@@ -4,9 +4,9 @@
 // - 测试随 AI 对话模块迁移，直接覆盖 SQLite、SSE、请求体、模型选择和输入区高度等内部规则。
 // - 断言保持迁移前语义不变，用于证明本次只是代码组织重构。
 
-use std::{env, fs, path::PathBuf, sync::mpsc};
+use std::{collections::HashSet, env, fs, path::PathBuf, sync::mpsc};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 use super::view::ai_chat_placeholder_description;
 use super::*;
@@ -63,6 +63,7 @@ fn ai_对话数据库初始化并读写会话消息() {
         conversation_id: conversation.id.clone(),
         role: AiChatMessageRole::User,
         content: "为什么失败".to_string(),
+        reasoning_content: String::new(),
         status: AiChatMessageStatus::Complete,
         error_message: None,
         sequence: 1,
@@ -74,6 +75,7 @@ fn ai_对话数据库初始化并读写会话消息() {
         conversation_id: conversation.id.clone(),
         role: AiChatMessageRole::Assistant,
         content: "需要看错误栈".to_string(),
+        reasoning_content: "先看错误栈".to_string(),
         status: AiChatMessageStatus::Complete,
         error_message: None,
         sequence: 2,
@@ -122,6 +124,7 @@ fn ai_对话删除会话会级联删除消息() {
         conversation_id: conversation.id.clone(),
         role: AiChatMessageRole::User,
         content: "删除测试".to_string(),
+        reasoning_content: String::new(),
         status: AiChatMessageStatus::Complete,
         error_message: None,
         sequence: 1,
@@ -137,6 +140,89 @@ fn ai_对话删除会话会级联删除消息() {
             .unwrap()
             .is_empty()
     );
+
+    let _ = fs::remove_file(&path);
+    if let Some(parent) = path.parent() {
+        let _ = fs::remove_dir_all(parent);
+    }
+}
+
+/// 验证旧版 AI 对话数据库会补齐推理内容字段。
+///
+/// 业务意图：
+/// - 深度思考功能新增 `reasoning_content` 列，用户已有历史库不能因为缺列而无法打开 AI 对话页。
+#[test]
+fn ai_对话旧数据库会迁移推理内容字段() {
+    let path =
+        test_ai_chat_database_file_path("migrate-reasoning").join(AI_CHAT_DATABASE_FILE_NAME);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("测试数据库目录应能创建");
+    }
+    {
+        let connection = Connection::open(&path).expect("测试数据库应能打开");
+        connection
+            .execute_batch(
+                r#"
+                PRAGMA foreign_keys = ON;
+                CREATE TABLE conversations (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    title TEXT NOT NULL,
+                    model_profile_id TEXT,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                CREATE TABLE messages (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    error_message TEXT,
+                    sequence INTEGER NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+                );
+                PRAGMA user_version = 1;
+                "#,
+            )
+            .expect("旧 schema 应能创建");
+        connection
+            .execute(
+                "INSERT INTO conversations
+                    (id, title, model_profile_id, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, NULL, ?3, ?4)",
+                params!["old-conversation", "旧对话", 1_i64, 1_i64],
+            )
+            .expect("旧会话应能写入");
+        connection
+            .execute(
+                "INSERT INTO messages
+                    (id, conversation_id, role, content, status, error_message,
+                     sequence, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8)",
+                params![
+                    "old-message",
+                    "old-conversation",
+                    "assistant",
+                    "旧回答",
+                    "complete",
+                    1_i64,
+                    2_i64,
+                    2_i64
+                ],
+            )
+            .expect("旧消息应能写入");
+    }
+
+    let messages = load_ai_chat_messages(&path, "old-conversation").unwrap();
+    assert_eq!(messages[0].content, "旧回答");
+    assert_eq!(messages[0].reasoning_content, "");
+    let connection = Connection::open(&path).expect("测试数据库应能重新打开");
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("schema 版本应能读取");
+    assert_eq!(version, AI_CHAT_DATABASE_SCHEMA_VERSION);
 
     let _ = fs::remove_file(&path);
     if let Some(parent) = path.parent() {
@@ -223,6 +309,7 @@ fn ai_对话请求体过滤失败和流式消息() {
             conversation_id: "c".to_string(),
             role: AiChatMessageRole::User,
             content: "用户问题".to_string(),
+            reasoning_content: String::new(),
             status: AiChatMessageStatus::Complete,
             error_message: None,
             sequence: 1,
@@ -234,6 +321,7 @@ fn ai_对话请求体过滤失败和流式消息() {
             conversation_id: "c".to_string(),
             role: AiChatMessageRole::Assistant,
             content: "有效回答".to_string(),
+            reasoning_content: "历史推理不应进入请求".to_string(),
             status: AiChatMessageStatus::Complete,
             error_message: None,
             sequence: 2,
@@ -245,6 +333,7 @@ fn ai_对话请求体过滤失败和流式消息() {
             conversation_id: "c".to_string(),
             role: AiChatMessageRole::Assistant,
             content: "失败回答".to_string(),
+            reasoning_content: "失败推理".to_string(),
             status: AiChatMessageStatus::Failed,
             error_message: Some("失败".to_string()),
             sequence: 3,
@@ -256,6 +345,7 @@ fn ai_对话请求体过滤失败和流式消息() {
             conversation_id: "c".to_string(),
             role: AiChatMessageRole::Assistant,
             content: "半截回答".to_string(),
+            reasoning_content: "半截推理".to_string(),
             status: AiChatMessageStatus::Streaming,
             error_message: None,
             sequence: 4,
@@ -264,14 +354,47 @@ fn ai_对话请求体过滤失败和流式消息() {
         },
     ];
 
-    let body = ai_chat_stream_request_body(" gpt-test ", &messages);
+    let body =
+        ai_chat_stream_request_body(" gpt-test ", &messages, false, AiChatReasoningEffort::High);
     assert_eq!(body["model"], "gpt-test");
     assert_eq!(body["stream"], true);
+    assert!(body.get("reasoning_effort").is_none());
+    assert_eq!(body["thinking"]["type"], "disabled");
     assert_eq!(body["messages"].as_array().unwrap().len(), 2);
     assert_eq!(body["messages"][0]["role"], "user");
     assert_eq!(body["messages"][0]["content"], "用户问题");
     assert_eq!(body["messages"][1]["role"], "assistant");
     assert_eq!(body["messages"][1]["content"], "有效回答");
+    assert!(body["messages"][1].get("reasoning_content").is_none());
+
+    let reasoning_body =
+        ai_chat_stream_request_body("gpt-test", &messages, true, AiChatReasoningEffort::High);
+    assert_eq!(reasoning_body["reasoning_effort"], "high");
+    assert_eq!(reasoning_body["thinking"]["type"], "enabled");
+
+    let max_reasoning_body =
+        ai_chat_stream_request_body("gpt-test", &messages, true, AiChatReasoningEffort::Max);
+    assert_eq!(max_reasoning_body["reasoning_effort"], "max");
+    assert_eq!(max_reasoning_body["thinking"]["type"], "enabled");
+}
+
+/// 验证深度思考单控件状态按关闭、高、最大循环。
+///
+/// 业务意图：
+/// - 底部浮层使用单控件承载思考开关和强度选择；循环顺序必须稳定，避免用户误发错误强度。
+#[test]
+fn ai_对话深度思考单控件按关高最大循环() {
+    let (enabled, effort) = next_ai_chat_deep_thinking_mode(false, AiChatReasoningEffort::Max);
+    assert!(enabled);
+    assert_eq!(effort, AiChatReasoningEffort::High);
+
+    let (enabled, effort) = next_ai_chat_deep_thinking_mode(true, AiChatReasoningEffort::High);
+    assert!(enabled);
+    assert_eq!(effort, AiChatReasoningEffort::Max);
+
+    let (enabled, effort) = next_ai_chat_deep_thinking_mode(true, AiChatReasoningEffort::Max);
+    assert!(!enabled);
+    assert_eq!(effort, AiChatReasoningEffort::High);
 }
 
 /// 验证 AI 对话实体 ID 在连续生成时不会冲突。
@@ -298,6 +421,7 @@ fn ai_对话停止流式消息会保留内容并进入停止状态() {
         conversation_id: "conversation".to_string(),
         role: AiChatMessageRole::Assistant,
         content: "已经生成的部分内容".to_string(),
+        reasoning_content: "已经生成的思考".to_string(),
         status: AiChatMessageStatus::Streaming,
         error_message: None,
         sequence: 1,
@@ -314,9 +438,61 @@ fn ai_对话停止流式消息会保留内容并进入停止状态() {
     .expect("应返回需要落库的助手消息副本");
 
     assert_eq!(messages[0].content, "已经生成的部分内容");
+    assert_eq!(messages[0].reasoning_content, "已经生成的思考");
     assert_eq!(messages[0].status, AiChatMessageStatus::Stopped);
     assert_eq!(persisted.content, "已经生成的部分内容");
+    assert_eq!(persisted.reasoning_content, "已经生成的思考");
     assert_eq!(persisted.status, AiChatMessageStatus::Stopped);
+}
+
+/// 验证思考过程面板在推理阶段默认展开，正式回复开始后默认折叠。
+///
+/// 业务意图：
+/// - 深度思考的实时推理内容需要在等待答案时直接可见；最终答案开始输出后，界面应自动把阅读焦点切回正式回复。
+#[test]
+fn ai_对话思考过程面板按生成阶段默认展开和折叠() {
+    let mut message = AiChatMessage {
+        id: "assistant-thinking".to_string(),
+        conversation_id: "conversation".to_string(),
+        role: AiChatMessageRole::Assistant,
+        content: String::new(),
+        reasoning_content: "先检查上下文".to_string(),
+        status: AiChatMessageStatus::Streaming,
+        error_message: None,
+        sequence: 1,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+    };
+    let mut expanded_message_ids = HashSet::new();
+    let mut collapsed_message_ids = HashSet::new();
+
+    assert!(ai_chat_reasoning_panel_is_expanded(
+        &message,
+        &expanded_message_ids,
+        &collapsed_message_ids
+    ));
+
+    collapsed_message_ids.insert(message.id.clone());
+    assert!(!ai_chat_reasoning_panel_is_expanded(
+        &message,
+        &expanded_message_ids,
+        &collapsed_message_ids
+    ));
+
+    collapsed_message_ids.clear();
+    message.content = "正式答案".to_string();
+    assert!(!ai_chat_reasoning_panel_is_expanded(
+        &message,
+        &expanded_message_ids,
+        &collapsed_message_ids
+    ));
+
+    expanded_message_ids.insert(message.id.clone());
+    assert!(ai_chat_reasoning_panel_is_expanded(
+        &message,
+        &expanded_message_ids,
+        &collapsed_message_ids
+    ));
 }
 
 /// 验证 AI 输入区拖拽高度会被限制在安全范围内。
@@ -411,6 +587,48 @@ fn ai_对话_sse_解析支持跨_chunk() {
             AiChatSseParsedEvent::Delta("你好".to_string()),
             AiChatSseParsedEvent::Done
         ]
+    );
+}
+
+/// 验证 AI 对话 SSE 会把推理增量和正式回复拆开。
+///
+/// 业务意图：
+/// - 深度思考只展示服务端显式返回的推理字段，不能把它混入正式回复正文。
+#[test]
+fn ai_对话_sse_解析推理字段和正式回复() {
+    let mut parser = AiChatSseParser::new();
+    let events = parser
+        .push_bytes(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"先分析\",\"content\":\"结论\"}}]}\n\n"
+                .as_bytes(),
+        )
+        .unwrap();
+    assert_eq!(
+        events,
+        vec![
+            AiChatSseParsedEvent::ReasoningDelta("先分析".to_string()),
+            AiChatSseParsedEvent::Delta("结论".to_string())
+        ]
+    );
+
+    let mut reasoning_parser = AiChatSseParser::new();
+    let reasoning_events = reasoning_parser
+        .push_bytes("data: {\"choices\":[{\"delta\":{\"reasoning\":\"中间推理\"}}]}\n\n".as_bytes())
+        .unwrap();
+    assert_eq!(
+        reasoning_events,
+        vec![AiChatSseParsedEvent::ReasoningDelta("中间推理".to_string())]
+    );
+
+    let mut fallback_parser = AiChatSseParser::new();
+    let fallback_events = fallback_parser
+        .push_bytes(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_text\":\"备用字段\"}}]}\n\n".as_bytes(),
+        )
+        .unwrap();
+    assert_eq!(
+        fallback_events,
+        vec![AiChatSseParsedEvent::ReasoningDelta("备用字段".to_string())]
     );
 }
 

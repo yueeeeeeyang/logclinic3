@@ -4,7 +4,12 @@
 // - 该文件只承载会话、消息、滚动、输入、流式任务等 AI 对话面板 UI 状态，以及不触碰 SQLite/网络的纯逻辑。
 // - 类型可见性限制在 app 模块内，避免把第一版 AI 对话内部状态暴露成 crate 级 API。
 
-use std::{cell::RefCell, collections::HashMap, ops::Range, sync::mpsc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    ops::Range,
+    sync::mpsc,
+};
 
 use super::*;
 
@@ -184,6 +189,28 @@ pub(in crate::app) struct AiChatWorkspaceState {
     pub(in crate::app) input_height: f32,
     /// AI 对话输入区高度拖拽状态。
     pub(in crate::app) input_resize_drag: Option<AiChatInputResizeDrag>,
+    /// 深度思考开关是否开启。
+    ///
+    /// 业务意图：
+    /// - 开启后下一次请求会显式传入 `thinking.type = enabled` 和当前思考强度，并展示模型服务返回的推理内容。
+    /// - 该偏好只在当前会话内保存，不写入配置文件，避免不同模型兼容性差异导致下次启动默认失败。
+    pub(in crate::app) deep_thinking_enabled: bool,
+    /// 深度思考开启时使用的思考强度。
+    ///
+    /// 边界条件：
+    /// - 只允许 `high` 和 `max` 两个协议值；关闭深度思考时该值保留在内存中，但不会随请求发送。
+    pub(in crate::app) reasoning_effort: AiChatReasoningEffort,
+    /// 当前展开推理内容的助手消息 ID 集合。
+    ///
+    /// UI 约束：
+    /// - 正式回复开始后推理内容默认折叠，用户展开状态只影响当前页面展示，不参与 SQLite 持久化或后续请求上下文。
+    pub(in crate::app) expanded_reasoning_message_ids: HashSet<String>,
+    /// 当前明确折叠推理内容的助手消息 ID 集合。
+    ///
+    /// 业务意图：
+    /// - 推理内容流式生成且正式回复尚未开始时默认展开；如果用户此时手动折叠，需要记录折叠覆盖，避免后续推理增量再次自动展开。
+    /// - 当正式回复开始生成时也会写入该集合，使“思考完毕后折叠”的状态稳定。
+    pub(in crate::app) collapsed_reasoning_message_ids: HashSet<String>,
     /// 当前正在进行的 AI 流式任务。
     pub(in crate::app) streaming_task: Option<AiChatStreamingTask>,
     /// 下一个 AI 流式任务 ID。
@@ -228,10 +255,50 @@ impl AiChatWorkspaceState {
             input_selection_drag: None,
             input_height: AI_CHAT_INPUT_DEFAULT_HEIGHT,
             input_resize_drag: None,
+            deep_thinking_enabled: false,
+            reasoning_effort: AiChatReasoningEffort::High,
+            expanded_reasoning_message_ids: HashSet::new(),
+            collapsed_reasoning_message_ids: HashSet::new(),
             streaming_task: None,
             next_job_id: 1,
             markdown_cache: RefCell::new(HashMap::new()),
         }
+    }
+}
+
+/// 判断助手消息的思考过程面板是否应展开。
+///
+/// 业务意图：
+/// - 模型仍在输出推理且正式回复尚未开始时默认展开，方便用户看到“正在思考”的实时内容。
+/// - 一旦正式回复开始，面板默认折叠，避免推理过程挤压最终答案；用户仍可手动展开查看。
+pub(in crate::app) fn ai_chat_reasoning_panel_is_expanded(
+    message: &AiChatMessage,
+    expanded_message_ids: &HashSet<String>,
+    collapsed_message_ids: &HashSet<String>,
+) -> bool {
+    if collapsed_message_ids.contains(&message.id) {
+        return false;
+    }
+    let is_thinking_without_answer =
+        message.status == AiChatMessageStatus::Streaming && message.content.is_empty();
+    is_thinking_without_answer || expanded_message_ids.contains(&message.id)
+}
+
+/// 计算深度思考单控件的下一状态。
+///
+/// 业务意图：
+/// - 底部输入浮层空间有限，因此把“开关”和“强度”合并为一个循环控件：关闭 -> 高 -> 最大 -> 关闭。
+/// - 关闭状态不发送 `reasoning_effort`；重新开启时回到默认 `high`，避免用户不知情地长期使用最慢的 `max`。
+pub(in crate::app) fn next_ai_chat_deep_thinking_mode(
+    enabled: bool,
+    effort: AiChatReasoningEffort,
+) -> (bool, AiChatReasoningEffort) {
+    if !enabled {
+        return (true, AiChatReasoningEffort::High);
+    }
+    match effort {
+        AiChatReasoningEffort::High => (true, AiChatReasoningEffort::Max),
+        AiChatReasoningEffort::Max => (false, AiChatReasoningEffort::High),
     }
 }
 

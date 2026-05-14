@@ -90,6 +90,37 @@ impl AiChatMessageStatus {
     }
 }
 
+/// AI 对话思考强度。
+///
+/// 业务意图：
+/// - 该值只在深度思考开启时随请求发送给模型服务，限制为当前服务端支持的 `high` 和 `max`，避免 UI 传出未知字符串。
+/// - 当前不持久化到配置文件，防止不同模型或兼容服务对思考强度支持不一致。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AiChatReasoningEffort {
+    /// 较高思考强度，作为默认值，兼顾响应质量和耗时。
+    High,
+    /// 最大思考强度，适合复杂排障问题，可能带来更长响应时间。
+    Max,
+}
+
+impl AiChatReasoningEffort {
+    /// 转换为模型服务请求体使用的协议字符串。
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+
+    /// 转换为界面展示的中文标签。
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::High => "高",
+            Self::Max => "最大",
+        }
+    }
+}
+
 /// AI 对话会话摘要。
 ///
 /// 业务意图：
@@ -122,6 +153,12 @@ pub(crate) struct AiChatMessage {
     pub(crate) role: AiChatMessageRole,
     /// 消息正文；失败消息可能为空，错误原因放在 `error_message`。
     pub(crate) content: String,
+    /// 模型服务显式返回的推理内容。
+    ///
+    /// 业务意图：
+    /// - 该字段只保存 OpenAI 兼容响应中显式提供的 reasoning 字段，不存放本客户端或提示词伪造的内部思维。
+    /// - 后续请求上下文只发送正式 `content`，不会把历史推理内容回传给模型。
+    pub(crate) reasoning_content: String,
     /// 消息生命周期状态。
     pub(crate) status: AiChatMessageStatus,
     /// 失败时的用户可见中文错误。
@@ -141,6 +178,8 @@ pub(crate) struct AiChatMessage {
 pub(crate) enum AiChatStreamEvent {
     /// 收到一段助手回复增量。
     Delta(String),
+    /// 收到一段模型服务显式返回的推理增量。
+    ReasoningDelta(String),
     /// 服务端发送 `[DONE]` 或响应读取到 EOF。
     Done,
     /// 用户请求停止后后台循环退出。

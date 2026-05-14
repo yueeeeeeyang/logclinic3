@@ -31,6 +31,8 @@ use super::*;
 pub(crate) fn ai_chat_stream_request_body(
     model: &str,
     messages: &[AiChatMessage],
+    deep_thinking: bool,
+    reasoning_effort: AiChatReasoningEffort,
 ) -> serde_json::Value {
     let request_messages = messages
         .iter()
@@ -50,11 +52,19 @@ pub(crate) fn ai_chat_stream_request_body(
         })
         .collect::<Vec<_>>();
 
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model.trim(),
         "messages": request_messages,
-        "stream": true
-    })
+        "stream": true,
+        "thinking": {
+            "type": if deep_thinking { "enabled" } else { "disabled" }
+        }
+    });
+    if deep_thinking {
+        // 思考强度仅在思考模式开启时发送；关闭时保留明确的 `thinking.type = disabled`，避免服务端误触发推理。
+        body["reasoning_effort"] = serde_json::json!(reasoning_effort.as_str());
+    }
+    body
 }
 
 /// AI 对话 SSE 解析事件。
@@ -62,6 +72,8 @@ pub(crate) fn ai_chat_stream_request_body(
 pub(crate) enum AiChatSseParsedEvent {
     /// 回复增量文本。
     Delta(String),
+    /// 模型服务显式返回的推理增量文本。
+    ReasoningDelta(String),
     /// 服务端结束标记。
     Done,
 }
@@ -113,9 +125,7 @@ impl AiChatSseParser {
         while let Some(separator_index) = self.text_buffer.find("\n\n") {
             let raw_event = self.text_buffer[..separator_index].to_string();
             self.text_buffer.drain(..separator_index + 2);
-            if let Some(event) = parse_ai_chat_sse_event(&raw_event)? {
-                parsed.push(event);
-            }
+            parsed.extend(parse_ai_chat_sse_event(&raw_event)?);
         }
         Ok(parsed)
     }
@@ -127,7 +137,7 @@ impl AiChatSseParser {
 /// - OpenAI 兼容服务可能发送注释、空事件或不含 `delta.content` 的角色/结束事件；这些事件应忽略而不是报错。
 pub(crate) fn parse_ai_chat_sse_event(
     raw_event: &str,
-) -> Result<Option<AiChatSseParsedEvent>, String> {
+) -> Result<Vec<AiChatSseParsedEvent>, String> {
     let mut data_lines = Vec::new();
     for line in raw_event.lines() {
         if let Some(data) = line.strip_prefix("data:") {
@@ -135,22 +145,40 @@ pub(crate) fn parse_ai_chat_sse_event(
         }
     }
     if data_lines.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let data = data_lines.join("\n");
     if data.trim() == "[DONE]" {
-        return Ok(Some(AiChatSseParsedEvent::Done));
+        return Ok(vec![AiChatSseParsedEvent::Done]);
     }
     let value = serde_json::from_str::<serde_json::Value>(&data)
         .map_err(|error| format!("AI 响应 SSE JSON 解析失败：{error}"))?;
-    let content = value
+    let delta = value
         .get("choices")
         .and_then(|choices| choices.as_array())
         .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("delta"))
+        .and_then(|choice| choice.get("delta"));
+    let mut events = Vec::new();
+    if let Some(reasoning) = delta.and_then(ai_chat_sse_reasoning_delta_text) {
+        events.push(AiChatSseParsedEvent::ReasoningDelta(reasoning.to_string()));
+    }
+    if let Some(content) = delta
         .and_then(|delta| delta.get("content"))
-        .and_then(|content| content.as_str());
-    Ok(content.map(|content| AiChatSseParsedEvent::Delta(content.to_string())))
+        .and_then(|content| content.as_str())
+    {
+        events.push(AiChatSseParsedEvent::Delta(content.to_string()));
+    }
+    Ok(events)
+}
+
+/// 从 SSE delta 中读取模型服务显式返回的推理字段。
+///
+/// 业务意图：
+/// - 不同 OpenAI 兼容服务的字段名不完全一致；这里只接受已知显式字段，不从普通正文中拆分或猜测思考内容。
+fn ai_chat_sse_reasoning_delta_text(delta: &serde_json::Value) -> Option<&str> {
+    ["reasoning_content", "reasoning", "reasoning_text"]
+        .into_iter()
+        .find_map(|field| delta.get(field).and_then(|value| value.as_str()))
 }
 
 /// 执行一次 OpenAI 兼容 AI 对话流式请求。
@@ -160,6 +188,8 @@ pub(crate) fn parse_ai_chat_sse_event(
 pub(crate) fn stream_openai_compatible_ai_chat(
     profile: ModelProfile,
     messages: Vec<AiChatMessage>,
+    deep_thinking: bool,
+    reasoning_effort: AiChatReasoningEffort,
     cancel: Arc<AtomicBool>,
     sender: mpsc::Sender<AiChatStreamEvent>,
 ) {
@@ -170,9 +200,12 @@ pub(crate) fn stream_openai_compatible_ai_chat(
             .timeout(Duration::from_secs(AI_CHAT_REQUEST_TIMEOUT_SECONDS))
             .build()
             .map_err(|error| format!("AI 请求失败：创建 HTTP 客户端失败：{error}"))?;
-        let mut request = client
-            .post(url)
-            .json(&ai_chat_stream_request_body(&profile.model, &messages));
+        let mut request = client.post(url).json(&ai_chat_stream_request_body(
+            &profile.model,
+            &messages,
+            deep_thinking,
+            reasoning_effort,
+        ));
         if let Some(authorization) = model_test_authorization_header(&profile.api_key) {
             request = request.header(reqwest::header::AUTHORIZATION, authorization);
         }
@@ -208,6 +241,14 @@ pub(crate) fn stream_openai_compatible_ai_chat(
                 match event {
                     AiChatSseParsedEvent::Delta(content) => {
                         if sender.send(AiChatStreamEvent::Delta(content)).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    AiChatSseParsedEvent::ReasoningDelta(content) => {
+                        if sender
+                            .send(AiChatStreamEvent::ReasoningDelta(content))
+                            .is_err()
+                        {
                             return Ok(());
                         }
                     }

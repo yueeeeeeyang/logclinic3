@@ -70,6 +70,7 @@ pub(crate) fn initialize_ai_chat_database(connection: &Connection) -> Result<(),
                 conversation_id TEXT NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
+                reasoning_content TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL,
                 error_message TEXT,
                 sequence INTEGER NOT NULL,
@@ -85,12 +86,42 @@ pub(crate) fn initialize_ai_chat_database(connection: &Connection) -> Result<(),
         )
         .map_err(|error| format!("初始化 AI 对话数据库失败：{error}"))?;
 
-    if version == 0 {
+    if version < 2 && !ai_chat_messages_has_column(connection, "reasoning_content")? {
+        // 版本 2 把模型显式推理内容和正式回复拆开保存；默认空字符串保证旧消息仍可按原语义展示。
+        connection
+            .execute(
+                "ALTER TABLE messages ADD COLUMN reasoning_content TEXT NOT NULL DEFAULT ''",
+                [],
+            )
+            .map_err(|error| format!("迁移 AI 对话推理内容字段失败：{error}"))?;
+    }
+
+    if version < AI_CHAT_DATABASE_SCHEMA_VERSION {
         connection
             .pragma_update(None, "user_version", AI_CHAT_DATABASE_SCHEMA_VERSION)
             .map_err(|error| format!("写入 AI 对话数据库版本失败：{error}"))?;
     }
     Ok(())
+}
+
+/// 判断消息表是否已经包含指定列。
+///
+/// 业务意图：
+/// - 新安装会先用最新 schema 创建表，此时不应再执行 `ALTER TABLE`；旧数据库则需要补齐新增列。
+fn ai_chat_messages_has_column(connection: &Connection, column_name: &str) -> Result<bool, String> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(messages)")
+        .map_err(|error| format!("读取 AI 对话消息表结构失败：{error}"))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("读取 AI 对话消息表结构失败：{error}"))?;
+    for row in rows {
+        let name = row.map_err(|error| format!("解析 AI 对话消息表结构失败：{error}"))?;
+        if name == column_name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// 加载 AI 对话会话列表。
@@ -136,7 +167,7 @@ pub(crate) fn load_ai_chat_messages(
     let mut statement = connection
         .prepare(
             r#"
-            SELECT id, conversation_id, role, content, status, error_message,
+            SELECT id, conversation_id, role, content, reasoning_content, status, error_message,
                    sequence, created_at_ms, updated_at_ms
             FROM messages
             WHERE conversation_id = ?1
@@ -152,10 +183,11 @@ pub(crate) fn load_ai_chat_messages(
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, i64>(6)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
                 row.get::<_, i64>(7)?,
                 row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
             ))
         })
         .map_err(|error| format!("读取 AI 对话消息失败：{error}"))?;
@@ -167,6 +199,7 @@ pub(crate) fn load_ai_chat_messages(
             conversation_id,
             role,
             content,
+            reasoning_content,
             status,
             error_message,
             sequence,
@@ -178,6 +211,7 @@ pub(crate) fn load_ai_chat_messages(
             conversation_id,
             role: AiChatMessageRole::from_str(&role)?,
             content,
+            reasoning_content,
             status: AiChatMessageStatus::from_str(&status)?,
             error_message,
             sequence,
@@ -259,15 +293,16 @@ pub(crate) fn insert_ai_chat_message(path: &Path, message: &AiChatMessage) -> Re
         .execute(
             r#"
             INSERT INTO messages
-                (id, conversation_id, role, content, status, error_message,
+                (id, conversation_id, role, content, reasoning_content, status, error_message,
                  sequence, created_at_ms, updated_at_ms)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             "#,
             params![
                 message.id,
                 message.conversation_id,
                 message.role.as_str(),
                 message.content,
+                message.reasoning_content,
                 message.status.as_str(),
                 message.error_message,
                 message.sequence,
@@ -286,12 +321,13 @@ pub(crate) fn update_ai_chat_message(path: &Path, message: &AiChatMessage) -> Re
         .execute(
             r#"
             UPDATE messages
-            SET content = ?2, status = ?3, error_message = ?4, updated_at_ms = ?5
+            SET content = ?2, reasoning_content = ?3, status = ?4, error_message = ?5, updated_at_ms = ?6
             WHERE id = ?1
             "#,
             params![
                 message.id,
                 message.content,
+                message.reasoning_content,
                 message.status.as_str(),
                 message.error_message,
                 message.updated_at_ms,

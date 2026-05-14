@@ -652,8 +652,8 @@ impl MainView {
                     .child(
                         list(
                             self.ai_chat.message_list_state.clone(),
-                            context.processor(move |view, index: usize, _window, _context| {
-                                view.render_ai_chat_message_at_index(index, palette)
+                            context.processor(move |view, index: usize, _window, context| {
+                                view.render_ai_chat_message_at_index(index, palette, context)
                             }),
                         )
                         .size_full(),
@@ -733,6 +733,7 @@ impl MainView {
         &self,
         index: usize,
         palette: AppThemePalette,
+        context: &mut Context<Self>,
     ) -> gpui::AnyElement {
         self.ai_chat
             .messages
@@ -743,7 +744,7 @@ impl MainView {
                 } else {
                     0.0
                 };
-                self.render_ai_chat_message(message, top_gap, palette)
+                self.render_ai_chat_message(message, top_gap, palette, context)
                     .into_any_element()
             })
             .unwrap_or_else(|| {
@@ -760,6 +761,7 @@ impl MainView {
         message: &AiChatMessage,
         top_gap: f32,
         palette: AppThemePalette,
+        context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let is_user = message.role == AiChatMessageRole::User;
         let status_text = match message.status {
@@ -768,7 +770,17 @@ impl MainView {
             AiChatMessageStatus::Failed => message.error_message.as_deref().or(Some("请求失败")),
             AiChatMessageStatus::Complete => None,
         };
+        let has_reasoning = !message.reasoning_content.is_empty();
         let message_content = if message.content.is_empty() {
+            let placeholder = if has_reasoning && message.status == AiChatMessageStatus::Streaming {
+                "思考中...".to_string()
+            } else if let Some(status_text) = status_text {
+                status_text.to_string()
+            } else if has_reasoning {
+                "未返回正式回复".to_string()
+            } else {
+                String::new()
+            };
             div()
                 .mt_1()
                 .w_full()
@@ -777,7 +789,7 @@ impl MainView {
                 .line_height(px(21.0))
                 .whitespace_normal()
                 .text_color(rgb(palette.text))
-                .child(status_text.unwrap_or("").to_string())
+                .child(placeholder)
                 .into_any_element()
         } else if is_user {
             div()
@@ -835,6 +847,9 @@ impl MainView {
                             }))
                             .child(if is_user { "你" } else { "助手" }),
                     )
+                    .when(!is_user && has_reasoning, |bubble| {
+                        bubble.child(self.render_ai_chat_reasoning_panel(message, palette, context))
+                    })
                     .child(message_content)
                     .when(
                         status_text.is_some() && !message.content.is_empty(),
@@ -855,6 +870,99 @@ impl MainView {
                         },
                     ),
             )
+    }
+
+    /// 渲染助手消息中的思考过程折叠面板。
+    ///
+    /// 业务意图：
+    /// - 推理内容来自模型服务显式返回的 reasoning 字段，必须和正式回复分开展示，避免用户误把中间推理当成最终结论。
+    /// - 思考阶段默认展开以展示实时进度，正式回复开始后默认折叠，减少长推理内容对最终答案的挤压。
+    pub(in crate::app) fn render_ai_chat_reasoning_panel(
+        &self,
+        message: &AiChatMessage,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let expanded = ai_chat_reasoning_panel_is_expanded(
+            message,
+            &self.ai_chat.expanded_reasoning_message_ids,
+            &self.ai_chat.collapsed_reasoning_message_ids,
+        );
+        let message_id = message.id.clone();
+        let reasoning_text = message.reasoning_content.clone();
+        let mut panel_background = rgb(palette.panel);
+        panel_background.a = 0.72;
+
+        div()
+            .id(SharedString::from(format!(
+                "ai-chat-reasoning-{}",
+                message.id
+            )))
+            .mt_2()
+            .mb_2()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(panel_background)
+            .overflow_hidden()
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "ai-chat-reasoning-header-{}",
+                        message.id
+                    )))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(30.0))
+                    .px_2()
+                    .cursor_pointer()
+                    .hover(move |header| header.bg(rgb(palette.hover)))
+                    .child(Self::render_lucide_icon(
+                        Some(if expanded {
+                            Icon::ChevronDown
+                        } else {
+                            Icon::ChevronRight
+                        }),
+                        13.0,
+                        13.0,
+                        palette.muted_text,
+                    ))
+                    .child(Self::render_lucide_icon(
+                        Some(Icon::Sparkles),
+                        13.0,
+                        13.0,
+                        palette.muted_text,
+                    ))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(palette.muted_text))
+                            .child("思考过程"),
+                    )
+                    .on_click(context.listener(
+                        move |view, _event: &ClickEvent, _window, context| {
+                            view.toggle_ai_chat_reasoning_message(&message_id, context);
+                            context.stop_propagation();
+                        },
+                    )),
+            )
+            .when(expanded, |panel| {
+                panel.child(
+                    div()
+                        .px_3()
+                        .pb_2()
+                        .pt_1()
+                        .border_t_1()
+                        .border_color(rgb(palette.border))
+                        .text_xs()
+                        .line_height(px(18.0))
+                        .whitespace_normal()
+                        .text_color(rgb(palette.muted_text))
+                        .child(reasoning_text),
+                )
+            })
     }
 
     /// 渲染 AI 对话输入栏。
@@ -1015,8 +1123,96 @@ impl MainView {
                     context.stop_propagation();
                 }),
             )
-            .child(self.render_ai_chat_model_selector(palette, context))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(self.render_ai_chat_model_selector(palette, context))
+                    .child(self.render_ai_chat_deep_thinking_control(palette, context)),
+            )
             .child(self.render_ai_chat_send_button(can_send, is_streaming, palette, context))
+    }
+
+    /// 渲染深度思考单控件。
+    ///
+    /// 业务意图：
+    /// - 单控件直接展示“关 / 高 / 最大”三种状态，替代原先独立开关和强度选择器，降低底部浮层宽度占用。
+    /// - 开启状态会随请求发送 `thinking.type = enabled` 和对应 `reasoning_effort`；关闭状态只发送 disabled。
+    pub(in crate::app) fn render_ai_chat_deep_thinking_control(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let enabled = self.ai_chat.deep_thinking_enabled;
+        let state_label = if enabled {
+            self.ai_chat.reasoning_effort.label()
+        } else {
+            "关"
+        };
+        div()
+            .id("ai-chat-deep-thinking-control")
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .h(px(AI_CHAT_MODEL_SELECTOR_HEIGHT))
+            .px_2()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(if enabled {
+                palette.accent
+            } else {
+                palette.border
+            }))
+            .bg(rgb(if enabled {
+                palette.selected
+            } else {
+                palette.panel
+            }))
+            .text_xs()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(if enabled {
+                palette.accent
+            } else {
+                palette.muted_text
+            }))
+            .cursor_pointer()
+            .hover(move |button| button.bg(rgb(palette.hover)))
+            .child(Self::render_lucide_icon(
+                Some(Icon::Sparkles),
+                13.0,
+                13.0,
+                if enabled {
+                    palette.accent
+                } else {
+                    palette.muted_text
+                },
+            ))
+            .child("思考")
+            .child(
+                div()
+                    .ml_1()
+                    .px_1()
+                    .rounded(px(4.0))
+                    .bg(rgb(if enabled {
+                        palette.background
+                    } else {
+                        palette.hover
+                    }))
+                    .text_color(rgb(if enabled {
+                        palette.accent
+                    } else {
+                        palette.muted_text
+                    }))
+                    .child(state_label),
+            )
+            .on_click(
+                context.listener(|view, _event: &ClickEvent, _window, context| {
+                    view.cycle_ai_chat_deep_thinking_mode(context);
+                    context.stop_propagation();
+                }),
+            )
     }
 
     /// 渲染 AI 对话发送或停止按钮。

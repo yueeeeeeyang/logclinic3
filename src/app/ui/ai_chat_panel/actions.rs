@@ -633,6 +633,59 @@ impl MainView {
         }
     }
 
+    /// 切换 AI 对话深度思考单控件状态。
+    ///
+    /// 业务意图：
+    /// - 单个紧凑控件按“关 -> 高 -> 最大 -> 关”循环，既能选择思考强度，又避免底部浮层在窄窗口溢出。
+    /// - 状态只影响之后发送的新请求；正在生成的流式请求不会被中途改写，避免前后台状态不一致。
+    pub(in crate::app) fn cycle_ai_chat_deep_thinking_mode(&mut self, context: &mut Context<Self>) {
+        let (enabled, effort) = next_ai_chat_deep_thinking_mode(
+            self.ai_chat.deep_thinking_enabled,
+            self.ai_chat.reasoning_effort,
+        );
+        self.ai_chat.deep_thinking_enabled = enabled;
+        self.ai_chat.reasoning_effort = effort;
+        self.ai_chat.model_menu_open = false;
+        context.notify();
+    }
+
+    /// 切换单条助手消息的思考过程展开状态。
+    pub(in crate::app) fn toggle_ai_chat_reasoning_message(
+        &mut self,
+        message_id: &str,
+        context: &mut Context<Self>,
+    ) {
+        let currently_expanded = self
+            .ai_chat
+            .messages
+            .iter()
+            .find(|message| message.id == message_id)
+            .is_some_and(|message| {
+                ai_chat_reasoning_panel_is_expanded(
+                    message,
+                    &self.ai_chat.expanded_reasoning_message_ids,
+                    &self.ai_chat.collapsed_reasoning_message_ids,
+                )
+            });
+        if currently_expanded {
+            self.ai_chat
+                .expanded_reasoning_message_ids
+                .remove(message_id);
+            self.ai_chat
+                .collapsed_reasoning_message_ids
+                .insert(message_id.to_string());
+        } else {
+            self.ai_chat
+                .collapsed_reasoning_message_ids
+                .remove(message_id);
+            self.ai_chat
+                .expanded_reasoning_message_ids
+                .insert(message_id.to_string());
+        }
+        self.invalidate_ai_chat_message_row(message_id, 0, true);
+        context.notify();
+    }
+
     /// 开始拖拽调整 AI 对话左侧会话栏宽度。
     ///
     /// 业务意图：
@@ -1075,6 +1128,7 @@ impl MainView {
             conversation_id: conversation_id.clone(),
             role: AiChatMessageRole::User,
             content,
+            reasoning_content: String::new(),
             status: AiChatMessageStatus::Complete,
             error_message: None,
             sequence: next_sequence,
@@ -1086,6 +1140,7 @@ impl MainView {
             conversation_id: conversation_id.clone(),
             role: AiChatMessageRole::Assistant,
             content: String::new(),
+            reasoning_content: String::new(),
             status: AiChatMessageStatus::Streaming,
             error_message: None,
             sequence: next_sequence.saturating_add(1),
@@ -1116,6 +1171,8 @@ impl MainView {
         self.ai_chat.database_error = None;
 
         let mut conversation_to_update = None;
+        let deep_thinking = self.ai_chat.deep_thinking_enabled;
+        let reasoning_effort = self.ai_chat.reasoning_effort;
         let should_update_title = self
             .active_ai_chat_conversation()
             .is_some_and(|conversation| conversation.title == "新对话");
@@ -1155,6 +1212,8 @@ impl MainView {
                 stream_openai_compatible_ai_chat(
                     profile,
                     request_messages,
+                    deep_thinking,
+                    reasoning_effort,
                     cancel_for_task,
                     sender,
                 );
@@ -1257,24 +1316,78 @@ impl MainView {
                 let mut message_to_persist = None;
                 let mut changed_message_id = None;
                 let mut changed_message_content_len = 0;
+                let mut should_fold_reasoning_panel = false;
                 if let Some(message) = self
                     .ai_chat
                     .messages
                     .iter_mut()
                     .find(|message| message.id == assistant_message_id)
                 {
+                    should_fold_reasoning_panel =
+                        message.content.is_empty() && !message.reasoning_content.is_empty();
                     message.content.push_str(&delta);
                     message.updated_at_ms = current_unix_time_millis();
                     changed_message_id = Some(message.id.clone());
-                    changed_message_content_len = message.content.len();
+                    changed_message_content_len =
+                        message.content.len() + message.reasoning_content.len();
                     if let Some(task) = self.ai_chat.streaming_task.as_mut()
                         && message
                             .content
                             .len()
+                            .saturating_add(message.reasoning_content.len())
                             .saturating_sub(task.last_persisted_len)
                             >= 512
                     {
-                        task.last_persisted_len = message.content.len();
+                        task.last_persisted_len =
+                            message.content.len() + message.reasoning_content.len();
+                        message_to_persist = Some(message.clone());
+                    }
+                }
+                if should_fold_reasoning_panel {
+                    // 正式回复的首个增量到达时，说明“思考阶段”结束；折叠推理面板，把阅读焦点让给最终答案。
+                    self.ai_chat
+                        .expanded_reasoning_message_ids
+                        .remove(&assistant_message_id);
+                    self.ai_chat
+                        .collapsed_reasoning_message_ids
+                        .insert(assistant_message_id.clone());
+                }
+                if let Some(message) = message_to_persist {
+                    self.persist_ai_chat_message(&message);
+                }
+                if let Some(message_id) = changed_message_id {
+                    self.invalidate_ai_chat_message_row(
+                        &message_id,
+                        changed_message_content_len,
+                        false,
+                    );
+                }
+            }
+            AiChatStreamEvent::ReasoningDelta(delta) => {
+                let mut message_to_persist = None;
+                let mut changed_message_id = None;
+                let mut changed_message_content_len = 0;
+                if let Some(message) = self
+                    .ai_chat
+                    .messages
+                    .iter_mut()
+                    .find(|message| message.id == assistant_message_id)
+                {
+                    message.reasoning_content.push_str(&delta);
+                    message.updated_at_ms = current_unix_time_millis();
+                    changed_message_id = Some(message.id.clone());
+                    changed_message_content_len =
+                        message.content.len() + message.reasoning_content.len();
+                    if let Some(task) = self.ai_chat.streaming_task.as_mut()
+                        && message
+                            .content
+                            .len()
+                            .saturating_add(message.reasoning_content.len())
+                            .saturating_sub(task.last_persisted_len)
+                            >= 512
+                    {
+                        task.last_persisted_len =
+                            message.content.len() + message.reasoning_content.len();
                         message_to_persist = Some(message.clone());
                     }
                 }
@@ -1331,7 +1444,11 @@ impl MainView {
         );
         if let Some(message) = message_to_persist {
             self.persist_ai_chat_message(&message);
-            self.invalidate_ai_chat_message_row(&message.id, message.content.len(), true);
+            self.invalidate_ai_chat_message_row(
+                &message.id,
+                message.content.len() + message.reasoning_content.len(),
+                true,
+            );
         }
     }
 
