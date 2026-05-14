@@ -121,3 +121,17 @@ fn 笔记正文自动换行支持超长单词强制断行() {
     let end = preferred_soft_wrap_end(text, 0, "super".len());
     assert_eq!(end, "super".len());
 }
+
+/// 验证笔记纸张保持接近 A4 的视觉比例。
+///
+/// 业务意图：
+/// - 笔记编辑器和预览页需要给用户稳定的纸张版心，而不是随窗口宽度不断拉伸。
+/// - 常量一旦被误改，会直接影响正文换行、截图中纸面比例和代码块菜单定位。
+#[test]
+fn 笔记_a4_纸张比例稳定() {
+    let ratio = NOTES_A4_PAGE_HEIGHT / NOTES_A4_PAGE_WIDTH;
+    assert!((ratio - (297.0 / 210.0)).abs() < 0.02);
+    assert!(NOTES_A4_PAGE_WIDTH > 700.0);
+    assert!(NOTES_A4_PAGE_HEIGHT > NOTES_A4_PAGE_WIDTH);
+    assert!(NOTES_A4_PAGE_GUTTER >= 24.0);
+}

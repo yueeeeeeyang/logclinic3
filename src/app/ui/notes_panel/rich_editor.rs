@@ -522,11 +522,11 @@ impl RichTextEditorState {
             == NoteRichTextBlockKind::CodeBlock
     }
 
-    /// 根据最近一次代码块语言标签命中位置，返回语言下拉菜单在编辑器容器内的相对坐标。
+    /// 根据最近一次代码块语言标签命中位置，返回语言下拉菜单在 A4 纸张内的相对坐标。
     ///
     /// 业务意图：
     /// - 语言菜单现在由代码块左上角标签触发，必须贴近具体代码块，而不是固定显示在顶部工具栏。
-    /// - GPUI 自绘元素缓存的是窗口坐标，菜单浮层是编辑器容器内的绝对布局，因此这里使用正文自绘边界做坐标换算。
+    /// - GPUI 自绘元素缓存的是窗口坐标，菜单浮层随 A4 纸张一起滚动和居中，因此这里使用正文自绘边界做纸张内坐标换算。
     ///
     /// 边界条件：
     /// - 首次绘制或滚动过程中可能暂时没有有效缓存，此时退回到代码块常见的左上位置，保证菜单仍可见。
@@ -534,19 +534,18 @@ impl RichTextEditorState {
         let Some(anchor) = self.code_language_menu_anchor else {
             return (
                 px(NOTES_RICH_TEXT_HORIZONTAL_PADDING),
-                px(NOTES_RICH_TEXT_TOOLBAR_HEIGHT + NOTES_RICH_TEXT_VERTICAL_PADDING),
+                px(NOTES_RICH_TEXT_VERTICAL_PADDING),
             );
         };
         let Some(bounds) = self.last_bounds else {
             return (
                 px(NOTES_RICH_TEXT_HORIZONTAL_PADDING),
-                px(NOTES_RICH_TEXT_TOOLBAR_HEIGHT + NOTES_RICH_TEXT_VERTICAL_PADDING),
+                px(NOTES_RICH_TEXT_VERTICAL_PADDING),
             );
         };
         (
             (anchor.left() - bounds.left()).max(px(4.0)),
-            (anchor.bottom() - bounds.top() + px(NOTES_RICH_TEXT_TOOLBAR_HEIGHT + 2.0))
-                .max(px(NOTES_RICH_TEXT_TOOLBAR_HEIGHT)),
+            (anchor.bottom() - bounds.top() + px(2.0)).max(px(4.0)),
         )
     }
 
@@ -820,6 +819,12 @@ pub(in crate::app) struct NoteRichTextElement {
     pub(in crate::app) view: Entity<MainView>,
     /// 是否为编辑态。
     pub(in crate::app) editable: bool,
+    /// 是否按 A4 纸张宽度排版。
+    ///
+    /// 业务意图：
+    /// - 编辑和预览共用纸张版心，正文换行必须严格使用纸张容器宽度。
+    /// - 保留独立开关，避免未来复用只读富文本元素时误把普通滚动阅读器也固定成 A4。
+    pub(in crate::app) paper_layout: bool,
     /// 当前主题。
     pub(in crate::app) palette: AppThemePalette,
     /// 当前有效主题，用于 syntect 选择亮色/暗色高亮。
@@ -855,7 +860,15 @@ impl Element for NoteRichTextElement {
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut style = Style::default();
         style.size.width = relative(1.0).into();
-        style.size.height = px(self.view.read(context).notes.rich_editor.visual_height()).into();
+        // 纸张模式正文元素需要至少铺满整张 A4 纸，保证编辑态点击空白纸面时仍会命中输入处理器；
+        // 非纸张只读态保留内容高度，避免普通阅读器为短笔记制造额外空白。
+        let visual_height = self.view.read(context).notes.rich_editor.visual_height();
+        let height = if self.paper_layout {
+            visual_height.max(NOTES_A4_PAGE_HEIGHT)
+        } else {
+            visual_height
+        };
+        style.size.height = px(height).into();
         (window.request_layout(style, [], context), ())
     }
 
@@ -878,7 +891,7 @@ impl Element for NoteRichTextElement {
                 view.notes.rich_editor.code_block_scroll_left.clone(),
             )
         };
-        let layout_bounds = note_rich_text_layout_bounds(bounds, window);
+        let layout_bounds = note_rich_text_layout_bounds(bounds, window, self.paper_layout);
         Some(layout_rich_text_document(
             &document,
             selection,
@@ -1619,9 +1632,16 @@ fn paint_rich_text_fragment(
 /// 返回笔记正文排版使用的有效边界。
 ///
 /// 业务意图：
-/// - GPUI 滚动容器中的自绘元素在部分场景会拿到偏窄的子元素 bounds，导致右侧仍有可视空间时提前换行。
-/// - 笔记正文所在页面本身占据主窗口右侧区域，因此排版宽度以元素 bounds 和窗口右边界两者中的较大者为准。
-fn note_rich_text_layout_bounds(bounds: Bounds<Pixels>, window: &Window) -> Bounds<Pixels> {
+/// - A4 纸张模式已经由纸张容器提供稳定宽度，排版必须严格使用元素 bounds，否则窗口变宽会破坏纸张版心和换行结果。
+/// - 非纸张阅读器继续保留原来的视口宽度修正，避免 GPUI 滚动容器偶发给出偏窄子元素 bounds 时提前换行。
+fn note_rich_text_layout_bounds(
+    bounds: Bounds<Pixels>,
+    window: &Window,
+    paper_layout: bool,
+) -> Bounds<Pixels> {
+    if paper_layout {
+        return bounds;
+    }
     let viewport_width = window.viewport_size().width;
     let viewport_available = (viewport_width - bounds.left()).max(bounds.size.width);
     Bounds::new(bounds.origin, size(viewport_available, bounds.size.height))

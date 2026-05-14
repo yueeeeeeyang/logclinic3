@@ -683,12 +683,7 @@ impl MainView {
                     }
                 },
             ))
-            .child(NoteRichTextElement {
-                view: context.entity(),
-                editable: false,
-                palette,
-                theme: self.effective_theme(),
-            })
+            .child(self.render_note_a4_page("note-reader", false, palette, context))
     }
 
     /// 渲染笔记编辑器。
@@ -794,15 +789,64 @@ impl MainView {
                                     }
                                 },
                             ))
-                            .child(NoteRichTextElement {
-                                view: context.entity(),
-                                editable: true,
-                                palette,
-                                theme: self.effective_theme(),
-                            }),
+                            .child(self.render_note_a4_page("note-editor", true, palette, context)),
                     )
                     .child(self.render_note_rich_toolbar_menus(palette, context)),
             )
+    }
+
+    /// 渲染笔记正文使用的 A4 纸张区域。
+    ///
+    /// 业务意图：
+    /// - 编辑态和预览态都需要像文档一样有清晰页面边界，避免长段落随着窗口变宽而无限延展。
+    /// - 两种状态共用同一套纸张容器，保证编辑后的换行和预览看到的版心一致。
+    /// - 外层内容宽度包含左右安全留白，窄窗口时由滚动容器提供横向滚动，宽窗口时纸张保持居中。
+    ///
+    /// 边界条件：
+    /// - A4 高度只作为最小视觉高度；正文超过一页时富文本元素会继续撑高纸张，不做分页裁剪。
+    /// - 代码块语言菜单只在编辑态出现，并且必须放在纸张容器内使用同一坐标系，避免居中和横向滚动后错位。
+    fn render_note_a4_page(
+        &self,
+        id_prefix: &'static str,
+        editable: bool,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let page = div()
+            .id(SharedString::from(format!("{id_prefix}-a4-page")))
+            .relative()
+            .w(px(NOTES_A4_PAGE_WIDTH))
+            .min_h(px(NOTES_A4_PAGE_HEIGHT))
+            .flex_none()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.surface))
+            .shadow_md()
+            .child(NoteRichTextElement {
+                view: context.entity(),
+                editable,
+                paper_layout: true,
+                palette,
+                theme: self.effective_theme(),
+            });
+        let page = if editable {
+            page.child(self.render_note_rich_code_language_menu(palette, context))
+        } else {
+            page
+        };
+
+        div()
+            .id(SharedString::from(format!("{id_prefix}-scroll-content")))
+            .relative()
+            .flex()
+            .justify_center()
+            .items_start()
+            .min_w(px(NOTES_A4_PAGE_WIDTH + NOTES_A4_PAGE_GUTTER * 2.0))
+            .w_full()
+            .px(px(NOTES_A4_PAGE_GUTTER))
+            .py(px(NOTES_A4_PAGE_VERTICAL_MARGIN))
+            .child(page)
     }
 
     /// 渲染富文本编辑工具栏。
@@ -949,8 +993,7 @@ impl MainView {
     ) -> gpui::Stateful<gpui::Div> {
         let menu_open = self.notes.rich_editor.font_size_menu_open
             || self.notes.rich_editor.color_menu_open
-            || self.notes.rich_editor.background_color_menu_open
-            || self.notes.rich_editor.code_language_menu_open;
+            || self.notes.rich_editor.background_color_menu_open;
         if !menu_open {
             return div().id("note-rich-toolbar-menus-empty").hidden();
         }
@@ -967,7 +1010,6 @@ impl MainView {
             .child(self.render_note_rich_font_size_menu(palette, context))
             .child(self.render_note_rich_color_menu(palette, context))
             .child(self.render_note_rich_background_color_menu(palette, context))
-            .child(self.render_note_rich_code_language_menu(palette, context))
     }
 
     /// 渲染富文本工具栏菜单透明遮罩。

@@ -1160,6 +1160,12 @@ impl MainView {
             context.notify();
             return;
         }
+        // 代码块语言菜单现在绘制在 A4 纸张内部，没有全屏遮罩；当用户点击其它正文位置时，
+        // 应立即关闭旧菜单，避免菜单悬停在新的编辑目标上方。
+        if self.notes.rich_editor.code_language_menu_open {
+            self.notes.rich_editor.code_language_menu_open = false;
+            self.notes.rich_editor.code_language_menu_anchor = None;
+        }
         if self
             .notes
             .rich_editor
