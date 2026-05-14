@@ -10,11 +10,16 @@ use super::*;
 mod hprof_thread_details_view;
 /// HPROF dump 分析 GPUI 视图。
 mod hprof_view;
+/// 日志智能分析独立窗口视图。
+mod log_ai_analysis_window;
 /// 线程分析独立窗口视图。
 mod thread_window_view;
 
 pub(in crate::app) use hprof_thread_details_view::HprofThreadDetailsWindowView;
 pub(in crate::app) use hprof_view::HprofAnalysisView;
+pub(in crate::app) use log_ai_analysis_window::{
+    LOG_AI_ANALYSIS_WINDOW_HEIGHT, LOG_AI_ANALYSIS_WINDOW_WIDTH, LogAiAnalysisWindowView,
+};
 pub(in crate::app) use thread_window_view::{
     SearchResultsResizeDrag, SearchTarget, ThreadAnalysisWindowView,
 };

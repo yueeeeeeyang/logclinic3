@@ -21,6 +21,7 @@ mod config;
 mod highlighting;
 mod hprof;
 mod launch;
+mod log_ai_analysis;
 mod log_document;
 mod log_loader;
 mod log_source;

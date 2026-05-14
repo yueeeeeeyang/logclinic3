@@ -94,6 +94,13 @@ pub(in crate::app) struct MainView {
     /// - 句柄只服务当前会话；关闭窗口后由回调清空。
     pub(in crate::app) thread_analysis_window: Option<WindowHandle<ThreadAnalysisWindowView>>,
 
+    /// 日志智能分析独立窗口句柄。
+    ///
+    /// 业务意图：
+    /// - 智能分析窗口需要持续展示后台流式结果和用户停止/继续操作，生命周期由主视图协调。
+    /// - 句柄只服务当前会话；关闭窗口后由关闭回调清空，后台任务会通过窗口视图 drop 置位取消标记。
+    pub(in crate::app) log_ai_analysis_window: Option<WindowHandle<LogAiAnalysisWindowView>>,
+
     /// HPROF dump 分析内嵌视图实体。
     ///
     /// 业务意图：
@@ -173,6 +180,7 @@ impl MainView {
             settings: SettingsState::new(context),
             model_config,
             thread_analysis_window: None,
+            log_ai_analysis_window: None,
             hprof_analysis_view: None,
             ai_chat,
             notes,

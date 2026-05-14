@@ -30,6 +30,7 @@ use crate::highlighting::{SyntaxTheme, highlight_line};
 use crate::launch::{
     classify_launch_paths, log_source_paths_from_launch_arguments, log_source_paths_from_open_urls,
 };
+use crate::log_ai_analysis::*;
 use crate::log_document;
 use crate::log_document::{EncodingChoice, LogContentError, LogTextEncoding, decode_log_bytes};
 use crate::log_document::{LargeLogOpenResult, LogTabDocument, open_log_source_for_tab};

@@ -27,7 +27,8 @@ mod settings_panel;
 mod shell;
 
 pub(in crate::app) use analysis_panel::{
-    HprofAnalysisView, SearchResultsResizeDrag, SearchTarget, ThreadAnalysisWindowView,
+    HprofAnalysisView, LOG_AI_ANALYSIS_WINDOW_HEIGHT, LOG_AI_ANALYSIS_WINDOW_WIDTH,
+    LogAiAnalysisWindowView, SearchResultsResizeDrag, SearchTarget, ThreadAnalysisWindowView,
 };
 pub(in crate::app) use chat_panel::*;
 pub(in crate::app) use markdown::*;

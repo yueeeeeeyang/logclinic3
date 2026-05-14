@@ -7,6 +7,131 @@
 use super::*;
 
 impl MainView {
+    /// 打开日志智能分析独立窗口。
+    ///
+    /// 业务意图：
+    /// - 右键菜单只负责收集来源，真实模型配置选择、窗口复用和后台任务启动集中在这里。
+    /// - 使用默认模型配置；默认 ID 缺失时回退第一条配置，保持和 AI 对话新会话的默认选择一致。
+    pub(in crate::app) fn open_log_ai_analysis_for_sources(
+        &mut self,
+        sources: Vec<LogFileSource>,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if sources.is_empty() {
+            return;
+        }
+        let Some(profile) = self.default_log_ai_analysis_model_profile() else {
+            return;
+        };
+        let targets = sources
+            .into_iter()
+            .map(LogAiAnalysisTarget::from_source)
+            .collect::<Vec<_>>();
+        let main_view = context.entity();
+        window.defer(context, move |_window, app| {
+            Self::open_log_ai_analysis_window_after_main_update(main_view, profile, targets, app);
+        });
+    }
+
+    /// 返回日志智能分析使用的默认模型配置。
+    pub(in crate::app) fn default_log_ai_analysis_model_profile(&self) -> Option<ModelProfile> {
+        let default_id = ai_chat_default_model_profile_id(
+            &self.model_config.model_config_profiles,
+            self.model_config.model_config_default_profile_id.as_deref(),
+        )?;
+        self.model_config
+            .model_config_profiles
+            .iter()
+            .find(|profile| profile.id == default_id)
+            .cloned()
+    }
+
+    /// 在主视图更新租借结束后打开或更新日志智能分析窗口。
+    ///
+    /// 业务意图：
+    /// - 智能分析窗口可重复使用；用户再次右键分析时直接替换任务并激活窗口。
+    /// - 窗口创建需要在 `App` 上下文中执行，避免在菜单点击的 `MainView` 更新栈里重入读取同一个视图。
+    pub(in crate::app) fn open_log_ai_analysis_window_after_main_update(
+        main_view: Entity<MainView>,
+        profile: ModelProfile,
+        targets: Vec<LogAiAnalysisTarget>,
+        app: &mut App,
+    ) {
+        let existing_window = main_view.update(app, |view, context| {
+            view.log.log_tree_context_menu = None;
+            context.notify();
+            view.log_ai_analysis_window
+        });
+        if let Some(window_handle) = existing_window {
+            if window_handle
+                .update(app, |window_view, window, context| {
+                    window_view.restart(profile.clone(), targets.clone(), context);
+                    window.activate_window();
+                })
+                .is_ok()
+            {
+                return;
+            }
+            main_view.update(app, |view, _| {
+                view.log_ai_analysis_window = None;
+            });
+        }
+
+        let main_view_for_window = main_view.clone();
+        let main_view_for_close = main_view.clone();
+        let profile_for_window = profile.clone();
+        let targets_for_window = targets.clone();
+        let window_options = WindowOptions {
+            titlebar: Some(TitlebarOptions {
+                title: Some("日志智能分析".into()),
+                ..Default::default()
+            }),
+            window_bounds: Some(WindowBounds::centered(
+                size(
+                    px(LOG_AI_ANALYSIS_WINDOW_WIDTH),
+                    px(LOG_AI_ANALYSIS_WINDOW_HEIGHT),
+                ),
+                app,
+            )),
+            is_resizable: true,
+            is_minimizable: true,
+            window_min_size: Some(size(px(760.0), px(460.0))),
+            ..Default::default()
+        };
+
+        match app.open_window(window_options, move |window, app| {
+            window.on_window_should_close(app, move |_, app| {
+                main_view_for_close.update(app, |view, context| {
+                    view.log_ai_analysis_window = None;
+                    context.notify();
+                });
+                true
+            });
+            app.new(|context| {
+                LogAiAnalysisWindowView::new(
+                    main_view_for_window,
+                    profile_for_window,
+                    targets_for_window,
+                    context,
+                )
+            })
+        }) {
+            Ok(window_handle) => {
+                main_view.update(app, |view, context| {
+                    view.log_ai_analysis_window = Some(window_handle);
+                    context.notify();
+                });
+            }
+            Err(_) => {
+                main_view.update(app, |view, context| {
+                    view.log_ai_analysis_window = None;
+                    context.notify();
+                });
+            }
+        }
+    }
+
     pub(in crate::app) fn open_thread_analysis_for_sources(
         &mut self,
         sources: Vec<LogFileSource>,

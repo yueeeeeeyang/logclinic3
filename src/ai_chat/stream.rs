@@ -21,32 +21,52 @@ use crate::config::{
 
 use super::*;
 
-/// 构造 AI 对话流式请求体。
+/// OpenAI 兼容 Chat Completions 消息。
 ///
 /// 业务意图：
-/// - 第一版只发送用户在 AI 对话页中的消息历史，不自动附加当前日志内容，避免误把本地日志或敏感数据上传给模型服务。
+/// - AI 对话和日志智能分析都需要发送 `role/content` 结构，但前者来自 SQLite 历史，后者来自一次性诊断提示词。
+/// - 抽出这个轻量类型后，日志分析可以复用同一套请求体、thinking 参数和 SSE 解析逻辑，不需要伪造成 AI 对话消息。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OpenAiCompatibleChatMessage {
+    /// Chat Completions 协议中的角色，例如 `system`、`user` 或 `assistant`。
+    pub(crate) role: String,
+    /// 发送给模型的正文。
+    pub(crate) content: String,
+}
+
+impl OpenAiCompatibleChatMessage {
+    /// 创建一条 OpenAI 兼容消息。
+    ///
+    /// 边界条件：
+    /// - 这里不校验角色集合，调用方负责只传入目标兼容服务支持的协议角色。
+    pub(crate) fn new(
+        role: impl Into<String>,
+        content: impl Into<String>,
+    ) -> OpenAiCompatibleChatMessage {
+        OpenAiCompatibleChatMessage {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+}
+
+/// 构造通用 OpenAI 兼容流式请求体。
 ///
-/// 边界条件：
-/// - 失败的助手消息和正在生成的助手消息不能作为上下文；空内容也不能发送，避免部分兼容接口拒绝请求。
-pub(crate) fn ai_chat_stream_request_body(
+/// 业务意图：
+/// - 统一 AI 对话和日志智能分析的 thinking 参数形状，避免两个调用点在兼容服务协议上分叉。
+/// - 历史推理内容不会进入 `messages`；调用方只提供允许发送给模型的正式正文。
+pub(crate) fn openai_compatible_stream_request_body(
     model: &str,
-    messages: &[AiChatMessage],
+    messages: &[OpenAiCompatibleChatMessage],
     deep_thinking: bool,
     reasoning_effort: AiChatReasoningEffort,
 ) -> serde_json::Value {
     let request_messages = messages
         .iter()
         .filter(|message| !message.content.trim().is_empty())
-        .filter(|message| {
-            !(message.role == AiChatMessageRole::Assistant
-                && matches!(
-                    message.status,
-                    AiChatMessageStatus::Failed | AiChatMessageStatus::Streaming
-                ))
-        })
         .map(|message| {
             serde_json::json!({
-                "role": message.role.as_str(),
+                "role": message.role,
                 "content": message.content,
             })
         })
@@ -65,6 +85,37 @@ pub(crate) fn ai_chat_stream_request_body(
         body["reasoning_effort"] = serde_json::json!(reasoning_effort.as_str());
     }
     body
+}
+
+/// 构造 AI 对话流式请求体。
+///
+/// 业务意图：
+/// - 第一版只发送用户在 AI 对话页中的消息历史，不自动附加当前日志内容，避免误把本地日志或敏感数据上传给模型服务。
+///
+/// 边界条件：
+/// - 失败的助手消息和正在生成的助手消息不能作为上下文；空内容也不能发送，避免部分兼容接口拒绝请求。
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn ai_chat_stream_request_body(
+    model: &str,
+    messages: &[AiChatMessage],
+    deep_thinking: bool,
+    reasoning_effort: AiChatReasoningEffort,
+) -> serde_json::Value {
+    let request_messages = messages
+        .iter()
+        .filter(|message| !message.content.trim().is_empty())
+        .filter(|message| {
+            !(message.role == AiChatMessageRole::Assistant
+                && matches!(
+                    message.status,
+                    AiChatMessageStatus::Failed | AiChatMessageStatus::Streaming
+                ))
+        })
+        .map(|message| {
+            OpenAiCompatibleChatMessage::new(message.role.as_str(), message.content.clone())
+        })
+        .collect::<Vec<_>>();
+    openai_compatible_stream_request_body(model, &request_messages, deep_thinking, reasoning_effort)
 }
 
 /// AI 对话 SSE 解析事件。
@@ -193,6 +244,65 @@ pub(crate) fn stream_openai_compatible_ai_chat(
     cancel: Arc<AtomicBool>,
     sender: mpsc::Sender<AiChatStreamEvent>,
 ) {
+    let request_messages = messages
+        .into_iter()
+        .filter(|message| !message.content.trim().is_empty())
+        .filter(|message| {
+            !(message.role == AiChatMessageRole::Assistant
+                && matches!(
+                    message.status,
+                    AiChatMessageStatus::Failed | AiChatMessageStatus::Streaming
+                ))
+        })
+        .map(|message| OpenAiCompatibleChatMessage::new(message.role.as_str(), message.content))
+        .collect::<Vec<_>>();
+    stream_openai_compatible_chat_messages(
+        profile,
+        request_messages,
+        deep_thinking,
+        reasoning_effort,
+        cancel,
+        sender,
+    );
+}
+
+/// 执行一次通用 OpenAI 兼容流式请求，并把事件发送到通道。
+///
+/// 业务意图：
+/// - AI 对话仍使用通道接收事件；日志智能分析使用下方 handler 版本把事件映射成带分块序号的窗口事件。
+pub(crate) fn stream_openai_compatible_chat_messages(
+    profile: ModelProfile,
+    messages: Vec<OpenAiCompatibleChatMessage>,
+    deep_thinking: bool,
+    reasoning_effort: AiChatReasoningEffort,
+    cancel: Arc<AtomicBool>,
+    sender: mpsc::Sender<AiChatStreamEvent>,
+) {
+    stream_openai_compatible_chat_messages_with_handler(
+        profile,
+        messages,
+        deep_thinking,
+        reasoning_effort,
+        cancel,
+        |event| sender.send(event).is_ok(),
+    );
+}
+
+/// 执行一次通用 OpenAI 兼容流式请求，并通过回调同步交付事件。
+///
+/// 业务意图：
+/// - 日志智能分析需要在同一后台线程里串行处理多个分块，请求事件必须实时映射到具体分块而不是等请求结束后再批量转发。
+/// - 回调返回 `false` 表示前台已关闭或不再需要事件，此时后台尽快停止后续解析。
+pub(crate) fn stream_openai_compatible_chat_messages_with_handler<F>(
+    profile: ModelProfile,
+    messages: Vec<OpenAiCompatibleChatMessage>,
+    deep_thinking: bool,
+    reasoning_effort: AiChatReasoningEffort,
+    cancel: Arc<AtomicBool>,
+    mut emit: F,
+) where
+    F: FnMut(AiChatStreamEvent) -> bool,
+{
     let result = (|| -> Result<(), String> {
         validate_model_profile_fields(&profile.name, &profile.base_url, &profile.model)?;
         let url = model_test_chat_completions_url(&profile.base_url)?;
@@ -200,12 +310,14 @@ pub(crate) fn stream_openai_compatible_ai_chat(
             .timeout(Duration::from_secs(AI_CHAT_REQUEST_TIMEOUT_SECONDS))
             .build()
             .map_err(|error| format!("AI 请求失败：创建 HTTP 客户端失败：{error}"))?;
-        let mut request = client.post(url).json(&ai_chat_stream_request_body(
-            &profile.model,
-            &messages,
-            deep_thinking,
-            reasoning_effort,
-        ));
+        let mut request = client
+            .post(url)
+            .json(&openai_compatible_stream_request_body(
+                &profile.model,
+                &messages,
+                deep_thinking,
+                reasoning_effort,
+            ));
         if let Some(authorization) = model_test_authorization_header(&profile.api_key) {
             request = request.header(reqwest::header::AUTHORIZATION, authorization);
         }
@@ -227,33 +339,30 @@ pub(crate) fn stream_openai_compatible_ai_chat(
         let mut buffer = [0u8; 4096];
         loop {
             if cancel.load(Ordering::Relaxed) {
-                let _ = sender.send(AiChatStreamEvent::Stopped);
+                let _ = emit(AiChatStreamEvent::Stopped);
                 return Ok(());
             }
             let read = response
                 .read(&mut buffer)
                 .map_err(|error| format!("AI 响应读取失败：{error}"))?;
             if read == 0 {
-                let _ = sender.send(AiChatStreamEvent::Done);
+                let _ = emit(AiChatStreamEvent::Done);
                 return Ok(());
             }
             for event in parser.push_bytes(&buffer[..read])? {
                 match event {
                     AiChatSseParsedEvent::Delta(content) => {
-                        if sender.send(AiChatStreamEvent::Delta(content)).is_err() {
+                        if !emit(AiChatStreamEvent::Delta(content)) {
                             return Ok(());
                         }
                     }
                     AiChatSseParsedEvent::ReasoningDelta(content) => {
-                        if sender
-                            .send(AiChatStreamEvent::ReasoningDelta(content))
-                            .is_err()
-                        {
+                        if !emit(AiChatStreamEvent::ReasoningDelta(content)) {
                             return Ok(());
                         }
                     }
                     AiChatSseParsedEvent::Done => {
-                        let _ = sender.send(AiChatStreamEvent::Done);
+                        let _ = emit(AiChatStreamEvent::Done);
                         return Ok(());
                     }
                 }
@@ -262,6 +371,6 @@ pub(crate) fn stream_openai_compatible_ai_chat(
     })();
 
     if let Err(message) = result {
-        let _ = sender.send(AiChatStreamEvent::Error(message));
+        let _ = emit(AiChatStreamEvent::Error(message));
     }
 }

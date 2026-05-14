@@ -641,6 +641,37 @@ pub(in crate::app) fn render_app_markdown_document(
     message_id: &str,
     palette: AppThemePalette,
 ) -> gpui::Div {
+    render_app_markdown_document_with_block_inserts(
+        document,
+        message_id,
+        palette,
+        |_index, _block| Vec::new(),
+    )
+}
+
+/// 渲染完整 Markdown 文档，并允许调用方在块级元素后插入自定义元素。
+///
+/// 业务意图：
+/// - 日志智能分析最终结论需要把本地原日志证据片段插入到引用证据 ID 的结论附近；
+///   普通 Markdown 渲染不应该知道日志分析业务，因此通过回调扩展块级渲染。
+pub(in crate::app) fn render_app_markdown_document_with_block_inserts<F>(
+    document: &AppMarkdownDocument,
+    message_id: &str,
+    palette: AppThemePalette,
+    mut insert_after_block: F,
+) -> gpui::Div
+where
+    F: FnMut(usize, &AppMarkdownBlock) -> Vec<gpui::AnyElement>,
+{
+    let mut children = Vec::new();
+    for (index, block) in document.blocks.iter().enumerate() {
+        let block_key = format!("{message_id}-{index}");
+        children.push(render_ai_chat_markdown_block(
+            block, index, &block_key, palette,
+        ));
+        children.extend(insert_after_block(index, block));
+    }
+
     div()
         .mt_1()
         .w_full()
@@ -648,10 +679,7 @@ pub(in crate::app) fn render_app_markdown_document(
         .text_sm()
         .line_height(px(21.0))
         .text_color(rgb(palette.text))
-        .children(document.blocks.iter().enumerate().map(|(index, block)| {
-            let block_key = format!("{message_id}-{index}");
-            render_ai_chat_markdown_block(block, index, &block_key, palette)
-        }))
+        .children(children)
 }
 
 /// 渲染单个 Markdown 块级元素。

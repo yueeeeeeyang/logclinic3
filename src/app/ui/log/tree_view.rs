@@ -627,6 +627,10 @@ impl MainView {
         let palette = self.palette();
         let node_id = menu.node_id;
         let fallback_source = menu.source.clone();
+        let file_action_enabled =
+            self.log_tree_selected_file_sources_available(fallback_source.as_ref());
+        let smart_analysis_enabled =
+            self.log_ai_analysis_sources_available(fallback_source.as_ref());
 
         div()
             .id("log-tree-context-menu")
@@ -661,10 +665,25 @@ impl MainView {
                     action: LogTreeContextMenuAction::SaveAs,
                     label: "另存为...",
                     icon: Icon::Save,
+                    enabled: file_action_enabled,
                     palette,
                 },
                 context,
             ))
+            .when(self.log_ai_analysis_model_configured(), |menu| {
+                menu.child(self.render_log_tree_context_menu_item(
+                    LogTreeContextMenuItemRequest {
+                        node_id,
+                        fallback_source: fallback_source.clone(),
+                        action: LogTreeContextMenuAction::SmartAnalyze,
+                        label: "智能分析",
+                        icon: Icon::Sparkles,
+                        enabled: smart_analysis_enabled,
+                        palette,
+                    },
+                    context,
+                ))
+            })
             .child(self.render_log_tree_context_menu_item(
                 LogTreeContextMenuItemRequest {
                     node_id,
@@ -672,6 +691,7 @@ impl MainView {
                     action: LogTreeContextMenuAction::AnalyzeThreads,
                     label: "线程日志分析",
                     icon: Icon::ChartNoAxesCombined,
+                    enabled: file_action_enabled,
                     palette,
                 },
                 context,
@@ -741,6 +761,7 @@ impl MainView {
             action,
             label,
             icon,
+            enabled,
             palette,
         } = request;
 
@@ -755,9 +776,16 @@ impl MainView {
             .h(px(LOG_TREE_CONTEXT_MENU_ITEM_HEIGHT))
             .px_3()
             .text_sm()
-            .text_color(rgb(palette.text))
-            .cursor_pointer()
-            .hover(move |item| item.bg(rgb(palette.hover)))
+            .text_color(rgb(if enabled {
+                palette.text
+            } else {
+                palette.muted_text
+            }))
+            .opacity(if enabled { 1.0 } else { 0.52 })
+            .when(enabled, |item| {
+                item.cursor_pointer()
+                    .hover(move |item| item.bg(rgb(palette.hover)))
+            })
             .child(Self::render_lucide_icon(
                 Some(icon),
                 16.0,
@@ -768,12 +796,14 @@ impl MainView {
             .on_mouse_down(
                 MouseButton::Left,
                 context.listener(move |view, _event: &MouseDownEvent, window, context| {
-                    view.handle_log_tree_context_menu_action(
-                        action,
-                        fallback_source.clone(),
-                        window,
-                        context,
-                    );
+                    if enabled {
+                        view.handle_log_tree_context_menu_action(
+                            action,
+                            fallback_source.clone(),
+                            window,
+                            context,
+                        );
+                    }
                     // 菜单项命令执行后不允许事件继续落到背后的树行，否则会改变当前选中集合。
                     context.stop_propagation();
                 }),
@@ -791,6 +821,7 @@ impl MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
+        let fallback_for_action = fallback_source.clone();
         let mut sources = self.selected_log_tree_file_sources();
         if sources.is_empty()
             && let Some(fallback_source) = fallback_source
@@ -809,8 +840,44 @@ impl MainView {
             LogTreeContextMenuAction::AnalyzeThreads => {
                 self.open_thread_analysis_for_sources(sources, window, context);
             }
+            LogTreeContextMenuAction::SmartAnalyze => {
+                let mut analysis_sources = self.selected_log_tree_ai_analysis_sources();
+                if analysis_sources.is_empty()
+                    && let Some(fallback_source) = fallback_for_action
+                {
+                    analysis_sources.push(fallback_source);
+                }
+                self.open_log_ai_analysis_for_sources(analysis_sources, window, context);
+            }
         }
         context.notify();
+    }
+
+    /// 判断当前普通文件菜单项是否有可用文件来源。
+    ///
+    /// 业务意图：
+    /// - 另存为和线程分析只处理显式文件来源；目录节点本身不作为普通文件命令输入。
+    pub(in crate::app) fn log_tree_selected_file_sources_available(
+        &self,
+        fallback_source: Option<&LogFileSource>,
+    ) -> bool {
+        !self.selected_log_tree_file_sources().is_empty() || fallback_source.is_some()
+    }
+
+    /// 判断智能分析入口是否有已配置模型。
+    ///
+    /// 业务意图：
+    /// - 用户要求“配置模型后可见”，因此模型列表为空时不渲染入口，避免点击后才提示配置缺失。
+    pub(in crate::app) fn log_ai_analysis_model_configured(&self) -> bool {
+        !self.model_config.model_config_profiles.is_empty()
+    }
+
+    /// 判断当前选择是否包含智能分析可处理的日志来源。
+    pub(in crate::app) fn log_ai_analysis_sources_available(
+        &self,
+        fallback_source: Option<&LogFileSource>,
+    ) -> bool {
+        !self.selected_log_tree_ai_analysis_sources().is_empty() || fallback_source.is_some()
     }
 
     /// 返回当前目录树选择中的可读取日志来源。
@@ -835,6 +902,21 @@ impl MainView {
                 })
             })
             .collect()
+    }
+
+    /// 返回当前目录树选择中用于智能分析的递归日志来源。
+    ///
+    /// 业务意图：
+    /// - 智能分析面向“选中的日志集合”，目录和压缩包节点需要展开为其下所有可读文件。
+    /// - 父目录和子文件同时被多选时会按树顺序去重，避免同一日志被重复发送给模型。
+    pub(in crate::app) fn selected_log_tree_ai_analysis_sources(&self) -> Vec<LogFileSource> {
+        let LogTreeLoadState::Loaded(tree_state) = &self.log.load_state else {
+            return Vec::new();
+        };
+        collect_log_ai_analysis_sources_from_tree(
+            &tree_state.tree,
+            &self.log.log_tree_selected_node_ids,
+        )
     }
 
     /// 将当前选择的日志来源另存为到用户选择的目录。

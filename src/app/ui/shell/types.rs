@@ -1742,6 +1742,8 @@ pub(in crate::app) enum LogTreeContextMenuAction {
     SaveAs,
     /// 对当前多选日志文件执行 Java thread dump 时间线分析。
     AnalyzeThreads,
+    /// 调用已配置模型对选中日志执行性能和异常智能分析。
+    SmartAnalyze,
 }
 
 /// 渲染左侧目录树右键菜单项的参数对象。
@@ -1759,6 +1761,11 @@ pub(in crate::app) struct LogTreeContextMenuItemRequest {
     pub(in crate::app) label: &'static str,
     /// 菜单图标。
     pub(in crate::app) icon: Icon,
+    /// 菜单项是否可点击。
+    ///
+    /// 业务意图：
+    /// - 智能分析需要同时满足“已配置模型”和“当前选择包含可读取日志”，不可用时必须置灰且不能透传点击。
+    pub(in crate::app) enabled: bool,
     /// 当前主题色板。
     pub(in crate::app) palette: AppThemePalette,
 }
