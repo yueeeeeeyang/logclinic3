@@ -55,6 +55,20 @@ pub(crate) const QUICK_SEARCH_KEYWORDS_FILE_NAME: &str = "quick-search-keywords.
 /// - 用户已确认第一版 API Key 明文保存在应用配置目录；UI 默认掩码显示，代码中避免把 Key 写入错误文案。
 pub(crate) const MODEL_CONFIGS_FILE_NAME: &str = "model-configs.json";
 
+/// 插件注册表文件名。
+///
+/// 业务意图：
+/// - 插件 manifest 已固定为 JSON，注册表也使用 JSON 保存用户安装目录、来源类型和启用状态。
+/// - 注册表只保存插件位置和开关，不复制插件 manifest 内容，重新加载时始终以插件目录中的 `plugin.json` 为准。
+pub(crate) const PLUGIN_REGISTRY_FILE_NAME: &str = "plugin-registry.json";
+
+/// 插件安装目录名。
+///
+/// 业务意图：
+/// - 从 zip 安装的插件需要复制到应用配置目录，避免用户删除下载目录后插件失效。
+/// - 开发目录插件只保存引用路径，不复制到该目录，方便第三方编辑后重新加载。
+pub(crate) const PLUGINS_INSTALL_DIR_NAME: &str = "plugins";
+
 /// 获取当前平台的应用配置目录。
 ///
 /// 跨平台约束：
@@ -115,4 +129,14 @@ pub(crate) fn quick_search_keywords_preference_path() -> Option<PathBuf> {
 /// 获取模型配置文件路径。
 pub(crate) fn model_configs_preference_path() -> Option<PathBuf> {
     app_config_dir().map(|dir| dir.join(MODEL_CONFIGS_FILE_NAME))
+}
+
+/// 获取插件注册表路径。
+pub(crate) fn plugin_registry_path() -> Option<PathBuf> {
+    app_config_dir().map(|dir| dir.join(PLUGIN_REGISTRY_FILE_NAME))
+}
+
+/// 获取 zip 插件安装根目录。
+pub(crate) fn plugins_install_dir() -> Option<PathBuf> {
+    app_config_dir().map(|dir| dir.join(PLUGINS_INSTALL_DIR_NAME))
 }

@@ -1,15 +1,16 @@
 // 笔记富文本文档模型。
 //
 // 业务意图：
-// - 笔记正文升级为自研富文本后，SQLite 仍只保存一个 `content` 字段，因此这里定义稳定 JSON v1 文档结构。
-// - 本模块不依赖 GPUI，负责文本、块、样式、选区变换和序列化；UI 只消费这些纯状态，避免渲染代码直接改 JSON。
+// - 笔记正文仍由自研富文本编辑器承载，但持久化文件改为 Markdown，因此这里同时负责富文本 JSON 兼容和 Markdown 双向转换。
+// - 本模块不依赖 GPUI，负责文本、块、样式、选区变换和序列化；UI 只消费这些纯状态，避免渲染代码直接改持久化文本。
 //
 // 边界条件：
 // - 所有选区位置都使用线性 UTF-8 字节下标，段落之间用一个 `\n` 映射，确保中文和 emoji 不会被截断。
-// - 旧纯文本和旧 Markdown 不解析语法，只按原始文本拆成富文本段落，保存后才写回富文本 JSON。
+// - Markdown 只做基础语义映射；颜色、字号、背景色、下划线等 Markdown 不支持的样式在导出时会丢弃。
 
 use std::ops::Range;
 
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
 
 use super::*;
@@ -17,7 +18,7 @@ use super::*;
 /// 富文本 JSON 版本号。
 ///
 /// 业务意图：
-/// - 当前不提升 SQLite schema，只在 JSON 内部保存版本；未来增加表格、对齐、链接等能力时可按文档版本迁移。
+/// - 富文本 JSON 只作为旧笔记迁移和编辑器内部兼容格式；未来增加表格、对齐、链接等能力时可按文档版本迁移。
 pub(crate) const NOTE_RICH_TEXT_JSON_VERSION: u32 = 1;
 
 /// 富文本默认字号。
@@ -289,7 +290,7 @@ impl NoteRichTextDocument {
         document
     }
 
-    /// 从 SQLite 保存的 JSON 解析富文本文档。
+    /// 从旧存储保存的 JSON 解析富文本文档。
     pub(crate) fn from_json(raw: &str) -> Result<Self, String> {
         let mut document: Self =
             serde_json::from_str(raw).map_err(|error| format!("解析富文本笔记失败：{error}"))?;
@@ -300,9 +301,28 @@ impl NoteRichTextDocument {
         Ok(document)
     }
 
-    /// 序列化为 SQLite `notes.content` 字段。
+    /// 序列化为旧富文本 JSON 字段。
+    #[cfg(test)]
     pub(crate) fn to_json(&self) -> Result<String, String> {
         serde_json::to_string(self).map_err(|error| format!("序列化富文本笔记失败：{error}"))
+    }
+
+    /// 从 Markdown 文本构建富文本文档。
+    ///
+    /// 业务意图：
+    /// - 物理文件存储以 Markdown 为真实正文格式，但编辑器仍使用富文本模型；加载文件时需要把常用 Markdown 语义映射到现有块和 run。
+    /// - 第一版只做基础映射，确保外部 `.md` 文件可读可编辑；表格、引用、链接等复杂结构会降级为普通可见文本。
+    pub(crate) fn from_markdown(markdown: &str) -> Self {
+        note_rich_text_document_from_markdown(markdown)
+    }
+
+    /// 导出为 Markdown 文本。
+    ///
+    /// 业务意图：
+    /// - 保存笔记时写入真实 `.md` 文件，外部编辑器应能直接打开；因此富文本需要导出为可读的 Markdown。
+    /// - Markdown 不支持的局部颜色、字号、背景色和下划线会被丢弃，避免写入私有扩展污染用户文件。
+    pub(crate) fn to_markdown(&self) -> String {
+        note_rich_text_document_to_markdown(self)
     }
 
     /// 返回线性纯文本，块之间用换行连接。
@@ -760,10 +780,334 @@ impl NoteRichTextClipboardPayload {
 pub(crate) fn rich_text_document_from_note(note: &Note) -> Result<NoteRichTextDocument, String> {
     match note.content_format {
         NoteContentFormat::RichText => NoteRichTextDocument::from_json(&note.content),
-        NoteContentFormat::PlainText | NoteContentFormat::Markdown => {
-            Ok(NoteRichTextDocument::from_plain_text(&note.content))
+        NoteContentFormat::PlainText => Ok(NoteRichTextDocument::from_plain_text(&note.content)),
+        NoteContentFormat::Markdown => Ok(NoteRichTextDocument::from_markdown(&note.content)),
+    }
+}
+
+/// 返回笔记 Markdown 解析使用的扩展集合。
+fn note_markdown_options() -> Options {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    options.insert(Options::ENABLE_GFM);
+    options
+}
+
+/// 把 Markdown 基础语义转换为富文本文档。
+fn note_rich_text_document_from_markdown(markdown: &str) -> NoteRichTextDocument {
+    let markdown = markdown.strip_prefix('\u{feff}').unwrap_or(markdown);
+    let mut blocks = Vec::new();
+    let mut runs = Vec::new();
+    let mut block_kind: Option<NoteRichTextBlockKind> = None;
+    let mut code_language: Option<String> = None;
+    let mut style = NoteRichTextStyle::default();
+    let mut list_stack: Vec<NoteRichTextBlockKind> = Vec::new();
+
+    for event in Parser::new_ext(markdown, note_markdown_options()) {
+        match event {
+            Event::Start(Tag::Paragraph) | Event::Start(Tag::Heading { .. }) => {
+                begin_markdown_block(
+                    &mut blocks,
+                    &mut runs,
+                    &mut block_kind,
+                    &mut code_language,
+                    NoteRichTextBlockKind::Paragraph,
+                    None,
+                );
+            }
+            Event::End(TagEnd::Paragraph) | Event::End(TagEnd::Heading(_)) => {
+                finish_markdown_block(&mut blocks, &mut runs, &mut block_kind, &mut code_language);
+            }
+            Event::Start(Tag::List(start)) => {
+                list_stack.push(if start.is_some() {
+                    NoteRichTextBlockKind::OrderedListItem
+                } else {
+                    NoteRichTextBlockKind::UnorderedListItem
+                });
+            }
+            Event::End(TagEnd::List(_)) => {
+                list_stack.pop();
+            }
+            Event::Start(Tag::Item) => {
+                let kind = list_stack
+                    .last()
+                    .copied()
+                    .unwrap_or(NoteRichTextBlockKind::UnorderedListItem);
+                begin_markdown_block(
+                    &mut blocks,
+                    &mut runs,
+                    &mut block_kind,
+                    &mut code_language,
+                    kind,
+                    None,
+                );
+            }
+            Event::End(TagEnd::Item) => {
+                finish_markdown_block(&mut blocks, &mut runs, &mut block_kind, &mut code_language);
+            }
+            Event::Start(Tag::CodeBlock(kind)) => {
+                let language = match kind {
+                    CodeBlockKind::Fenced(info) => info
+                        .split_whitespace()
+                        .next()
+                        .filter(|value| !value.is_empty())
+                        .map(ToString::to_string),
+                    CodeBlockKind::Indented => None,
+                };
+                begin_markdown_block(
+                    &mut blocks,
+                    &mut runs,
+                    &mut block_kind,
+                    &mut code_language,
+                    NoteRichTextBlockKind::CodeBlock,
+                    language,
+                );
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                finish_markdown_block(&mut blocks, &mut runs, &mut block_kind, &mut code_language);
+            }
+            Event::Start(Tag::Strong) => style.bold = true,
+            Event::End(TagEnd::Strong) => style.bold = false,
+            Event::Start(Tag::Emphasis) => style.italic = true,
+            Event::End(TagEnd::Emphasis) => style.italic = false,
+            Event::Start(Tag::Strikethrough) => style.strikethrough = true,
+            Event::End(TagEnd::Strikethrough) => style.strikethrough = false,
+            Event::Text(text) | Event::Code(text) => {
+                append_markdown_text(
+                    &mut blocks,
+                    &mut runs,
+                    &mut block_kind,
+                    &mut code_language,
+                    &style,
+                    &text,
+                );
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                finish_markdown_block(&mut blocks, &mut runs, &mut block_kind, &mut code_language);
+                begin_markdown_block(
+                    &mut blocks,
+                    &mut runs,
+                    &mut block_kind,
+                    &mut code_language,
+                    NoteRichTextBlockKind::Paragraph,
+                    None,
+                );
+            }
+            Event::Rule => {
+                begin_markdown_block(
+                    &mut blocks,
+                    &mut runs,
+                    &mut block_kind,
+                    &mut code_language,
+                    NoteRichTextBlockKind::Paragraph,
+                    None,
+                );
+                append_markdown_text(
+                    &mut blocks,
+                    &mut runs,
+                    &mut block_kind,
+                    &mut code_language,
+                    &style,
+                    "---",
+                );
+                finish_markdown_block(&mut blocks, &mut runs, &mut block_kind, &mut code_language);
+            }
+            Event::Html(html) | Event::InlineHtml(html) => {
+                append_markdown_text(
+                    &mut blocks,
+                    &mut runs,
+                    &mut block_kind,
+                    &mut code_language,
+                    &style,
+                    &html,
+                );
+            }
+            _ => {}
         }
     }
+    finish_markdown_block(&mut blocks, &mut runs, &mut block_kind, &mut code_language);
+
+    if blocks.is_empty() {
+        NoteRichTextDocument::empty()
+    } else {
+        let mut document = NoteRichTextDocument {
+            version: NOTE_RICH_TEXT_JSON_VERSION,
+            blocks,
+        };
+        document.normalize();
+        document
+    }
+}
+
+/// 开始一个 Markdown 导入块。
+fn begin_markdown_block(
+    blocks: &mut Vec<NoteRichTextBlock>,
+    runs: &mut Vec<NoteRichTextRun>,
+    block_kind: &mut Option<NoteRichTextBlockKind>,
+    code_language: &mut Option<String>,
+    next_kind: NoteRichTextBlockKind,
+    next_language: Option<String>,
+) {
+    finish_markdown_block(blocks, runs, block_kind, code_language);
+    *block_kind = Some(next_kind);
+    *code_language = next_language;
+}
+
+/// 结束当前 Markdown 导入块。
+fn finish_markdown_block(
+    blocks: &mut Vec<NoteRichTextBlock>,
+    runs: &mut Vec<NoteRichTextRun>,
+    block_kind: &mut Option<NoteRichTextBlockKind>,
+    code_language: &mut Option<String>,
+) {
+    let Some(kind) = block_kind.take() else {
+        return;
+    };
+    blocks.push(NoteRichTextBlock {
+        kind,
+        code_language: (kind == NoteRichTextBlockKind::CodeBlock)
+            .then(|| code_language.take())
+            .flatten(),
+        runs: std::mem::take(runs),
+    });
+}
+
+/// 把 Markdown 文本追加到当前块；文本内换行会拆成多个富文本块。
+fn append_markdown_text(
+    blocks: &mut Vec<NoteRichTextBlock>,
+    runs: &mut Vec<NoteRichTextRun>,
+    block_kind: &mut Option<NoteRichTextBlockKind>,
+    code_language: &mut Option<String>,
+    style: &NoteRichTextStyle,
+    text: &str,
+) {
+    if block_kind.is_none() {
+        *block_kind = Some(NoteRichTextBlockKind::Paragraph);
+    }
+    let mut parts = text.split('\n').peekable();
+    while let Some(part) = parts.next() {
+        if !part.is_empty() {
+            let in_code_block = block_kind
+                .as_ref()
+                .is_some_and(|kind| *kind == NoteRichTextBlockKind::CodeBlock);
+            let mut run_style = if in_code_block {
+                NoteRichTextStyle::default()
+            } else {
+                style.clone()
+            };
+            if in_code_block {
+                run_style.bold = false;
+                run_style.italic = false;
+                run_style.strikethrough = false;
+            }
+            runs.push(NoteRichTextRun {
+                text: part.to_string(),
+                style: run_style,
+            });
+        }
+        if parts.peek().is_some() {
+            let kind = block_kind.unwrap_or(NoteRichTextBlockKind::Paragraph);
+            let language = code_language.clone();
+            finish_markdown_block(blocks, runs, block_kind, code_language);
+            *block_kind = Some(kind);
+            *code_language = language;
+        }
+    }
+}
+
+/// 把富文本文档导出为 Markdown。
+fn note_rich_text_document_to_markdown(document: &NoteRichTextDocument) -> String {
+    let mut output = String::new();
+    let mut index = 0;
+    while index < document.blocks.len() {
+        if document.blocks[index].kind == NoteRichTextBlockKind::CodeBlock {
+            let language = document.blocks[index].code_language.clone();
+            if !output.is_empty() {
+                output.push_str("\n\n");
+            }
+            output.push_str("```");
+            if let Some(language) = language.as_deref().filter(|value| !value.is_empty()) {
+                output.push_str(language);
+            }
+            output.push('\n');
+            while index < document.blocks.len()
+                && document.blocks[index].kind == NoteRichTextBlockKind::CodeBlock
+                && document.blocks[index].code_language == language
+            {
+                output.push_str(&document.blocks[index].plain_text());
+                output.push('\n');
+                index += 1;
+            }
+            output.push_str("```");
+            continue;
+        }
+
+        if !output.is_empty() {
+            output.push_str("\n\n");
+        }
+        match document.blocks[index].kind {
+            NoteRichTextBlockKind::Paragraph => {
+                output.push_str(&note_rich_text_runs_to_markdown(
+                    &document.blocks[index].runs,
+                ));
+            }
+            NoteRichTextBlockKind::UnorderedListItem => {
+                output.push_str("- ");
+                output.push_str(&note_rich_text_runs_to_markdown(
+                    &document.blocks[index].runs,
+                ));
+            }
+            NoteRichTextBlockKind::OrderedListItem => {
+                output.push_str("1. ");
+                output.push_str(&note_rich_text_runs_to_markdown(
+                    &document.blocks[index].runs,
+                ));
+            }
+            NoteRichTextBlockKind::CodeBlock => {}
+        }
+        index += 1;
+    }
+    output
+}
+
+/// 把一组富文本 run 导出为 Markdown 行内文本。
+fn note_rich_text_runs_to_markdown(runs: &[NoteRichTextRun]) -> String {
+    let mut output = String::new();
+    for run in runs {
+        output.push_str(&note_rich_text_run_to_markdown(run));
+    }
+    output
+}
+
+/// 把单个 run 导出为 Markdown 行内文本。
+fn note_rich_text_run_to_markdown(run: &NoteRichTextRun) -> String {
+    let mut text = escape_note_markdown_text(&run.text);
+    if run.style.strikethrough && !text.is_empty() {
+        text = format!("~~{text}~~");
+    }
+    if run.style.italic && !text.is_empty() {
+        text = format!("*{text}*");
+    }
+    if run.style.bold && !text.is_empty() {
+        text = format!("**{text}**");
+    }
+    text
+}
+
+/// 转义 Markdown 行内文本中的基础控制字符。
+fn escape_note_markdown_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        if matches!(
+            character,
+            '\\' | '*' | '_' | '`' | '[' | ']' | '<' | '>' | '#'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 /// 限制富文本字节位置到 UTF-8 字符边界。
@@ -928,7 +1272,7 @@ mod tests {
     /// 验证代码块 JSON 能往返，并保留语言字段。
     ///
     /// 业务意图：
-    /// - 笔记代码块只扩展富文本 JSON，不提升 SQLite schema；该测试锁定旧字段兼容和新语言字段的保存语义。
+    /// - 笔记代码块只扩展富文本 JSON，不改变 Markdown 文件身份；该测试锁定旧字段兼容和新语言字段的保存语义。
     #[test]
     fn 富文本代码块_json_保留语言字段() {
         let mut document = NoteRichTextDocument::from_plain_text("fn main() {}\nprintln!();");

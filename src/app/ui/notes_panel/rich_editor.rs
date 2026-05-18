@@ -231,9 +231,13 @@ impl RichTextEditorState {
         self.pending_style = self.document.style_at_position(self.selection_range.end);
     }
 
-    /// 返回可保存的富文本 JSON。
-    pub(in crate::app) fn serialized_content(&self) -> Result<String, String> {
-        self.document.to_json()
+    /// 返回当前富文本文档导出的 Markdown。
+    ///
+    /// 业务意图：
+    /// - 笔记物理文件以 Markdown 为真实存储格式；编辑器内部仍使用富文本模型，保存和未保存检测都需要统一导出文本。
+    /// - Markdown 不支持的富文本样式会在模型层导出时丢弃，避免 UI 层重复理解样式兼容规则。
+    pub(in crate::app) fn markdown_content(&self) -> String {
+        self.document.to_markdown()
     }
 
     /// 返回显示高度估算，供自绘元素参与滚动布局。

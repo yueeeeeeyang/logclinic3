@@ -382,20 +382,32 @@ mod state_tests {
         );
     }
 
-    /// 验证设置窗口页签包含关于入口。
+    /// 验证设置窗口页签包含插件、存储和关于入口。
     ///
     /// 业务意图：
-    /// - 关于功能已经收入口设置窗口，页签顺序和图标必须稳定，避免主导航移除关于入口后用户找不到关于信息。
+    /// - 插件管理、存储管理和关于功能都收入口设置窗口，页签顺序和图标必须稳定，避免用户找不到本地数据位置和关于信息。
     #[test]
-    fn 设置页签包含关于入口() {
+    fn 设置页签包含插件存储和关于入口() {
         assert_eq!(
             SettingsTab::all(),
             &[
                 SettingsTab::General,
                 SettingsTab::Log,
                 SettingsTab::Model,
+                SettingsTab::Plugin,
+                SettingsTab::Storage,
                 SettingsTab::About
             ]
+        );
+        assert_eq!(SettingsTab::Plugin.label(), "插件");
+        assert_eq!(
+            char::from(SettingsTab::Plugin.icon()),
+            char::from(Icon::FileArchive)
+        );
+        assert_eq!(SettingsTab::Storage.label(), "存储");
+        assert_eq!(
+            char::from(SettingsTab::Storage.icon()),
+            char::from(Icon::Database)
         );
         assert_eq!(SettingsTab::About.label(), "关于");
         assert_eq!(
@@ -3309,6 +3321,133 @@ mod state_tests {
             MainView::log_tree_menu_action_sources(vec![selected.clone()], Some(fallback)),
             vec![selected]
         );
+    }
+
+    /// 验证插件日志树菜单只收集选中目录的直接子文件。
+    ///
+    /// 业务意图：
+    /// - 插件框架第一版只把用户明确选择或目录直接子文件作为上下文发送给第三方插件，不递归扩大到深层目录。
+    /// - 这样可以避免用户右键上层目录时意外把大量日志元数据发送给插件。
+    #[test]
+    fn 插件日志树菜单目录只收集直接子文件() {
+        let direct = test_local_file("/tmp/direct.log");
+        let nested = test_local_file("/tmp/nested.log");
+        let tree = LoadedLogTree {
+            summary: "4 个节点".to_string(),
+            rows: vec![
+                test_tree_row(0, 0, LogTreeEntryKind::Directory, true, None),
+                test_tree_row(1, 1, LogTreeEntryKind::File, false, Some(direct)),
+                test_tree_row(2, 1, LogTreeEntryKind::Directory, true, None),
+                test_tree_row(3, 2, LogTreeEntryKind::File, false, Some(nested)),
+            ],
+            error_count: 0,
+            temporary_paths: Vec::new(),
+        };
+        let state = LoadedLogTreeState::new(tree);
+        let selected = HashSet::from([0]);
+        let files = state.plugin_log_files_for_menu(&selected, 0, None);
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].display_name, "direct.log");
+    }
+
+    /// 验证插件菜单启用态只做存在性判断且目录直接子文件可启用。
+    ///
+    /// 业务意图：
+    /// - 大目录右键菜单渲染阶段不能提前构造完整插件文件列表，只要发现第一个直接子文件即可启用插件菜单项。
+    /// - 该测试锁定启用态规则与实际收集规则的一致性，避免后续改回“渲染时完整收集”。
+    #[test]
+    fn 插件日志树菜单启用态目录直接子文件为真() {
+        let direct = test_local_file("/tmp/direct.log");
+        let tree = LoadedLogTree {
+            summary: "2 个节点".to_string(),
+            rows: vec![
+                test_tree_row(0, 0, LogTreeEntryKind::Directory, true, None),
+                test_tree_row(1, 1, LogTreeEntryKind::File, false, Some(direct)),
+            ],
+            error_count: 0,
+            temporary_paths: Vec::new(),
+        };
+        let state = LoadedLogTreeState::new(tree);
+        let selected = HashSet::from([0]);
+
+        assert!(state.has_plugin_log_file_for_menu(&selected, 0, None));
+    }
+
+    /// 验证普通文件菜单启用态不会把目录子文件当作显式选中文件。
+    ///
+    /// 业务意图：
+    /// - “另存为”“选中搜索”“线程日志分析”保持只处理显式文件来源的旧语义。
+    /// - 优化右键菜单性能时不能为了短路把普通目录错误识别为普通文件操作可用。
+    #[test]
+    fn 普通文件菜单启用态选中目录不会因子文件误启用() {
+        let direct = test_local_file("/tmp/direct.log");
+        let tree = LoadedLogTree {
+            summary: "2 个节点".to_string(),
+            rows: vec![
+                test_tree_row(0, 0, LogTreeEntryKind::Directory, true, None),
+                test_tree_row(1, 1, LogTreeEntryKind::File, false, Some(direct)),
+            ],
+            error_count: 0,
+            temporary_paths: Vec::new(),
+        };
+        let state = LoadedLogTreeState::new(tree);
+        let selected = HashSet::from([0]);
+
+        assert!(!state.has_file_source_for_node_ids(&selected));
+    }
+
+    /// 验证插件日志树菜单混选时按树顺序去重。
+    ///
+    /// 业务意图：
+    /// - 用户同时选中目录和该目录下的文件时，插件只应收到一次文件元数据，并且顺序与左侧加载树一致。
+    #[test]
+    fn 插件日志树菜单混选文件和目录按树顺序去重() {
+        let first = test_local_file("/tmp/first.log");
+        let second = test_local_file("/tmp/second.log");
+        let tree = LoadedLogTree {
+            summary: "3 个节点".to_string(),
+            rows: vec![
+                test_tree_row(0, 0, LogTreeEntryKind::Directory, true, None),
+                test_tree_row(1, 1, LogTreeEntryKind::File, false, Some(first)),
+                test_tree_row(2, 1, LogTreeEntryKind::File, false, Some(second)),
+            ],
+            error_count: 0,
+            temporary_paths: Vec::new(),
+        };
+        let state = LoadedLogTreeState::new(tree);
+        let selected = HashSet::from([0, 2]);
+        let files = state.plugin_log_files_for_menu(&selected, 0, None);
+        let names = files
+            .into_iter()
+            .map(|file| file.display_name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["first.log", "second.log"]);
+    }
+
+    /// 验证插件日志树菜单在当前选择无候选时使用右键落点兜底。
+    ///
+    /// 业务意图：
+    /// - 右键未选中行或选择集中只有错误节点时，插件菜单仍应能对右键落点文件执行。
+    #[test]
+    fn 插件日志树菜单选择无候选时使用右键兜底文件() {
+        let fallback = test_local_file("/tmp/fallback.log");
+        let tree = LoadedLogTree {
+            summary: "2 个节点".to_string(),
+            rows: vec![
+                test_tree_row(0, 0, LogTreeEntryKind::Error, false, None),
+                test_tree_row(1, 0, LogTreeEntryKind::File, false, Some(fallback.clone())),
+            ],
+            error_count: 1,
+            temporary_paths: Vec::new(),
+        };
+        let state = LoadedLogTreeState::new(tree);
+        let selected = HashSet::from([0]);
+        let files = state.plugin_log_files_for_menu(&selected, 1, Some(&fallback));
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].display_name, "fallback.log");
     }
 
     /// 验证空文件名搜索保持普通展开/折叠可见行规则。

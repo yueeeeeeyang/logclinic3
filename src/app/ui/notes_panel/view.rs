@@ -2,9 +2,26 @@
 //
 // 业务意图：
 // - 该文件只描述笔记树、阅读器、编辑器和确认弹窗的 GPUI 结构。
-// - 状态流转、SQLite 操作和输入编辑逻辑集中在 actions.rs，避免渲染路径混入持久化副作用。
+// - 状态流转、物理文件操作和输入编辑逻辑集中在 actions.rs，避免渲染路径混入持久化副作用。
 
 use super::*;
+
+/// 笔记树插件右键菜单渲染快照。
+///
+/// 业务意图：
+/// - 笔记树菜单同样从运行时 manifest 读取贡献点；渲染前整理成独立结构，避免监听闭包持有 manifest 引用。
+struct NotesPluginMenuRenderItem {
+    /// 插件 ID。
+    plugin_id: String,
+    /// 菜单贡献点 ID。
+    menu_id: String,
+    /// 命令 ID。
+    command_id: String,
+    /// 菜单标题。
+    title: String,
+    /// 菜单图标。
+    icon: Icon,
+}
 
 impl MainView {
     /// 渲染笔记页。
@@ -147,6 +164,15 @@ impl MainView {
                     .flex()
                     .items_center()
                     .gap_1()
+                    .child(self.render_notes_toolbar_button(
+                        "notes-refresh",
+                        Icon::RefreshCw,
+                        palette,
+                        context.listener(|view, _event: &ClickEvent, _window, context| {
+                            view.request_refresh_notes_tree(context);
+                            context.stop_propagation();
+                        }),
+                    ))
                     .child(self.render_notes_toolbar_button(
                         "notes-create-menu",
                         Icon::Plus,
@@ -305,7 +331,7 @@ impl MainView {
             ))
             .pr(px(LOG_TREE_ROW_HORIZONTAL_PADDING))
             .bg(rgb(background))
-            .text_size(px(LOG_TREE_FONT_SIZE))
+            .text_size(px(NOTES_TREE_FONT_SIZE))
             .text_color(rgb(if selected {
                 palette.accent
             } else {
@@ -470,7 +496,7 @@ impl MainView {
             .on_mouse_down(
                 MouseButton::Left,
                 context.listener(move |view, _event: &MouseDownEvent, window, context| {
-                    view.handle_notes_tree_create_menu_action(action, window, context);
+                    view.handle_notes_tree_create_menu_action(action.clone(), window, context);
                 }),
             )
     }
@@ -485,6 +511,7 @@ impl MainView {
             return div().id("notes-tree-context-menu-empty").hidden();
         };
         let target_kind = menu.target.kind;
+        let plugin_menu_items = self.notes_tree_plugin_menu_items();
         div()
             .id("notes-tree-context-menu")
             .absolute()
@@ -512,14 +539,14 @@ impl MainView {
             .when(target_kind == NoteTreeRowKind::Directory, |menu| {
                 menu.child(self.render_notes_tree_context_menu_item(
                     NotesTreeContextMenuAction::NewDirectory,
-                    "新建目录",
+                    "新建目录".to_string(),
                     Icon::FolderPlus,
                     palette,
                     context,
                 ))
                 .child(self.render_notes_tree_context_menu_item(
                     NotesTreeContextMenuAction::NewNote,
-                    "新建笔记",
+                    "新建笔记".to_string(),
                     Icon::FilePlus,
                     palette,
                     context,
@@ -527,25 +554,70 @@ impl MainView {
             })
             .child(self.render_notes_tree_context_menu_item(
                 NotesTreeContextMenuAction::Rename,
-                "重命名",
+                "重命名".to_string(),
                 Icon::Pencil,
                 palette,
                 context,
             ))
             .child(self.render_notes_tree_context_menu_item(
                 NotesTreeContextMenuAction::Delete,
-                "删除",
+                "删除".to_string(),
                 Icon::Trash2,
                 palette,
                 context,
             ))
+            .children(plugin_menu_items.into_iter().map(|item| {
+                self.render_notes_tree_context_menu_item(
+                    NotesTreeContextMenuAction::Plugin {
+                        plugin_id: item.plugin_id,
+                        menu_id: item.menu_id,
+                        command_id: item.command_id,
+                    },
+                    item.title,
+                    item.icon,
+                    palette,
+                    context,
+                )
+            }))
+    }
+
+    /// 返回当前已启用插件贡献的笔记树右键菜单项。
+    ///
+    /// 业务意图：
+    /// - 插件可以向笔记左栏追加右键菜单，但第一版只传递节点元数据，避免插件直接读取或修改笔记正文。
+    /// - 加载失败和禁用插件不参与渲染，用户可在设置页查看具体原因。
+    fn notes_tree_plugin_menu_items(&self) -> Vec<NotesPluginMenuRenderItem> {
+        self.plugins
+            .definitions
+            .iter()
+            .filter(|plugin| plugin.active())
+            .filter_map(|plugin| {
+                plugin
+                    .manifest
+                    .as_ref()
+                    .map(|manifest| (plugin.id.clone(), manifest))
+            })
+            .flat_map(|(plugin_id, manifest)| {
+                manifest
+                    .contributes
+                    .notes_tree_context_menu
+                    .iter()
+                    .map(move |menu| NotesPluginMenuRenderItem {
+                        plugin_id: plugin_id.clone(),
+                        menu_id: menu.id.clone(),
+                        command_id: menu.command_id().to_string(),
+                        title: menu.title.clone(),
+                        icon: Self::plugin_menu_icon(menu.icon.as_deref()),
+                    })
+            })
+            .collect()
     }
 
     /// 渲染笔记树右键菜单单项。
     fn render_notes_tree_context_menu_item(
         &self,
         action: NotesTreeContextMenuAction,
-        label: &'static str,
+        label: String,
         icon: Icon,
         palette: AppThemePalette,
         context: &mut Context<Self>,
@@ -571,7 +643,7 @@ impl MainView {
             .on_mouse_down(
                 MouseButton::Left,
                 context.listener(move |view, _event: &MouseDownEvent, window, context| {
-                    view.handle_notes_tree_context_menu_action(action, window, context);
+                    view.handle_notes_tree_context_menu_action(action.clone(), window, context);
                 }),
             )
     }
@@ -837,14 +909,18 @@ impl MainView {
         div()
             .id("note-editor")
             .flex()
-            .flex_col()
+            .gap_3()
             .size_full()
             .p(px(NOTES_EDITOR_PADDING))
             .child(
+                // UI 约束：
+                // - AI 侧边栏打开时，正文区域必须允许在横向 flex 中收缩，否则固定宽度侧栏会挤压到窗口外。
+                // - 这里只约束布局收缩，不改变富文本编辑器自身的滚动和选择行为。
                 div()
                     .id("note-editor-content")
                     .relative()
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
                     .flex()
                     .flex_col()
@@ -898,6 +974,624 @@ impl MainView {
                     )
                     .child(self.render_note_rich_toolbar_menus(palette, context)),
             )
+            .when(self.notes.ai.is_open, |editor| {
+                editor.child(self.render_notes_ai_assistant_panel(palette, context))
+            })
+    }
+
+    /// 渲染笔记 AI 侧边栏。
+    ///
+    /// 业务意图：
+    /// - 侧边栏绑定当前编辑中的笔记，每次发送前读取当前草稿 Markdown；回复只在用户点击插入后才进入编辑器。
+    /// - 面板所有鼠标事件都消费，避免点击模型、消息或输入区时透传到下方富文本编辑器造成光标跳动。
+    fn render_notes_ai_assistant_panel(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let can_send = self.notes_ai_can_send();
+        let is_streaming = self.notes.ai.streaming_task.is_some();
+        div()
+            .id("notes-ai-assistant")
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(px(NOTES_AI_ASSISTANT_WIDTH))
+            .min_w(px(NOTES_AI_ASSISTANT_WIDTH))
+            .h_full()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.panel))
+            .overflow_hidden()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    context.stop_propagation();
+                }),
+            )
+            .child(self.render_notes_ai_header(palette, context))
+            .child(self.render_notes_ai_messages(palette, context))
+            .child(self.render_notes_ai_input(can_send, is_streaming, palette, context))
+    }
+
+    /// 渲染笔记 AI 侧边栏头部。
+    fn render_notes_ai_header(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("notes-ai-header")
+            .relative()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .w_full()
+            .min_w_0()
+            .flex_none()
+            .h(px(44.0))
+            .px_3()
+            .border_b_1()
+            .border_color(rgb(palette.border))
+            .child(
+                // UI 约束：
+                // - 标题区在模型名称较长时优先收缩，避免右侧模型选择和关闭按钮越界。
+                // - 侧栏宽度固定，所有头部子元素都必须显式声明 min_w_0/flex_none 才能稳定截断。
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .flex_1()
+                    .min_w_0()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(palette.text))
+                    .child(Self::render_lucide_icon(
+                        Some(Icon::Sparkles),
+                        16.0,
+                        15.0,
+                        palette.accent,
+                    ))
+                    .child("AI 工具"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .flex_none()
+                    .min_w_0()
+                    .child(self.render_notes_ai_model_selector(palette, context))
+                    .child(
+                        div()
+                            .id("notes-ai-close")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(28.0))
+                            .h(px(28.0))
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .hover(move |button| button.bg(rgb(palette.hover)))
+                            .child(Self::render_lucide_icon(
+                                Some(Icon::X),
+                                14.0,
+                                14.0,
+                                palette.muted_text,
+                            ))
+                            .on_click(context.listener(
+                                |view, _event: &ClickEvent, _window, context| {
+                                    view.stop_notes_ai_streaming_without_notify(
+                                        AiChatMessageStatus::Stopped,
+                                        None,
+                                    );
+                                    view.notes.ai.is_open = false;
+                                    context.stop_propagation();
+                                    context.notify();
+                                },
+                            )),
+                    ),
+            )
+            .when(self.notes.ai.model_menu_open, |header| {
+                header.child(self.render_notes_ai_model_menu(palette, context))
+            })
+    }
+
+    /// 渲染笔记 AI 模型选择按钮。
+    fn render_notes_ai_model_selector(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let label = self
+            .active_notes_ai_model_profile()
+            .map(|profile| profile.name)
+            .unwrap_or_else(|| "选择模型".to_string());
+        div()
+            .id("notes-ai-model-selector")
+            .flex()
+            .items_center()
+            .gap_1()
+            .w(px(136.0))
+            .flex_none()
+            .h(px(28.0))
+            .px_2()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.input))
+            .text_xs()
+            .text_color(rgb(palette.text))
+            .cursor_pointer()
+            .overflow_hidden()
+            .hover(move |button| button.bg(rgb(palette.hover)))
+            .child(div().flex_1().min_w_0().truncate().child(label))
+            .child(div().flex_none().child(Self::render_lucide_icon(
+                Some(Icon::ChevronDown),
+                12.0,
+                12.0,
+                palette.muted_text,
+            )))
+            .on_click(
+                context.listener(|view, _event: &ClickEvent, _window, context| {
+                    view.notes.ai.model_menu_open = !view.notes.ai.model_menu_open;
+                    context.stop_propagation();
+                    context.notify();
+                }),
+            )
+    }
+
+    /// 渲染笔记 AI 模型下拉菜单。
+    fn render_notes_ai_model_menu(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("notes-ai-model-menu")
+            .absolute()
+            .right(px(40.0))
+            .top(px(38.0))
+            .w(px(220.0))
+            .max_h(px(240.0))
+            .overflow_y_scroll()
+            .scrollbar_width(px(6.0))
+            .rounded(px(7.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.menu))
+            .shadow_lg()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    context.stop_propagation();
+                }),
+            )
+            .when(self.model_config.model_config_profiles.is_empty(), |menu| {
+                menu.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .text_xs()
+                        .text_color(rgb(palette.muted_text))
+                        .child("暂无模型配置"),
+                )
+            })
+            .children(
+                self.model_config
+                    .model_config_profiles
+                    .iter()
+                    .map(|profile| {
+                        let profile_id = profile.id.clone();
+                        let selected = self.notes.ai.selected_model_profile_id.as_deref()
+                            == Some(profile.id.as_str());
+                        div()
+                            .id(SharedString::from(format!("notes-ai-model-{}", profile.id)))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .px_3()
+                            .py_2()
+                            .text_xs()
+                            .text_color(rgb(palette.text))
+                            .bg(rgb(if selected {
+                                palette.selected
+                            } else {
+                                palette.menu
+                            }))
+                            .cursor_pointer()
+                            .hover(move |item| item.bg(rgb(palette.hover)))
+                            .child(div().truncate().child(profile.name.clone()))
+                            .when(selected, |item| {
+                                item.child(Self::render_lucide_icon(
+                                    Some(Icon::Check),
+                                    12.0,
+                                    12.0,
+                                    palette.accent,
+                                ))
+                            })
+                            .on_click(context.listener(
+                                move |view, _event: &ClickEvent, _window, context| {
+                                    view.select_notes_ai_model_profile(profile_id.clone(), context);
+                                    context.stop_propagation();
+                                },
+                            ))
+                    }),
+            )
+    }
+
+    /// 渲染笔记 AI 消息区。
+    fn render_notes_ai_messages(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("notes-ai-messages")
+            .flex()
+            .flex_col()
+            .gap_2()
+            .flex_1()
+            .w_full()
+            .min_w_0()
+            .min_h_0()
+            .p_3()
+            .overflow_y_scroll()
+            .scrollbar_width(px(6.0))
+            .when(self.notes.ai.messages.is_empty(), |messages| {
+                messages.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .p_3()
+                        .rounded(px(7.0))
+                        .border_1()
+                        .border_color(rgb(palette.border))
+                        .text_sm()
+                        .line_height(px(20.0))
+                        .text_color(rgb(palette.muted_text))
+                        .child("输入生成、改写或总结要求。发送时会携带当前笔记标题和未保存的 Markdown 草稿。"),
+                )
+            })
+            .children(
+                self.notes
+                    .ai
+                    .messages
+                    .iter()
+                    .map(|message| self.render_notes_ai_message(message, palette, context)),
+            )
+            .children(self.notes.ai.error_message.as_ref().map(|error| {
+                div()
+                    .rounded(px(7.0))
+                    .border_1()
+                    .border_color(rgb(0xfca5a5))
+                    .bg(rgb(0xfef2f2))
+                    .p_2()
+                    .text_xs()
+                    .line_height(px(18.0))
+                    .text_color(rgb(0xb91c1c))
+                    .child(error.clone())
+            }))
+    }
+
+    /// 渲染笔记 AI 单条消息。
+    fn render_notes_ai_message(
+        &self,
+        message: &NotesAiMessage,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let is_user = message.role == NotesAiMessageRole::User;
+        let message_id = message.id.clone();
+        let status_text = match message.status {
+            AiChatMessageStatus::Streaming => Some("生成中..."),
+            AiChatMessageStatus::Stopped => Some("已停止"),
+            AiChatMessageStatus::Failed => message.error_message.as_deref().or(Some("请求失败")),
+            AiChatMessageStatus::Complete => None,
+        };
+        div()
+            .id(SharedString::from(format!(
+                "notes-ai-message-{}",
+                message.id
+            )))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(rgb(if is_user {
+                palette.accent
+            } else {
+                palette.border
+            }))
+            .bg(rgb(if is_user {
+                palette.selected
+            } else {
+                palette.background
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(if is_user {
+                        palette.accent
+                    } else {
+                        palette.muted_text
+                    }))
+                    .child(if is_user { "我" } else { "AI" })
+                    .children(status_text.map(|status| {
+                        div()
+                            .font_weight(FontWeight::NORMAL)
+                            .text_color(rgb(palette.muted_text))
+                            .child(status.to_string())
+                    })),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .line_height(px(20.0))
+                    .text_color(rgb(palette.text))
+                    .child(if message.content.is_empty() {
+                        "等待模型响应".to_string()
+                    } else {
+                        message.content.clone()
+                    }),
+            )
+            .when(
+                !is_user
+                    && !message.content.trim().is_empty()
+                    && matches!(
+                        message.status,
+                        AiChatMessageStatus::Complete | AiChatMessageStatus::Stopped
+                    ),
+                |card| {
+                    card.child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .child(self.render_notes_ai_small_button(
+                                "插入",
+                                Icon::CornerDownLeft,
+                                palette,
+                                context.listener(
+                                    move |view, _event: &ClickEvent, window, context| {
+                                        view.insert_notes_ai_message_into_editor(
+                                            message_id.clone(),
+                                            window,
+                                            context,
+                                        );
+                                        context.stop_propagation();
+                                    },
+                                ),
+                            )),
+                    )
+                },
+            )
+    }
+
+    /// 渲染笔记 AI 输入框。
+    fn render_notes_ai_input(
+        &self,
+        can_send: bool,
+        is_streaming: bool,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("notes-ai-input-wrap")
+            .w_full()
+            .min_w_0()
+            .flex_none()
+            .p_3()
+            .border_t_1()
+            .border_color(rgb(palette.border))
+            .child(
+                div()
+                    .id("notes-ai-input")
+                    .relative()
+                    .w_full()
+                    .min_w_0()
+                    .flex_none()
+                    .h(px(NOTES_AI_INPUT_HEIGHT))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.input))
+                    .track_focus(&self.notes.ai.input_focus)
+                    .key_context("notes-ai-input")
+                    .on_key_down(context.listener(
+                        |view, event: &KeyDownEvent, _window, context| {
+                            view.handle_notes_ai_input_key_down(event, context);
+                        },
+                    ))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        context.listener(|view, event: &MouseDownEvent, window, context| {
+                            view.start_notes_ai_input_mouse_selection(event, context);
+                            window.focus(&view.notes.ai.input_focus);
+                            context.stop_propagation();
+                        }),
+                    )
+                    .on_mouse_move(context.listener(
+                        |view, event: &MouseMoveEvent, _window, context| {
+                            view.update_notes_ai_input_mouse_selection(event.position, context);
+                        },
+                    ))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        context.listener(|view, _event: &MouseUpEvent, _window, context| {
+                            view.finish_notes_ai_input_mouse_selection(context);
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        context.listener(|view, _event: &MouseUpEvent, _window, context| {
+                            view.finish_notes_ai_input_mouse_selection(context);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .id("notes-ai-input-scroll")
+                            .size_full()
+                            .min_w_0()
+                            .px_3()
+                            .pt(px(8.0))
+                            .pb(px(NOTES_AI_INPUT_BOTTOM_PADDING))
+                            .overflow_y_scroll()
+                            .scrollbar_width(px(6.0))
+                            .text_size(px(14.0))
+                            .line_height(px(NOTES_AI_INPUT_LINE_HEIGHT))
+                            .text_color(rgb(palette.text))
+                            .child(NotesAiInputElement {
+                                view: context.entity(),
+                                focus_handle: self.notes.ai.input_focus.clone(),
+                                placeholder: "输入要求，Enter 发送，Shift+Enter 换行",
+                                palette,
+                            }),
+                    )
+                    .child(self.render_notes_ai_input_controls(
+                        can_send,
+                        is_streaming,
+                        palette,
+                        context,
+                    )),
+            )
+    }
+
+    /// 渲染笔记 AI 输入框底部控件。
+    fn render_notes_ai_input_controls(
+        &self,
+        can_send: bool,
+        is_streaming: bool,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("notes-ai-input-controls")
+            .absolute()
+            .left(px(8.0))
+            .right(px(8.0))
+            .bottom(px(8.0))
+            .flex()
+            .items_center()
+            .justify_end()
+            .min_w_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    context.stop_propagation();
+                }),
+            )
+            .child(self.render_notes_ai_send_button(can_send, is_streaming, palette, context))
+    }
+
+    /// 渲染笔记 AI 发送或停止按钮。
+    fn render_notes_ai_send_button(
+        &self,
+        can_send: bool,
+        is_streaming: bool,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let enabled = can_send || is_streaming;
+        div()
+            .id("notes-ai-send-button")
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .h(px(30.0))
+            .px_3()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(if enabled {
+                palette.accent
+            } else {
+                palette.border
+            }))
+            .bg(rgb(if enabled {
+                palette.accent
+            } else {
+                palette.panel
+            }))
+            .text_xs()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(if enabled {
+                palette.on_accent
+            } else {
+                palette.muted_text
+            }))
+            .when(enabled, |button| {
+                button
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(rgb(palette.accent_hover)))
+            })
+            .when(!enabled, |button| button.opacity(0.55))
+            .child(Self::render_lucide_icon(
+                Some(if is_streaming { Icon::X } else { Icon::Send }),
+                13.0,
+                13.0,
+                if enabled {
+                    palette.on_accent
+                } else {
+                    palette.muted_text
+                },
+            ))
+            .child(if is_streaming { "停止" } else { "发送" })
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, _window, context| {
+                    if is_streaming {
+                        view.stop_notes_ai_streaming(context);
+                    } else if can_send {
+                        view.start_notes_ai_send(context);
+                    }
+                    context.stop_propagation();
+                }),
+            )
+    }
+
+    /// 渲染笔记 AI 轻量操作按钮。
+    fn render_notes_ai_small_button(
+        &self,
+        label: &'static str,
+        icon: Icon,
+        palette: AppThemePalette,
+        listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(SharedString::from(format!("notes-ai-small-button-{label}")))
+            .flex()
+            .items_center()
+            .gap_1()
+            .h(px(28.0))
+            .px_2()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.input))
+            .text_xs()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(palette.accent))
+            .cursor_pointer()
+            .hover(move |button| button.bg(rgb(palette.hover)))
+            .child(Self::render_lucide_icon(
+                Some(icon),
+                12.0,
+                12.0,
+                palette.accent,
+            ))
+            .child(label)
+            .on_click(listener)
     }
 
     /// 渲染笔记正文使用的 A4 纸张区域。
@@ -1085,6 +1779,16 @@ impl MainView {
                         NoteRichTextBlockKind::OrderedListItem,
                         context,
                     );
+                    context.stop_propagation();
+                }),
+            ))
+            .child(self.render_note_rich_toolbar_icon(
+                "ai",
+                Icon::Sparkles,
+                self.notes.ai.is_open,
+                palette,
+                context.listener(|view, _event: &ClickEvent, window, context| {
+                    view.toggle_notes_ai_assistant(window, context);
                     context.stop_propagation();
                 }),
             ))

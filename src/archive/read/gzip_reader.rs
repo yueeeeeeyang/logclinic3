@@ -47,6 +47,25 @@ pub(super) fn read_gzip_member(
     )))
 }
 
+/// 从 GZIP 压缩日志中把唯一虚拟成员直接写入 writer。
+///
+/// 业务意图：
+/// - `.gz` 日志没有目录结构，插件 SQL 下钻可以让 gzip 解码器直接把解压字节写入内容流。
+pub(super) fn stream_gzip_member_to_writer<W: Write + ?Sized>(
+    archive_path: &Path,
+    member_path: &str,
+    writer: &mut W,
+) -> Result<(), ArchiveReadError> {
+    if is_single_gzip_member_path(member_path) {
+        return stream_single_gzip_payload_from_path_to_writer(archive_path, member_path, writer);
+    }
+
+    Err(ArchiveReadError::new(format!(
+        "GZIP 日志中未找到虚拟成员：{}",
+        member_path
+    )))
+}
+
 /// 从内存 GZIP 字节中读取唯一虚拟成员。
 ///
 /// 业务意图：
@@ -59,6 +78,23 @@ pub(super) fn read_gzip_member_from_bytes(
 ) -> Result<Vec<u8>, ArchiveReadError> {
     if is_single_gzip_member_path(member_path) {
         return read_single_gzip_payload_from_bytes(archive_bytes, member_path);
+    }
+
+    Err(ArchiveReadError::new(format!(
+        "嵌套 GZIP {} 中未找到虚拟成员：{}",
+        label, member_path
+    )))
+}
+
+/// 从内存 GZIP 字节中把唯一虚拟成员直接写入 writer。
+pub(super) fn stream_gzip_member_from_bytes_to_writer<W: Write + ?Sized>(
+    archive_bytes: &[u8],
+    member_path: &str,
+    label: &str,
+    writer: &mut W,
+) -> Result<(), ArchiveReadError> {
+    if is_single_gzip_member_path(member_path) {
+        return stream_single_gzip_payload_from_bytes_to_writer(archive_bytes, member_path, writer);
     }
 
     Err(ArchiveReadError::new(format!(
@@ -88,6 +124,24 @@ pub(super) fn read_single_gzip_payload_from_path(
     read_reader_to_vec_with_limit(decoder, None, &label)
 }
 
+/// 从本地 gzip 文件中按“单个 gzip 日志”流式写出解压内容。
+pub(super) fn stream_single_gzip_payload_from_path_to_writer<W: Write + ?Sized>(
+    archive_path: &Path,
+    member_path: &str,
+    writer: &mut W,
+) -> Result<(), ArchiveReadError> {
+    let file = File::open(archive_path).map_err(|error| {
+        ArchiveReadError::new(format!(
+            "无法打开 GZIP 日志 {}：{}",
+            archive_path.display(),
+            error
+        ))
+    })?;
+    let decoder = GzDecoder::new(BufReader::new(file));
+    let label = single_gzip_member_display_name(member_path);
+    copy_reader_to_writer(decoder, writer, &label)
+}
+
 /// 从内存字节中按“单个 gzip 日志”读取解压内容。
 ///
 /// 业务意图：
@@ -104,6 +158,21 @@ pub(super) fn read_single_gzip_payload_from_bytes(
         label.to_string()
     };
     read_reader_to_vec_with_limit(decoder, None, &display_label)
+}
+
+/// 从内存字节中按“单个 gzip 日志”流式写出解压内容。
+pub(super) fn stream_single_gzip_payload_from_bytes_to_writer<W: Write + ?Sized>(
+    archive_bytes: &[u8],
+    label: &str,
+    writer: &mut W,
+) -> Result<(), ArchiveReadError> {
+    let decoder = GzDecoder::new(Cursor::new(archive_bytes));
+    let display_label = if is_single_gzip_member_path(label) {
+        single_gzip_member_display_name(label)
+    } else {
+        label.to_string()
+    };
+    copy_reader_to_writer(decoder, writer, &display_label)
 }
 
 /// 判断本地 gzip 层是否可以开始解压。

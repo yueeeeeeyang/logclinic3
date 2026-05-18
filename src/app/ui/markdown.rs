@@ -2,7 +2,7 @@
 //
 // 业务意图：
 // - AI 对话和笔记阅读器都会展示 Markdown；解析、代码块高亮和 GPUI 渲染必须复用同一套规则，避免同一段内容在不同模块显示不一致。
-// - 展示层只消费原始 Markdown 字符串并生成本地富文本结构，不改写 SQLite 中保存的内容，也不执行 HTML。
+// - 展示层只消费原始 Markdown 字符串并生成本地富文本结构，不改写物理笔记文件或 AI 对话存储，也不执行 HTML。
 //
 // 边界条件：
 // - Markdown 解析失败、不完整流式片段或未知语法必须降级为可见文本，不能导致 UI 崩溃或丢失用户内容。
@@ -139,10 +139,12 @@ impl MainView {
         &self,
         message: &AiChatMessage,
         palette: AppThemePalette,
+        context: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = self.effective_theme();
         let document = self.ai_chat_markdown_document_for_message(message, theme);
-        render_app_markdown_document(&document, &message.id, palette).into_any_element()
+        self.render_ai_chat_selectable_markdown_document(&document, &message.id, palette, context)
+            .into_any_element()
     }
 
     /// 返回指定助手消息的 Markdown 解析结果。
@@ -174,6 +176,395 @@ impl MainView {
             },
         );
         document
+    }
+
+    /// 渲染支持拖选复制的 AI 消息 Markdown 文档。
+    ///
+    /// 业务意图：
+    /// - AI 对话气泡需要保持 Markdown 展示，同时允许用户用鼠标选择其中一段文本再复制。
+    /// - 通用 `render_app_markdown_document` 仍用于日志分析等只读展示场景，这里只给 AI 对话页面接入消息选区状态。
+    fn render_ai_chat_selectable_markdown_document(
+        &self,
+        document: &AppMarkdownDocument,
+        message_id: &str,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Div {
+        let mut children = Vec::new();
+        for (index, block) in document.blocks.iter().enumerate() {
+            let block_key = format!("{message_id}-{index}");
+            children.push(self.render_ai_chat_selectable_markdown_block(
+                block, index, &block_key, message_id, palette, context,
+            ));
+        }
+        div()
+            .mt_1()
+            .w_full()
+            .min_w_0()
+            .text_sm()
+            .line_height(px(21.0))
+            .text_color(rgb(palette.text))
+            .children(children)
+    }
+
+    /// 渲染可选择的 AI 消息文本段。
+    ///
+    /// 边界条件：
+    /// - 空文本不注册鼠标选区，避免没有内容的 Markdown 块抢占点击事件。
+    pub(in crate::app) fn render_ai_chat_selectable_text_segment(
+        &self,
+        segment: AiChatMessageTextSegmentKey,
+        text: String,
+        highlights: Vec<(Range<usize>, HighlightStyle)>,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Div {
+        let selectable_text = text.clone();
+        let selectable_segment = segment.clone();
+        div()
+            .w_full()
+            .min_w_0()
+            .child(AiChatSelectableTextElement {
+                view: context.entity(),
+                segment,
+                text,
+                highlights,
+                palette,
+            })
+            .when(!selectable_text.is_empty(), |text_element| {
+                text_element.on_mouse_down(
+                    MouseButton::Left,
+                    context.listener(move |view, event: &MouseDownEvent, window, context| {
+                        view.start_ai_chat_message_text_selection(
+                            selectable_segment.clone(),
+                            selectable_text.clone(),
+                            event,
+                            window,
+                            context,
+                        );
+                        context.stop_propagation();
+                    }),
+                )
+            })
+    }
+
+    /// 渲染单个可选择 Markdown 块级元素。
+    fn render_ai_chat_selectable_markdown_block(
+        &self,
+        block: &AppMarkdownBlock,
+        index: usize,
+        block_key: &str,
+        message_id: &str,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        match block {
+            AppMarkdownBlock::Paragraph(inlines) => {
+                let (text, highlights) = flatten_ai_chat_markdown_inlines(inlines, palette);
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .when(index > 0, |block| block.mt_2())
+                    .whitespace_normal()
+                    .child(self.render_ai_chat_selectable_text_segment(
+                        AiChatMessageTextSegmentKey::new(message_id.to_string(), block_key),
+                        text,
+                        highlights,
+                        palette,
+                        context,
+                    ))
+                    .into_any_element()
+            }
+            AppMarkdownBlock::Heading { level, inlines } => self
+                .render_ai_chat_selectable_markdown_heading(
+                    *level, inlines, index, block_key, message_id, palette, context,
+                )
+                .into_any_element(),
+            AppMarkdownBlock::List { start, items } => self
+                .render_ai_chat_selectable_markdown_list(
+                    *start, items, index, block_key, message_id, palette, context,
+                )
+                .into_any_element(),
+            AppMarkdownBlock::BlockQuote(children) => div()
+                .when(index > 0, |block| block.mt_2())
+                .pl_3()
+                .border_l_1()
+                .border_color(rgb(palette.border))
+                .text_color(rgb(palette.muted_text))
+                .children(children.iter().enumerate().map(|(child_index, child)| {
+                    let child_key = format!("{block_key}-quote-{child_index}");
+                    self.render_ai_chat_selectable_markdown_block(
+                        child,
+                        child_index,
+                        &child_key,
+                        message_id,
+                        palette,
+                        context,
+                    )
+                }))
+                .into_any_element(),
+            AppMarkdownBlock::CodeBlock { language, lines } => self
+                .render_ai_chat_selectable_markdown_code_block(
+                    language.as_deref(),
+                    lines,
+                    index,
+                    block_key,
+                    message_id,
+                    palette,
+                    context,
+                )
+                .into_any_element(),
+            AppMarkdownBlock::Table { headers, rows } => self
+                .render_ai_chat_selectable_markdown_table(
+                    headers, rows, index, block_key, message_id, palette, context,
+                )
+                .into_any_element(),
+            AppMarkdownBlock::ThematicBreak => div()
+                .when(index > 0, |block| block.mt_3())
+                .mb_2()
+                .h(px(1.0))
+                .w_full()
+                .bg(rgb(palette.border))
+                .into_any_element(),
+        }
+    }
+}
+
+impl MainView {
+    /// 渲染支持文本选择的 Markdown 标题。
+    fn render_ai_chat_selectable_markdown_heading(
+        &self,
+        level: u8,
+        inlines: &[AppMarkdownInline],
+        index: usize,
+        block_key: &str,
+        message_id: &str,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Div {
+        let font_size = match level {
+            1 => 18.0,
+            2 => 16.0,
+            3 => 15.0,
+            _ => 14.0,
+        };
+        let (text, highlights) = flatten_ai_chat_markdown_inlines(inlines, palette);
+        div()
+            .when(index > 0, |block| block.mt_3())
+            .text_size(px(font_size))
+            .line_height(px(font_size + 6.0))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(palette.text))
+            .child(self.render_ai_chat_selectable_text_segment(
+                AiChatMessageTextSegmentKey::new(message_id.to_string(), block_key),
+                text,
+                highlights,
+                palette,
+                context,
+            ))
+    }
+
+    /// 渲染支持文本选择的 Markdown 列表。
+    fn render_ai_chat_selectable_markdown_list(
+        &self,
+        start: Option<u64>,
+        items: &[Vec<AppMarkdownBlock>],
+        index: usize,
+        block_key: &str,
+        message_id: &str,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Div {
+        div()
+            .when(index > 0, |block| block.mt_2())
+            .flex()
+            .flex_col()
+            .gap_1()
+            .children(items.iter().enumerate().map(|(item_index, item)| {
+                let marker = start
+                    .map(|start| format!("{}.", start + item_index as u64))
+                    .unwrap_or_else(|| "-".to_string());
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(24.0))
+                            .text_right()
+                            .text_color(rgb(palette.muted_text))
+                            .child(marker),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .children(item.iter().enumerate().map(|(child_index, child)| {
+                                let child_key =
+                                    format!("{block_key}-item-{item_index}-{child_index}");
+                                self.render_ai_chat_selectable_markdown_block(
+                                    child,
+                                    child_index,
+                                    &child_key,
+                                    message_id,
+                                    palette,
+                                    context,
+                                )
+                            })),
+                    )
+            }))
+    }
+
+    /// 渲染支持文本选择的 Markdown 代码块。
+    fn render_ai_chat_selectable_markdown_code_block(
+        &self,
+        language: Option<&str>,
+        lines: &[AppMarkdownCodeLine],
+        index: usize,
+        block_key: &str,
+        message_id: &str,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(SharedString::from(format!(
+                "ai-chat-markdown-code-{block_key}"
+            )))
+            .when(index > 0, |block| block.mt_2())
+            .w_full()
+            .min_w_0()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.input))
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(rgb(palette.border))
+                    .text_xs()
+                    .text_color(rgb(palette.muted_text))
+                    .child(language.unwrap_or("text").to_string()),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "ai-chat-markdown-code-scroll-{block_key}"
+                    )))
+                    .w_full()
+                    .min_w_0()
+                    .overflow_x_scroll()
+                    .px_3()
+                    .py_2()
+                    .font_family(LOG_VIEWER_FONT_FAMILY)
+                    .text_size(px(13.0))
+                    .line_height(px(19.0))
+                    .children(lines.iter().enumerate().map(|(line_index, line)| {
+                        let text = if line.text.is_empty() {
+                            " ".to_string()
+                        } else {
+                            line.text.clone()
+                        };
+                        div().whitespace_nowrap().child(
+                            self.render_ai_chat_selectable_text_segment(
+                                AiChatMessageTextSegmentKey::new(
+                                    message_id.to_string(),
+                                    format!("{block_key}-code-{line_index}"),
+                                ),
+                                text,
+                                line.highlights.clone(),
+                                palette,
+                                context,
+                            ),
+                        )
+                    })),
+            )
+    }
+
+    /// 渲染支持文本选择的 Markdown 表格。
+    fn render_ai_chat_selectable_markdown_table(
+        &self,
+        headers: &[Vec<AppMarkdownInline>],
+        rows: &[Vec<Vec<AppMarkdownInline>>],
+        index: usize,
+        block_key: &str,
+        message_id: &str,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(SharedString::from(format!(
+                "ai-chat-markdown-table-{block_key}"
+            )))
+            .when(index > 0, |block| block.mt_2())
+            .w_full()
+            .min_w_0()
+            .overflow_x_scroll()
+            .border_1()
+            .border_color(rgb(palette.border))
+            .rounded(px(6.0))
+            .children(headers.iter().next().map(|_| {
+                self.render_ai_chat_selectable_markdown_table_row(
+                    headers, true, block_key, message_id, 0, palette, context,
+                )
+            }))
+            .children(rows.iter().enumerate().map(|(row_index, row)| {
+                self.render_ai_chat_selectable_markdown_table_row(
+                    row,
+                    false,
+                    block_key,
+                    message_id,
+                    row_index + 1,
+                    palette,
+                    context,
+                )
+            }))
+    }
+
+    /// 渲染支持文本选择的 Markdown 表格行。
+    fn render_ai_chat_selectable_markdown_table_row(
+        &self,
+        cells: &[Vec<AppMarkdownInline>],
+        header: bool,
+        block_key: &str,
+        message_id: &str,
+        row_index: usize,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Div {
+        div()
+            .flex()
+            .min_w(px(360.0))
+            .when(!header, |row| {
+                row.border_t_1().border_color(rgb(palette.border))
+            })
+            .when(header, |row| row.bg(rgb(palette.panel)))
+            .children(cells.iter().enumerate().map(|(cell_index, cell)| {
+                let (text, highlights) = flatten_ai_chat_markdown_inlines(cell, palette);
+                div()
+                    .flex_1()
+                    .min_w(px(120.0))
+                    .px_2()
+                    .py_1()
+                    .text_color(rgb(palette.text))
+                    .when(header, |cell| cell.font_weight(FontWeight::SEMIBOLD))
+                    .child(self.render_ai_chat_selectable_text_segment(
+                        AiChatMessageTextSegmentKey::new(
+                            message_id.to_string(),
+                            format!("{block_key}-table-{row_index}-{cell_index}"),
+                        ),
+                        text,
+                        highlights,
+                        palette,
+                        context,
+                    ))
+            }))
     }
 }
 

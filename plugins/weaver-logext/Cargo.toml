@@ -1,0 +1,15 @@
+[package]
+# 插件包名与 manifest ID 保持一致，方便打包脚本定位二进制并生成 ZIP。
+name = "weaver-logext"
+# 插件版本需要和 plugin.json 中的 version 同步；宿主只读取 manifest，不读取 Cargo 元数据。
+version = "0.2.0"
+# 插件独立于主程序编译，但仍使用稳定 Rust 2024 edition。
+edition = "2024"
+
+[dependencies]
+# chrono 用于把 13 位毫秒时间戳转换成本机可读时间；SQL 明细读取仍使用标准库逐行解析，避免引入额外重依赖。
+chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
+# serde 只用于解析宿主发来的插件协议请求和序列化声明式页面响应。
+serde = { version = "1.0.228", features = ["derive"] }
+# serde_json 是插件与宿主 stdin/stdout 通讯的唯一序列化格式。
+serde_json = "1.0.145"

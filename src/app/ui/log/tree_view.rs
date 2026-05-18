@@ -21,6 +21,24 @@ enum LogTreeSearchDeleteDirection {
     Forward,
 }
 
+/// 插件右键菜单渲染快照。
+///
+/// 业务意图：
+/// - 插件贡献点来自运行时 `plugin.json`，渲染菜单时需要先把 manifest 中的动态数据整理成可移动到监听闭包的值。
+/// - 该结构只服务当前一帧菜单渲染，不写入配置，也不保存日志来源快照。
+struct PluginMenuRenderItem {
+    /// 插件 ID。
+    plugin_id: String,
+    /// 菜单贡献点 ID。
+    menu_id: String,
+    /// 命令 ID。
+    command_id: String,
+    /// 菜单标题。
+    title: String,
+    /// 菜单图标。
+    icon: Icon,
+}
+
 impl MainView {
     pub(in crate::app) fn render_log_tree_panel(
         &self,
@@ -1422,8 +1440,12 @@ impl MainView {
         let fallback_source = menu.source.clone();
         let file_action_enabled =
             self.log_tree_selected_file_sources_available(fallback_source.as_ref());
-        let smart_analysis_enabled =
-            self.log_ai_analysis_sources_available(fallback_source.as_ref());
+        let smart_analysis_configured = self.log_ai_analysis_model_configured();
+        let smart_analysis_enabled = smart_analysis_configured
+            && self.log_ai_analysis_sources_available(fallback_source.as_ref());
+        let plugin_menu_items = self.log_tree_plugin_menu_items();
+        let plugin_action_enabled = !plugin_menu_items.is_empty()
+            && self.log_tree_plugin_menu_available(node_id, fallback_source.as_ref());
 
         div()
             .id("log-tree-context-menu")
@@ -1456,7 +1478,7 @@ impl MainView {
                     node_id,
                     fallback_source: fallback_source.clone(),
                     action: LogTreeContextMenuAction::SaveAs,
-                    label: "另存为...",
+                    label: "另存为...".to_string(),
                     icon: Icon::Save,
                     enabled: file_action_enabled,
                     palette,
@@ -1468,20 +1490,38 @@ impl MainView {
                     node_id,
                     fallback_source: fallback_source.clone(),
                     action: LogTreeContextMenuAction::SearchSelected,
-                    label: "选中搜索",
+                    label: "选中搜索".to_string(),
                     icon: Icon::Search,
                     enabled: file_action_enabled,
                     palette,
                 },
                 context,
             ))
-            .when(self.log_ai_analysis_model_configured(), |menu| {
+            .children(plugin_menu_items.into_iter().map(|item| {
+                self.render_log_tree_context_menu_item(
+                    LogTreeContextMenuItemRequest {
+                        node_id,
+                        fallback_source: fallback_source.clone(),
+                        action: LogTreeContextMenuAction::Plugin {
+                            plugin_id: item.plugin_id,
+                            menu_id: item.menu_id,
+                            command_id: item.command_id,
+                        },
+                        label: item.title,
+                        icon: item.icon,
+                        enabled: plugin_action_enabled,
+                        palette,
+                    },
+                    context,
+                )
+            }))
+            .when(smart_analysis_configured, |menu| {
                 menu.child(self.render_log_tree_context_menu_item(
                     LogTreeContextMenuItemRequest {
                         node_id,
                         fallback_source: fallback_source.clone(),
                         action: LogTreeContextMenuAction::SmartAnalyze,
-                        label: "智能分析",
+                        label: "智能分析".to_string(),
                         icon: Icon::Sparkles,
                         enabled: smart_analysis_enabled,
                         palette,
@@ -1494,7 +1534,7 @@ impl MainView {
                     node_id,
                     fallback_source,
                     action: LogTreeContextMenuAction::AnalyzeThreads,
-                    label: "线程日志分析",
+                    label: "线程日志分析".to_string(),
                     icon: Icon::ChartNoAxesCombined,
                     enabled: file_action_enabled,
                     palette,
@@ -1603,7 +1643,7 @@ impl MainView {
                 context.listener(move |view, _event: &MouseDownEvent, window, context| {
                     if enabled {
                         view.handle_log_tree_context_menu_action(
-                            action,
+                            action.clone(),
                             fallback_source.clone(),
                             window,
                             context,
@@ -1627,10 +1667,12 @@ impl MainView {
         context: &mut Context<Self>,
     ) {
         let fallback_for_action = fallback_source.clone();
-        let sources = Self::log_tree_menu_action_sources(
-            self.selected_log_tree_file_sources(),
-            fallback_source,
-        );
+        let fallback_node_id = self
+            .log
+            .log_tree_context_menu
+            .as_ref()
+            .map(|menu| menu.node_id)
+            .unwrap_or_default();
         self.log.log_tree_context_menu = None;
         self.log.tab_context_menu = None;
         self.log.encoding_dropdown_menu = None;
@@ -1638,9 +1680,17 @@ impl MainView {
 
         match action {
             LogTreeContextMenuAction::SaveAs => {
+                let sources = Self::log_tree_menu_action_sources(
+                    self.selected_log_tree_file_sources(),
+                    fallback_source,
+                );
                 self.save_selected_log_tree_sources_as(sources, context);
             }
             LogTreeContextMenuAction::SearchSelected => {
+                let sources = Self::log_tree_menu_action_sources(
+                    self.selected_log_tree_file_sources(),
+                    fallback_source,
+                );
                 self.schedule_open_search_dialog_with_preset(
                     SearchDialogOpenPreset::SelectedFiles { sources },
                     window,
@@ -1648,6 +1698,10 @@ impl MainView {
                 );
             }
             LogTreeContextMenuAction::AnalyzeThreads => {
+                let sources = Self::log_tree_menu_action_sources(
+                    self.selected_log_tree_file_sources(),
+                    fallback_source,
+                );
                 self.open_thread_analysis_for_sources(sources, window, context);
             }
             LogTreeContextMenuAction::SmartAnalyze => {
@@ -1659,8 +1713,99 @@ impl MainView {
                 }
                 self.open_log_ai_analysis_for_sources(analysis_sources, window, context);
             }
+            LogTreeContextMenuAction::Plugin {
+                plugin_id,
+                menu_id,
+                command_id,
+            } => {
+                let plugin_files_for_action =
+                    self.log_tree_plugin_menu_files(fallback_node_id, fallback_for_action.as_ref());
+                self.invoke_log_tree_plugin_menu(
+                    plugin_id,
+                    menu_id,
+                    command_id,
+                    plugin_files_for_action,
+                    window,
+                    context,
+                );
+            }
         }
         context.notify();
+    }
+
+    /// 返回当前已启用插件贡献的日志树右键菜单项。
+    ///
+    /// 业务意图：
+    /// - 插件菜单在内置“选中搜索”后渲染，既保持用户已熟悉的核心操作位置，也让第三方扩展入口集中展示。
+    /// - 只读取已成功加载且已启用的插件定义；加载失败或禁用插件会保留在设置页，不污染右键菜单。
+    fn log_tree_plugin_menu_items(&self) -> Vec<PluginMenuRenderItem> {
+        self.plugins
+            .definitions
+            .iter()
+            .filter(|plugin| plugin.active())
+            .filter_map(|plugin| {
+                plugin
+                    .manifest
+                    .as_ref()
+                    .map(|manifest| (plugin.id.clone(), manifest))
+            })
+            .flat_map(|(plugin_id, manifest)| {
+                manifest
+                    .contributes
+                    .log_tree_context_menu
+                    .iter()
+                    .map(move |menu| PluginMenuRenderItem {
+                        plugin_id: plugin_id.clone(),
+                        menu_id: menu.id.clone(),
+                        command_id: menu.command_id().to_string(),
+                        title: menu.title.clone(),
+                        icon: Self::plugin_menu_icon(menu.icon.as_deref()),
+                    })
+            })
+            .collect()
+    }
+
+    /// 收集日志树插件菜单当前上下文中的候选日志。
+    ///
+    /// 业务意图：
+    /// - 插件只能拿到用户当前选择或右键落点对应的日志元数据；目录节点只展开直接子文件，不递归读取深层目录。
+    /// - 该函数用于菜单启用态预判，不启动插件进程，也不读取日志正文。
+    pub(in crate::app) fn log_tree_plugin_menu_files(
+        &self,
+        fallback_node_id: usize,
+        fallback_source: Option<&LogFileSource>,
+    ) -> Vec<PluginLogFile> {
+        let LogTreeLoadState::Loaded(tree_state) = &self.log.load_state else {
+            return Vec::new();
+        };
+        tree_state.plugin_log_files_for_menu(
+            &self.log.log_tree_selected_node_ids,
+            fallback_node_id,
+            fallback_source,
+        )
+    }
+
+    /// 判断日志树插件菜单当前上下文是否存在候选日志。
+    ///
+    /// 业务意图：
+    /// - 该函数只服务右键菜单启用态，必须避免构造完整插件文件列表。
+    /// - 大目录菜单打开后鼠标 hover 会频繁重渲染，启用态使用短路判断可以避免主线程反复分配上万条插件元数据。
+    pub(in crate::app) fn log_tree_plugin_menu_available(
+        &self,
+        fallback_node_id: usize,
+        fallback_source: Option<&LogFileSource>,
+    ) -> bool {
+        if fallback_source.is_some() {
+            return true;
+        }
+        let LogTreeLoadState::Loaded(tree_state) = &self.log.load_state else {
+            return false;
+        };
+        tree_state.has_plugin_log_file_for_menu(
+            &self.log.log_tree_selected_node_ids,
+            fallback_node_id,
+            fallback_source,
+        )
     }
 
     /// 判断当前普通文件菜单项是否有可用文件来源。
@@ -1671,7 +1816,13 @@ impl MainView {
         &self,
         fallback_source: Option<&LogFileSource>,
     ) -> bool {
-        !self.selected_log_tree_file_sources().is_empty() || fallback_source.is_some()
+        if fallback_source.is_some() {
+            return true;
+        }
+        let LogTreeLoadState::Loaded(tree_state) = &self.log.load_state else {
+            return false;
+        };
+        tree_state.has_file_source_for_node_ids(&self.log.log_tree_selected_node_ids)
     }
 
     /// 判断智能分析入口是否有已配置模型。
@@ -1687,7 +1838,13 @@ impl MainView {
         &self,
         fallback_source: Option<&LogFileSource>,
     ) -> bool {
-        !self.selected_log_tree_ai_analysis_sources().is_empty() || fallback_source.is_some()
+        if fallback_source.is_some() {
+            return true;
+        }
+        let LogTreeLoadState::Loaded(tree_state) = &self.log.load_state else {
+            return false;
+        };
+        has_log_ai_analysis_source_in_tree(&tree_state.tree, &self.log.log_tree_selected_node_ids)
     }
 
     /// 返回当前目录树选择中的可读取日志来源。

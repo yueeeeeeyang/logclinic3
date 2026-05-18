@@ -87,6 +87,16 @@ pub(in crate::app) struct MainView {
     /// - API Key 的明文存储策略保持原状，本次重构不扩大可见范围。
     pub(in crate::app) model_config: ModelConfigState,
 
+    /// 插件注册、贡献点和插件声明式结果窗口状态。
+    ///
+    /// 业务意图：
+    /// - 设置页、日志树右键菜单和笔记树右键菜单都需要读取同一份插件定义快照。
+    /// - 插件第一版只通过外部进程协议返回声明式页面或消息，不允许直接持有或修改日志正文、笔记正文等内部状态。
+    ///
+    /// 边界条件：
+    /// - 插件注册表读取失败不阻断主窗口启动；用户安装插件的加载错误会在设置页中展示。
+    pub(in crate::app) plugins: PluginWorkspaceState,
+
     /// 线程日志分析独立窗口句柄。
     ///
     /// 业务意图：
@@ -119,7 +129,7 @@ pub(in crate::app) struct MainView {
     ///
     /// 业务意图：
     /// - 笔记目录树、当前笔记、阅读器选区、编辑草稿和确认弹窗统一收口到该字段。
-    /// - 主视图只负责在大功能页之间协调，避免根实体直接理解笔记 SQLite 初始化细节。
+    /// - 主视图只负责在大功能页之间协调，避免根实体直接理解笔记文件扫描和迁移细节。
     pub(in crate::app) notes: NotesWorkspaceState,
 
     /// 当前窗口系统外观。
@@ -179,6 +189,7 @@ impl MainView {
             search: SearchWorkspaceState::new(context),
             settings: SettingsState::new(context),
             model_config,
+            plugins: PluginWorkspaceState::load(),
             thread_analysis_window: None,
             log_ai_analysis_window: None,
             hprof_analysis_view: None,

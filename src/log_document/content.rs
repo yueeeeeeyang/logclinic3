@@ -13,7 +13,8 @@
 use std::{
     error::Error,
     fmt::{self, Display},
-    fs,
+    fs::{self, File},
+    io::{self, BufReader, Write},
     path::Path,
     sync::Arc,
 };
@@ -28,7 +29,9 @@ use crate::{
     archive::{
         ArchiveFormat, ArchiveReadError, is_single_gzip_member_path, read_archive_member,
         read_archive_member_from_bytes, read_single_file_archive_from_bytes,
-        read_single_file_archive_from_path, write_temporary_nested_archive_bytes,
+        read_single_file_archive_from_path, stream_archive_member_from_bytes_to_writer,
+        stream_archive_member_to_writer, stream_single_file_archive_from_bytes_to_writer,
+        stream_single_file_archive_from_path_to_writer, write_temporary_nested_archive_bytes,
     },
     log_source::LogFileSource,
 };
@@ -323,6 +326,119 @@ pub fn read_log_source_bytes(source: &LogFileSource) -> Result<Arc<Vec<u8>>, Log
     Ok(Arc::new(bytes))
 }
 
+/// 将日志来源的原始字节直接写入目标 writer。
+///
+/// 业务意图：
+/// - 插件分析、SQL 下钻等后台任务只需要顺序消费日志正文，不应沿用右侧日志 tab 的“整文件读入内存”模式。
+/// - 该函数保持与 `read_log_source_bytes` 相同的来源语义：普通文件读自身，压缩包成员读成员内容，压缩包文件本身则读取内部唯一普通文件。
+///
+/// 关键约束：
+/// - 该入口不缓存原始字节，也不应用 200MB tab 内存上限；调用方必须在后台线程使用，并通过进度或超时给用户反馈。
+/// - 嵌套压缩包仍需要先取得内层压缩包字节才能解析目录；但目标日志成员会直接写入 writer，不再为插件生成临时日志文件。
+pub fn stream_log_source_bytes_to_writer<W: Write + ?Sized>(
+    source: &LogFileSource,
+    writer: &mut W,
+) -> Result<(), LogContentError> {
+    if let Some(format) = archive_format_for_source(source) {
+        match source {
+            LogFileSource::LocalFile { path } => {
+                return Ok(stream_single_file_archive_from_path_to_writer(
+                    path, format, writer,
+                )?);
+            }
+            LogFileSource::ArchiveMember {
+                archive_path,
+                archive_format,
+                member_path,
+            } => {
+                let archive_bytes =
+                    read_archive_member(archive_path, *archive_format, member_path)?;
+                return Ok(stream_single_file_archive_from_bytes_to_writer(
+                    &archive_bytes,
+                    format,
+                    member_path,
+                    "压缩包内嵌套压缩包",
+                    writer,
+                )?);
+            }
+            LogFileSource::MaterializedArchiveMember {
+                member_path,
+                temp_path,
+                ..
+            } => {
+                return stream_single_file_archive_from_path_to_writer(temp_path, format, writer)
+                    .map_err(|error| {
+                        LogContentError::new(format!(
+                            "读取 7Z 物化成员 {} 失败：{}",
+                            member_path, error
+                        ))
+                    });
+            }
+            LogFileSource::NestedArchiveMember {
+                outer_archive_path,
+                outer_archive_format,
+                archive_member_path,
+                nested_archive_format,
+                nested_member_path,
+            } => {
+                let nested_bytes = read_nested_archive_member_bytes(
+                    outer_archive_path,
+                    *outer_archive_format,
+                    archive_member_path,
+                    *nested_archive_format,
+                    nested_member_path,
+                )?;
+                if format == ArchiveFormat::Rar {
+                    let temp_path =
+                        write_temporary_nested_archive_bytes(&nested_bytes, nested_member_path)?;
+                    let result =
+                        stream_single_file_archive_from_path_to_writer(&temp_path, format, writer);
+                    let _ = fs::remove_file(&temp_path);
+                    return Ok(result?);
+                }
+                return Ok(stream_single_file_archive_from_bytes_to_writer(
+                    &nested_bytes,
+                    format,
+                    nested_member_path,
+                    "嵌套压缩包内再次嵌套压缩包",
+                    writer,
+                )?);
+            }
+        }
+    }
+
+    match source {
+        LogFileSource::LocalFile { path } => stream_local_file_to_writer(path, writer),
+        LogFileSource::ArchiveMember {
+            archive_path,
+            archive_format,
+            member_path,
+        } => Ok(stream_archive_member_to_writer(
+            archive_path,
+            *archive_format,
+            member_path,
+            writer,
+        )?),
+        LogFileSource::MaterializedArchiveMember { temp_path, .. } => {
+            stream_local_file_to_writer(temp_path, writer)
+        }
+        LogFileSource::NestedArchiveMember {
+            outer_archive_path,
+            outer_archive_format,
+            archive_member_path,
+            nested_archive_format,
+            nested_member_path,
+        } => stream_nested_archive_member_to_writer(
+            outer_archive_path,
+            *outer_archive_format,
+            archive_member_path,
+            *nested_archive_format,
+            nested_member_path,
+            writer,
+        ),
+    }
+}
+
 /// 读取外层压缩包中的内层压缩包成员。
 ///
 /// 业务意图：
@@ -351,6 +467,45 @@ fn read_nested_archive_member_bytes(
             nested_archive_format,
             nested_member_path,
             archive_member_path,
+        )?)
+    }
+}
+
+/// 将外层压缩包中的内层压缩包目标成员直接写入 writer。
+///
+/// 业务意图：
+/// - 嵌套压缩包无法仅凭外层顺序流定位内层目录；需要先取得内层压缩包字节。
+/// - 取得内层压缩包后，目标日志成员仍通过各格式 reader 写入 writer，避免再把目标日志正文整体读入内存。
+fn stream_nested_archive_member_to_writer<W: Write + ?Sized>(
+    outer_archive_path: &Path,
+    outer_archive_format: ArchiveFormat,
+    archive_member_path: &str,
+    nested_archive_format: ArchiveFormat,
+    nested_member_path: &str,
+    writer: &mut W,
+) -> Result<(), LogContentError> {
+    let archive_bytes = read_archive_member(
+        outer_archive_path,
+        outer_archive_format,
+        archive_member_path,
+    )?;
+    if nested_archive_format == ArchiveFormat::Rar {
+        let temp_path = write_temporary_nested_archive_bytes(&archive_bytes, archive_member_path)?;
+        let result = stream_archive_member_to_writer(
+            &temp_path,
+            nested_archive_format,
+            nested_member_path,
+            writer,
+        );
+        let _ = fs::remove_file(&temp_path);
+        Ok(result?)
+    } else {
+        Ok(stream_archive_member_from_bytes_to_writer(
+            &archive_bytes,
+            nested_archive_format,
+            nested_member_path,
+            archive_member_path,
+            writer,
         )?)
     }
 }
@@ -425,6 +580,28 @@ fn read_local_file(path: &Path) -> Result<Vec<u8>, LogContentError> {
     ensure_size_within_limit(metadata.len(), &path.display().to_string())?;
     fs::read(path).map_err(|error| {
         LogContentError::new(format!("无法读取文件 {}：{}", path.display(), error))
+    })
+}
+
+/// 将本地文件内容顺序复制到目标 writer。
+///
+/// 业务意图：
+/// - 插件后台分析可以处理远大于右侧 tab 内存模式的日志文件，因此这里不使用 `fs::read`。
+/// - 复制过程在后台线程执行，调用方负责把 writer 设计成按行消费并汇报进度。
+fn stream_local_file_to_writer<W: Write + ?Sized>(
+    path: &Path,
+    writer: &mut W,
+) -> Result<(), LogContentError> {
+    let file = File::open(path).map_err(|error| {
+        LogContentError::new(format!("无法打开日志文件 {}：{}", path.display(), error))
+    })?;
+    let mut reader = BufReader::new(file);
+    io::copy(&mut reader, writer).map(|_| ()).map_err(|error| {
+        LogContentError::new(format!(
+            "流式读取日志文件 {} 失败：{}",
+            path.display(),
+            error
+        ))
     })
 }
 
@@ -789,6 +966,57 @@ mod tests {
         Ok(())
     }
 
+    /// 验证本地日志可以通过 writer 流式读取，供插件后台分析避免整文件缓存。
+    ///
+    /// 业务意图：
+    /// - SQL 下钻需要处理可能很大的日志文件；本地文件路径必须通过顺序复制写出，而不是 `fs::read`。
+    #[test]
+    fn 流式读取本地日志原始字节() -> Result<(), Box<dyn Error>> {
+        let temp_dir = unique_temp_dir("logclinic3-local-stream-content-test")?;
+        let log_path = temp_dir.join("access.log");
+        fs::write(&log_path, b"INFO one\nINFO two")?;
+        let mut streamed = Vec::new();
+
+        stream_log_source_bytes_to_writer(
+            &LogFileSource::LocalFile { path: log_path },
+            &mut streamed,
+        )?;
+
+        assert_eq!(streamed, b"INFO one\nINFO two");
+        fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    /// 验证 ZIP 成员可以直接流式写入 writer，不需要先把目标日志正文读成 `Vec<u8>`。
+    ///
+    /// 业务意图：
+    /// - 插件点击“显示SQL”时可能面对压缩包内日志；该路径应由压缩库 reader 直接推给宿主内容流。
+    #[test]
+    fn 流式读取_zip_压缩包成员原始字节() -> Result<(), Box<dyn Error>> {
+        let temp_dir = unique_temp_dir("logclinic3-zip-stream-content-test")?;
+        let archive_path = temp_dir.join("logs.zip");
+        let archive_file = File::create(&archive_path)?;
+        let mut zip_writer = zip::ZipWriter::new(archive_file);
+
+        zip_writer.start_file("logs\\access.log", zip::write::SimpleFileOptions::default())?;
+        zip_writer.write_all(b"INFO zip stream")?;
+        zip_writer.finish()?;
+        let mut streamed = Vec::new();
+
+        stream_log_source_bytes_to_writer(
+            &LogFileSource::ArchiveMember {
+                archive_path: archive_path.clone(),
+                archive_format: ArchiveFormat::Zip,
+                member_path: "logs/access.log".to_string(),
+            },
+            &mut streamed,
+        )?;
+
+        assert_eq!(streamed, b"INFO zip stream");
+        fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
     /// 验证读取 TAR.GZ 后续成员前会跳过前置成员正文。
     ///
     /// 业务意图：
@@ -1020,6 +1248,46 @@ mod tests {
         })?;
 
         assert_eq!(&bytes[..], b"INFO second");
+        fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    /// 验证嵌套 ZIP 指定成员也可以通过 writer 流式输出目标日志正文。
+    ///
+    /// 业务意图：
+    /// - 外层包中的内层多文件压缩包需要先定位内层压缩包，但具体日志成员不应再整体读入内存后才交给插件。
+    #[test]
+    fn 流式读取外层_zip_中多文件_zip_的指定成员() -> Result<(), Box<dyn Error>> {
+        let temp_dir = unique_temp_dir("logclinic3-nested-stream-content-test")?;
+        let archive_path = temp_dir.join("outer.zip");
+        let inner_cursor = Cursor::new(Vec::new());
+        let mut inner_writer = zip::ZipWriter::new(inner_cursor);
+
+        inner_writer.start_file("first.log", zip::write::SimpleFileOptions::default())?;
+        inner_writer.write_all(b"INFO first")?;
+        inner_writer.start_file("second.log", zip::write::SimpleFileOptions::default())?;
+        inner_writer.write_all(b"INFO second stream")?;
+        let inner_zip_bytes = inner_writer.finish()?.into_inner();
+
+        let archive_file = File::create(&archive_path)?;
+        let mut zip_writer = zip::ZipWriter::new(archive_file);
+        zip_writer.start_file("thread_multi.zip", zip::write::SimpleFileOptions::default())?;
+        zip_writer.write_all(&inner_zip_bytes)?;
+        zip_writer.finish()?;
+        let mut streamed = Vec::new();
+
+        stream_log_source_bytes_to_writer(
+            &LogFileSource::NestedArchiveMember {
+                outer_archive_path: archive_path.clone(),
+                outer_archive_format: ArchiveFormat::Zip,
+                archive_member_path: "thread_multi.zip".to_string(),
+                nested_archive_format: ArchiveFormat::Zip,
+                nested_member_path: "second.log".to_string(),
+            },
+            &mut streamed,
+        )?;
+
+        assert_eq!(streamed, b"INFO second stream");
         fs::remove_dir_all(temp_dir)?;
         Ok(())
     }

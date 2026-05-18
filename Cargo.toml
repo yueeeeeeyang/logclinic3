@@ -1,11 +1,10 @@
 [package]
 # 包名固定为用户确认的 logclinic3，后续发布、日志目录和进程名都应以这里为准。
 name = "logclinic3"
-# 当前仍处于首版工程搭建阶段，版本号保留 Cargo 默认语义。
-version = "0.1.0"
+# 主程序发布版本号；插件独立编译打包，不跟随该版本字段自动升级。
+version = "0.2.0"
 # 使用稳定 Rust 2024 edition；如后续目标工具链不支持，需要在跨平台验收时统一降级。
 edition = "2024"
-
 [dependencies]
 # chardetng 用于日志正文的编码自动检测；检测失败时 UI 允许用户手动切换编码重新解码。
 chardetng = "1.0.0"
@@ -40,6 +39,8 @@ regex = "1.12.3"
 sevenz-rust = { version = "0.6.1", default-features = false, features = ["bzip2", "zstd"] }
 # tar 用于遍历 tar.gz/tgz 内部条目头部，配合 flate2 实现流式目录树构建。
 tar = "0.4.45"
+# trash 用于把真实笔记文件和目录移动到系统回收站/废纸篓，避免物理文件存储下误删用户数据。
+trash = "5.2.6"
 # tree-sitter 提供增量解析和查询能力；本项目只在小型 XML/properties 文件上启用整文件语法高亮。
 tree-sitter = "0.26.8"
 # tree-sitter-properties 提供 Java properties 文件语法和官方高亮查询，避免手写完整 properties 解析器。

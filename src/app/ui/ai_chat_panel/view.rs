@@ -39,6 +39,7 @@ impl MainView {
             .flex()
             .size_full()
             .bg(rgb(palette.background))
+            .track_focus(&self.ai_chat.message_selection_focus)
             .on_mouse_move(context.listener(Self::handle_ai_chat_mouse_move))
             .on_mouse_up(
                 MouseButton::Left,
@@ -792,6 +793,7 @@ impl MainView {
                 .child(placeholder)
                 .into_any_element()
         } else if is_user {
+            let segment = AiChatMessageTextSegmentKey::new(message.id.clone(), "content");
             div()
                 .mt_1()
                 .w_full()
@@ -800,11 +802,18 @@ impl MainView {
                 .line_height(px(21.0))
                 .whitespace_normal()
                 .text_color(rgb(palette.text))
-                .child(message.content.clone())
+                .child(self.render_ai_chat_selectable_text_segment(
+                    segment,
+                    message.content.clone(),
+                    Vec::new(),
+                    palette,
+                    context,
+                ))
                 .into_any_element()
         } else {
-            self.render_ai_chat_markdown_message(message, palette)
+            self.render_ai_chat_markdown_message(message, palette, context)
         };
+        let message_id = message.id.clone();
         div()
             .id(SharedString::from(format!(
                 "ai-chat-message-{}",
@@ -838,6 +847,10 @@ impl MainView {
                     }))
                     .child(
                         div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(if is_user {
@@ -845,7 +858,12 @@ impl MainView {
                             } else {
                                 palette.muted_text
                             }))
-                            .child(if is_user { "你" } else { "助手" }),
+                            .child(if is_user { "你" } else { "助手" })
+                            .child(
+                                self.render_ai_chat_message_copy_button(
+                                    message_id, palette, context,
+                                ),
+                            ),
                     )
                     .when(!is_user && has_reasoning, |bubble| {
                         bubble.child(self.render_ai_chat_reasoning_panel(message, palette, context))
@@ -869,6 +887,44 @@ impl MainView {
                             )
                         },
                     ),
+            )
+    }
+
+    /// 渲染 AI 消息气泡的一键复制按钮。
+    ///
+    /// 业务意图：
+    /// - 一键复制复制整条消息原始正文，和拖选片段复制互补；按钮放在气泡标题行，避免占用正文阅读空间。
+    /// - 按下事件必须停止传播，避免点击复制按钮时同时触发气泡正文选区。
+    fn render_ai_chat_message_copy_button(
+        &self,
+        message_id: String,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(SharedString::from(format!(
+                "ai-chat-message-copy-{message_id}"
+            )))
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(24.0))
+            .h(px(24.0))
+            .rounded(px(5.0))
+            .cursor_pointer()
+            .hover(move |button| button.bg(rgb(palette.hover)))
+            .child(Self::render_lucide_icon(
+                Some(Icon::Copy),
+                13.0,
+                13.0,
+                palette.muted_text,
+            ))
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(move |view, _event: &MouseDownEvent, _window, context| {
+                    view.copy_ai_chat_message_to_clipboard(&message_id, context);
+                    context.stop_propagation();
+                }),
             )
     }
 

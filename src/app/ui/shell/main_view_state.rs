@@ -251,6 +251,187 @@ pub(in crate::app) struct SettingsState {
     pub(in crate::app) thread_analysis_filter_last_bounds: Option<Bounds<Pixels>>,
     /// 线程日志分析过滤输入区拖拽选择锚点。
     pub(in crate::app) thread_analysis_filter_selection_drag: Option<usize>,
+    /// 存储页扫描和操作状态。
+    ///
+    /// 业务意图：
+    /// - 存储页需要后台统计应用配置目录、数据库、插件目录和临时缓存大小；扫描结果保存在设置状态中，避免渲染阶段同步访问磁盘。
+    /// - 该状态只存在于当前设置会话，不写入配置；真实来源始终是文件系统当前状态。
+    pub(in crate::app) storage: StorageSettingsState,
+}
+
+/// 存储位置类型。
+///
+/// 业务意图：
+/// - 存储页需要用稳定分类区分 SQLite 数据库、普通目录和临时缓存，便于渲染不同说明和安全操作。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(in crate::app) enum StorageLocationKind {
+    /// SQLite 数据库文件。
+    Database,
+    /// 应用配置目录或插件安装目录。
+    Directory,
+    /// 系统临时目录中的大日志物化缓存。
+    Cache,
+}
+
+impl StorageLocationKind {
+    /// 返回存储类型中文标签。
+    pub(in crate::app) fn label(self) -> &'static str {
+        match self {
+            Self::Database => "数据库",
+            Self::Directory => "目录",
+            Self::Cache => "临时缓存",
+        }
+    }
+}
+
+/// 单个存储位置的扫描状态。
+///
+/// 业务意图：
+/// - UI 渲染只消费该快照，不在渲染阶段读取文件系统，避免目录过大或权限异常时卡住设置窗口。
+/// - 路径不可用、未创建和读取失败都需要区分展示，方便用户判断是正常尚未使用还是存在权限问题。
+#[derive(Clone, Debug)]
+pub(in crate::app) struct StorageLocationStatus {
+    /// 稳定条目 ID，用于按钮事件回查当前扫描结果。
+    pub(in crate::app) id: &'static str,
+    /// 展示名称。
+    pub(in crate::app) name: &'static str,
+    /// 所属分组。
+    pub(in crate::app) group: &'static str,
+    /// 存储用途说明。
+    pub(in crate::app) purpose: &'static str,
+    /// 存储类型。
+    pub(in crate::app) kind: StorageLocationKind,
+    /// 当前平台解析出的路径；为空表示该平台没有对应存储位置。
+    pub(in crate::app) path: Option<PathBuf>,
+    /// 路径是否已经存在。
+    pub(in crate::app) exists: bool,
+    /// 文件大小或目录递归统计大小；为空表示未创建或无法统计。
+    pub(in crate::app) size_bytes: Option<u64>,
+    /// 最近修改时间；为空表示未创建或系统无法提供。
+    pub(in crate::app) modified: Option<SystemTime>,
+    /// 当前条目的读取错误；不会影响其它条目展示。
+    pub(in crate::app) error: Option<String>,
+}
+
+impl StorageLocationStatus {
+    /// 返回当前条目的状态标签。
+    pub(in crate::app) fn state_label(&self) -> &'static str {
+        if self.path.is_none() {
+            "不可用"
+        } else if self.error.is_some() {
+            "读取失败"
+        } else if self.exists {
+            "已创建"
+        } else {
+            "未创建"
+        }
+    }
+}
+
+/// 设置页存储管理状态。
+///
+/// 业务意图：
+/// - 存储扫描涉及文件系统递归统计，必须由后台任务刷新；UI 用这里的快照展示最近一次结果。
+/// - 安全管理操作只更新状态提示和重新扫描结果，不直接删除配置、数据库或插件目录。
+#[derive(Clone, Debug)]
+pub(in crate::app) struct StorageSettingsState {
+    /// 是否正在后台扫描。
+    pub(in crate::app) loading: bool,
+    /// 最近一次刷新完成时间。
+    pub(in crate::app) last_refreshed_at: Option<SystemTime>,
+    /// 最近一次扫描得到的存储条目。
+    pub(in crate::app) locations: Vec<StorageLocationStatus>,
+    /// 存储页操作提示。
+    pub(in crate::app) status_message: Option<String>,
+}
+
+impl StorageSettingsState {
+    /// 创建空的存储页状态。
+    pub(in crate::app) fn new() -> Self {
+        Self {
+            loading: false,
+            last_refreshed_at: None,
+            locations: Vec::new(),
+            status_message: None,
+        }
+    }
+}
+
+/// 插件管理和声明式插件窗口状态。
+///
+/// 业务意图：
+/// - 插件框架允许第三方通过 JSON manifest 贡献导航页和右键菜单；主窗口需要持有当前会话内的加载快照，
+///   让设置页、日志树和笔记树在同一份数据上渲染。
+/// - 注册表仍以 JSON 写入应用配置目录；该状态只缓存读取结果和最近一次操作提示，不把插件运行结果写回配置。
+///
+/// 边界条件：
+/// - 插件启用状态由注册表持久化，加载错误只在当前启动后重新计算，避免旧错误在修复插件目录后继续误导用户。
+/// - 插件进程由命令触发时短暂启动，当前第一版不保持常驻进程，因此这里不保存子进程句柄。
+pub(in crate::app) struct PluginWorkspaceState {
+    /// 插件注册表 JSON 的内存副本。
+    ///
+    /// 业务意图：
+    /// - 设置页启用、禁用、加载和卸载操作先更新该副本，再写回磁盘，最后重建 `definitions`。
+    /// - 如果应用配置目录不可用，写入函数会返回中文错误并展示在设置页。
+    pub(in crate::app) registry: PluginRegistry,
+    /// 当前可渲染插件定义列表，包含开发目录插件、ZIP 安装插件和加载失败占位项。
+    pub(in crate::app) definitions: Vec<PluginDefinition>,
+    /// 最近一次插件管理或运行操作的用户可见提示。
+    ///
+    /// 边界条件：
+    /// - `None` 表示当前没有需要展示的提示；错误和成功提示都用短中文文本保存，避免设置页继续理解底层错误类型。
+    pub(in crate::app) status_message: Option<String>,
+    /// 插件声明式页面独立窗口句柄。
+    ///
+    /// 业务意图：
+    /// - 插件 v1 只允许返回宿主可控的声明式页面；窗口句柄由主视图统一持有，重复打开时复用并替换页面内容。
+    pub(in crate::app) page_window: Option<WindowHandle<PluginPageWindowView>>,
+    /// 当前正在执行的插件命令代次。
+    ///
+    /// 业务意图：
+    /// - 插件命令在后台进程中运行，用户可能连续触发不同插件；代次用于丢弃旧进程迟到的进度和结果。
+    /// - `None` 表示当前没有受宿主追踪的运行中插件命令，窗口可以展示最终结果或空状态。
+    pub(in crate::app) active_command_generation: Option<usize>,
+    /// 下一个插件命令代次。
+    ///
+    /// 边界条件：
+    /// - 代次只在当前会话内用于 UI 竞争消解，不写入配置；溢出时使用饱和加一即可，实际会话不会达到上限。
+    pub(in crate::app) next_command_generation: usize,
+}
+
+impl PluginWorkspaceState {
+    /// 从 JSON 注册表加载插件工作区状态。
+    ///
+    /// 边界条件：
+    /// - 注册表读取失败会回退为空注册表；具体磁盘错误不阻断主窗口启动，用户可以在设置页重新加载插件。
+    pub(in crate::app) fn load() -> Self {
+        let registry = load_plugin_registry();
+        let definitions = load_plugin_definitions(&registry);
+        Self {
+            registry,
+            definitions,
+            status_message: None,
+            page_window: None,
+            active_command_generation: None,
+            next_command_generation: 1,
+        }
+    }
+
+    /// 按当前注册表重新读取插件 manifest。
+    ///
+    /// 业务意图：
+    /// - 加载目录插件、安装 ZIP、启用禁用和卸载后都需要立刻刷新贡献点列表，让右键菜单和设置页保持一致。
+    pub(in crate::app) fn reload_definitions(&mut self) {
+        self.definitions = load_plugin_definitions(&self.registry);
+    }
+
+    /// 开始追踪一个新的插件命令并返回代次。
+    pub(in crate::app) fn begin_command_generation(&mut self) -> usize {
+        let generation = self.next_command_generation;
+        self.next_command_generation = self.next_command_generation.saturating_add(1);
+        self.active_command_generation = Some(generation);
+        generation
+    }
 }
 
 impl SettingsState {
@@ -284,6 +465,7 @@ impl SettingsState {
             thread_analysis_filter_last_layouts: Vec::new(),
             thread_analysis_filter_last_bounds: None,
             thread_analysis_filter_selection_drag: None,
+            storage: StorageSettingsState::new(),
         }
     }
 }

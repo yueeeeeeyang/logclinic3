@@ -49,12 +49,12 @@ fn 笔记源码双击选词只包含文字() {
     );
 }
 
-/// 验证旧 Markdown 笔记进入编辑态后即使正文未变也会提示保存。
+/// 验证 Markdown 笔记编辑态按导出的 Markdown 判断未保存修改。
 ///
 /// 业务意图：
-/// - Markdown UI 已隐藏，旧数据按普通文本富文本化展示和编辑；保存后需要把格式字段转为 `RichText`，避免后续再次触发旧格式分支。
+/// - 物理文件存储下 Markdown 是真实正文格式；如果富文本导出的 Markdown 与文件原文一致，就不应提示保存。
 #[test]
-fn markdown_笔记编辑后会按富文本保存() {
+fn markdown_笔记编辑后按_markdown_内容判断未保存() {
     let note = Note {
         id: "note-1".to_string(),
         directory_id: None,
@@ -65,28 +65,18 @@ fn markdown_笔记编辑后会按富文本保存() {
         updated_at_ms: 1,
     };
 
-    assert!(NotesWorkspaceState::note_editor_has_unsaved_changes(
-        true,
-        "旧笔记",
-        &NoteRichTextDocument::from_plain_text("# 标题")
-            .to_json()
-            .unwrap(),
-        &note
-    ));
-
-    let rich_content = NoteRichTextDocument::from_plain_text("# 标题")
-        .to_json()
-        .unwrap();
-    let rich_note = Note {
-        content: rich_content.clone(),
-        content_format: NoteContentFormat::RichText,
-        ..note
-    };
     assert!(!NotesWorkspaceState::note_editor_has_unsaved_changes(
         true,
         "旧笔记",
-        &rich_content,
-        &rich_note
+        "# 标题",
+        &note
+    ));
+
+    assert!(NotesWorkspaceState::note_editor_has_unsaved_changes(
+        true,
+        "旧笔记",
+        "## 标题",
+        &note
     ));
 }
 
@@ -151,4 +141,94 @@ fn 笔记代码块视觉高度包含卡片结构() {
                 + NOTES_CODE_BLOCK_VERTICAL_PADDING
                 + NOTES_CODE_BLOCK_LINE_HEIGHT
     );
+}
+
+/// 验证笔记 AI 请求上下文使用当前编辑器草稿。
+///
+/// 业务意图：
+/// - 笔记 AI 发送前必须携带当前未保存标题和 Markdown 正文；该测试锁定请求构造，不允许未来改成重新读取磁盘旧内容。
+#[test]
+fn 笔记_ai_请求包含当前草稿标题和_markdown() {
+    let document = NotesAiDocumentContext {
+        title: "草稿标题".to_string(),
+        markdown: "# 未保存正文".to_string(),
+    };
+    let messages = build_notes_ai_request_messages(&document, &[], "帮我扩写");
+
+    assert_eq!(messages[0].role, "system");
+    assert!(messages[1].content.contains("草稿标题"));
+    assert!(messages[1].content.contains("# 未保存正文"));
+    assert_eq!(messages.last().unwrap().role, "user");
+    assert_eq!(messages.last().unwrap().content, "帮我扩写");
+}
+
+/// 验证笔记 AI 临时历史只发送可用消息。
+///
+/// 边界条件：
+/// - 失败、正在生成和空正文消息不能再次进入请求上下文，否则模型会看到错误或半截回复。
+#[test]
+fn 笔记_ai_请求过滤失败和流式历史() {
+    let document = NotesAiDocumentContext {
+        title: "标题".to_string(),
+        markdown: "正文".to_string(),
+    };
+    let history = vec![
+        NotesAiMessage {
+            id: "user-ok".to_string(),
+            role: NotesAiMessageRole::User,
+            content: "上一轮要求".to_string(),
+            reasoning_content: String::new(),
+            status: AiChatMessageStatus::Complete,
+            error_message: None,
+        },
+        NotesAiMessage {
+            id: "assistant-streaming".to_string(),
+            role: NotesAiMessageRole::Assistant,
+            content: "半截回复".to_string(),
+            reasoning_content: String::new(),
+            status: AiChatMessageStatus::Streaming,
+            error_message: None,
+        },
+        NotesAiMessage {
+            id: "assistant-failed".to_string(),
+            role: NotesAiMessageRole::Assistant,
+            content: "失败回复".to_string(),
+            reasoning_content: String::new(),
+            status: AiChatMessageStatus::Failed,
+            error_message: Some("失败".to_string()),
+        },
+        NotesAiMessage {
+            id: "assistant-ok".to_string(),
+            role: NotesAiMessageRole::Assistant,
+            content: "可用回复".to_string(),
+            reasoning_content: String::new(),
+            status: AiChatMessageStatus::Stopped,
+            error_message: None,
+        },
+    ];
+
+    let messages = build_notes_ai_request_messages(&document, &history, "继续");
+    let joined = messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(joined.contains("上一轮要求"));
+    assert!(joined.contains("可用回复"));
+    assert!(!joined.contains("半截回复"));
+    assert!(!joined.contains("失败回复"));
+}
+
+/// 验证 AI Markdown 回复可以转换为富文本片段。
+///
+/// 业务意图：
+/// - 用户点击“插入”时会把 AI Markdown 回复转成编辑器富文本片段；基础 Markdown 语义必须能进入文档模型。
+#[test]
+fn 笔记_ai_markdown_回复可转换为富文本() {
+    let document = NoteRichTextDocument::from_markdown("**重点**\n\n- 条目");
+    let markdown = document.to_markdown();
+
+    assert!(markdown.contains("**重点**"));
+    assert!(markdown.contains("- 条目"));
 }

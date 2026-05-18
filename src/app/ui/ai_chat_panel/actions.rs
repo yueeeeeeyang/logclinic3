@@ -751,10 +751,22 @@ impl MainView {
         context: &mut Context<Self>,
     ) {
         let was_resizing_conversation_list = self.ai_chat.conversation_list_resize_drag.is_some();
+        let was_selecting_message_text = self
+            .ai_chat
+            .message_text_selection
+            .as_ref()
+            .is_some_and(|selection| selection.dragging);
         self.update_ai_chat_scrollbar_drag(event, context);
         self.update_ai_chat_input_resize_drag(event, window, context);
         self.update_ai_chat_conversation_list_resize_drag(event, window, context);
-        if was_resizing_conversation_list {
+        if was_selecting_message_text {
+            if event.dragging() {
+                self.update_ai_chat_message_text_selection(event.position, context);
+            } else {
+                self.finish_ai_chat_message_text_selection(context);
+            }
+        }
+        if was_resizing_conversation_list || was_selecting_message_text {
             context.stop_propagation();
         }
     }
@@ -767,10 +779,16 @@ impl MainView {
         context: &mut Context<Self>,
     ) {
         let was_resizing_conversation_list = self.ai_chat.conversation_list_resize_drag.is_some();
+        let was_selecting_message_text = self
+            .ai_chat
+            .message_text_selection
+            .as_ref()
+            .is_some_and(|selection| selection.dragging);
         self.stop_ai_chat_scrollbar_drag(context);
         self.stop_ai_chat_input_resize_drag(context);
         self.stop_ai_chat_conversation_list_resize_drag(context);
-        if was_resizing_conversation_list {
+        self.finish_ai_chat_message_text_selection(context);
+        if was_resizing_conversation_list || was_selecting_message_text {
             context.stop_propagation();
         }
     }
@@ -797,6 +815,158 @@ impl MainView {
     ) {
         self.ai_chat.input_last_layouts = layouts;
         self.ai_chat.input_last_bounds = Some(bounds);
+    }
+
+    /// 保存 AI 对话消息正文文本段最近一次绘制布局。
+    ///
+    /// 业务意图：
+    /// - 消息气泡正文是自绘可选文本，鼠标拖选必须基于最近一帧真实自动换行布局命中字符。
+    /// - 这里只缓存已经绘制过的文本段布局，不参与持久化；布局失效时会在下一帧重绘覆盖。
+    pub(in crate::app) fn store_ai_chat_message_text_layout(
+        &mut self,
+        segment: AiChatMessageTextSegmentKey,
+        snapshot: AiChatMessageTextLayoutSnapshot,
+    ) {
+        self.ai_chat.message_text_layouts.insert(segment, snapshot);
+    }
+
+    /// 返回指定消息文本段当前选择范围。
+    pub(in crate::app) fn ai_chat_message_text_selection_for_segment(
+        &self,
+        segment: &AiChatMessageTextSegmentKey,
+    ) -> Option<Range<usize>> {
+        self.ai_chat
+            .message_text_selection
+            .as_ref()
+            .filter(|selection| &selection.segment == segment)
+            .map(|selection| selection.range.clone())
+    }
+
+    /// 开始选择 AI 消息气泡文本。
+    ///
+    /// 业务意图：
+    /// - 单击只定位锚点，拖动选择文本；双击选择词，三击选择当前可绘制文本段。
+    /// - 选区开始时聚焦消息选择句柄，让随后 `Cmd/Ctrl+C` 复制消息选区，而不是继续作用于输入框。
+    pub(in crate::app) fn start_ai_chat_message_text_selection(
+        &mut self,
+        segment: AiChatMessageTextSegmentKey,
+        text: String,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        let index = self.ai_chat_message_text_index_at_position(&segment, event.position);
+        let range = match event.click_count {
+            0 | 1 => index..index,
+            2 => Self::search_text_word_range_for_index(&text, index),
+            _ => 0..text.len(),
+        };
+        let range = Self::clamp_search_text_range(&text, range);
+        self.ai_chat.message_text_selection = Some(AiChatMessageTextSelection {
+            segment,
+            text,
+            drag_anchor: range.start,
+            dragging: event.click_count <= 1,
+            range,
+        });
+        window.focus(&self.ai_chat.message_selection_focus);
+        context.notify();
+    }
+
+    /// 根据窗口坐标返回 AI 消息文本段 UTF-8 字节下标。
+    fn ai_chat_message_text_index_at_position(
+        &self,
+        segment: &AiChatMessageTextSegmentKey,
+        position: Point<Pixels>,
+    ) -> usize {
+        let Some(snapshot) = self.ai_chat.message_text_layouts.get(segment) else {
+            return self
+                .ai_chat
+                .message_text_selection
+                .as_ref()
+                .filter(|selection| &selection.segment == segment)
+                .map(|selection| selection.text.len())
+                .unwrap_or(0);
+        };
+        ai_chat_selectable_text_index_for_position(snapshot, position)
+    }
+
+    /// 鼠标拖拽时更新 AI 消息文本选区终点。
+    fn update_ai_chat_message_text_selection(
+        &mut self,
+        position: Point<Pixels>,
+        context: &mut Context<Self>,
+    ) {
+        let Some(selection_snapshot) = self.ai_chat.message_text_selection.clone() else {
+            return;
+        };
+        if !selection_snapshot.dragging {
+            return;
+        }
+        let index =
+            self.ai_chat_message_text_index_at_position(&selection_snapshot.segment, position);
+        let range = Self::clamp_search_text_range(
+            &selection_snapshot.text,
+            selection_snapshot.drag_anchor..index,
+        );
+        if let Some(selection) = self.ai_chat.message_text_selection.as_mut() {
+            selection.range = range;
+        }
+        context.notify();
+    }
+
+    /// 结束 AI 消息文本拖选。
+    fn finish_ai_chat_message_text_selection(&mut self, context: &mut Context<Self>) {
+        if let Some(selection) = self.ai_chat.message_text_selection.as_mut()
+            && selection.dragging
+        {
+            selection.dragging = false;
+            context.notify();
+        }
+    }
+
+    /// 复制当前 AI 消息气泡文本选区。
+    ///
+    /// 边界条件：
+    /// - 空选区不消费复制快捷键，为其它控件保留默认复制行为。
+    pub(in crate::app) fn copy_selected_ai_chat_message_text(
+        &self,
+        context: &mut Context<Self>,
+    ) -> bool {
+        let Some(selection) = self.ai_chat.message_text_selection.as_ref() else {
+            return false;
+        };
+        let range = Self::clamp_search_text_range(&selection.text, selection.range.clone());
+        if range.start >= range.end {
+            return false;
+        }
+        context.write_to_clipboard(ClipboardItem::new_string(selection.text[range].to_string()));
+        true
+    }
+
+    /// 复制整条 AI 对话消息正文。
+    pub(in crate::app) fn copy_ai_chat_message_to_clipboard(
+        &self,
+        message_id: &str,
+        context: &mut Context<Self>,
+    ) -> bool {
+        let Some(message) = self
+            .ai_chat
+            .messages
+            .iter()
+            .find(|message| message.id == message_id)
+        else {
+            return false;
+        };
+        let text = ai_chat_message_clipboard_text(message);
+        if text.is_empty() {
+            return false;
+        }
+        context.write_to_clipboard(ClipboardItem::new_string(text));
+        true
     }
 
     /// 返回 AI 对话输入区当前内容需要的可视行数。

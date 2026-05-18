@@ -4,24 +4,149 @@
 // - 本文件集中维护笔记树创建/选择/删除、阅读器选区、编辑器快捷键、保存和确认弹窗状态流转。
 // - 方法仍实现到 MainView 上，保持和其它 app UI 动作模块一致的调用方式，不引入新的公开状态对象。
 
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    time::Duration,
+};
+
 use super::*;
 
 impl MainView {
-    /// 返回笔记数据库路径，失败时同步记录错误。
-    pub(in crate::app) fn notes_database_path_or_error(&mut self) -> Option<PathBuf> {
-        let path = notes_database_path();
+    /// 返回笔记物理根目录路径，失败时同步记录错误。
+    pub(in crate::app) fn notes_root_dir_or_error(&mut self) -> Option<PathBuf> {
+        let path = notes_root_dir();
         if path.is_none() {
             self.notes.database_error =
-                Some("当前平台没有可用的应用配置目录，无法保存笔记".to_string());
+                Some("当前平台没有可用的应用配置目录，无法保存笔记文件".to_string());
         }
         path
     }
 
+    /// 清空并关闭当前笔记 AI 临时会话。
+    ///
+    /// 业务意图：
+    /// - 笔记 AI 请求会携带当前文档全文；切换、删除或退出编辑时必须停止旧任务并清空消息，避免旧上下文误用于其它笔记。
+    /// - 该方法只影响当前内存会话，不触碰全局 AI 对话数据库和笔记 Markdown 文件。
+    pub(in crate::app) fn reset_notes_ai_assistant_session(&mut self) {
+        self.notes.ai.is_open = false;
+        self.notes.ai.reset_session();
+    }
+
+    /// 切换笔记 AI 侧边栏开关。
+    ///
+    /// UI 约束：
+    /// - 入口只在编辑态可用；如果通过快捷路径误调用，必须静默返回，避免只读阅读器出现可写 AI 工具。
+    /// - 打开时会选择默认模型并聚焦输入框，让用户可以直接输入生成要求。
+    pub(in crate::app) fn toggle_notes_ai_assistant(
+        &mut self,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if self.notes.active_note.is_none() || !self.notes.is_editing {
+            return;
+        }
+        if self.notes.ai.is_open {
+            self.stop_notes_ai_streaming_without_notify(AiChatMessageStatus::Stopped, None);
+            self.notes.ai.is_open = false;
+        } else {
+            self.ensure_notes_ai_model_selection();
+            self.notes.ai.is_open = true;
+            self.notes.ai.error_message = None;
+            window.focus(&self.notes.ai.input_focus);
+        }
+        context.notify();
+    }
+
+    /// 确保笔记 AI 有一个可用模型选择。
+    ///
+    /// 业务意图：
+    /// - 模型配置可能在设置页被删除或修改；发送前和打开侧边栏时都要重新校正，避免持有悬空模型 ID。
+    pub(in crate::app) fn ensure_notes_ai_model_selection(&mut self) {
+        let current_is_valid = self
+            .notes
+            .ai
+            .selected_model_profile_id
+            .as_deref()
+            .is_some_and(|profile_id| {
+                self.model_config
+                    .model_config_profiles
+                    .iter()
+                    .any(|profile| profile.id == profile_id)
+            });
+        if current_is_valid {
+            return;
+        }
+        self.notes.ai.selected_model_profile_id = ai_chat_default_model_profile_id(
+            &self.model_config.model_config_profiles,
+            self.model_config.model_config_default_profile_id.as_deref(),
+        );
+    }
+
+    /// 返回笔记 AI 当前选择的模型配置。
+    pub(in crate::app) fn active_notes_ai_model_profile(&self) -> Option<ModelProfile> {
+        let profile_id = self.notes.ai.selected_model_profile_id.as_deref()?;
+        self.model_config
+            .model_config_profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+    }
+
+    /// 判断笔记 AI 当前是否可以发送。
+    ///
+    /// 边界条件：
+    /// - 必须处于编辑态并有当前笔记；AI 生成结果只写入编辑草稿，不允许在只读态暗中修改文档。
+    /// - 正在流式生成时禁止再次发送，避免多个后台任务同时写同一个临时助手消息。
+    pub(in crate::app) fn notes_ai_can_send(&self) -> bool {
+        self.notes.active_note.is_some()
+            && self.notes.is_editing
+            && self.notes.ai.streaming_task.is_none()
+            && self.active_notes_ai_model_profile().is_some()
+            && !self.notes.ai.input_text.trim().is_empty()
+    }
+
+    /// 返回当前笔记 AI 请求应携带的文档上下文。
+    ///
+    /// 业务意图：
+    /// - 上下文必须来自当前编辑器草稿，包括尚未保存的标题和正文 Markdown，不能重新读取磁盘上的旧文件。
+    pub(in crate::app) fn current_notes_ai_document_context(
+        &self,
+    ) -> Option<NotesAiDocumentContext> {
+        self.notes.active_note.as_ref()?;
+        Some(NotesAiDocumentContext {
+            title: self.notes.editor_title.clone(),
+            markdown: self.notes.rich_editor.markdown_content(),
+        })
+    }
+
+    /// 选择笔记 AI 使用的模型配置。
+    pub(in crate::app) fn select_notes_ai_model_profile(
+        &mut self,
+        profile_id: String,
+        context: &mut Context<Self>,
+    ) {
+        if self
+            .model_config
+            .model_config_profiles
+            .iter()
+            .any(|profile| profile.id == profile_id)
+        {
+            self.notes.ai.selected_model_profile_id = Some(profile_id);
+            self.notes.ai.model_menu_open = false;
+            self.notes.ai.error_message = None;
+        }
+        context.notify();
+    }
+
     /// 重新加载笔记树并保持可见状态。
     pub(in crate::app) fn reload_notes_tree(&mut self) {
-        let Some(path) = notes_database_path() else {
+        let Some(path) = notes_root_dir() else {
             self.notes.database_error =
-                Some("当前平台没有可用的应用配置目录，无法保存笔记".to_string());
+                Some("当前平台没有可用的应用配置目录，无法保存笔记文件".to_string());
             return;
         };
         match load_note_tree(&path) {
@@ -29,15 +154,64 @@ impl MainView {
                 self.notes.tree_rows = rows;
                 self.notes.database_error = None;
                 self.notes.rebuild_visible_rows();
+                self.reconcile_active_note_after_tree_reload();
             }
             Err(error) => self.notes.database_error = Some(error),
+        }
+    }
+
+    /// 请求手动刷新物理笔记目录。
+    ///
+    /// 业务意图：
+    /// - 物理 Markdown 文件可能被外部编辑器新增、删除或重命名；本版本不做文件监听，用户通过刷新按钮显式同步。
+    /// - 如果当前富文本编辑器有未保存修改，必须沿用现有确认弹窗，避免刷新时丢失草稿。
+    pub(in crate::app) fn request_refresh_notes_tree(&mut self, context: &mut Context<Self>) {
+        if self.notes.has_unsaved_changes() {
+            self.notes.unsaved_dialog = Some(NotesUnsavedDialog {
+                action: NotesPendingAction::Refresh,
+            });
+            context.notify();
+            return;
+        }
+        self.reload_notes_tree();
+        context.notify();
+    }
+
+    /// 刷新笔记树后校正当前打开的笔记状态。
+    ///
+    /// 边界条件：
+    /// - 外部删除当前文件后，右侧不能继续显示已经不存在的正文。
+    /// - 外部修改当前文件且当前不在编辑态时，刷新应重新读取正文。
+    fn reconcile_active_note_after_tree_reload(&mut self) {
+        let Some(active_note) = self.notes.active_note.clone() else {
+            return;
+        };
+        let still_exists = self
+            .notes
+            .tree_rows
+            .iter()
+            .any(|row| row.kind == NoteTreeRowKind::Note && row.id == active_note.id);
+        if !still_exists {
+            self.notes.active_note = None;
+            self.notes.selected = None;
+            self.notes.is_editing = false;
+            self.notes
+                .rich_editor
+                .reset_document(NoteRichTextDocument::empty());
+            self.notes.editor_title.clear();
+            self.notes.title_selection_range = 0..0;
+            self.reset_notes_ai_assistant_session();
+            return;
+        }
+        if !self.notes.is_editing {
+            self.load_note_into_workspace(&active_note.id);
         }
     }
 
     /// 将笔记正文加载为富文本文档。
     ///
     /// 业务意图：
-    /// - 旧纯文本和 Markdown 笔记在打开时懒转换为富文本文档，只在保存时写回 JSON，避免启动时迁移整库。
+    /// - Markdown 笔记在打开时转换为富文本文档，保存时再导出 Markdown，避免编辑器状态直接泄漏到物理文件格式。
     /// - 富文本 JSON 解析失败说明单篇笔记数据损坏，需要展示中文错误并阻止用户在错误文档上误保存。
     ///
     /// 边界条件：
@@ -118,6 +292,7 @@ impl MainView {
         self.notes.tree_context_menu = None;
         self.notes.tree_create_menu_open = false;
         self.notes.delete_confirm_dialog = None;
+        self.reset_notes_ai_assistant_session();
 
         match selection.kind {
             NoteTreeRowKind::Directory => {
@@ -161,11 +336,12 @@ impl MainView {
 
     /// 加载笔记正文到右侧工作区。
     pub(in crate::app) fn load_note_into_workspace(&mut self, note_id: &str) {
-        let Some(path) = self.notes_database_path_or_error() else {
+        let Some(path) = self.notes_root_dir_or_error() else {
             return;
         };
         match load_note(&path, note_id) {
             Ok(Some(note)) => {
+                self.reset_notes_ai_assistant_session();
                 self.notes.editor_title = note.title.clone();
                 let title_cursor = self.notes.editor_title.len();
                 self.notes.title_selection_range = title_cursor..title_cursor;
@@ -249,7 +425,9 @@ impl MainView {
             NotesTreeContextMenuAction::NewNote => {
                 self.create_note_in_selected_directory(window, context);
             }
-            NotesTreeContextMenuAction::Rename | NotesTreeContextMenuAction::Delete => {}
+            NotesTreeContextMenuAction::Rename
+            | NotesTreeContextMenuAction::Delete
+            | NotesTreeContextMenuAction::Plugin { .. } => {}
         }
         context.stop_propagation();
     }
@@ -276,7 +454,7 @@ impl MainView {
         parent_id: Option<String>,
         context: &mut Context<Self>,
     ) {
-        let Some(path) = self.notes_database_path_or_error() else {
+        let Some(path) = self.notes_root_dir_or_error() else {
             context.notify();
             return;
         };
@@ -297,6 +475,7 @@ impl MainView {
                     .reset_document(NoteRichTextDocument::empty());
                 self.notes.editor_title.clear();
                 self.notes.title_selection_range = 0..0;
+                self.reset_notes_ai_assistant_session();
             }
             Err(error) => self.notes.database_error = Some(error),
         }
@@ -337,7 +516,7 @@ impl MainView {
         window: Option<&mut Window>,
         context: &mut Context<Self>,
     ) {
-        let Some(path) = self.notes_database_path_or_error() else {
+        let Some(path) = self.notes_root_dir_or_error() else {
             context.notify();
             return;
         };
@@ -358,6 +537,7 @@ impl MainView {
                 self.notes.title_marked_range = None;
                 self.reset_note_rich_editor_from_note(&note, false, None);
                 self.notes.is_editing = true;
+                self.reset_notes_ai_assistant_session();
                 if let Some(window) = window {
                     window.focus(&self.notes.rich_editor.focus);
                 }
@@ -440,12 +620,12 @@ impl MainView {
         context.notify();
     }
 
-    /// 确认重命名弹窗并写入 SQLite。
+    /// 确认重命名弹窗并重命名真实目录或 Markdown 文件。
     pub(in crate::app) fn confirm_note_rename(&mut self, context: &mut Context<Self>) -> bool {
         let Some(dialog) = self.notes.rename_dialog.take() else {
             return false;
         };
-        let Some(path) = self.notes_database_path_or_error() else {
+        let Some(path) = self.notes_root_dir_or_error() else {
             self.notes.rename_dialog = Some(dialog);
             context.notify();
             return false;
@@ -471,11 +651,40 @@ impl MainView {
             NoteTreeRowKind::Note => rename_note(&path, &dialog.target.id, next_title),
         };
         match result {
-            Ok(()) => {
+            Ok(next_id) => {
                 if let Some(note) = self.notes.active_note.as_mut()
                     && note.id == dialog.target.id
                 {
+                    note.id = next_id.clone();
                     note.title = next_title.to_string();
+                }
+                if dialog.target.kind == NoteTreeRowKind::Directory {
+                    if let Some(note) = self.notes.active_note.as_mut() {
+                        Self::rewrite_note_path_value_prefix(
+                            &mut note.id,
+                            &dialog.target.id,
+                            &next_id,
+                        );
+                        Self::rewrite_optional_note_path_prefix(
+                            &mut note.directory_id,
+                            &dialog.target.id,
+                            &next_id,
+                        );
+                    }
+                    if let Some(selection) = self.notes.selected.as_mut() {
+                        Self::rewrite_note_path_value_prefix(
+                            &mut selection.id,
+                            &dialog.target.id,
+                            &next_id,
+                        );
+                    }
+                    self.rewrite_expanded_note_directory_prefix(&dialog.target.id, &next_id);
+                }
+                if let Some(selection) = self.notes.selected.as_mut()
+                    && selection.id == dialog.target.id
+                    && selection.kind == dialog.target.kind
+                {
+                    selection.id = next_id.clone();
                 }
                 self.notes.editor_title = self
                     .notes
@@ -539,7 +748,7 @@ impl MainView {
         let Some(dialog) = self.notes.delete_confirm_dialog.take() else {
             return;
         };
-        let Some(path) = self.notes_database_path_or_error() else {
+        let Some(path) = self.notes_root_dir_or_error() else {
             context.notify();
             return;
         };
@@ -558,6 +767,7 @@ impl MainView {
                         .reset_document(NoteRichTextDocument::empty());
                     self.notes.editor_title.clear();
                     self.notes.title_selection_range = 0..0;
+                    self.reset_notes_ai_assistant_session();
                 }
                 self.notes.selected = None;
                 self.notes.tree_context_menu = None;
@@ -571,7 +781,7 @@ impl MainView {
     /// 判断删除目标是否覆盖当前右侧打开的笔记。
     ///
     /// 业务意图：
-    /// - 删除目录会由 SQLite 外键级联删除子目录和子笔记，UI 也必须同步清空右侧旧正文，避免用户继续查看或编辑已经不存在的笔记。
+    /// - 删除目录会把真实目录移入系统回收站，UI 也必须同步清空右侧旧正文，避免用户继续查看或编辑已经不存在的笔记。
     fn note_delete_target_contains_active_note(&self, target: &NotesTreeSelection) -> bool {
         let Some(active_note) = self.notes.active_note.as_ref() else {
             return false;
@@ -599,9 +809,660 @@ impl MainView {
         }
     }
 
+    /// 重写已展开目录集合中的路径前缀。
+    ///
+    /// 业务意图：
+    /// - 物理文件存储下目录 ID 就是相对路径，重命名目录会同步改变所有子路径；展开状态也要跟随路径变化。
+    /// - 如果不处理，用户重命名展开目录后会看到子树意外折叠，且旧路径会残留在会话状态中。
+    fn rewrite_expanded_note_directory_prefix(&mut self, old_id: &str, next_id: &str) {
+        let old_prefix = format!("{old_id}/");
+        self.notes.expanded_directory_ids = self
+            .notes
+            .expanded_directory_ids
+            .iter()
+            .map(|id| {
+                if id == old_id {
+                    next_id.to_string()
+                } else if let Some(suffix) = id.strip_prefix(&old_prefix) {
+                    format!("{next_id}/{suffix}")
+                } else {
+                    id.clone()
+                }
+            })
+            .collect();
+    }
+
+    /// 重写单个笔记路径 ID 的目录前缀。
+    ///
+    /// 业务意图：
+    /// - 目录重命名后，所有子目录和子笔记的 ID 都随真实路径变化；当前打开笔记和选中节点必须同步更新，刷新树时才不会被误判为已删除。
+    fn rewrite_note_path_value_prefix(value: &mut String, old_id: &str, next_id: &str) -> bool {
+        if value == old_id {
+            *value = next_id.to_string();
+            return true;
+        }
+        let old_prefix = format!("{old_id}/");
+        if let Some(suffix) = value.strip_prefix(&old_prefix) {
+            *value = format!("{next_id}/{suffix}");
+            return true;
+        }
+        false
+    }
+
+    /// 重写可选笔记路径 ID 的目录前缀。
+    fn rewrite_optional_note_path_prefix(
+        value: &mut Option<String>,
+        old_id: &str,
+        next_id: &str,
+    ) -> bool {
+        let Some(value) = value.as_mut() else {
+            return false;
+        };
+        Self::rewrite_note_path_value_prefix(value, old_id, next_id)
+    }
+
     /// 取消删除确认。
     pub(in crate::app) fn cancel_note_delete(&mut self, context: &mut Context<Self>) {
         self.notes.delete_confirm_dialog = None;
+        context.notify();
+    }
+
+    /// 读取笔记 AI 输入区当前文本、选择范围和组合文本范围的快照。
+    pub(in crate::app) fn notes_ai_input_text_snapshot(
+        &self,
+    ) -> (String, Range<usize>, Option<Range<usize>>) {
+        (
+            self.notes.ai.input_text.clone(),
+            Self::clamp_search_text_range(
+                &self.notes.ai.input_text,
+                self.notes.ai.input_selection_range.clone(),
+            ),
+            self.notes.ai.input_marked_range.clone(),
+        )
+    }
+
+    /// 保存笔记 AI 输入区最近一次多行排版结果。
+    pub(in crate::app) fn store_notes_ai_input_text_layouts(
+        &mut self,
+        layouts: Vec<NotesAiInputLineLayout>,
+        bounds: Bounds<Pixels>,
+    ) -> bool {
+        let layout_count_changed = self.notes.ai.input_last_layouts.len() != layouts.len();
+        self.notes.ai.input_last_layouts = layouts;
+        self.notes.ai.input_last_bounds = Some(bounds);
+        layout_count_changed
+    }
+
+    /// 返回笔记 AI 输入区当前内容需要的可视行数。
+    pub(in crate::app) fn notes_ai_input_visual_line_count(&self) -> usize {
+        let hard_line_count = Self::thread_analysis_filter_line_ranges(&self.notes.ai.input_text)
+            .len()
+            .max(1);
+        self.notes
+            .ai
+            .input_last_layouts
+            .len()
+            .max(hard_line_count)
+            .max(1)
+    }
+
+    /// 根据窗口坐标返回笔记 AI 输入区 UTF-8 字节下标。
+    pub(in crate::app) fn notes_ai_input_index_for_point(&self, position: Point<Pixels>) -> usize {
+        if self.notes.ai.input_text.is_empty() {
+            return 0;
+        }
+        for layout in &self.notes.ai.input_last_layouts {
+            if position.y >= layout.bounds.top() && position.y <= layout.bounds.bottom() {
+                return layout
+                    .byte_range
+                    .start
+                    .saturating_add(
+                        layout
+                            .line
+                            .closest_index_for_x(position.x - layout.bounds.left()),
+                    )
+                    .min(layout.byte_range.end);
+            }
+        }
+        if let Some(bounds) = &self.notes.ai.input_last_bounds
+            && position.y < bounds.top()
+        {
+            return 0;
+        }
+        self.notes.ai.input_text.len()
+    }
+
+    /// 开始笔记 AI 输入区鼠标选择。
+    pub(in crate::app) fn start_notes_ai_input_mouse_selection(
+        &mut self,
+        event: &MouseDownEvent,
+        context: &mut Context<Self>,
+    ) {
+        let index = self.notes_ai_input_index_for_point(event.position);
+        self.notes.ai.input_marked_range = None;
+        match event.click_count {
+            0 | 1 => {
+                if event.modifiers.shift {
+                    self.notes.ai.input_selection_range.end = index;
+                    self.notes.ai.input_selection_range = Self::clamp_search_text_range(
+                        &self.notes.ai.input_text,
+                        self.notes.ai.input_selection_range.clone(),
+                    );
+                } else {
+                    self.notes.ai.input_selection_range = index..index;
+                }
+                self.notes.ai.input_selection_drag =
+                    Some(self.notes.ai.input_selection_range.start);
+            }
+            2 => {
+                self.notes.ai.input_selection_range =
+                    Self::search_text_word_range_for_index(&self.notes.ai.input_text, index);
+                self.notes.ai.input_selection_drag = None;
+            }
+            _ => {
+                self.notes.ai.input_selection_range = 0..self.notes.ai.input_text.len();
+                self.notes.ai.input_selection_drag = None;
+            }
+        }
+        self.touch_search_text_cursor_activity();
+        context.notify();
+    }
+
+    /// 鼠标拖拽时更新笔记 AI 输入区选区终点。
+    pub(in crate::app) fn update_notes_ai_input_mouse_selection(
+        &mut self,
+        position: Point<Pixels>,
+        context: &mut Context<Self>,
+    ) {
+        let Some(anchor) = self.notes.ai.input_selection_drag else {
+            return;
+        };
+        let index = self.notes_ai_input_index_for_point(position);
+        self.notes.ai.input_marked_range = None;
+        self.notes.ai.input_selection_range =
+            Self::clamp_search_text_range(&self.notes.ai.input_text, anchor..index);
+        self.touch_search_text_cursor_activity();
+        context.notify();
+    }
+
+    /// 结束笔记 AI 输入区鼠标拖拽选择。
+    pub(in crate::app) fn finish_notes_ai_input_mouse_selection(
+        &mut self,
+        context: &mut Context<Self>,
+    ) {
+        if self.notes.ai.input_selection_drag.take().is_some() {
+            context.notify();
+        }
+    }
+
+    /// 返回笔记 AI 输入区当前选中文本。
+    pub(in crate::app) fn selected_notes_ai_input_text(&self) -> Option<String> {
+        let range = Self::clamp_search_text_range(
+            &self.notes.ai.input_text,
+            self.notes.ai.input_selection_range.clone(),
+        );
+        (range.start < range.end).then(|| self.notes.ai.input_text[range].to_string())
+    }
+
+    /// 用给定文本替换笔记 AI 输入区当前选区。
+    pub(in crate::app) fn replace_notes_ai_input_selection(&mut self, replacement: &str) {
+        let replacement = replacement.replace("\r\n", "\n").replace('\r', "\n");
+        let range = self.notes.ai.input_marked_range.take().unwrap_or_else(|| {
+            Self::clamp_search_text_range(
+                &self.notes.ai.input_text,
+                self.notes.ai.input_selection_range.clone(),
+            )
+        });
+        self.notes
+            .ai
+            .input_text
+            .replace_range(range.clone(), &replacement);
+        let cursor = range.start + replacement.len();
+        self.notes.ai.input_selection_range = cursor..cursor;
+    }
+
+    /// 处理笔记 AI 输入区按键。
+    ///
+    /// 业务意图：
+    /// - Enter 发送、Shift+Enter 换行；普通字符和中文 IME 提交继续交给平台输入协议，避免手写按键字符破坏输入法。
+    pub(in crate::app) fn handle_notes_ai_input_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        context: &mut Context<Self>,
+    ) {
+        if Self::is_paste_keystroke(&event.keystroke) {
+            if let Some(text) = context.read_from_clipboard().and_then(|item| item.text()) {
+                self.replace_notes_ai_input_selection(&text);
+                self.touch_search_text_cursor_activity();
+                context.notify();
+            }
+            context.stop_propagation();
+            return;
+        }
+
+        if Self::is_copy_keystroke(&event.keystroke) {
+            if let Some(text) = self.selected_notes_ai_input_text() {
+                context.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            context.stop_propagation();
+            return;
+        }
+
+        if Self::is_cut_keystroke(&event.keystroke) {
+            if let Some(text) = self.selected_notes_ai_input_text() {
+                context.write_to_clipboard(ClipboardItem::new_string(text));
+                self.replace_notes_ai_input_selection("");
+                self.touch_search_text_cursor_activity();
+                context.notify();
+            }
+            context.stop_propagation();
+            return;
+        }
+
+        if Self::is_select_all_keystroke(&event.keystroke) {
+            self.notes.ai.input_marked_range = None;
+            self.notes.ai.input_selection_range = 0..self.notes.ai.input_text.len();
+            self.touch_search_text_cursor_activity();
+            context.stop_propagation();
+            context.notify();
+            return;
+        }
+
+        match event.keystroke.key.as_str() {
+            "enter" => {
+                if event.keystroke.modifiers.shift {
+                    self.replace_notes_ai_input_selection("\n");
+                    self.touch_search_text_cursor_activity();
+                } else {
+                    self.start_notes_ai_send(context);
+                }
+                context.stop_propagation();
+                context.notify();
+            }
+            "left" => {
+                self.notes.ai.input_marked_range = None;
+                if event.keystroke.modifiers.shift {
+                    self.notes.ai.input_selection_range.end = Self::previous_search_text_boundary(
+                        &self.notes.ai.input_text,
+                        self.notes.ai.input_selection_range.end,
+                    );
+                    self.notes.ai.input_selection_range = Self::clamp_search_text_range(
+                        &self.notes.ai.input_text,
+                        self.notes.ai.input_selection_range.clone(),
+                    );
+                } else if self.notes.ai.input_selection_range.start
+                    != self.notes.ai.input_selection_range.end
+                {
+                    self.notes.ai.input_selection_range = self.notes.ai.input_selection_range.start
+                        ..self.notes.ai.input_selection_range.start;
+                } else {
+                    let cursor = Self::previous_search_text_boundary(
+                        &self.notes.ai.input_text,
+                        self.notes.ai.input_selection_range.end,
+                    );
+                    self.notes.ai.input_selection_range = cursor..cursor;
+                }
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "right" => {
+                self.notes.ai.input_marked_range = None;
+                if event.keystroke.modifiers.shift {
+                    self.notes.ai.input_selection_range.end = Self::next_search_text_boundary(
+                        &self.notes.ai.input_text,
+                        self.notes.ai.input_selection_range.end,
+                    );
+                    self.notes.ai.input_selection_range = Self::clamp_search_text_range(
+                        &self.notes.ai.input_text,
+                        self.notes.ai.input_selection_range.clone(),
+                    );
+                } else if self.notes.ai.input_selection_range.start
+                    != self.notes.ai.input_selection_range.end
+                {
+                    self.notes.ai.input_selection_range = self.notes.ai.input_selection_range.end
+                        ..self.notes.ai.input_selection_range.end;
+                } else {
+                    let cursor = Self::next_search_text_boundary(
+                        &self.notes.ai.input_text,
+                        self.notes.ai.input_selection_range.end,
+                    );
+                    self.notes.ai.input_selection_range = cursor..cursor;
+                }
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "up" => {
+                self.notes.ai.input_marked_range = None;
+                self.notes.ai.input_selection_range = 0..0;
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "down" => {
+                self.notes.ai.input_marked_range = None;
+                let cursor = self.notes.ai.input_text.len();
+                self.notes.ai.input_selection_range = cursor..cursor;
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "backspace" => {
+                if self.notes.ai.input_selection_range.start
+                    != self.notes.ai.input_selection_range.end
+                    || self.notes.ai.input_marked_range.is_some()
+                {
+                    self.replace_notes_ai_input_selection("");
+                } else if let Some((previous_index, _)) = self.notes.ai.input_text
+                    [..self.notes.ai.input_selection_range.end]
+                    .char_indices()
+                    .next_back()
+                {
+                    let cursor = self.notes.ai.input_selection_range.end;
+                    self.notes
+                        .ai
+                        .input_text
+                        .replace_range(previous_index..cursor, "");
+                    self.notes.ai.input_selection_range = previous_index..previous_index;
+                    self.notes.ai.input_marked_range = None;
+                }
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "delete" => {
+                if self.notes.ai.input_selection_range.start
+                    != self.notes.ai.input_selection_range.end
+                    || self.notes.ai.input_marked_range.is_some()
+                {
+                    self.replace_notes_ai_input_selection("");
+                } else if let Some((next_index, next_character)) = self.notes.ai.input_text
+                    [self.notes.ai.input_selection_range.end..]
+                    .char_indices()
+                    .next()
+                {
+                    let start = self.notes.ai.input_selection_range.end + next_index;
+                    let end = start + next_character.len_utf8();
+                    self.notes.ai.input_text.replace_range(start..end, "");
+                    self.notes.ai.input_selection_range = start..start;
+                    self.notes.ai.input_marked_range = None;
+                }
+                self.touch_search_text_cursor_activity();
+                context.stop_propagation();
+                context.notify();
+            }
+            "escape" => {}
+            _ => {}
+        }
+    }
+
+    /// 开始发送笔记 AI 生成请求。
+    ///
+    /// 业务意图：
+    /// - 请求必须在后台执行，并且每次发送前都重新读取当前编辑器草稿 Markdown，确保模型使用最新未保存内容。
+    /// - 笔记 AI 不写入 `ai-chat.db`；消息只追加到当前侧边栏内存列表。
+    pub(in crate::app) fn start_notes_ai_send(&mut self, context: &mut Context<Self>) {
+        self.ensure_notes_ai_model_selection();
+        if !self.notes_ai_can_send() {
+            if self.active_notes_ai_model_profile().is_none() {
+                self.notes.ai.error_message = Some("需要先在设置中配置一个可用模型".to_string());
+                context.notify();
+            }
+            return;
+        }
+        let Some(profile) = self.active_notes_ai_model_profile() else {
+            self.notes.ai.error_message = Some("需要选择一个可用模型配置".to_string());
+            context.notify();
+            return;
+        };
+        let Some(document) = self.current_notes_ai_document_context() else {
+            self.notes.ai.error_message = Some("请先打开并编辑一篇笔记".to_string());
+            context.notify();
+            return;
+        };
+        let prompt = self.notes.ai.input_text.trim().to_string();
+        let request_messages =
+            build_notes_ai_request_messages(&document, &self.notes.ai.messages, &prompt);
+
+        let user_message = NotesAiMessage {
+            id: new_ai_chat_entity_id("notes-ai-message"),
+            role: NotesAiMessageRole::User,
+            content: prompt,
+            reasoning_content: String::new(),
+            status: AiChatMessageStatus::Complete,
+            error_message: None,
+        };
+        let assistant_message = NotesAiMessage {
+            id: new_ai_chat_entity_id("notes-ai-message"),
+            role: NotesAiMessageRole::Assistant,
+            content: String::new(),
+            reasoning_content: String::new(),
+            status: AiChatMessageStatus::Streaming,
+            error_message: None,
+        };
+        let assistant_message_id = assistant_message.id.clone();
+        self.notes.ai.messages.push(user_message);
+        self.notes.ai.messages.push(assistant_message);
+        self.notes.ai.input_text.clear();
+        self.notes.ai.input_selection_range = 0..0;
+        self.notes.ai.input_marked_range = None;
+        self.notes.ai.error_message = None;
+
+        let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_for_task = cancel.clone();
+        let job_id = self.notes.ai.next_job_id;
+        self.notes.ai.next_job_id = self.notes.ai.next_job_id.saturating_add(1);
+        self.notes.ai.streaming_task = Some(NotesAiStreamingTask {
+            job_id,
+            assistant_message_id,
+            receiver,
+            cancel,
+        });
+
+        context
+            .background_spawn(async move {
+                stream_openai_compatible_chat_messages(
+                    profile,
+                    request_messages,
+                    false,
+                    AiChatReasoningEffort::High,
+                    cancel_for_task,
+                    sender,
+                );
+            })
+            .detach();
+        self.schedule_notes_ai_stream_poll(context);
+        context.notify();
+    }
+
+    /// 停止当前笔记 AI 流式生成。
+    pub(in crate::app) fn stop_notes_ai_streaming(&mut self, context: &mut Context<Self>) {
+        self.stop_notes_ai_streaming_without_notify(AiChatMessageStatus::Stopped, None);
+        context.notify();
+    }
+
+    /// 在不通知 UI 的情况下结束笔记 AI 流式任务。
+    ///
+    /// 业务意图：
+    /// - 切换笔记、关闭侧边栏或退出编辑态时经常需要先同步清理任务，再由外层统一 `notify`，避免重复重绘。
+    pub(in crate::app) fn stop_notes_ai_streaming_without_notify(
+        &mut self,
+        status: AiChatMessageStatus,
+        error_message: Option<String>,
+    ) {
+        let Some(task) = self.notes.ai.streaming_task.take() else {
+            return;
+        };
+        task.cancel.store(true, Ordering::Relaxed);
+        self.finish_notes_ai_assistant_message(&task.assistant_message_id, status, error_message);
+    }
+
+    /// 安排 UI 线程轮询笔记 AI 后台流式事件。
+    ///
+    /// 实现原因：
+    /// - GPUI 状态只能在实体更新闭包内修改；后台请求通过通道回传事件，再由该轮询把增量应用到侧边栏消息。
+    pub(in crate::app) fn schedule_notes_ai_stream_poll(&self, context: &mut Context<Self>) {
+        context
+            .spawn(async move |view, app| {
+                loop {
+                    app.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                    let keep_polling = view
+                        .update(app, |view, context| {
+                            view.drain_notes_ai_stream_events(context);
+                            view.notes.ai.streaming_task.is_some()
+                        })
+                        .unwrap_or(false);
+                    if !keep_polling {
+                        break;
+                    }
+                }
+            })
+            .detach();
+    }
+
+    /// 读取并应用笔记 AI 后台流式事件。
+    pub(in crate::app) fn drain_notes_ai_stream_events(&mut self, context: &mut Context<Self>) {
+        let mut received_event = false;
+        while let Some(task) = self.notes.ai.streaming_task.as_ref() {
+            let event = match task.receiver.try_recv() {
+                Ok(event) => {
+                    received_event = true;
+                    event
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    received_event = true;
+                    AiChatStreamEvent::Done
+                }
+            };
+            self.apply_notes_ai_stream_event(event);
+        }
+        if received_event {
+            context.notify();
+        }
+    }
+
+    /// 应用单个笔记 AI 流式事件。
+    pub(in crate::app) fn apply_notes_ai_stream_event(&mut self, event: AiChatStreamEvent) {
+        let Some(task_snapshot) = self
+            .notes
+            .ai
+            .streaming_task
+            .as_ref()
+            .map(|task| (task.assistant_message_id.clone(), task.job_id))
+        else {
+            return;
+        };
+        let (assistant_message_id, _job_id) = task_snapshot;
+        match event {
+            AiChatStreamEvent::Delta(delta) => {
+                if let Some(message) = self
+                    .notes
+                    .ai
+                    .messages
+                    .iter_mut()
+                    .find(|message| message.id == assistant_message_id)
+                {
+                    message.content.push_str(&delta);
+                }
+            }
+            AiChatStreamEvent::ReasoningDelta(delta) => {
+                if let Some(message) = self
+                    .notes
+                    .ai
+                    .messages
+                    .iter_mut()
+                    .find(|message| message.id == assistant_message_id)
+                {
+                    message.reasoning_content.push_str(&delta);
+                }
+            }
+            AiChatStreamEvent::Done => {
+                self.finish_notes_ai_assistant_message(
+                    &assistant_message_id,
+                    AiChatMessageStatus::Complete,
+                    None,
+                );
+                self.notes.ai.streaming_task = None;
+            }
+            AiChatStreamEvent::Stopped => {
+                self.finish_notes_ai_assistant_message(
+                    &assistant_message_id,
+                    AiChatMessageStatus::Stopped,
+                    None,
+                );
+                self.notes.ai.streaming_task = None;
+            }
+            AiChatStreamEvent::Error(message) => {
+                self.finish_notes_ai_assistant_message(
+                    &assistant_message_id,
+                    AiChatMessageStatus::Failed,
+                    Some(message.clone()),
+                );
+                self.notes.ai.error_message = Some(message);
+                self.notes.ai.streaming_task = None;
+            }
+        }
+    }
+
+    /// 完成、停止或失败笔记 AI 助手消息。
+    pub(in crate::app) fn finish_notes_ai_assistant_message(
+        &mut self,
+        message_id: &str,
+        status: AiChatMessageStatus,
+        error_message: Option<String>,
+    ) {
+        if let Some(message) = self
+            .notes
+            .ai
+            .messages
+            .iter_mut()
+            .find(|message| message.id == message_id)
+        {
+            message.status = status;
+            message.error_message = error_message;
+        }
+    }
+
+    /// 将一条笔记 AI 回复插入当前富文本编辑器。
+    ///
+    /// 业务意图：
+    /// - AI 回复先在侧边栏预览，只有用户明确点击插入才会修改当前编辑器草稿。
+    /// - 插入使用点击时的当前选区；有选区则替换，无选区则插入光标处，之后仍由用户手动保存 Markdown 文件。
+    pub(in crate::app) fn insert_notes_ai_message_into_editor(
+        &mut self,
+        message_id: String,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if !self.notes.is_editing || self.notes.active_note.is_none() {
+            return;
+        }
+        let Some(content) = self
+            .notes
+            .ai
+            .messages
+            .iter()
+            .find(|message| message.id == message_id)
+            .map(|message| message.content.clone())
+        else {
+            return;
+        };
+        if content.trim().is_empty() {
+            self.notes.ai.error_message = Some("AI 回复为空，无法插入".to_string());
+            context.notify();
+            return;
+        }
+        let document = NoteRichTextDocument::from_markdown(&content);
+        self.notes
+            .rich_editor
+            .replace_selection_with_document(&document);
+        self.notes.ai.error_message = None;
+        window.focus(&self.notes.rich_editor.focus);
         context.notify();
     }
 
@@ -622,10 +1483,12 @@ impl MainView {
         // 这里先完成正文加载，再打开编辑状态；失败时保留只读错误展示，等待用户处理原始数据。
         if !self.reset_note_rich_editor_from_note(&note, true, Some(window)) {
             self.notes.is_editing = false;
+            self.reset_notes_ai_assistant_session();
             context.notify();
             return;
         }
         self.notes.is_editing = true;
+        self.reset_notes_ai_assistant_session();
         context.notify();
     }
 
@@ -639,6 +1502,7 @@ impl MainView {
             self.reset_note_rich_editor_from_note(&note, false, None);
         }
         self.notes.is_editing = false;
+        self.reset_notes_ai_assistant_session();
         context.notify();
     }
 
@@ -651,18 +1515,11 @@ impl MainView {
         let Some(note) = self.notes.active_note.clone() else {
             return false;
         };
-        let Some(path) = self.notes_database_path_or_error() else {
+        let Some(path) = self.notes_root_dir_or_error() else {
             context.notify();
             return false;
         };
-        let content = match self.notes.rich_editor.serialized_content() {
-            Ok(content) => content,
-            Err(error) => {
-                self.notes.database_error = Some(error);
-                context.notify();
-                return false;
-            }
-        };
+        let content = self.notes.rich_editor.markdown_content();
         let trimmed_title = self.notes.editor_title.trim();
         let title = if trimmed_title.is_empty() {
             "未命名笔记"
@@ -674,17 +1531,17 @@ impl MainView {
             &note.id,
             title,
             &content,
-            NoteContentFormat::RichText,
+            NoteContentFormat::Markdown,
         );
         match result {
-            Ok(updated_at_ms) => {
-                let mut updated = note;
-                updated.title = title.to_string();
-                updated.content = content;
-                updated.content_format = NoteContentFormat::RichText;
-                updated.updated_at_ms = updated_at_ms;
+            Ok(updated) => {
+                self.notes.selected = Some(NotesTreeSelection {
+                    id: updated.id.clone(),
+                    kind: NoteTreeRowKind::Note,
+                });
                 self.notes.active_note = Some(updated);
                 self.notes.is_editing = false;
+                self.reset_notes_ai_assistant_session();
                 self.notes.database_error = None;
                 self.reload_notes_tree();
                 context.notify();
@@ -750,6 +1607,10 @@ impl MainView {
             }
             NotesPendingAction::Rename(selection) => {
                 self.open_note_rename_dialog(selection, Some(window), context)
+            }
+            NotesPendingAction::Refresh => {
+                self.reload_notes_tree();
+                context.notify();
             }
         }
     }
@@ -928,8 +1789,38 @@ impl MainView {
             NotesTreeContextMenuAction::Delete => {
                 self.request_delete_note_tree_item(target, context);
             }
+            NotesTreeContextMenuAction::Plugin {
+                plugin_id,
+                menu_id,
+                command_id,
+            } => {
+                let title = self.note_tree_title_for_selection(&target);
+                let plugin_target = PluginNoteTreeTarget {
+                    id: target.id,
+                    title,
+                    kind: Self::plugin_note_tree_kind_label(target.kind).to_string(),
+                };
+                self.invoke_notes_tree_plugin_menu(
+                    plugin_id,
+                    menu_id,
+                    command_id,
+                    plugin_target,
+                    context,
+                );
+            }
         }
         context.stop_propagation();
+    }
+
+    /// 返回插件协议中的笔记树节点类型标签。
+    ///
+    /// 业务意图：
+    /// - 插件只接收稳定、可序列化的节点类型字符串，不依赖 Rust 内部枚举名称，便于第三方语言实现。
+    fn plugin_note_tree_kind_label(kind: NoteTreeRowKind) -> &'static str {
+        match kind {
+            NoteTreeRowKind::Directory => "directory",
+            NoteTreeRowKind::Note => "note",
+        }
     }
 
     /// 根据窗口坐标返回笔记标题 UTF-8 字节下标。
@@ -1777,5 +2668,41 @@ impl MainView {
                 column: end_column,
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 验证目录重命名会同步重写子路径前缀。
+    ///
+    /// 业务意图：
+    /// - 物理笔记 ID 来自相对路径，父目录改名会改变所有子笔记 ID；当前打开笔记和选中节点不能继续保留旧路径。
+    #[test]
+    fn 目录重命名会重写子笔记路径前缀() {
+        let mut note_id = "旧目录/子目录/笔记.md".to_string();
+        assert!(MainView::rewrite_note_path_value_prefix(
+            &mut note_id,
+            "旧目录",
+            "新目录"
+        ));
+        assert_eq!(note_id, "新目录/子目录/笔记.md");
+
+        let mut directory_id = Some("旧目录/子目录".to_string());
+        assert!(MainView::rewrite_optional_note_path_prefix(
+            &mut directory_id,
+            "旧目录",
+            "新目录"
+        ));
+        assert_eq!(directory_id.as_deref(), Some("新目录/子目录"));
+
+        let mut unrelated = "其它目录/笔记.md".to_string();
+        assert!(!MainView::rewrite_note_path_value_prefix(
+            &mut unrelated,
+            "旧目录",
+            "新目录"
+        ));
+        assert_eq!(unrelated, "其它目录/笔记.md");
     }
 }

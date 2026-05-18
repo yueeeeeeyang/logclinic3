@@ -1,7 +1,7 @@
 // 笔记业务功能域入口。
 //
 // 业务意图：
-// - 顶层 notes 模块承载笔记领域类型、树构建和 SQLite 持久化，不依赖 GPUI 或 `app`。
+// - 顶层 notes 模块承载笔记领域类型、树构建和物理 Markdown 文件持久化，不依赖 GPUI 或 `app`。
 // - `app/ui/notes_panel` 只负责页面渲染、输入控件和 UI 事件适配，依赖方向固定为 `app -> notes`。
 
 mod constants;
@@ -18,40 +18,38 @@ pub(crate) use storage::*;
 mod tests {
     use std::{env, fs, path::PathBuf};
 
-    use rusqlite::Connection;
-
     use super::*;
 
-    /// 构造唯一的笔记数据库测试路径。
+    /// 构造唯一的笔记根目录测试路径。
     ///
     /// 业务意图：
-    /// - 笔记数据库保存用户正文，测试必须使用临时路径，避免污染真实应用笔记。
-    fn test_notes_database_file_path(name: &str) -> PathBuf {
-        env::temp_dir().join(format!(
+    /// - 物理文件存储会创建真实目录和 Markdown 文件，测试必须使用临时路径，避免污染真实应用笔记。
+    fn test_notes_root_dir(name: &str) -> PathBuf {
+        let root = env::temp_dir().join(format!(
             "logclinic3-notes-test-{}-{}",
             std::process::id(),
             name
-        ))
+        ));
+        let _ = fs::remove_dir_all(&root);
+        root
     }
 
-    /// 验证笔记数据库 schema 初始化和基础 CRUD。
+    /// 验证物理 Markdown 存储初始化和基础 CRUD。
     #[test]
-    fn 笔记数据库初始化并读写目录和笔记() {
-        let path = test_notes_database_file_path("roundtrip").join(NOTES_DATABASE_FILE_NAME);
+    fn 笔记物理目录初始化并读写目录和笔记() {
+        let path = test_notes_root_dir("roundtrip");
         let root = create_note_directory(&path, None, "根目录".to_string()).unwrap();
         let child =
             create_note_directory(&path, Some(root.id.clone()), "子目录".to_string()).unwrap();
         let note = create_note(&path, Some(child.id.clone()), "新建笔记".to_string()).unwrap();
-        assert_eq!(note.content_format, NoteContentFormat::RichText);
-        let empty_document = NoteRichTextDocument::from_json(&note.content).unwrap();
-        assert!(empty_document.is_empty());
+        assert_eq!(note.content_format, NoteContentFormat::Markdown);
+        assert!(
+            path.join("根目录")
+                .join("子目录")
+                .join("新建笔记.md")
+                .exists()
+        );
         update_note_content(&path, &note.id, "# 标题", NoteContentFormat::Markdown).unwrap();
-
-        let connection = Connection::open(&path).unwrap();
-        let version: i64 = connection
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, NOTES_DATABASE_SCHEMA_VERSION);
 
         let loaded = load_note(&path, &note.id).unwrap().unwrap();
         assert_eq!(loaded.content, "# 标题");
@@ -62,60 +60,56 @@ mod tests {
         assert_eq!(tree[1].depth, 1);
         assert_eq!(tree[2].kind, NoteTreeRowKind::Note);
 
-        let _ = fs::remove_file(&path);
-        if let Some(parent) = path.parent() {
-            let _ = fs::remove_dir_all(parent);
-        }
+        let _ = fs::remove_dir_all(&path);
     }
 
-    /// 验证删除目录会级联删除子目录和笔记。
+    /// 验证扫描只识别 Markdown 文件并忽略隐藏项和非 Markdown 文件。
     #[test]
-    fn 删除笔记目录会级联删除子内容() {
-        let path = test_notes_database_file_path("cascade").join(NOTES_DATABASE_FILE_NAME);
-        let root = create_note_directory(&path, None, "根目录".to_string()).unwrap();
-        let child =
-            create_note_directory(&path, Some(root.id.clone()), "子目录".to_string()).unwrap();
-        let note = create_note(&path, Some(child.id.clone()), "笔记".to_string()).unwrap();
+    fn 笔记扫描只识别_markdown_文件() {
+        let path = test_notes_root_dir("scan");
+        fs::create_dir_all(path.join("目录")).unwrap();
+        fs::write(path.join("目录").join("可见.md"), "正文").unwrap();
+        fs::write(path.join("目录").join("兼容.markdown"), "正文").unwrap();
+        fs::write(path.join("目录").join("忽略.txt"), "正文").unwrap();
+        fs::create_dir_all(path.join(".hidden")).unwrap();
+        fs::write(path.join(".hidden").join("隐藏.md"), "正文").unwrap();
 
-        delete_note_directory(&path, &root.id).unwrap();
-        assert!(load_note_tree(&path).unwrap().is_empty());
-        assert!(load_note(&path, &note.id).unwrap().is_none());
+        let tree = load_note_tree(&path).unwrap();
+        let note_titles = tree
+            .iter()
+            .filter(|row| row.kind == NoteTreeRowKind::Note)
+            .map(|row| row.title.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(note_titles.len(), 2);
+        assert!(note_titles.contains(&"可见"));
+        assert!(note_titles.contains(&"兼容"));
 
-        let _ = fs::remove_file(&path);
-        if let Some(parent) = path.parent() {
-            let _ = fs::remove_dir_all(parent);
-        }
+        let _ = fs::remove_dir_all(&path);
     }
 
-    /// 验证目录和笔记可独立重命名，且删除单篇笔记不会影响所在目录。
+    /// 验证目录和笔记可独立重命名，并处理同名冲突。
     #[test]
-    fn 笔记和目录支持重命名以及单篇删除() {
-        let path = test_notes_database_file_path("rename-delete").join(NOTES_DATABASE_FILE_NAME);
+    fn 笔记和目录支持重命名以及同名冲突() {
+        let path = test_notes_root_dir("rename");
         let root = create_note_directory(&path, None, "旧目录".to_string()).unwrap();
         let note = create_note(&path, Some(root.id.clone()), "旧笔记".to_string()).unwrap();
+        let _conflict = create_note(&path, Some(root.id.clone()), "新笔记".to_string()).unwrap();
 
-        rename_note_directory(&path, &root.id, "新目录").unwrap();
-        rename_note(&path, &note.id, "新笔记").unwrap();
+        let next_note_id = rename_note(&path, &note.id, "新笔记").unwrap();
+        let next_root_id = rename_note_directory(&path, &root.id, "新目录").unwrap();
         let tree = load_note_tree(&path).unwrap();
         assert_eq!(tree[0].title, "新目录");
-        assert_eq!(tree[1].title, "新笔记");
+        assert_eq!(next_root_id, "新目录");
+        assert_eq!(next_note_id, "旧目录/新笔记 (2).md");
+        assert!(tree.iter().any(|row| row.id == "新目录/新笔记 (2).md"));
 
-        delete_note(&path, &note.id).unwrap();
-        assert!(load_note(&path, &note.id).unwrap().is_none());
-        let tree_after_delete = load_note_tree(&path).unwrap();
-        assert_eq!(tree_after_delete.len(), 1);
-        assert_eq!(tree_after_delete[0].id, root.id);
-
-        let _ = fs::remove_file(&path);
-        if let Some(parent) = path.parent() {
-            let _ = fs::remove_dir_all(parent);
-        }
+        let _ = fs::remove_dir_all(&path);
     }
 
-    /// 验证正文超过 1 MiB 时拒绝保存，并保留数据库中已有内容。
+    /// 验证正文超过 1 MiB 时拒绝保存，并保留文件中已有内容。
     #[test]
-    fn 笔记内容超过上限不会写入数据库() {
-        let path = test_notes_database_file_path("content-limit").join(NOTES_DATABASE_FILE_NAME);
+    fn 笔记内容超过上限不会写入文件() {
+        let path = test_notes_root_dir("content-limit");
         let note = create_note(&path, None, "容量测试".to_string()).unwrap();
         update_note_content(&path, &note.id, "原始内容", NoteContentFormat::PlainText).unwrap();
 
@@ -126,22 +120,19 @@ mod tests {
         let loaded = load_note(&path, &note.id).unwrap().unwrap();
         assert_eq!(loaded.content, "原始内容");
 
-        let _ = fs::remove_file(&path);
-        if let Some(parent) = path.parent() {
-            let _ = fs::remove_dir_all(parent);
-        }
+        let _ = fs::remove_dir_all(&path);
     }
 
-    /// 验证保存笔记会在同一次写入中更新标题、正文和格式。
+    /// 验证保存笔记会更新标题、正文和文件路径。
     ///
     /// 业务意图：
-    /// - UI 编辑器保存按钮允许标题和正文一起提交，存储层必须提供单次业务写入，避免半保存状态。
+    /// - UI 编辑器保存按钮允许标题和正文一起提交；物理文件存储下标题变化必须返回新的路径 ID。
     #[test]
-    fn 保存笔记会同时更新标题正文和格式() {
-        let path = test_notes_database_file_path("atomic-update").join(NOTES_DATABASE_FILE_NAME);
+    fn 保存笔记会同时更新标题正文和路径() {
+        let path = test_notes_root_dir("atomic-update");
         let note = create_note(&path, None, "旧标题".to_string()).unwrap();
 
-        let updated_at_ms = update_note(
+        let updated = update_note(
             &path,
             &note.id,
             "新标题",
@@ -149,11 +140,11 @@ mod tests {
             NoteContentFormat::PlainText,
         )
         .unwrap();
-        let loaded = load_note(&path, &note.id).unwrap().unwrap();
+        let loaded = load_note(&path, &updated.id).unwrap().unwrap();
         assert_eq!(loaded.title, "新标题");
         assert_eq!(loaded.content, "新正文");
-        assert_eq!(loaded.content_format, NoteContentFormat::PlainText);
-        assert_eq!(loaded.updated_at_ms, updated_at_ms);
+        assert_eq!(loaded.content_format, NoteContentFormat::Markdown);
+        assert_eq!(updated.id, "新标题.md");
 
         let error = update_note(
             &path,
@@ -165,10 +156,7 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("不存在"));
 
-        let _ = fs::remove_file(&path);
-        if let Some(parent) = path.parent() {
-            let _ = fs::remove_dir_all(parent);
-        }
+        let _ = fs::remove_dir_all(&path);
     }
 
     /// 验证同级排序遵循目录优先、更新时间倒序和标题升序。
@@ -219,7 +207,7 @@ mod tests {
     /// 验证非法富文本 JSON 会返回中文错误。
     ///
     /// 业务意图：
-    /// - SQLite 字段仍是普通文本，用户或未来版本可能写入损坏 JSON；解析层必须返回可展示的中文错误，而不是 panic。
+    /// - 旧 SQLite 迁移可能遇到损坏富文本 JSON；解析层必须返回可展示的中文错误，而不是 panic。
     #[test]
     fn 非法富文本_json_会报中文错误() {
         let note = Note {

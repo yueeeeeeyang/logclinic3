@@ -42,6 +42,14 @@ impl EntityInputHandler for MainView {
             adjusted_range.replace(Self::search_input_range_to_utf16(&text, range.clone()));
             return Some(text[range].to_string());
         }
+        if self.notes.ai.input_focus.is_focused(window) {
+            let range = Self::search_input_range_from_utf16(&self.notes.ai.input_text, range_utf16);
+            adjusted_range.replace(Self::search_input_range_to_utf16(
+                &self.notes.ai.input_text,
+                range.clone(),
+            ));
+            return Some(self.notes.ai.input_text[range].to_string());
+        }
         if self.ai_chat.input_focus.is_focused(window) {
             let range = Self::search_input_range_from_utf16(&self.ai_chat.input_text, range_utf16);
             adjusted_range.replace(Self::search_input_range_to_utf16(
@@ -131,6 +139,15 @@ impl EntityInputHandler for MainView {
                 reversed: false,
             });
         }
+        if self.notes.ai.input_focus.is_focused(window) {
+            return Some(UTF16Selection {
+                range: Self::search_input_range_to_utf16(
+                    &self.notes.ai.input_text,
+                    self.notes.ai.input_selection_range.clone(),
+                ),
+                reversed: false,
+            });
+        }
         if self.ai_chat.input_focus.is_focused(window) {
             return Some(UTF16Selection {
                 range: Self::search_input_range_to_utf16(
@@ -212,6 +229,14 @@ impl EntityInputHandler for MainView {
                 .clone()
                 .map(|range| Self::search_input_range_to_utf16(&text, range));
         }
+        if self.notes.ai.input_focus.is_focused(window) {
+            return self
+                .notes
+                .ai
+                .input_marked_range
+                .clone()
+                .map(|range| Self::search_input_range_to_utf16(&self.notes.ai.input_text, range));
+        }
         if self.ai_chat.input_focus.is_focused(window) {
             return self
                 .ai_chat
@@ -279,6 +304,11 @@ impl EntityInputHandler for MainView {
         }
         if self.notes.rich_editor.focus.is_focused(window) {
             self.notes.rich_editor.marked_range = None;
+            context.notify();
+            return;
+        }
+        if self.notes.ai.input_focus.is_focused(window) {
+            self.notes.ai.input_marked_range = None;
             context.notify();
             return;
         }
@@ -376,6 +406,24 @@ impl EntityInputHandler for MainView {
             self.notes
                 .rich_editor
                 .replace_range_with_text(Some(range), text);
+            self.touch_search_text_cursor_activity();
+            context.notify();
+            return;
+        }
+        if self.notes.ai.input_focus.is_focused(window) {
+            let replacement = text.replace("\r\n", "\n").replace('\r', "\n");
+            let range = range_utf16
+                .map(|range| Self::search_input_range_from_utf16(&self.notes.ai.input_text, range))
+                .or_else(|| self.notes.ai.input_marked_range.clone())
+                .unwrap_or_else(|| self.notes.ai.input_selection_range.clone());
+            let range = Self::clamp_search_text_range(&self.notes.ai.input_text, range);
+            self.notes
+                .ai
+                .input_text
+                .replace_range(range.clone(), &replacement);
+            let cursor = range.start + replacement.len();
+            self.notes.ai.input_selection_range = cursor..cursor;
+            self.notes.ai.input_marked_range = None;
             self.touch_search_text_cursor_activity();
             context.notify();
             return;
@@ -618,6 +666,39 @@ impl EntityInputHandler for MainView {
                     cursor..cursor
                 });
             self.notes.rich_editor.selection_range = selected_range;
+            self.touch_search_text_cursor_activity();
+            context.notify();
+            return;
+        }
+        if self.notes.ai.input_focus.is_focused(window) {
+            let replacement = new_text.replace("\r\n", "\n").replace('\r', "\n");
+            let range = range_utf16
+                .map(|range| Self::search_input_range_from_utf16(&self.notes.ai.input_text, range))
+                .or_else(|| self.notes.ai.input_marked_range.clone())
+                .unwrap_or_else(|| self.notes.ai.input_selection_range.clone());
+            let range = Self::clamp_search_text_range(&self.notes.ai.input_text, range);
+            self.notes
+                .ai
+                .input_text
+                .replace_range(range.clone(), &replacement);
+
+            if replacement.is_empty() {
+                self.notes.ai.input_marked_range = None;
+            } else {
+                self.notes.ai.input_marked_range =
+                    Some(range.start..range.start + replacement.len());
+            }
+
+            let selected_range = new_selected_range_utf16
+                .map(|utf16_range| Self::search_input_range_from_utf16(&replacement, utf16_range))
+                .map(|relative_range| {
+                    range.start + relative_range.start..range.start + relative_range.end
+                })
+                .unwrap_or_else(|| {
+                    let cursor = range.start + replacement.len();
+                    cursor..cursor
+                });
+            self.notes.ai.input_selection_range = selected_range;
             self.touch_search_text_cursor_activity();
             context.notify();
             return;
@@ -878,6 +959,22 @@ impl EntityInputHandler for MainView {
                     .rich_editor
                     .bounds_for_range(range, element_bounds),
             );
+        }
+        if self.notes.ai.input_focus.is_focused(window) {
+            let range = Self::search_input_range_from_utf16(&self.notes.ai.input_text, range_utf16);
+            let cursor = range.start;
+            for layout in &self.notes.ai.input_last_layouts {
+                if cursor >= layout.byte_range.start && cursor <= layout.byte_range.end {
+                    let x = layout
+                        .line
+                        .x_for_index(cursor.saturating_sub(layout.byte_range.start));
+                    return Some(Bounds::new(
+                        point(layout.bounds.left() + x, layout.bounds.top()),
+                        size(px(1.0), layout.bounds.bottom() - layout.bounds.top()),
+                    ));
+                }
+            }
+            return Some(element_bounds);
         }
         if self.ai_chat.input_focus.is_focused(window) {
             let range = Self::search_input_range_from_utf16(&self.ai_chat.input_text, range_utf16);

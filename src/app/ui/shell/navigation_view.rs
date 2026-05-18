@@ -5,6 +5,24 @@
 // - 所有行为保持迁移前一致，不改变窗口生命周期、路径选择策略或加载状态文案。
 
 use super::*;
+use std::sync::mpsc;
+
+/// 插件主导航按钮渲染快照。
+///
+/// 业务意图：
+/// - 插件导航贡献来自运行时 manifest，渲染前整理成独立值，避免按钮监听闭包持有插件定义借用。
+struct PluginNavigationRenderItem {
+    /// 插件 ID。
+    plugin_id: String,
+    /// 导航贡献点 ID。
+    contribution_id: String,
+    /// 命令 ID。
+    command_id: String,
+    /// 展示标题。
+    title: String,
+    /// 图标。
+    icon: Icon,
+}
 
 impl MainView {
     /// 返回当前主视图实际生效的主题。
@@ -60,6 +78,7 @@ impl MainView {
                 )
             })
             .collect::<Vec<_>>();
+        let plugin_items = self.plugin_navigation_items();
 
         div()
             .id("main-navigation")
@@ -81,7 +100,12 @@ impl MainView {
                     .flex_col()
                     .items_center()
                     .gap(px(MAIN_NAV_BUTTON_GAP))
-                    .children(main_items),
+                    .children(main_items)
+                    .children(
+                        plugin_items.into_iter().map(|item| {
+                            self.render_plugin_navigation_button(item, palette, context)
+                        }),
+                    ),
             )
             .child(
                 div()
@@ -163,6 +187,157 @@ impl MainView {
                     context.stop_propagation();
                 }),
             )
+    }
+
+    /// 返回当前已启用插件贡献的主导航按钮。
+    ///
+    /// 业务意图：
+    /// - 插件可通过 `navigation` 贡献点在左侧主导航追加入口；点击后调用插件命令并由宿主打开声明式窗口。
+    /// - 第一版不把插件页面嵌入主工作区，避免第三方页面影响日志、笔记等核心功能状态。
+    fn plugin_navigation_items(&self) -> Vec<PluginNavigationRenderItem> {
+        self.plugins
+            .definitions
+            .iter()
+            .filter(|plugin| plugin.active())
+            .filter_map(|plugin| {
+                plugin
+                    .manifest
+                    .as_ref()
+                    .map(|manifest| (plugin.id.clone(), manifest))
+            })
+            .flat_map(|(plugin_id, manifest)| {
+                manifest
+                    .contributes
+                    .navigation
+                    .iter()
+                    .map(move |navigation| PluginNavigationRenderItem {
+                        plugin_id: plugin_id.clone(),
+                        contribution_id: navigation.id.clone(),
+                        command_id: navigation.command_id().to_string(),
+                        title: navigation.title.clone(),
+                        icon: Self::plugin_menu_icon(navigation.icon.as_deref()),
+                    })
+            })
+            .collect()
+    }
+
+    /// 渲染插件主导航按钮。
+    fn render_plugin_navigation_button(
+        &self,
+        item: PluginNavigationRenderItem,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let PluginNavigationRenderItem {
+            plugin_id,
+            contribution_id,
+            command_id,
+            title,
+            icon,
+        } = item;
+        div()
+            .id(SharedString::from(format!(
+                "main-nav-plugin-{plugin_id}-{contribution_id}"
+            )))
+            .relative()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(MAIN_NAV_BUTTON_SIZE))
+            .h(px(MAIN_NAV_BUTTON_SIZE))
+            .rounded(px(8.0))
+            .bg(rgb(palette.panel))
+            .text_color(rgb(palette.muted_text))
+            .cursor_pointer()
+            .hover(move |button| {
+                button
+                    .bg(rgb(palette.hover))
+                    .text_color(rgb(palette.accent))
+            })
+            .child(Self::render_lucide_icon(
+                Some(icon),
+                MAIN_NAV_ICON_WIDTH,
+                MAIN_NAV_ICON_SIZE,
+                palette.muted_text,
+            ))
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, _window, context| {
+                    view.invoke_plugin_navigation(
+                        plugin_id.clone(),
+                        command_id.clone(),
+                        title.clone(),
+                        context,
+                    );
+                    context.stop_propagation();
+                }),
+            )
+    }
+
+    /// 调用插件主导航命令。
+    ///
+    /// 业务意图：
+    /// - 插件导航入口只触发声明式页面请求；插件无法直接切换主工作区状态，避免破坏核心页面生命周期。
+    fn invoke_plugin_navigation(
+        &mut self,
+        plugin_id: String,
+        command_id: String,
+        title: String,
+        context: &mut Context<Self>,
+    ) {
+        let Some(plugin) = self
+            .plugins
+            .definitions
+            .iter()
+            .find(|plugin| plugin.id == plugin_id && plugin.active())
+            .cloned()
+        else {
+            self.plugins.status_message = Some("插件未启用或加载失败，无法打开导航页".to_string());
+            return;
+        };
+        let generation = self.plugins.begin_command_generation();
+        let initial_progress =
+            Self::initial_plugin_progress(format!("正在打开插件页面：{title}"), None, "项");
+        let (progress_sender, progress_receiver) = mpsc::channel();
+        self.plugins.status_message = Some(initial_progress.message.clone());
+        let origin_plugin = Some(plugin.clone());
+        self.schedule_open_plugin_page_window_from_context(
+            context.entity(),
+            generation,
+            title.clone(),
+            Self::plugin_running_page(title, initial_progress),
+            origin_plugin.clone(),
+            std::collections::BTreeMap::new(),
+            context,
+        );
+        self.spawn_plugin_progress_poller(generation, progress_receiver, context);
+        let command_context = PluginCommandContext::NavigationPage;
+        let main_view = context.entity();
+        context
+            .spawn(async move |_view, app| {
+                let result = app
+                    .background_executor()
+                    .spawn(async move {
+                        invoke_plugin_command_with_progress(
+                            &plugin,
+                            &command_id,
+                            command_context,
+                            Some(progress_sender),
+                        )
+                    })
+                    .await;
+                app.update(move |app| {
+                    Self::handle_plugin_command_result_after_main_update(
+                        main_view,
+                        generation,
+                        origin_plugin,
+                        std::collections::BTreeMap::new(),
+                        result,
+                        app,
+                    );
+                })
+                .ok();
+            })
+            .detach();
     }
 
     /// 渲染左侧导航 hover 名称气泡覆盖层。

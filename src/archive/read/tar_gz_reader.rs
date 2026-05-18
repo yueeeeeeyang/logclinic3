@@ -142,6 +142,78 @@ pub(super) fn read_single_file_tar_gz_from_bytes(
     })
 }
 
+/// 从内存 TAR.GZ 字节中把唯一普通文件直接写入 writer。
+///
+/// 业务意图：
+/// - 插件分析场景只需要顺序消费目标日志，gzip 解压层和 tar 条目正文都可以直接流向调用方。
+/// - 如果内容并非 tar 目录但可作为单 gzip 日志读取，则降级到单 gzip 流式读取，保持现有兼容行为。
+pub(super) fn stream_single_file_tar_gz_from_bytes_to_writer<W: Write + ?Sized>(
+    archive_bytes: &[u8],
+    label: &str,
+    writer: &mut W,
+) -> Result<(), ArchiveReadError> {
+    let decoder = GzDecoder::new(Cursor::new(archive_bytes));
+    let mut archive = TarArchive::new(decoder);
+    let entries = match archive.entries() {
+        Ok(entries) => entries,
+        Err(_) => {
+            return stream_single_gzip_payload_from_bytes_to_writer(archive_bytes, label, writer);
+        }
+    };
+    let mut single_member = None;
+    let mut wrote_member = false;
+    let mut entry_errors = Vec::new();
+
+    for entry in entries {
+        let mut entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                entry_errors.push(error.to_string());
+                continue;
+            }
+        };
+        if entry.header().entry_type().is_dir() {
+            continue;
+        }
+
+        let entry_path = entry.path().map_err(|error| {
+            ArchiveReadError::new(format!("无法读取嵌套 TAR.GZ 条目路径：{}", error))
+        })?;
+        let raw_name = entry_path.to_string_lossy();
+        let normalized = normalize_archive_member_path(&raw_name).map_err(|reason| {
+            ArchiveReadError::new(format!("{} 内包含非法 TAR.GZ 条目：{}", label, reason))
+        })?;
+        remember_single_archive_member(&mut single_member, normalized.clone(), label)?;
+        if wrote_member {
+            drain_tar_entry(&mut entry, &normalized)?;
+            continue;
+        }
+
+        copy_reader_to_writer(&mut entry, writer, &normalized)?;
+        wrote_member = true;
+    }
+
+    if single_member.is_none() && !entry_errors.is_empty() {
+        return stream_single_gzip_payload_from_bytes_to_writer(archive_bytes, label, writer);
+    }
+    if let Some(error) = entry_errors.into_iter().next() {
+        return Err(ArchiveReadError::new(format!(
+            "无法读取嵌套 TAR.GZ 条目：{}",
+            error
+        )));
+    }
+
+    require_single_archive_member(single_member, label)?;
+    if wrote_member {
+        Ok(())
+    } else {
+        Err(ArchiveReadError::new(format!(
+            "{} 内没有可打开的普通文件，无法直接显示日志内容",
+            label
+        )))
+    }
+}
+
 /// 从 tar.gz 或 tgz 压缩包中读取成员。
 ///
 /// 业务意图：
@@ -193,6 +265,56 @@ pub(super) fn read_tar_gz_member(
     )))
 }
 
+/// 从 tar.gz 或 tgz 压缩包中把指定成员内容直接写入 writer。
+///
+/// 业务意图：
+/// - 目标成员正文直接从 gzip 解压流进入插件内容流，不经过整块内存或临时文件。
+pub(super) fn stream_tar_gz_member_to_writer<W: Write + ?Sized>(
+    archive_path: &Path,
+    member_path: &str,
+    writer: &mut W,
+) -> Result<(), ArchiveReadError> {
+    if is_single_gzip_member_path(member_path) {
+        return stream_single_gzip_payload_from_path_to_writer(archive_path, member_path, writer);
+    }
+
+    let file = File::open(archive_path).map_err(|error| {
+        ArchiveReadError::new(format!(
+            "无法打开 TAR.GZ 压缩包 {}：{}",
+            archive_path.display(),
+            error
+        ))
+    })?;
+    let decoder = GzDecoder::new(BufReader::new(file));
+    let mut archive = TarArchive::new(decoder);
+    let entries = archive
+        .entries()
+        .map_err(|error| ArchiveReadError::new(format!("无法读取 TAR.GZ 目录：{}", error)))?;
+
+    for entry in entries {
+        let mut entry = entry
+            .map_err(|error| ArchiveReadError::new(format!("无法读取 TAR.GZ 条目：{}", error)))?;
+        let entry_path = entry.path().map_err(|error| {
+            ArchiveReadError::new(format!("无法读取 TAR.GZ 条目路径：{}", error))
+        })?;
+        let raw_name = entry_path.to_string_lossy().to_string();
+        if entry.header().entry_type().is_dir() {
+            continue;
+        }
+        if normalize_archive_member_path(&raw_name).ok().as_deref() != Some(member_path) {
+            drain_tar_entry(&mut entry, member_path)?;
+            continue;
+        }
+
+        return copy_reader_to_writer(&mut entry, writer, member_path);
+    }
+
+    Err(ArchiveReadError::new(format!(
+        "压缩包中未找到日志文件：{}",
+        member_path
+    )))
+}
+
 /// 从内存 TAR.GZ 字节中读取指定成员。
 pub(super) fn read_tar_gz_member_from_bytes(
     archive_bytes: &[u8],
@@ -228,6 +350,48 @@ pub(super) fn read_tar_gz_member_from_bytes(
         let size = entry.size();
         ensure_size_within_limit(size, member_path)?;
         return read_reader_to_vec_with_limit(&mut entry, Some(size), member_path);
+    }
+
+    Err(ArchiveReadError::new(format!(
+        "嵌套压缩包 {} 中未找到日志文件：{}",
+        label, member_path
+    )))
+}
+
+/// 从内存 TAR.GZ 字节中把指定成员内容直接写入 writer。
+pub(super) fn stream_tar_gz_member_from_bytes_to_writer<W: Write + ?Sized>(
+    archive_bytes: &[u8],
+    member_path: &str,
+    label: &str,
+    writer: &mut W,
+) -> Result<(), ArchiveReadError> {
+    if is_single_gzip_member_path(member_path) {
+        return stream_single_gzip_payload_from_bytes_to_writer(archive_bytes, member_path, writer);
+    }
+
+    let decoder = GzDecoder::new(Cursor::new(archive_bytes));
+    let mut archive = TarArchive::new(decoder);
+    let entries = archive.entries().map_err(|error| {
+        ArchiveReadError::new(format!("无法读取嵌套 TAR.GZ {} 的目录：{}", label, error))
+    })?;
+
+    for entry in entries {
+        let mut entry = entry.map_err(|error| {
+            ArchiveReadError::new(format!("无法读取嵌套 TAR.GZ 条目：{}", error))
+        })?;
+        let entry_path = entry.path().map_err(|error| {
+            ArchiveReadError::new(format!("无法读取嵌套 TAR.GZ 条目路径：{}", error))
+        })?;
+        let raw_name = entry_path.to_string_lossy().to_string();
+        if entry.header().entry_type().is_dir() {
+            continue;
+        }
+        if normalize_archive_member_path(&raw_name).ok().as_deref() != Some(member_path) {
+            drain_tar_entry(&mut entry, member_path)?;
+            continue;
+        }
+
+        return copy_reader_to_writer(&mut entry, writer, member_path);
     }
 
     Err(ArchiveReadError::new(format!(

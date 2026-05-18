@@ -13,7 +13,7 @@ use std::{
     error::Error,
     fmt::{self, Display},
     fs::{self, File},
-    io::{self, BufReader, Cursor, Read},
+    io::{self, BufReader, Cursor, Read, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -150,6 +150,36 @@ pub(crate) fn read_archive_member(
     }
 }
 
+/// 按压缩包格式把指定成员原始内容直接写入目标 writer。
+///
+/// 业务意图：
+/// - 插件 SQL 下钻这类后台分析只需要顺序读取日志正文，不需要像日志 tab 一样把整份原始字节缓存到内存。
+/// - 该入口让压缩库 reader 直接把解压后的字节推给调用方，避免为了插件再物化临时日志文件或组装整块 `Vec<u8>`。
+///
+/// 关键约束：
+/// - 该函数不套用“日志 tab 200MB 内存缓存上限”，因为调用方是流式消费；上限仍由插件超时和用户选择范围承担。
+/// - RAR 受当前 `unrar` crate API 限制，底层仍只能先返回成员字节，再写入 writer；但不会创建新的临时日志文件。
+pub(crate) fn stream_archive_member_to_writer<W: Write + ?Sized>(
+    archive_path: &Path,
+    archive_format: ArchiveFormat,
+    member_path: &str,
+    writer: &mut W,
+) -> Result<(), ArchiveReadError> {
+    let archive_format = if archive_format == ArchiveFormat::TarGz {
+        ArchiveFormat::from_file(archive_path).unwrap_or(archive_format)
+    } else {
+        archive_format
+    };
+    match archive_format {
+        ArchiveFormat::Zip => stream_zip_member_to_writer(archive_path, member_path, writer),
+        ArchiveFormat::Rar => stream_rar_member_to_writer(archive_path, member_path, writer),
+        ArchiveFormat::Tar => stream_tar_member_to_writer(archive_path, member_path, writer),
+        ArchiveFormat::TarGz => stream_tar_gz_member_to_writer(archive_path, member_path, writer),
+        ArchiveFormat::Gzip => stream_gzip_member_to_writer(archive_path, member_path, writer),
+        ArchiveFormat::SevenZ => stream_7z_member_to_writer(archive_path, member_path, writer),
+    }
+}
+
 /// 从内存中的压缩包字节读取指定成员。
 ///
 /// 业务意图：
@@ -172,6 +202,45 @@ pub(crate) fn read_archive_member_from_bytes(
         ArchiveFormat::SevenZ => read_7z_member_from_bytes(archive_bytes, member_path, label),
         ArchiveFormat::Rar => Err(ArchiveReadError::new(format!(
             "嵌套 RAR {} 暂不支持直接从内存读取，请先选择外层解包后的 RAR 文件",
+            label
+        ))),
+    }
+}
+
+/// 从内存中的压缩包字节把指定成员内容直接写入目标 writer。
+///
+/// 业务意图：
+/// - 嵌套压缩包需要先定位内层压缩包本身；当内层压缩包字节已经在内存中时，仍应避免把目标日志成员再读成 `Vec<u8>`。
+/// - ZIP/TAR/TAR.GZ/GZIP/7Z 可以基于内存 reader 直接向调用方输出目标成员正文。
+///
+/// 边界条件：
+/// - 嵌套 RAR 仍受 `unrar` 需要真实路径的限制，这里返回清晰错误；调用方如果已经决定允许临时内层 RAR，可走路径版入口。
+pub(crate) fn stream_archive_member_from_bytes_to_writer<W: Write + ?Sized>(
+    archive_bytes: &[u8],
+    archive_format: ArchiveFormat,
+    member_path: &str,
+    label: &str,
+    writer: &mut W,
+) -> Result<(), ArchiveReadError> {
+    let archive_format = archive_format.resolve_from_bytes(archive_bytes);
+    match archive_format {
+        ArchiveFormat::Zip => {
+            stream_zip_member_from_bytes_to_writer(archive_bytes, member_path, label, writer)
+        }
+        ArchiveFormat::Tar => {
+            stream_tar_member_from_bytes_to_writer(archive_bytes, member_path, label, writer)
+        }
+        ArchiveFormat::TarGz => {
+            stream_tar_gz_member_from_bytes_to_writer(archive_bytes, member_path, label, writer)
+        }
+        ArchiveFormat::Gzip => {
+            stream_gzip_member_from_bytes_to_writer(archive_bytes, member_path, label, writer)
+        }
+        ArchiveFormat::SevenZ => {
+            stream_7z_member_from_bytes_to_writer(archive_bytes, member_path, label, writer)
+        }
+        ArchiveFormat::Rar => Err(ArchiveReadError::new(format!(
+            "嵌套 RAR {} 暂不支持直接从内存流式读取，请先选择外层解包后的 RAR 文件",
             label
         ))),
     }
@@ -201,6 +270,27 @@ pub(crate) fn read_single_file_archive_from_path(
     read_archive_member(archive_path, archive_format, &member_path)
 }
 
+/// 从本地压缩包文件中把唯一普通文件成员直接写入目标 writer。
+///
+/// 业务意图：
+/// - 该函数服务插件、后台分析等只做顺序消费的场景，避免把单文件压缩日志先解压到内存或临时文件。
+/// - “唯一普通文件”的业务判断仍复用现有目录扫描逻辑，避免多文件压缩包误读第一个成员。
+pub(crate) fn stream_single_file_archive_from_path_to_writer<W: Write + ?Sized>(
+    archive_path: &Path,
+    archive_format: ArchiveFormat,
+    writer: &mut W,
+) -> Result<(), ArchiveReadError> {
+    let label = archive_path.display().to_string();
+    let archive_format = if archive_format == ArchiveFormat::TarGz {
+        ArchiveFormat::from_file(archive_path).unwrap_or(archive_format)
+    } else {
+        archive_format
+    };
+    let member_path =
+        single_file_archive_member_path_from_path(archive_path, archive_format, label.as_str())?;
+    stream_archive_member_to_writer(archive_path, archive_format, &member_path, writer)
+}
+
 /// 从内存中的压缩包字节读取唯一普通文件成员。
 ///
 /// 业务意图：
@@ -224,6 +314,42 @@ pub(crate) fn read_single_file_archive_from_bytes(
         ArchiveFormat::SevenZ => read_single_file_7z_from_bytes(archive_bytes, label),
         ArchiveFormat::Rar => Err(ArchiveReadError::new(format!(
             "{} {} 暂不支持直接从内存读取 RAR，请先选择外层解包后的 RAR 文件",
+            context_label, label
+        ))),
+    }
+}
+
+/// 从内存中的压缩包字节把唯一普通文件成员直接写入目标 writer。
+///
+/// 业务意图：
+/// - 外层压缩包内的单文件压缩日志只需要顺序解压给插件，不应再为目标日志成员分配整块内存。
+/// - 单文件校验由各格式 reader 负责，确保多文件包仍返回明确错误。
+pub(crate) fn stream_single_file_archive_from_bytes_to_writer<W: Write + ?Sized>(
+    archive_bytes: &[u8],
+    archive_format: ArchiveFormat,
+    label: &str,
+    context_label: &str,
+    writer: &mut W,
+) -> Result<(), ArchiveReadError> {
+    let archive_format = archive_format.resolve_from_bytes(archive_bytes);
+    match archive_format {
+        ArchiveFormat::Zip => {
+            stream_single_file_zip_from_bytes_to_writer(archive_bytes, label, writer)
+        }
+        ArchiveFormat::Tar => {
+            stream_single_file_tar_from_bytes_to_writer(archive_bytes, label, writer)
+        }
+        ArchiveFormat::TarGz => {
+            stream_single_file_tar_gz_from_bytes_to_writer(archive_bytes, label, writer)
+        }
+        ArchiveFormat::Gzip => {
+            stream_single_gzip_payload_from_bytes_to_writer(archive_bytes, label, writer)
+        }
+        ArchiveFormat::SevenZ => {
+            stream_single_file_7z_from_bytes_to_writer(archive_bytes, label, writer)
+        }
+        ArchiveFormat::Rar => Err(ArchiveReadError::new(format!(
+            "{} {} 暂不支持直接从内存流式读取 RAR，请先选择外层解包后的 RAR 文件",
             context_label, label
         ))),
     }
@@ -315,6 +441,28 @@ fn read_reader_to_vec_with_limit<R: Read>(
         .map_err(|error| ArchiveReadError::new(format!("读取日志内容失败：{}", error)))?;
     ensure_buffer_within_limit(bytes.len(), label)?;
     Ok(bytes)
+}
+
+/// 把 reader 内容顺序复制到调用方 writer。
+///
+/// 业务意图：
+/// - 该辅助函数专门用于“后台流式分析”而不是右侧日志 tab 打开，因此不分配整块内存。
+/// - 调用方 writer 可以在写入过程中按行拆分、上报进度或转发给插件进程。
+///
+/// 边界条件：
+/// - 不检查 200MB tab 缓存上限；如果底层 reader 或 writer 失败，会带上成员名称形成中文错误。
+fn copy_reader_to_writer<R, W>(
+    mut reader: R,
+    writer: &mut W,
+    label: &str,
+) -> Result<(), ArchiveReadError>
+where
+    R: Read,
+    W: Write + ?Sized,
+{
+    io::copy(&mut reader, writer).map(|_| ()).map_err(|error| {
+        ArchiveReadError::new(format!("流式读取日志内容 {} 失败：{}", label, error))
+    })
 }
 
 /// 检查声明大小是否超过上限。

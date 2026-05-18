@@ -80,6 +80,7 @@ impl SettingsWindowView {
             _main_view_subscription: main_view_subscription,
         };
         view.refresh_shell_integration_status(context);
+        view.ensure_storage_locations_loaded(context);
         view
     }
 
@@ -92,6 +93,10 @@ impl SettingsWindowView {
             view.settings.settings_active_tab = tab;
             context.notify();
         });
+        // 存储页展示的是文件系统实时快照，用户切入页签时刷新一次，避免继续显示旧大小或旧错误。
+        if tab == SettingsTab::Storage {
+            self.refresh_storage_locations_from_settings(context);
+        }
         context.notify();
     }
 
@@ -542,6 +547,8 @@ impl SettingsWindowView {
                 context,
             ),
             SettingsTab::Model => self.render_model_tab(palette, context),
+            SettingsTab::Plugin => self.render_plugin_tab(palette, context),
+            SettingsTab::Storage => self.render_storage_tab(palette, context),
             SettingsTab::About => super::about_view::render_about_settings_tab(palette),
         }
     }

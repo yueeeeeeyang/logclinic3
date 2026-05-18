@@ -16,7 +16,7 @@ mod scan;
 pub use self::format::ArchiveFormat;
 pub(crate) use self::materialize::{
     MaterializedLogSource, cleanup_materialized_file, cleanup_stale_large_log_cache,
-    materialize_source_for_paging,
+    large_log_cache_root, large_log_session_dir, materialize_source_for_paging,
 };
 pub(crate) use self::path::{
     is_single_gzip_member_path, join_archive_segments, normalize_archive_member_path,
@@ -25,7 +25,9 @@ pub(crate) use self::path::{
 pub(crate) use self::read::{
     ArchiveReadError, read_archive_member, read_archive_member_from_bytes,
     read_single_file_archive_from_bytes, read_single_file_archive_from_path,
-    single_file_archive_member_path_from_path, write_temporary_nested_archive_bytes,
+    single_file_archive_member_path_from_path, stream_archive_member_from_bytes_to_writer,
+    stream_archive_member_to_writer, stream_single_file_archive_from_bytes_to_writer,
+    stream_single_file_archive_from_path_to_writer, write_temporary_nested_archive_bytes,
 };
 #[cfg(test)]
 pub(crate) use self::scan::normalized_rar_nested_archive_member_path;

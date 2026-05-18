@@ -1,0 +1,21 @@
+{
+  "api_version": 1,
+  "id": "weaver-logext",
+  "name": "泛微日志插件",
+  "version": "0.2.0",
+  "entry": {
+    "command": ["weaver-logext"]
+  },
+  "permissions": ["ui.log_tree_menu", "logs.metadata", "logs.content"],
+  "contributes": {
+    "log_tree_context_menu": [
+      {
+        "id": "weaver.performance_list",
+        "title": "性能列表解析",
+        "icon": "ChartNoAxesCombined",
+        "command": "performance_list_parse",
+        "when": "selection_has_log_file"
+      }
+    ]
+  }
+}

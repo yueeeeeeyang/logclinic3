@@ -397,6 +397,35 @@ pub(crate) fn collect_log_ai_analysis_sources_from_tree(
     sources
 }
 
+/// 判断日志树选择中是否存在至少一个可用于智能分析的文件来源。
+///
+/// 业务意图：
+/// - 右键菜单渲染阶段只需要判断“智能分析”是否可点，不应提前递归收集完整文件列表。
+/// - 大目录下菜单 hover 会触发重渲染；选中目录时如果第一个后代就是文件，应立即返回，避免 UI 线程遍历上万行。
+///
+/// 边界条件：
+/// - 规则和 `collect_log_ai_analysis_sources_from_tree` 一致：选中文件处理自身，选中目录或压缩包时递归查看后代文件。
+/// - 这里不克隆 `LogFileSource`，只判断来源是否存在，避免菜单启用态造成路径字符串分配。
+pub(crate) fn has_log_ai_analysis_source_in_tree(
+    tree: &LoadedLogTree,
+    selected_node_ids: &HashSet<usize>,
+) -> bool {
+    for (index, row) in tree.rows.iter().enumerate() {
+        if !selected_node_ids.contains(&row.id) {
+            continue;
+        }
+
+        if row_has_log_ai_analysis_source(row) {
+            return true;
+        }
+        if row.has_children && has_descendant_log_ai_analysis_source(&tree.rows, index, row.depth) {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// 执行一次日志智能分析后台任务。
 ///
 /// 业务意图：
@@ -1442,6 +1471,14 @@ fn push_log_ai_analysis_row_source(
     }
 }
 
+/// 判断单个树行自身是否可作为智能分析来源。
+///
+/// 业务意图：
+/// - 菜单启用态需要和实际收集逻辑共享“只有文件节点且存在来源才可分析”的核心规则。
+fn row_has_log_ai_analysis_source(row: &LogTreeRow) -> bool {
+    row.kind == LogTreeEntryKind::File && row.source.is_some()
+}
+
 /// 收集某个目录或压缩包节点下的所有文件来源。
 fn collect_descendant_log_ai_analysis_sources(
     rows: &[LogTreeRow],
@@ -1456,6 +1493,26 @@ fn collect_descendant_log_ai_analysis_sources(
         }
         push_log_ai_analysis_row_source(row, sources, seen_keys);
     }
+}
+
+/// 判断某个目录或压缩包节点后代中是否存在可分析文件。
+///
+/// 业务意图：
+/// - 右键菜单启用态只做存在性判断，发现第一个文件来源后立刻短路，避免大目录 hover 重渲染时重复构造完整来源列表。
+fn has_descendant_log_ai_analysis_source(
+    rows: &[LogTreeRow],
+    parent_index: usize,
+    parent_depth: usize,
+) -> bool {
+    for row in rows.iter().skip(parent_index + 1) {
+        if row.depth <= parent_depth {
+            break;
+        }
+        if row_has_log_ai_analysis_source(row) {
+            return true;
+        }
+    }
+    false
 }
 
 /// 把超长日志行切成不会超过预算的 UTF-8 安全片段。

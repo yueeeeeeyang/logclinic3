@@ -34,6 +34,13 @@ pub(in crate::app) const NOTES_WORKSPACE_MIN_WIDTH: f32 = 420.0;
 /// 笔记树默认展开深度。
 pub(in crate::app) const NOTES_TREE_DEFAULT_EXPANDED_DEPTH: usize = 2;
 
+/// 笔记树行文字字号。
+///
+/// UI 约束：
+/// - 笔记左侧树通常展示较多真实目录和 Markdown 文件名，13px 比日志树默认字号更紧凑，能在同样宽度下保留更多路径信息。
+/// - 该值只影响笔记树行，不复用日志树字号，避免后续调整日志目录树时连带改变笔记页密度。
+pub(in crate::app) const NOTES_TREE_FONT_SIZE: f32 = 13.0;
+
 /// 笔记源码阅读和编辑区行高。
 pub(in crate::app) const NOTES_TEXT_LINE_HEIGHT: f32 = 21.0;
 
@@ -82,6 +89,31 @@ pub(in crate::app) const NOTES_RICH_TEXT_VERTICAL_PADDING: f32 = 14.0;
 
 /// 富文本工具栏高度。
 pub(in crate::app) const NOTES_RICH_TEXT_TOOLBAR_HEIGHT: f32 = 40.0;
+
+/// 笔记 AI 侧边栏宽度。
+///
+/// UI 约束：
+/// - 侧边栏只服务当前编辑中的笔记，宽度需要容纳模型选择、对话预览和输入框，同时不能把 A4 编辑区挤到不可用。
+/// - 该宽度只在笔记编辑态使用，不写入配置文件，避免临时 AI 辅助布局影响后续普通笔记阅读。
+pub(in crate::app) const NOTES_AI_ASSISTANT_WIDTH: f32 = 360.0;
+
+/// 笔记 AI 输入框默认高度。
+///
+/// 业务意图：
+/// - 用户通常输入一句生成或改写要求，默认高度给两到三行文本空间；更长输入仍可通过内部滚动完整编辑。
+pub(in crate::app) const NOTES_AI_INPUT_HEIGHT: f32 = 116.0;
+
+/// 笔记 AI 输入框行高。
+///
+/// 跨平台约束：
+/// - macOS 和 Windows 的默认 UI 字体字形高度不同，固定逻辑像素行高可以避免 IME 光标和多行命中在不同平台明显漂移。
+pub(in crate::app) const NOTES_AI_INPUT_LINE_HEIGHT: f32 = 20.0;
+
+/// 笔记 AI 输入框底部浮层预留高度。
+///
+/// UI 约束：
+/// - 发送按钮位于输入框底部浮层，正文滚动区需要保留空间，避免最后一行文字被按钮遮挡。
+pub(in crate::app) const NOTES_AI_INPUT_BOTTOM_PADDING: f32 = 44.0;
 
 /// 代码块横向内边距。
 pub(in crate::app) const NOTES_CODE_BLOCK_HORIZONTAL_PADDING: f32 = 16.0;

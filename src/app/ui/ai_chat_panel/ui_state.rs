@@ -6,7 +6,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     ops::Range,
     sync::mpsc,
 };
@@ -129,6 +129,70 @@ pub(in crate::app) struct AiChatInputLineLayout {
     pub(in crate::app) bounds: Bounds<Pixels>,
 }
 
+/// AI 对话消息正文中的可选择文本段标识。
+///
+/// 业务意图：
+/// - 一条 Markdown 消息会被拆成段落、标题、代码行和表格单元格等多个可绘制文本段；选区必须精确绑定到其中一个文本段。
+/// - `message_id` 和 `segment_id` 共同组成稳定键，避免虚拟列表滚动复用元素时把选区画到其它消息上。
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(in crate::app) struct AiChatMessageTextSegmentKey {
+    /// 所属 AI 消息 ID。
+    pub(in crate::app) message_id: String,
+    /// 消息内部文本段 ID，例如 `content`、`0`、`2-code-3`。
+    pub(in crate::app) segment_id: String,
+}
+
+impl AiChatMessageTextSegmentKey {
+    /// 创建消息文本段标识。
+    pub(in crate::app) fn new(
+        message_id: impl Into<String>,
+        segment_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            message_id: message_id.into(),
+            segment_id: segment_id.into(),
+        }
+    }
+}
+
+/// AI 对话消息正文文本选区。
+///
+/// 业务意图：
+/// - 气泡内容不是系统文本控件，不能依赖平台选区；这里保存用户在某个可绘制文本段内拖出的 UTF-8 字节范围。
+/// - 复制快捷键只复制当前选中的文本片段；一键复制按钮则复制整条消息正文，两个行为互不干扰。
+///
+/// 边界条件：
+/// - `text` 是开始选择时的文本快照，复制时不再读取可能已经被流式更新的消息，避免范围和内容长度错位。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::app) struct AiChatMessageTextSelection {
+    /// 当前选区所属文本段。
+    pub(in crate::app) segment: AiChatMessageTextSegmentKey,
+    /// 文本段快照。
+    pub(in crate::app) text: String,
+    /// 当前选中范围。
+    pub(in crate::app) range: Range<usize>,
+    /// 拖动开始时的字节位置。
+    pub(in crate::app) drag_anchor: usize,
+    /// 是否处于鼠标拖选生命周期。
+    pub(in crate::app) dragging: bool,
+}
+
+/// AI 对话消息文本段最近一次绘制布局。
+///
+/// 业务意图：
+/// - 鼠标拖选需要把窗口坐标换算成文本字节下标；直接复用自绘元素最近一帧的 `WrappedLine`，可以保留 Markdown 样式、自动换行和平台字体差异。
+/// - 布局只在当前运行会话内使用；页面重绘会覆盖同一文本段的旧布局，滚动历史时最多保留轻量的命中计算缓存。
+pub(in crate::app) struct AiChatMessageTextLayoutSnapshot {
+    /// 文本段快照。
+    pub(in crate::app) text: String,
+    /// 当前段落的自动换行排版结果。
+    pub(in crate::app) lines: Vec<gpui::WrappedLine>,
+    /// 当前文本段行高。
+    pub(in crate::app) line_height: Pixels,
+    /// 当前文本段在窗口中的边界。
+    pub(in crate::app) bounds: Bounds<Pixels>,
+}
+
 /// AI 对话页面完整工作区状态。
 ///
 /// 业务意图：
@@ -185,6 +249,16 @@ pub(in crate::app) struct AiChatWorkspaceState {
     pub(in crate::app) input_last_bounds: Option<Bounds<Pixels>>,
     /// AI 对话输入框拖拽选择锚点。
     pub(in crate::app) input_selection_drag: Option<usize>,
+    /// AI 对话消息文本选区焦点句柄。
+    ///
+    /// 业务意图：
+    /// - 用户从输入框切到消息气泡拖选文本后，需要让 `Cmd/Ctrl+C` 复制消息选区，而不是仍然落到输入框。
+    pub(in crate::app) message_selection_focus: gpui::FocusHandle,
+    /// AI 对话消息正文当前文本选区。
+    pub(in crate::app) message_text_selection: Option<AiChatMessageTextSelection>,
+    /// 已绘制消息文本段的最近布局缓存。
+    pub(in crate::app) message_text_layouts:
+        BTreeMap<AiChatMessageTextSegmentKey, AiChatMessageTextLayoutSnapshot>,
     /// AI 对话输入区当前高度。
     pub(in crate::app) input_height: f32,
     /// AI 对话输入区高度拖拽状态。
@@ -253,6 +327,9 @@ impl AiChatWorkspaceState {
             input_last_layouts: Vec::new(),
             input_last_bounds: None,
             input_selection_drag: None,
+            message_selection_focus: context.focus_handle(),
+            message_text_selection: None,
+            message_text_layouts: BTreeMap::new(),
             input_height: AI_CHAT_INPUT_DEFAULT_HEIGHT,
             input_resize_drag: None,
             deep_thinking_enabled: false,
@@ -282,6 +359,21 @@ pub(in crate::app) fn ai_chat_reasoning_panel_is_expanded(
     let is_thinking_without_answer =
         message.status == AiChatMessageStatus::Streaming && message.content.is_empty();
     is_thinking_without_answer || expanded_message_ids.contains(&message.id)
+}
+
+/// 返回一键复制整条 AI 消息时写入剪贴板的文本。
+///
+/// 业务意图：
+/// - 用户点击气泡复制按钮时应拿到可继续粘贴使用的原始消息正文；助手 Markdown 不转成富文本，也不包含“助手/你”等 UI 标签。
+/// - 流式阶段如果正式回复仍为空但已有推理内容，则允许复制推理文本，避免用户无法取出正在生成的可见内容。
+pub(in crate::app) fn ai_chat_message_clipboard_text(message: &AiChatMessage) -> String {
+    if !message.content.is_empty() {
+        message.content.clone()
+    } else if !message.reasoning_content.is_empty() {
+        message.reasoning_content.clone()
+    } else {
+        message.error_message.as_ref().cloned().unwrap_or_default()
+    }
 }
 
 /// 计算深度思考单控件的下一状态。

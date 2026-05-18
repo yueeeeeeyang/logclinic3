@@ -98,6 +98,58 @@ pub(super) fn read_single_file_tar_from_bytes(
     })
 }
 
+/// 从内存 TAR 字节中把唯一普通文件直接写入 writer。
+///
+/// 业务意图：
+/// - TAR 是顺序格式，插件分析可在确认唯一成员的同时把目标正文流给调用方。
+/// - 仍必须扫描到末尾确认没有第二个普通文件；因此目标成员会在扫描时立即写出，随后继续排空后续条目。
+pub(super) fn stream_single_file_tar_from_bytes_to_writer<W: Write + ?Sized>(
+    archive_bytes: &[u8],
+    label: &str,
+    writer: &mut W,
+) -> Result<(), ArchiveReadError> {
+    let mut archive = TarArchive::new(Cursor::new(archive_bytes));
+    let entries = archive
+        .entries()
+        .map_err(|error| ArchiveReadError::new(format!("无法读取嵌套 TAR 目录：{}", error)))?;
+    let mut single_member = None;
+    let mut wrote_member = false;
+
+    for entry in entries {
+        let mut entry = entry
+            .map_err(|error| ArchiveReadError::new(format!("无法读取嵌套 TAR 条目：{}", error)))?;
+        if entry.header().entry_type().is_dir() {
+            continue;
+        }
+
+        let entry_path = entry.path().map_err(|error| {
+            ArchiveReadError::new(format!("无法读取嵌套 TAR 条目路径：{}", error))
+        })?;
+        let raw_name = entry_path.to_string_lossy();
+        let normalized = normalize_archive_member_path(&raw_name).map_err(|reason| {
+            ArchiveReadError::new(format!("{} 内包含非法 TAR 条目：{}", label, reason))
+        })?;
+        remember_single_archive_member(&mut single_member, normalized.clone(), label)?;
+        if wrote_member {
+            drain_tar_entry(&mut entry, &normalized)?;
+            continue;
+        }
+
+        copy_reader_to_writer(&mut entry, writer, &normalized)?;
+        wrote_member = true;
+    }
+
+    require_single_archive_member(single_member, label)?;
+    if wrote_member {
+        Ok(())
+    } else {
+        Err(ArchiveReadError::new(format!(
+            "{} 内没有可打开的普通文件，无法直接显示日志内容",
+            label
+        )))
+    }
+}
+
 /// 从 TAR 压缩包中读取成员。
 ///
 /// 业务意图：
@@ -145,6 +197,51 @@ pub(super) fn read_tar_member(
     )))
 }
 
+/// 从 TAR 压缩包中把指定成员内容直接写入 writer。
+///
+/// 业务意图：
+/// - 顺序读取 TAR 条目并把目标日志直接转交给插件内容流，避免整份日志进入内存。
+pub(super) fn stream_tar_member_to_writer<W: Write + ?Sized>(
+    archive_path: &Path,
+    member_path: &str,
+    writer: &mut W,
+) -> Result<(), ArchiveReadError> {
+    let file = File::open(archive_path).map_err(|error| {
+        ArchiveReadError::new(format!(
+            "无法打开 TAR 压缩包 {}：{}",
+            archive_path.display(),
+            error
+        ))
+    })?;
+    let mut archive = TarArchive::new(BufReader::new(file));
+    let entries = archive
+        .entries()
+        .map_err(|error| ArchiveReadError::new(format!("无法读取 TAR 目录：{}", error)))?;
+
+    for entry in entries {
+        let mut entry = entry
+            .map_err(|error| ArchiveReadError::new(format!("无法读取 TAR 条目：{}", error)))?;
+        let entry_path = entry
+            .path()
+            .map_err(|error| ArchiveReadError::new(format!("无法读取 TAR 条目路径：{}", error)))?;
+        let raw_name = entry_path.to_string_lossy().to_string();
+        if entry.header().entry_type().is_dir() {
+            continue;
+        }
+        if normalize_archive_member_path(&raw_name).ok().as_deref() != Some(member_path) {
+            drain_tar_entry(&mut entry, member_path)?;
+            continue;
+        }
+
+        return copy_reader_to_writer(&mut entry, writer, member_path);
+    }
+
+    Err(ArchiveReadError::new(format!(
+        "TAR 压缩包中未找到成员 {}",
+        member_path
+    )))
+}
+
 /// 从内存 TAR 字节中读取指定成员。
 ///
 /// 业务意图：
@@ -177,6 +274,42 @@ pub(super) fn read_tar_member_from_bytes(
         let size = entry.size();
         ensure_size_within_limit(size, member_path)?;
         return read_reader_to_vec_with_limit(&mut entry, Some(size), member_path);
+    }
+
+    Err(ArchiveReadError::new(format!(
+        "嵌套压缩包 {} 中未找到日志文件：{}",
+        label, member_path
+    )))
+}
+
+/// 从内存 TAR 字节中把指定成员内容直接写入 writer。
+pub(super) fn stream_tar_member_from_bytes_to_writer<W: Write + ?Sized>(
+    archive_bytes: &[u8],
+    member_path: &str,
+    label: &str,
+    writer: &mut W,
+) -> Result<(), ArchiveReadError> {
+    let mut archive = TarArchive::new(Cursor::new(archive_bytes));
+    let entries = archive.entries().map_err(|error| {
+        ArchiveReadError::new(format!("无法读取嵌套 TAR {} 的目录：{}", label, error))
+    })?;
+
+    for entry in entries {
+        let mut entry = entry
+            .map_err(|error| ArchiveReadError::new(format!("无法读取嵌套 TAR 条目：{}", error)))?;
+        let entry_path = entry.path().map_err(|error| {
+            ArchiveReadError::new(format!("无法读取嵌套 TAR 条目路径：{}", error))
+        })?;
+        let raw_name = entry_path.to_string_lossy().to_string();
+        if entry.header().entry_type().is_dir() {
+            continue;
+        }
+        if normalize_archive_member_path(&raw_name).ok().as_deref() != Some(member_path) {
+            drain_tar_entry(&mut entry, member_path)?;
+            continue;
+        }
+
+        return copy_reader_to_writer(&mut entry, writer, member_path);
     }
 
     Err(ArchiveReadError::new(format!(

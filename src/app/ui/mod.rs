@@ -19,6 +19,8 @@ mod log;
 mod markdown;
 /// 笔记 GPUI 面板。
 mod notes_panel;
+/// 插件声明式窗口和命令调度。
+mod plugin_panel;
 /// 搜索弹窗和结果面板 GPUI 适配。
 mod search_panel;
 /// 设置窗口 GPUI 视图和动作。
@@ -33,6 +35,7 @@ pub(in crate::app) use analysis_panel::{
 pub(in crate::app) use chat_panel::*;
 pub(in crate::app) use markdown::*;
 pub(in crate::app) use notes_panel::*;
+pub(in crate::app) use plugin_panel::PluginPageWindowView;
 pub(in crate::app) use search_panel::SearchDialogWindowView;
 pub(in crate::app) use settings_panel::SettingsWindowView;
 pub(in crate::app) use shell::*;

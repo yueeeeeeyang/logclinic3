@@ -861,3 +861,50 @@ fn ai_对话_markdown_正文哈希随内容变化() {
         ai_chat_markdown_content_hash("**不同**")
     );
 }
+
+/// 验证一键复制优先复制消息原始正文。
+///
+/// 业务意图：
+/// - 气泡标题行的复制按钮应复制可继续粘贴的原始 Markdown/用户输入，不应带上 UI 中的“你”“助手”等标签。
+#[test]
+fn ai_对话消息复制使用原始正文() {
+    let message = AiChatMessage {
+        id: "copy-message".to_string(),
+        conversation_id: "conversation".to_string(),
+        role: AiChatMessageRole::Assistant,
+        content: "**结论**\n\n- 条目".to_string(),
+        reasoning_content: "推理".to_string(),
+        status: AiChatMessageStatus::Complete,
+        error_message: None,
+        sequence: 1,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+    };
+
+    assert_eq!(
+        ai_chat_message_clipboard_text(&message),
+        "**结论**\n\n- 条目"
+    );
+}
+
+/// 验证空正式回复时仍可复制可见推理内容。
+///
+/// 边界条件：
+/// - 深度思考流式阶段可能先展示推理、正式回复为空；此时一键复制不能返回空字符串。
+#[test]
+fn ai_对话消息复制在空正文时回退推理内容() {
+    let message = AiChatMessage {
+        id: "reasoning-message".to_string(),
+        conversation_id: "conversation".to_string(),
+        role: AiChatMessageRole::Assistant,
+        content: String::new(),
+        reasoning_content: "正在分析问题".to_string(),
+        status: AiChatMessageStatus::Streaming,
+        error_message: None,
+        sequence: 1,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+    };
+
+    assert_eq!(ai_chat_message_clipboard_text(&message), "正在分析问题");
+}

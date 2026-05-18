@@ -92,6 +92,76 @@ pub(super) fn read_single_file_7z_from_bytes(
     }
 }
 
+/// 从内存 7Z 字节中把唯一普通文件直接写入 writer。
+///
+/// 业务意图：
+/// - 7Z 成员可能较大，插件分析应通过 `SevenZReader` 顺序输出，不为目标日志再分配整块内存。
+/// - 仍遍历所有条目确认唯一普通文件，保持单文件压缩包打开语义。
+pub(super) fn stream_single_file_7z_from_bytes_to_writer<W: Write + ?Sized>(
+    archive_bytes: &[u8],
+    label: &str,
+    writer: &mut W,
+) -> Result<(), ArchiveReadError> {
+    let cursor = Cursor::new(archive_bytes);
+    let mut reader = sevenz_rust::SevenZReader::new(
+        cursor,
+        archive_bytes.len() as u64,
+        sevenz_rust::Password::empty(),
+    )
+    .map_err(|error| ArchiveReadError::new(format!("无法读取嵌套 7Z 目录：{}", error)))?;
+    let mut single_member = None;
+    let mut wrote_member = false;
+    let mut result: Option<Result<(), ArchiveReadError>> = None;
+
+    reader
+        .for_each_entries(|entry, entry_reader| {
+            if entry.is_directory() {
+                return Ok(true);
+            }
+
+            let normalized = match normalize_archive_member_path(entry.name()) {
+                Ok(path) => path,
+                Err(reason) => {
+                    result = Some(Err(ArchiveReadError::new(format!(
+                        "{} 内包含非法 7Z 条目：{}",
+                        label, reason
+                    ))));
+                    return Ok(false);
+                }
+            };
+            if let Err(error) =
+                remember_single_archive_member(&mut single_member, normalized.clone(), label)
+            {
+                result = Some(Err(error));
+                return Ok(false);
+            }
+
+            if wrote_member {
+                drain_7z_entry_reader(entry_reader)?;
+                return Ok(true);
+            }
+
+            let copy_result = copy_reader_to_writer(entry_reader, writer, &normalized);
+            let should_continue = copy_result.is_ok();
+            result = Some(copy_result);
+            wrote_member = true;
+            Ok(should_continue)
+        })
+        .map_err(|error| ArchiveReadError::new(format!("读取嵌套 7Z 日志文件失败：{}", error)))?;
+
+    match result {
+        Some(Ok(())) => {
+            require_single_archive_member(single_member, label)?;
+            Ok(())
+        }
+        Some(Err(error)) => Err(error),
+        None => Err(ArchiveReadError::new(format!(
+            "{} 内没有可打开的普通文件，无法直接显示日志内容",
+            label
+        ))),
+    }
+}
+
 /// 从 7Z 压缩包中读取成员。
 ///
 /// 边界条件：
@@ -130,6 +200,41 @@ pub(super) fn read_7z_member(
     }
 }
 
+/// 从 7Z 压缩包中把指定成员内容直接写入 writer。
+///
+/// 业务意图：
+/// - 对 solid archive 仍顺序消费非目标条目；目标条目则直接输出到插件内容流。
+pub(super) fn stream_7z_member_to_writer<W: Write + ?Sized>(
+    archive_path: &Path,
+    member_path: &str,
+    writer: &mut W,
+) -> Result<(), ArchiveReadError> {
+    let mut reader = sevenz_rust::SevenZReader::open(archive_path, sevenz_rust::Password::empty())
+        .map_err(|error| ArchiveReadError::new(format!("无法打开 7Z 压缩包：{}", error)))?;
+    let mut result: Option<Result<(), ArchiveReadError>> = None;
+
+    reader
+        .for_each_entries(|entry, entry_reader| {
+            if entry.is_directory()
+                || normalize_archive_member_path(entry.name()).ok().as_deref() != Some(member_path)
+            {
+                drain_7z_entry_reader(entry_reader)?;
+                return Ok(true);
+            }
+
+            result = Some(copy_reader_to_writer(entry_reader, writer, member_path));
+            Ok(false)
+        })
+        .map_err(|error| ArchiveReadError::new(format!("读取 7Z 日志文件失败：{}", error)))?;
+
+    result.unwrap_or_else(|| {
+        Err(ArchiveReadError::new(format!(
+            "压缩包中未找到日志文件：{}",
+            member_path
+        )))
+    })
+}
+
 /// 从内存 7Z 字节中读取指定成员。
 pub(super) fn read_7z_member_from_bytes(
     archive_bytes: &[u8],
@@ -161,6 +266,46 @@ pub(super) fn read_7z_member_from_bytes(
                     read_reader_to_vec_with_limit(entry_reader, Some(entry.size), member_path)
                 }),
             );
+            Ok(false)
+        })
+        .map_err(|error| ArchiveReadError::new(format!("读取嵌套 7Z 日志文件失败：{}", error)))?;
+
+    result.unwrap_or_else(|| {
+        Err(ArchiveReadError::new(format!(
+            "嵌套压缩包 {} 中未找到日志文件：{}",
+            label, member_path
+        )))
+    })
+}
+
+/// 从内存 7Z 字节中把指定成员内容直接写入 writer。
+pub(super) fn stream_7z_member_from_bytes_to_writer<W: Write + ?Sized>(
+    archive_bytes: &[u8],
+    member_path: &str,
+    label: &str,
+    writer: &mut W,
+) -> Result<(), ArchiveReadError> {
+    let cursor = Cursor::new(archive_bytes);
+    let mut reader = sevenz_rust::SevenZReader::new(
+        cursor,
+        archive_bytes.len() as u64,
+        sevenz_rust::Password::empty(),
+    )
+    .map_err(|error| {
+        ArchiveReadError::new(format!("无法读取嵌套 7Z {} 的目录：{}", label, error))
+    })?;
+    let mut result: Option<Result<(), ArchiveReadError>> = None;
+
+    reader
+        .for_each_entries(|entry, entry_reader| {
+            if entry.is_directory()
+                || normalize_archive_member_path(entry.name()).ok().as_deref() != Some(member_path)
+            {
+                drain_7z_entry_reader(entry_reader)?;
+                return Ok(true);
+            }
+
+            result = Some(copy_reader_to_writer(entry_reader, writer, member_path));
             Ok(false)
         })
         .map_err(|error| ArchiveReadError::new(format!("读取嵌套 7Z 日志文件失败：{}", error)))?;

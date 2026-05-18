@@ -379,6 +379,247 @@ impl LoadedLogTreeState {
         sources
     }
 
+    /// 判断指定节点集合是否包含普通文件操作可处理的来源。
+    ///
+    /// 业务意图：
+    /// - 右键菜单渲染只需要知道菜单项是否可用，不应为了启用态构造完整来源列表。
+    /// - 大目录下打开菜单时，鼠标 hover 会触发多次重渲染；这里必须尽早短路，避免 UI 线程反复扫描和克隆上万条路径。
+    ///
+    /// 边界条件：
+    /// - 普通目录即使包含文件也不算普通文件操作来源，保持“另存为/选中搜索/线程分析”只处理显式文件的现有语义。
+    /// - 单文件压缩包根节点仍按既有规则映射为唯一内部文件。
+    pub(in crate::app) fn has_file_source_for_node_ids(&self, node_ids: &HashSet<usize>) -> bool {
+        if node_ids.is_empty() {
+            return false;
+        }
+
+        let mut remaining = node_ids.len();
+        for row in &self.tree.rows {
+            if !node_ids.contains(&row.id) {
+                continue;
+            }
+
+            remaining = remaining.saturating_sub(1);
+            if row.source.is_some() {
+                return true;
+            }
+            if row.kind == LogTreeEntryKind::Archive
+                && self.single_file_source_for_archive(row.id).is_some()
+            {
+                return true;
+            }
+            if remaining == 0 {
+                break;
+            }
+        }
+
+        false
+    }
+
+    /// 返回插件日志树菜单可接收的日志文件元数据。
+    ///
+    /// 业务意图：
+    /// - 插件默认只开放日志来源元数据；声明 `logs.content` 权限的插件会额外收到当前文件的受控读取路径。
+    /// - 选中文件节点直接进入候选；选中目录或压缩包目录时只展开直接子文件，不递归，符合“目录下的日志”已确认规则。
+    ///
+    /// 边界条件：
+    /// - 错误节点、符号链接节点、目录节点自身和没有 `LogFileSource` 的节点都不会发送给插件。
+    /// - 父目录和子文件同时被选中时按来源稳定键去重，并保持加载树前序顺序，保证插件结果稳定可复现。
+    pub(in crate::app) fn plugin_log_files_for_node_ids(
+        &self,
+        node_ids: &HashSet<usize>,
+    ) -> Vec<PluginLogFile> {
+        let mut selected_parent_stack: Vec<(usize, bool)> = Vec::new();
+        let mut seen_keys = HashSet::new();
+        let mut files = Vec::new();
+
+        for row in &self.tree.rows {
+            while selected_parent_stack
+                .last()
+                .is_some_and(|(depth, _)| *depth >= row.depth)
+            {
+                selected_parent_stack.pop();
+            }
+
+            let selected_direct_parent = selected_parent_stack
+                .last()
+                .is_some_and(|(depth, selected)| *selected && row.depth == depth + 1);
+            let selected_file = node_ids.contains(&row.id);
+            if row.kind == LogTreeEntryKind::File
+                && (selected_file || selected_direct_parent)
+                && let Some(source) = row.source.as_ref()
+            {
+                let source_key = source.stable_key();
+                if seen_keys.insert(source_key.clone()) {
+                    files.push(Self::plugin_log_file_from_row(row, source, source_key));
+                }
+            }
+
+            if row.has_children {
+                selected_parent_stack.push((row.depth, node_ids.contains(&row.id)));
+            }
+        }
+
+        files
+    }
+
+    /// 判断指定节点集合是否能为插件菜单提供至少一个日志文件。
+    ///
+    /// 业务意图：
+    /// - 插件菜单启用态只需要布尔值；在大目录中如果目录第一个直接子节点就是文件，应立刻返回，不能构造上万条 `PluginLogFile`。
+    /// - 完整元数据快照只在用户真正点击插件菜单项时生成，避免菜单 hover 重渲染拖慢主线程。
+    ///
+    /// 边界条件：
+    /// - 判断规则必须和 `plugin_log_files_for_node_ids` 保持一致：文件节点自身可用，目录只取直接子文件，不递归深层目录。
+    pub(in crate::app) fn has_plugin_log_file_for_node_ids(
+        &self,
+        node_ids: &HashSet<usize>,
+    ) -> bool {
+        if node_ids.is_empty() {
+            return false;
+        }
+
+        let mut selected_parent_stack: Vec<(usize, bool)> = Vec::new();
+        for row in &self.tree.rows {
+            while selected_parent_stack
+                .last()
+                .is_some_and(|(depth, _)| *depth >= row.depth)
+            {
+                selected_parent_stack.pop();
+            }
+
+            let selected_direct_parent = selected_parent_stack
+                .last()
+                .is_some_and(|(depth, selected)| *selected && row.depth == depth + 1);
+            let selected_file = node_ids.contains(&row.id);
+            if row.kind == LogTreeEntryKind::File
+                && (selected_file || selected_direct_parent)
+                && row.source.is_some()
+            {
+                return true;
+            }
+
+            if row.has_children {
+                selected_parent_stack.push((row.depth, node_ids.contains(&row.id)));
+            }
+        }
+
+        false
+    }
+
+    /// 按右键菜单规则收集插件候选日志，必要时使用右键落点兜底。
+    ///
+    /// 业务意图：
+    /// - 右键未落在当前多选集合时，打开菜单阶段会切换选择；但旧事件和特殊节点仍可能让选择没有可用文件。
+    /// - 兜底节点如果是目录或压缩包目录，同样只取直接子文件；如果是文件则取该文件来源。
+    pub(in crate::app) fn plugin_log_files_for_menu(
+        &self,
+        selected_node_ids: &HashSet<usize>,
+        fallback_node_id: usize,
+        fallback_source: Option<&LogFileSource>,
+    ) -> Vec<PluginLogFile> {
+        let selected_files = self.plugin_log_files_for_node_ids(selected_node_ids);
+        if !selected_files.is_empty() {
+            return selected_files;
+        }
+
+        let fallback_node_ids = HashSet::from([fallback_node_id]);
+        let fallback_files = self.plugin_log_files_for_node_ids(&fallback_node_ids);
+        if !fallback_files.is_empty() {
+            return fallback_files;
+        }
+
+        fallback_source
+            .map(|source| {
+                let source_key = source.stable_key();
+                vec![PluginLogFile {
+                    source_key,
+                    display_name: source.display_name(),
+                    path_label: source_location_label(source),
+                    source_kind: Self::plugin_source_kind_label(source).to_string(),
+                    node_kind: "file".to_string(),
+                    read_path: Self::plugin_read_path(source),
+                    host_source: Some(source.clone()),
+                }]
+            })
+            .unwrap_or_default()
+    }
+
+    /// 按右键菜单规则判断插件候选日志是否存在。
+    ///
+    /// 业务意图：
+    /// - 渲染右键菜单时用该函数计算插件菜单项启用态，避免提前构造完整插件上下文。
+    /// - 用户点击插件项时仍调用 `plugin_log_files_for_menu` 获取稳定快照，确保插件实际输入不受后续选择变化影响。
+    pub(in crate::app) fn has_plugin_log_file_for_menu(
+        &self,
+        selected_node_ids: &HashSet<usize>,
+        fallback_node_id: usize,
+        fallback_source: Option<&LogFileSource>,
+    ) -> bool {
+        if self.has_plugin_log_file_for_node_ids(selected_node_ids) {
+            return true;
+        }
+
+        let fallback_node_ids = HashSet::from([fallback_node_id]);
+        self.has_plugin_log_file_for_node_ids(&fallback_node_ids) || fallback_source.is_some()
+    }
+
+    /// 把加载树文件节点转换为插件协议使用的日志元数据。
+    fn plugin_log_file_from_row(
+        row: &LoadedLogTreeRow,
+        source: &LogFileSource,
+        source_key: String,
+    ) -> PluginLogFile {
+        PluginLogFile {
+            source_key,
+            display_name: source.display_name(),
+            path_label: source_location_label(source),
+            source_kind: Self::plugin_source_kind_label(source).to_string(),
+            node_kind: Self::plugin_node_kind_label(row.kind).to_string(),
+            read_path: Self::plugin_read_path(source),
+            host_source: Some(source.clone()),
+        }
+    }
+
+    /// 返回可发送给插件读取日志正文的本地路径。
+    ///
+    /// 业务意图：
+    /// - 普通文件和已物化压缩包成员已有稳定本地文件，可以在插件声明 `logs.content` 权限后交给插件读取正文。
+    /// - 未物化压缩包成员需要宿主内部解压管线才能读取，第一版插件协议不直接暴露压缩包读取能力，因此返回 `None`。
+    ///
+    /// 边界条件：
+    /// - 路径通过 JSON 传给外部进程，只能使用有损字符串；真实打开失败由插件展示为可理解错误，不能影响主程序稳定性。
+    fn plugin_read_path(source: &LogFileSource) -> Option<String> {
+        match source {
+            LogFileSource::LocalFile { path } => Some(path.to_string_lossy().into_owned()),
+            LogFileSource::MaterializedArchiveMember { temp_path, .. } => {
+                Some(temp_path.to_string_lossy().into_owned())
+            }
+            LogFileSource::ArchiveMember { .. } | LogFileSource::NestedArchiveMember { .. } => None,
+        }
+    }
+
+    /// 返回插件协议中的日志来源类型标签。
+    fn plugin_source_kind_label(source: &LogFileSource) -> &'static str {
+        match source {
+            LogFileSource::LocalFile { .. } => "local_file",
+            LogFileSource::ArchiveMember { .. } => "archive_member",
+            LogFileSource::MaterializedArchiveMember { .. } => "materialized_archive_member",
+            LogFileSource::NestedArchiveMember { .. } => "nested_archive_member",
+        }
+    }
+
+    /// 返回插件协议中的目录树节点类型标签。
+    fn plugin_node_kind_label(kind: LogTreeEntryKind) -> &'static str {
+        match kind {
+            LogTreeEntryKind::Directory => "directory",
+            LogTreeEntryKind::File => "file",
+            LogTreeEntryKind::Archive => "archive",
+            LogTreeEntryKind::Symlink => "symlink",
+            LogTreeEntryKind::Error => "error",
+        }
+    }
+
     /// 切换某个可展开节点的展开状态。
     ///
     /// 业务意图：
@@ -1460,7 +1701,7 @@ pub(in crate::app) enum MainNavigationTooltipAnchor {
 /// 设置窗口当前激活的页签。
 ///
 /// 业务意图：
-/// - 设置窗口按用户要求拆成“通用 / 日志 / 模型 / 关于”页签；状态放在主视图中，避免关闭窗口后当前会话选择丢失。
+/// - 设置窗口按用户要求拆成“通用 / 日志 / 模型 / 插件 / 存储 / 关于”页签；状态放在主视图中，避免关闭窗口后当前会话选择丢失。
 /// - 当前页签状态只存在于进程内，不写入配置文件；后续若需要记忆页签，应先定义设置持久化策略。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::app) enum SettingsTab {
@@ -1470,6 +1711,17 @@ pub(in crate::app) enum SettingsTab {
     Log,
     /// 模型设置页签，当前承载 OpenAI 兼容模型配置管理。
     Model,
+    /// 插件设置页签，当前承载插件加载、启用禁用、卸载和贡献点状态。
+    ///
+    /// 业务意图：
+    /// - 插件管理会读写应用配置目录中的 JSON 注册表，因此作为独立页签呈现，避免和普通显示偏好混在一起。
+    /// - 当前页签只管理插件元数据和进程入口，不允许插件直接改写日志或笔记数据。
+    Plugin,
+    /// 存储页签，集中展示配置文件、数据库、插件目录和临时缓存位置。
+    ///
+    /// 业务意图：
+    /// - 用户需要知道 LogClinic 在本机写入了哪些文件和目录；存储页只提供安全管理操作，避免误删配置或数据库。
+    Storage,
     /// 关于页签，承载软件版本、作者和特色功能说明。
     About,
 }
@@ -1480,7 +1732,14 @@ impl SettingsTab {
     /// 业务意图：
     /// - 页签顺序集中定义，避免渲染和测试出现顺序分歧；关于收入口设置后放在最后，保留配置类页签优先级。
     pub(in crate::app) fn all() -> &'static [Self] {
-        &[Self::General, Self::Log, Self::Model, Self::About]
+        &[
+            Self::General,
+            Self::Log,
+            Self::Model,
+            Self::Plugin,
+            Self::Storage,
+            Self::About,
+        ]
     }
 
     /// 返回页签中文标签。
@@ -1489,6 +1748,8 @@ impl SettingsTab {
             Self::General => "通用",
             Self::Log => "日志",
             Self::Model => "模型",
+            Self::Plugin => "插件",
+            Self::Storage => "存储",
             Self::About => "关于",
         }
     }
@@ -1502,6 +1763,8 @@ impl SettingsTab {
             Self::General => Icon::Settings,
             Self::Log => Icon::FileText,
             Self::Model => Icon::MonitorCog,
+            Self::Plugin => Icon::FileArchive,
+            Self::Storage => Icon::Database,
             Self::About => Icon::Info,
         }
     }
@@ -2135,7 +2398,7 @@ pub(in crate::app) struct LogTreeContextMenuRequest {
 ///
 /// 业务意图：
 /// - 文件另存为和线程日志分析都基于当前多选文件集合，集中枚举可以让渲染和执行逻辑保持一致。
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(in crate::app) enum LogTreeContextMenuAction {
     /// 把当前多选日志文件保存到用户指定目录。
     SaveAs,
@@ -2145,6 +2408,19 @@ pub(in crate::app) enum LogTreeContextMenuAction {
     AnalyzeThreads,
     /// 调用已配置模型对选中日志执行性能和异常智能分析。
     SmartAnalyze,
+    /// 调用插件贡献的日志树右键菜单命令。
+    ///
+    /// 业务意图：
+    /// - 插件菜单项来自 `plugin.json`，标签和命令 ID 都是运行时数据，不能再用静态枚举穷举。
+    /// - 这里仅保存插件 ID、菜单贡献点 ID 和命令 ID，真实上下文在点击时从当前目录树选择快照重新收集。
+    Plugin {
+        /// 插件 ID。
+        plugin_id: String,
+        /// manifest 中的菜单贡献点 ID。
+        menu_id: String,
+        /// 传给插件进程的命令 ID。
+        command_id: String,
+    },
 }
 
 /// 渲染左侧目录树右键菜单项的参数对象。
@@ -2159,7 +2435,7 @@ pub(in crate::app) struct LogTreeContextMenuItemRequest {
     /// 点击菜单项时执行的命令。
     pub(in crate::app) action: LogTreeContextMenuAction,
     /// 菜单展示文案。
-    pub(in crate::app) label: &'static str,
+    pub(in crate::app) label: String,
     /// 菜单图标。
     pub(in crate::app) icon: Icon,
     /// 菜单项是否可点击。

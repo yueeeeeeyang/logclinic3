@@ -26,6 +26,7 @@ mod log_document;
 mod log_loader;
 mod log_source;
 mod notes;
+mod plugin;
 mod search;
 mod shell_integration;
 mod theme;

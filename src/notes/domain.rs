@@ -1,34 +1,32 @@
 // 笔记业务领域类型和纯状态辅助函数。
 //
 // 业务意图：
-// - 这里定义目录、笔记、内容格式和树行等不依赖 GPUI 的模型，供 SQLite 存储层和 UI 工作区共同使用。
+// - 这里定义目录、笔记、内容格式和树行等不依赖 GPUI 的模型，供物理 Markdown 存储层和 UI 工作区共同使用。
 // - 本模块不持有窗口、焦点、滚动条或排版缓存，避免 notes 业务域反向依赖 app 壳层。
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::atomic::Ordering,
     time::{SystemTime, UNIX_EPOCH},
 };
-
-use super::*;
 
 /// 笔记内容格式。
 ///
 /// 业务意图：
-/// - 普通文本、旧 Markdown 和新富文本在保存层必须显式区分，避免 UI 只能通过标题、后缀或内容猜测展示方式。
-/// - 第一版富文本仍保留旧格式枚举，用于懒转换历史数据；保存后统一写回 `RichText`。
+/// - 运行时物理文件统一保存 Markdown；普通文本和富文本枚举只服务旧 SQLite 迁移和历史数据解析。
+/// - 保留显式格式可以让迁移逻辑知道旧 `content` 字段应直接写入 Markdown，还是先从富文本 JSON 导出。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NoteContentFormat {
     /// 普通纯文本，旧数据按原文懒转换为富文本。
     PlainText,
     /// Markdown 文本，旧数据不再预览，按原始文本懒转换为富文本。
     Markdown,
-    /// 富文本 JSON v1，保存在 `notes.content` 字段。
+    /// 富文本 JSON v1，旧 SQLite 中保存在 `notes.content` 字段。
     RichText,
 }
 
 impl NoteContentFormat {
-    /// 返回写入 SQLite 的稳定字符串。
+    /// 返回旧 SQLite 使用的稳定字符串。
+    #[cfg(test)]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::PlainText => "plain_text",
@@ -37,7 +35,7 @@ impl NoteContentFormat {
         }
     }
 
-    /// 从 SQLite 字符串恢复笔记格式。
+    /// 从旧 SQLite 字符串恢复笔记格式。
     ///
     /// 错误处理：
     /// - 数据库可能被用户或旧版本手工修改，未知格式直接返回中文错误，避免 UI 用错误规则展示正文。
@@ -46,7 +44,7 @@ impl NoteContentFormat {
             "plain_text" => Ok(Self::PlainText),
             "markdown" => Ok(Self::Markdown),
             "rich_text" => Ok(Self::RichText),
-            other => Err(format!("笔记数据库包含未知内容格式：{other}")),
+            other => Err(format!("旧笔记数据库包含未知内容格式：{other}")),
         }
     }
 }
@@ -57,7 +55,7 @@ impl NoteContentFormat {
 /// - 目录只负责树结构和命名，不直接保存正文；正文始终属于笔记，避免“目录绑定一篇笔记”和“目录容器”语义混在一起。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NoteDirectory {
-    /// 目录稳定 ID，作为子目录和笔记外键。
+    /// 目录稳定 ID；物理存储下为相对笔记根目录的路径。
     pub(crate) id: String,
     /// 父目录 ID；`None` 表示根层目录。
     pub(crate) parent_id: Option<String>,
@@ -75,13 +73,13 @@ pub(crate) struct NoteDirectory {
 /// - 笔记保存标题、所属目录、格式和完整正文，是右侧阅读器/编辑器的最小持久化单元。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Note {
-    /// 笔记稳定 ID。
+    /// 笔记稳定 ID；物理存储下为相对笔记根目录的 Markdown 文件路径。
     pub(crate) id: String,
     /// 所属目录 ID；`None` 表示根层笔记。
     pub(crate) directory_id: Option<String>,
     /// 用户可见标题。
     pub(crate) title: String,
-    /// 原始正文，使用 UTF-8 保存到 SQLite。
+    /// 原始正文；物理存储下为 UTF-8 Markdown 文本。
     pub(crate) content: String,
     /// 正文格式。
     pub(crate) content_format: NoteContentFormat,
@@ -103,7 +101,7 @@ pub(crate) enum NoteTreeRowKind {
 /// 左侧笔记树扁平行。
 ///
 /// 业务意图：
-/// - SQLite 保存的是父子关系，UI 虚拟列表需要按展开状态消费扁平行；该结构承载树节点展示所需的稳定信息。
+/// - 物理存储保存的是目录和文件层级，UI 虚拟列表需要按展开状态消费扁平行；该结构承载树节点展示所需的稳定信息。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NoteTreeRow {
     /// 节点 ID，目录和笔记分别在各自表内唯一。
@@ -133,54 +131,11 @@ pub(crate) fn current_note_time_millis() -> i64 {
         .unwrap_or(0)
 }
 
-/// 生成笔记实体 ID。
-pub(crate) fn new_note_entity_id(prefix: &str) -> String {
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let sequence = NOTE_ENTITY_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("{prefix}-{seed}-{sequence}")
-}
-
-/// 创建默认目录模型。
-pub(crate) fn new_note_directory(parent_id: Option<String>, title: String) -> NoteDirectory {
-    let now = current_note_time_millis();
-    NoteDirectory {
-        id: new_note_entity_id("note-directory"),
-        parent_id,
-        title,
-        created_at_ms: now,
-        updated_at_ms: now,
-    }
-}
-
-/// 创建默认笔记模型。
-///
-/// 业务意图：
-/// - 当前笔记模块默认进入富文本编辑器，因此新建笔记直接保存空富文本 JSON，避免第一次保存前格式语义不一致。
-/// - `PlainText` 和 `Markdown` 枚举仍保留，用于兼容旧数据库；旧数据由 UI 按原始文本打开，保存后再转为富文本。
-pub(crate) fn new_note(directory_id: Option<String>, title: String) -> Note {
-    let now = current_note_time_millis();
-    let content = NoteRichTextDocument::empty()
-        .to_json()
-        .unwrap_or_else(|_| String::new());
-    Note {
-        id: new_note_entity_id("note"),
-        directory_id,
-        title,
-        content,
-        content_format: NoteContentFormat::RichText,
-        created_at_ms: now,
-        updated_at_ms: now,
-    }
-}
-
 /// 构建左侧笔记树扁平行。
 ///
 /// 业务意图：
 /// - 按“目录在前、笔记在后；同类型按更新时间倒序再按标题升序”生成稳定展示顺序。
-/// - UI 展开/收起只需要在该完整行列表上过滤，不需要每次重新访问 SQLite。
+/// - UI 展开/收起只需要在该完整行列表上过滤，不需要每次重新扫描文件系统。
 pub(crate) fn build_note_tree_rows(
     directories: &[NoteDirectory],
     notes: &[Note],

@@ -44,6 +44,13 @@ impl MainView {
             return true;
         }
 
+        if self.navigation.active_main_feature == MainFeature::AiChat
+            && Self::is_copy_keystroke(&keystroke)
+            && self.copy_selected_ai_chat_message_text(context)
+        {
+            return true;
+        }
+
         if Self::is_copy_keystroke(&keystroke) && self.copy_selected_log_text(context) {
             return true;
         }

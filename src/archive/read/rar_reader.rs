@@ -86,3 +86,22 @@ pub(super) fn read_rar_member(
         member_path
     )))
 }
+
+/// 从 RAR 压缩包中把成员内容写入 writer。
+///
+/// 业务意图：
+/// - 对宿主插件内容流保持统一的“写入 writer”接口，调用方不需要知道 RAR 库的特殊限制。
+///
+/// 关键约束：
+/// - 当前 `unrar` crate 的处理接口只提供 `read()` 返回完整成员字节，不能像 ZIP/TAR/7Z 一样边解压边写。
+/// - 因此这里仍会为单个 RAR 成员短暂持有 `Vec<u8>`，但不会创建新的临时日志文件；用户可见行为仍是后台执行并显示错误。
+pub(super) fn stream_rar_member_to_writer<W: Write + ?Sized>(
+    archive_path: &Path,
+    member_path: &str,
+    writer: &mut W,
+) -> Result<(), ArchiveReadError> {
+    let bytes = read_rar_member(archive_path, member_path)?;
+    writer
+        .write_all(&bytes)
+        .map_err(|error| ArchiveReadError::new(format!("流式写入 RAR 日志文件失败：{}", error)))
+}

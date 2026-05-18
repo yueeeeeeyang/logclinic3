@@ -34,6 +34,7 @@ use crate::log_ai_analysis::*;
 use crate::log_document;
 use crate::log_document::{EncodingChoice, LogContentError, LogTextEncoding, decode_log_bytes};
 use crate::log_document::{LargeLogOpenResult, LogTabDocument, open_log_source_for_tab};
+use crate::plugin::*;
 use crate::search::{
     SearchFileError, SearchMatchMode, SearchMatchPosition, SearchOptions, SearchProgress,
     SearchResultItem, SearchScope, collect_current_directory_sources, count_query_occurrences,
