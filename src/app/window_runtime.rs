@@ -331,6 +331,12 @@ fn activate_main_window(main_window: WindowHandle<MainView>, app: &mut App) -> b
 fn install_main_window_keystroke_subscription(main_window: WindowHandle<MainView>, app: &mut App) {
     let main_view_for_keys = main_window;
     let subscription = app.intercept_keystrokes(move |event, window, app| {
+        // 应用级快捷键拦截器会收到插件窗口、线程分析窗口、搜索窗口等所有辅助窗口的按键。
+        // 只有主窗口按键才应该走主视图的“粘贴到搜索框”等兜底逻辑；否则插件窗口里 `Cmd+V`
+        // 会被误解释为日志区粘贴搜索，进而弹出搜索对话框。
+        if AnyWindowHandle::from(main_view_for_keys) != window.window_handle() {
+            return;
+        }
         // GPUI 0.2.2 在 macOS 上会从 Objective-C `keyEquivalent` 回调进入这里；该回调不能让 Rust panic
         // 继续向外 unwind，否则运行时会直接 abort。快捷键处理本身不是不可恢复业务，因此这里在边界处兜住
         // 我们自己的状态更新异常，并让事件继续按默认路径传播，避免一次快捷键输入击穿整个进程。

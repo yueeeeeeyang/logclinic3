@@ -25,6 +25,8 @@ pub(crate) enum HprofAnalysisStage {
     ReadingRecords,
     /// 正在把类 ID、字符串表和字段布局解析成可展示类名。
     ResolvingClasses,
+    /// 正在为已读取对象建立对象 ID 到连续下标的索引。
+    BuildingObjectIndex,
     /// 正在把原始 HPROF 字段引用转换成 MAT 兼容对象引用边。
     MaterializingReferences,
     /// 正在把对象引用关系转换成 dominator 算法使用的图结构。
@@ -49,6 +51,7 @@ impl HprofAnalysisStage {
             Self::ReadingHeader => "读取文件头",
             Self::ReadingRecords => "解析对象记录",
             Self::ResolvingClasses => "解析类/字段名",
+            Self::BuildingObjectIndex => "建立对象索引",
             Self::MaterializingReferences => "构建引用边",
             Self::BuildingDominatorGraph => "构建引用图",
             Self::ComputingDominatorTree => "计算 Dominator Tree",
@@ -57,6 +60,27 @@ impl HprofAnalysisStage {
             Self::Completed => "完成",
         }
     }
+}
+
+/// HPROF heap dump 子记录计数。
+///
+/// 业务意图：
+/// - 大型 dump 的读取速度通常不是按字节均匀变化，而是取决于当前区域里 INSTANCE、数组和 Root 记录的密度。
+/// - UI 展示这些计数后，用户可以区分“磁盘慢”和“对象极密集导致解析变慢”两类问题。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HprofHeapRecordCounts {
+    /// CLASS_DUMP 子记录数量。
+    pub(crate) class_dump: u64,
+    /// INSTANCE_DUMP 子记录数量。
+    pub(crate) instance_dump: u64,
+    /// OBJECT_ARRAY_DUMP 子记录数量。
+    pub(crate) object_array_dump: u64,
+    /// PRIMITIVE_ARRAY_DUMP / NODATA 子记录数量。
+    pub(crate) primitive_array_dump: u64,
+    /// GC Root 相关子记录数量。
+    pub(crate) gc_root: u64,
+    /// 其它已跳过或仅用于段信息的子记录数量。
+    pub(crate) other: u64,
 }
 
 /// HPROF 解析进度快照。
@@ -91,6 +115,19 @@ pub(crate) struct HprofProgress {
     pub(crate) phase_unit: &'static str,
     /// 当前阶段的细分说明。
     pub(crate) sub_message: String,
+    /// 最近一次采样得到的字节读取速度。
+    ///
+    /// 边界条件：
+    /// - 非读取阶段可能保持上一采样值或为 0；UI 只把它作为诊断指标，不参与完成条件。
+    pub(crate) bytes_per_second: f64,
+    /// 最近一次采样得到的记录解析速度。
+    pub(crate) records_per_second: f64,
+    /// 最近一次采样得到的对象收集速度。
+    pub(crate) objects_per_second: f64,
+    /// 当前正在处理或最近处理的 heap 子记录类型。
+    pub(crate) current_heap_record: &'static str,
+    /// 各类 heap 子记录累计数量。
+    pub(crate) heap_record_counts: HprofHeapRecordCounts,
 }
 
 impl HprofProgress {
@@ -113,6 +150,11 @@ impl HprofProgress {
             phase_total: 0,
             phase_unit: "",
             sub_message: String::new(),
+            bytes_per_second: 0.0,
+            records_per_second: 0.0,
+            objects_per_second: 0.0,
+            current_heap_record: "",
+            heap_record_counts: HprofHeapRecordCounts::default(),
         }
     }
 

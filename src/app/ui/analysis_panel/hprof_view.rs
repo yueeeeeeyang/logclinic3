@@ -681,6 +681,45 @@ impl HprofAnalysisView {
             self.render_metric("类", progress.class_count.to_string(), palette),
             self.render_metric("GC Root", progress.gc_root_count.to_string(), palette),
             self.render_metric("引用边", progress.edge_count.to_string(), palette),
+            self.render_metric(
+                "当前",
+                if progress.current_heap_record.is_empty() {
+                    "-".to_string()
+                } else {
+                    progress.current_heap_record.to_string()
+                },
+                palette,
+            ),
+            self.render_metric(
+                "读取",
+                Self::format_hprof_byte_rate(progress.bytes_per_second),
+                palette,
+            ),
+            self.render_metric(
+                "记录/s",
+                Self::format_hprof_count_rate(progress.records_per_second),
+                palette,
+            ),
+            self.render_metric(
+                "对象/s",
+                Self::format_hprof_count_rate(progress.objects_per_second),
+                palette,
+            ),
+            self.render_metric(
+                "实例",
+                progress.heap_record_counts.instance_dump.to_string(),
+                palette,
+            ),
+            self.render_metric(
+                "对象数组",
+                progress.heap_record_counts.object_array_dump.to_string(),
+                palette,
+            ),
+            self.render_metric(
+                "基础数组",
+                progress.heap_record_counts.primitive_array_dump.to_string(),
+                palette,
+            ),
         ])
     }
 
@@ -702,6 +741,34 @@ impl HprofAnalysisView {
             .text_xs()
             .child(div().text_color(rgb(palette.muted_text)).child(label))
             .child(div().text_color(rgb(palette.text)).child(value))
+    }
+
+    /// 格式化 HPROF 读取吞吐。
+    ///
+    /// 业务意图：
+    /// - 解析对象记录阶段字节进度可能很慢，显示吞吐能帮助用户判断是否是磁盘读取慢。
+    fn format_hprof_byte_rate(bytes_per_second: f64) -> String {
+        if bytes_per_second <= 0.0 || !bytes_per_second.is_finite() {
+            return "0 B/s".to_string();
+        }
+        format!("{}/s", format_hprof_bytes(bytes_per_second as u64))
+    }
+
+    /// 格式化 HPROF 记录和对象解析速率。
+    ///
+    /// 业务意图：
+    /// - 当文件后半段是小对象密集区时，字节/s 可能下降，但对象/s 更能说明后台线程仍在推进。
+    fn format_hprof_count_rate(count_per_second: f64) -> String {
+        if count_per_second <= 0.0 || !count_per_second.is_finite() {
+            return "0".to_string();
+        }
+        if count_per_second >= 1_000_000.0 {
+            format!("{:.1}M", count_per_second / 1_000_000.0)
+        } else if count_per_second >= 1_000.0 {
+            format!("{:.1}K", count_per_second / 1_000.0)
+        } else {
+            format!("{:.0}", count_per_second)
+        }
     }
 
     /// 渲染完成状态。

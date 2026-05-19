@@ -10,6 +10,7 @@
 //! - 损坏记录、重复对象 ID、缺失类布局和异常字符串都沿用原有中文错误或 fallback 行为。
 
 use super::*;
+use std::time::Instant;
 
 /// 解析 HPROF 对象图。
 pub(super) fn parse_hprof_object_graph<F>(
@@ -22,6 +23,7 @@ where
     F: FnMut(HprofProgress),
 {
     let bytes = HprofInputBytes::open(path)?;
+    let progress_rate = HprofProgressRateSampler::new(&progress);
     let mut parser = HprofParser {
         bytes: bytes.as_slice(),
         position: 0,
@@ -30,6 +32,7 @@ where
         progress_reporter,
         cancel_flag,
         state: HprofParserState::default(),
+        progress_rate,
     };
     parser.parse()
 }
@@ -240,6 +243,61 @@ where
     cancel_flag: &'a AtomicBool,
     /// 累积解析状态。
     state: HprofParserState,
+    /// 读取阶段速率采样器。
+    ///
+    /// 业务意图：
+    /// - 大 dump 的字节进度和真实工作量可能严重不一致；采样器在后台线程内计算 MiB/s、记录/s 和对象/s，
+    ///   UI 只展示结果，避免主线程再做状态差分。
+    progress_rate: HprofProgressRateSampler,
+}
+
+/// HPROF 读取进度速率采样器。
+///
+/// 业务意图：
+/// - 解析线程是唯一了解连续进度快照的地方，在这里按时间差计算速率可以帮助用户判断当前是 I/O 慢、记录密集还是对象索引密集。
+struct HprofProgressRateSampler {
+    /// 上次采样时间。
+    last_at: Instant,
+    /// 上次采样的已读字节。
+    last_bytes: u64,
+    /// 上次采样的记录数。
+    last_records: u64,
+    /// 上次采样的对象数。
+    last_objects: usize,
+}
+
+impl HprofProgressRateSampler {
+    /// 创建采样器。
+    fn new(progress: &HprofProgress) -> Self {
+        Self {
+            last_at: Instant::now(),
+            last_bytes: progress.bytes_read,
+            last_records: progress.record_count,
+            last_objects: progress.object_count,
+        }
+    }
+
+    /// 根据当前进度更新速率字段。
+    ///
+    /// 边界条件：
+    /// - 小于 200ms 的间隔不更新，避免进度回调过密时产生剧烈抖动。
+    fn update(&mut self, progress: &mut HprofProgress) {
+        let elapsed = self.last_at.elapsed();
+        let elapsed_seconds = elapsed.as_secs_f64();
+        if elapsed_seconds < 0.2 {
+            return;
+        }
+        progress.bytes_per_second =
+            progress.bytes_read.saturating_sub(self.last_bytes) as f64 / elapsed_seconds;
+        progress.records_per_second =
+            progress.record_count.saturating_sub(self.last_records) as f64 / elapsed_seconds;
+        progress.objects_per_second =
+            progress.object_count.saturating_sub(self.last_objects) as f64 / elapsed_seconds;
+        self.last_at = Instant::now();
+        self.last_bytes = progress.bytes_read;
+        self.last_records = progress.record_count;
+        self.last_objects = progress.object_count;
+    }
 }
 
 impl<'a, F> HprofParser<'a, F>
@@ -279,6 +337,7 @@ where
             self.maybe_report_progress();
         }
 
+        self.build_object_index_after_reading()?;
         self.report_stage(HprofAnalysisStage::ResolvingClasses, "正在解析类名和字段名")?;
         self.resolve_class_and_field_names()?;
         self.report_stage(
@@ -499,6 +558,7 @@ where
 
     /// 读取单个 heap dump 子记录。
     fn read_heap_sub_record(&mut self, sub_tag: u8) -> Result<(), HprofError> {
+        self.track_heap_sub_record(sub_tag);
         match sub_tag {
             SUB_ROOT_UNKNOWN => self.read_root_simple(HprofGcRootKind::Unknown),
             SUB_ROOT_JNI_GLOBAL => {
@@ -549,6 +609,66 @@ where
                 "暂不支持的 HEAP_DUMP 子记录：0x{sub_tag:02X}，偏移 {}",
                 self.position.saturating_sub(1)
             ))),
+        }
+    }
+
+    /// 记录当前 heap 子记录类型。
+    ///
+    /// 业务意图：
+    /// - 用户看到字节进度突然变慢时，需要知道当前区域是不是 INSTANCE_DUMP 高密度对象区。
+    /// - 这里仅维护轻量计数，不解析额外内容，不改变 HPROF 语义。
+    fn track_heap_sub_record(&mut self, sub_tag: u8) {
+        match sub_tag {
+            SUB_CLASS_DUMP => {
+                self.progress.current_heap_record = "CLASS_DUMP";
+                self.progress.heap_record_counts.class_dump = self
+                    .progress
+                    .heap_record_counts
+                    .class_dump
+                    .saturating_add(1);
+            }
+            SUB_INSTANCE_DUMP => {
+                self.progress.current_heap_record = "INSTANCE_DUMP";
+                self.progress.heap_record_counts.instance_dump = self
+                    .progress
+                    .heap_record_counts
+                    .instance_dump
+                    .saturating_add(1);
+            }
+            SUB_OBJECT_ARRAY_DUMP => {
+                self.progress.current_heap_record = "OBJECT_ARRAY_DUMP";
+                self.progress.heap_record_counts.object_array_dump = self
+                    .progress
+                    .heap_record_counts
+                    .object_array_dump
+                    .saturating_add(1);
+            }
+            SUB_PRIMITIVE_ARRAY_DUMP | SUB_PRIMITIVE_ARRAY_NODATA => {
+                self.progress.current_heap_record = "PRIMITIVE_ARRAY_DUMP";
+                self.progress.heap_record_counts.primitive_array_dump = self
+                    .progress
+                    .heap_record_counts
+                    .primitive_array_dump
+                    .saturating_add(1);
+            }
+            SUB_ROOT_UNKNOWN
+            | SUB_ROOT_JNI_GLOBAL
+            | SUB_ROOT_JNI_LOCAL
+            | SUB_ROOT_JAVA_FRAME
+            | SUB_ROOT_NATIVE_STACK
+            | SUB_ROOT_STICKY_CLASS
+            | SUB_ROOT_THREAD_BLOCK
+            | SUB_ROOT_MONITOR_USED
+            | SUB_ROOT_THREAD_OBJECT => {
+                self.progress.current_heap_record = "GC_ROOT";
+                self.progress.heap_record_counts.gc_root =
+                    self.progress.heap_record_counts.gc_root.saturating_add(1);
+            }
+            _ => {
+                self.progress.current_heap_record = "OTHER";
+                self.progress.heap_record_counts.other =
+                    self.progress.heap_record_counts.other.saturating_add(1);
+            }
         }
     }
 
@@ -658,7 +778,7 @@ where
                 instance_fields: field_descriptors,
             },
         );
-        graph.insert_object(
+        graph.insert_object_deferred_index(
             HprofHeapObject {
                 id: class_object_id,
                 class_id: class_object_id,
@@ -666,7 +786,7 @@ where
                 kind: HprofObjectKind::Class,
             },
             Vec::new(),
-        )?;
+        );
         Ok(())
     }
 
@@ -685,7 +805,7 @@ where
             data_len,
         });
 
-        self.graph_mut()?.insert_object(
+        self.graph_mut()?.insert_object_deferred_index(
             HprofHeapObject {
                 id: object_id,
                 class_id,
@@ -693,7 +813,7 @@ where
                 kind: HprofObjectKind::Instance,
             },
             Vec::new(),
-        )?;
+        );
         Ok(())
     }
 
@@ -709,7 +829,7 @@ where
             push_non_zero_reference(&mut references, reference_id);
         }
         let shallow_size = object_array_shallow_size(&self.graph_ref()?.size_model, length);
-        self.graph_mut()?.insert_object(
+        self.graph_mut()?.insert_object_deferred_index(
             HprofHeapObject {
                 id: array_id,
                 class_id: array_class_id,
@@ -717,7 +837,7 @@ where
                 kind: HprofObjectKind::ObjectArray { length },
             },
             references,
-        )?;
+        );
         Ok(())
     }
 
@@ -754,7 +874,7 @@ where
             element_type,
             u64::from(length),
         )?;
-        self.graph_mut()?.insert_object(
+        self.graph_mut()?.insert_object_deferred_index(
             HprofHeapObject {
                 id: array_id,
                 class_id: 0,
@@ -765,7 +885,59 @@ where
                 },
             },
             Vec::new(),
-        )?;
+        );
+        Ok(())
+    }
+
+    /// 顺序扫描结束后一次性建立对象索引。
+    ///
+    /// 业务意图：
+    /// - 读取 INSTANCE_DUMP 的热路径只追加连续对象数组，不再对千万级 `object_id -> index` HashMap 做随机写入。
+    /// - 顺序扫描完成后统一预留 HashMap 容量并建立索引，把慢点变成独立可见阶段，便于用户判断“解析对象记录”是否已经真正结束。
+    ///
+    /// 边界条件：
+    /// - 重复对象 ID 仍然是格式错误，只是从“读到第二个重复对象时失败”改为“建立索引阶段失败”，不改变最终校验语义。
+    fn build_object_index_after_reading(&mut self) -> Result<(), HprofError> {
+        self.check_cancel()?;
+        let mut graph = self.state.graph.take().ok_or_else(|| {
+            HprofError::InvalidFormat("内部错误：HPROF 对象图未初始化".to_string())
+        })?;
+        let total = graph.object_count();
+        graph.object_indices = FxHashMap::default();
+        graph.object_indices.reserve(total);
+
+        self.progress.stage = HprofAnalysisStage::BuildingObjectIndex;
+        self.progress.message = "正在建立 HPROF 对象索引".to_string();
+        self.progress.sub_message = "准备建立对象 ID 索引".to_string();
+        self.progress.phase_done = 0;
+        self.progress.phase_total = total as u64;
+        self.progress.phase_unit = "对象";
+        self.progress.bytes_read = self.position as u64;
+        self.progress.object_count = total;
+        self.progress.class_count = graph.class_count();
+        self.progress.gc_root_count = graph.gc_roots.len();
+        self.progress.edge_count = graph.edge_count();
+        self.report_progress();
+
+        for index in 0..total {
+            check_cancel(self.cancel_flag)?;
+            let object_id = graph.objects[index].id;
+            if graph.object_indices.insert(object_id, index).is_some() {
+                return Err(HprofError::InvalidFormat(format!(
+                    "HPROF 对象重复定义：0x{object_id:x}"
+                )));
+            }
+            let done = index + 1;
+            if should_report_work(done, total) {
+                self.progress.sub_message = "建立对象 ID 索引".to_string();
+                self.progress.phase_done = done as u64;
+                self.report_progress();
+            }
+        }
+        self.progress.phase_done = total as u64;
+        self.progress.sub_message = "对象 ID 索引建立完成".to_string();
+        self.report_progress();
+        self.state.graph = Some(graph);
         Ok(())
     }
 
@@ -1242,6 +1414,7 @@ where
 
     /// 立即报告当前进度。
     fn report_progress(&mut self) {
+        self.progress_rate.update(&mut self.progress);
         (self.progress_reporter)(self.progress.clone());
     }
 

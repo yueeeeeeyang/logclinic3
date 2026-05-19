@@ -386,7 +386,9 @@ impl HprofObjectGraph {
     /// 插入或替换一个对象。
     ///
     /// 业务意图：
-    /// - 真实 dump 理论上不应重复定义对象 ID，但损坏文件可能出现重复；这里按最后一次记录覆盖，并同步维护增量统计。
+    /// - 测试和小规模构造路径仍需要立即维护对象索引并拒绝重复 ID，便于尽早暴露损坏对象图。
+    /// - 大文件 parser 会使用 `insert_object_deferred_index` 延迟建立索引，避免读取 INSTANCE_DUMP 时对超大 HashMap 做随机写入。
+    #[cfg(test)]
     pub(crate) fn insert_object(
         &mut self,
         object: HprofHeapObject,
@@ -410,6 +412,60 @@ impl HprofObjectGraph {
         self.total_shallow_size = self.total_shallow_size.saturating_add(object.shallow_size);
         self.object_indices.insert(object.id, index);
         self.objects.push(object);
+        Ok(())
+    }
+
+    /// 插入对象但不立即更新对象 ID 索引。
+    ///
+    /// 业务意图：
+    /// - 生产 HPROF 中 INSTANCE_DUMP 数量可能达到千万级；如果每读一个对象都写入 `object_indices`，解析阶段会被超大 HashMap
+    ///   的随机内存写入和扩容拖慢。
+    /// - 读取阶段先把对象追加到连续数组，等顺序扫描结束后再一次性预留并构建索引，既保持后续引用解析语义，也让 UI 能单独展示“建立对象索引”阶段。
+    ///
+    /// 边界条件：
+    /// - 该方法不做重复 ID 检查；调用方必须在使用 `object_index` / `contains_object_id` 前调用 `rebuild_object_indices`。
+    pub(crate) fn insert_object_deferred_index(
+        &mut self,
+        object: HprofHeapObject,
+        mut references: Vec<HprofObjectId>,
+    ) {
+        normalize_references(&mut references);
+        let reference_offset = self.reference_targets.len();
+        let reference_len = references.len();
+        self.reference_targets.extend(references);
+        self.reference_offsets.push(reference_offset);
+        self.reference_lengths.push(reference_len);
+        self.edge_count = self.edge_count.saturating_add(reference_len);
+        self.total_shallow_size = self.total_shallow_size.saturating_add(object.shallow_size);
+        self.objects.push(object);
+    }
+
+    /// 重新建立对象 ID 到连续下标的索引并检查重复对象。
+    ///
+    /// 业务意图：
+    /// - 延迟索引构建把大 dump 读取阶段的随机写入集中到一个明确阶段，同时仍然保持“重复对象 ID 是损坏 dump”的校验语义。
+    pub(crate) fn rebuild_object_indices(&mut self) -> Result<(), HprofError> {
+        self.object_indices = FxHashMap::default();
+        self.object_indices.reserve(self.objects.len());
+        for (index, object) in self.objects.iter().enumerate() {
+            if self.object_indices.insert(object.id, index).is_some() {
+                return Err(HprofError::InvalidFormat(format!(
+                    "HPROF 对象重复定义：0x{:x}",
+                    object.id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// 确保对象索引已经覆盖当前所有对象。
+    ///
+    /// 边界条件：
+    /// - 单元测试可能直接构造 `HprofObjectGraph` 并进入 dominator 计算；这里提供兜底，避免测试或后续调用方忘记显式建索引。
+    pub(crate) fn ensure_object_indices(&mut self) -> Result<(), HprofError> {
+        if self.object_indices.len() != self.objects.len() {
+            self.rebuild_object_indices()?;
+        }
         Ok(())
     }
 

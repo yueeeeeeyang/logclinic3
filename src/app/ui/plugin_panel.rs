@@ -56,6 +56,27 @@ const PLUGIN_TABLE_SCROLLBAR_MIN_THUMB_LENGTH: f32 = 36.0;
 /// - 插件协议允许第三方返回任意表头；宿主只对已知业务列做宽度优化，未知列保持稳定兜底宽度。
 const PLUGIN_TABLE_FALLBACK_COLUMN_WIDTH: f32 = 160.0;
 
+/// 插件表格搜索栏高度。
+///
+/// 业务意图：
+/// - 所有插件声明式表格都共用宿主渲染层，搜索栏放在表格上方即可覆盖 weaver-logext 和第三方插件。
+/// - 高度保持紧凑，避免性能列表这类数据页因过滤控件占用过多垂直空间。
+const PLUGIN_TABLE_FILTER_HEIGHT: f32 = 34.0;
+
+/// 插件表格内容估算时单字符平均宽度。
+///
+/// 业务意图：
+/// - GPUI 排版必须在窗口绘制阶段才能拿到真实字体宽度；表格列宽需要在状态重建时确定，不能为每个单元格同步排版。
+/// - 使用偏保守的平均宽度估算列内容，可以让长 SQL、长请求路径触发横向滚动，同时避免逐行测量造成大表格卡顿。
+const PLUGIN_TABLE_APPROX_CHAR_WIDTH: f32 = 7.6;
+
+/// 插件表格内容列最大估算宽度。
+///
+/// 边界条件：
+/// - SQL 文本可能非常长，列宽不做上限会生成几万像素宽的滚动内容，影响命中测试和滚动体验。
+/// - 上限只限制单列首屏宽度；用户仍可复制可见文本范围，超长内容后续可通过插件详情页继续拆分展示。
+const PLUGIN_TABLE_MAX_CONTENT_COLUMN_WIDTH: f32 = 1800.0;
+
 /// 插件窗口默认尺寸。
 ///
 /// 业务意图：
@@ -155,6 +176,59 @@ struct PluginTableSelectableTextPrepaint {
     line: ShapedLine,
     /// 当前选区对应的绘制矩形；没有选区时为空。
     selection: Option<PaintQuad>,
+}
+
+/// 插件表格过滤输入框的预绘制结果。
+///
+/// 业务意图：
+/// - 表格过滤属于插件窗口内部的临时 UI 状态，不走主窗口搜索对话框，也不写入插件协议。
+/// - 输入框使用同一套 GPUI 平台输入协议，保证中文 IME、复制、粘贴和鼠标定位行为与其它输入框一致。
+struct PluginTableFilterInputPrepaint {
+    /// 当前输入文本的字形布局。
+    line: ShapedLine,
+    /// 当前选区对应的高亮矩形。
+    selection: Option<PaintQuad>,
+    /// 当前光标矩形。
+    cursor: Option<PaintQuad>,
+    /// 当前帧文本水平滚动偏移。
+    horizontal_scroll_px: f32,
+}
+
+/// 插件表格过滤输入框最近一次布局。
+///
+/// 业务意图：
+/// - 平台 IME 候选框和鼠标点击定位都需要把窗口坐标转换为文本字节位置。
+/// - 该布局只缓存当前输入框最近绘制结果，窗口重绘后会覆盖，不参与插件数据持久化。
+#[derive(Clone)]
+struct PluginTableFilterInputLayout {
+    /// 当前输入文本的字形布局。
+    line: ShapedLine,
+    /// 输入框文本元素边界。
+    bounds: Bounds<Pixels>,
+    /// 文本水平滚动偏移。
+    horizontal_scroll_px: f32,
+}
+
+/// 插件表格过滤输入元素。
+///
+/// 业务意图：
+/// - 所有插件表格都需要一个轻量本地过滤框，用户输入任意关键字后只过滤当前窗口内已有行，不重新执行插件。
+/// - 自绘输入避免引入平台差异明显的原生控件，同时复用 `EntityInputHandler` 支持中文输入法。
+struct PluginTableFilterInputElement {
+    /// 插件窗口实体。
+    view: Entity<PluginPageWindowView>,
+    /// 输入框焦点。
+    focus_handle: gpui::FocusHandle,
+    /// 当前主题调色板。
+    palette: AppThemePalette,
+}
+
+impl IntoElement for PluginTableFilterInputElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
 }
 
 /// 插件表格可选择文本元素。
@@ -301,6 +375,202 @@ impl PluginTableSelectableTextElement {
     }
 }
 
+impl Element for PluginTableFilterInputElement {
+    type RequestLayoutState = ();
+    type PrepaintState = Option<PluginTableFilterInputPrepaint>;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        context: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.0).into();
+        // 输入框文本元素需要明确行高，避免过滤栏在窗口缩放后出现光标高度为 0 的平台差异。
+        style.size.height = window.line_height().into();
+        (window.request_layout(style, [], context), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        context: &mut App,
+    ) -> Self::PrepaintState {
+        let snapshot = self.view.read(context).table_filter_snapshot();
+        let style = window.text_style();
+        let display_text = if snapshot.text.is_empty() {
+            SharedString::from("过滤当前表格任意关键字")
+        } else {
+            SharedString::from(snapshot.text.clone())
+        };
+        let text_color = if snapshot.text.is_empty() {
+            rgb(self.palette.muted_text).into()
+        } else {
+            style.color
+        };
+        let base_run = TextRun {
+            len: display_text.len(),
+            font: style.font(),
+            color: text_color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let runs = if !snapshot.text.is_empty()
+            && let Some(marked_range) = snapshot.marked_range.clone()
+        {
+            vec![
+                TextRun {
+                    len: marked_range.start,
+                    ..base_run.clone()
+                },
+                TextRun {
+                    len: marked_range.end.saturating_sub(marked_range.start),
+                    underline: Some(UnderlineStyle {
+                        color: Some(base_run.color),
+                        thickness: px(1.0),
+                        wavy: false,
+                    }),
+                    ..base_run.clone()
+                },
+                TextRun {
+                    len: display_text.len().saturating_sub(marked_range.end),
+                    ..base_run
+                },
+            ]
+            .into_iter()
+            .filter(|run| run.len > 0)
+            .collect::<Vec<_>>()
+        } else {
+            vec![base_run]
+        };
+
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let line = window
+            .text_system()
+            .shape_line(display_text, font_size, &runs, None);
+        let focused = self.focus_handle.is_focused(window);
+        let selection_range =
+            MainView::clamp_search_text_range(&snapshot.text, snapshot.selection_range);
+        let has_selection =
+            focused && !snapshot.text.is_empty() && selection_range.start < selection_range.end;
+        let cursor_index = selection_range.end;
+        let content_width = if snapshot.text.is_empty() {
+            px(0.0)
+        } else {
+            line.x_for_index(snapshot.text.len())
+        };
+        let horizontal_scroll_px = MainView::single_line_horizontal_scroll_offset(
+            snapshot.horizontal_scroll_px,
+            line.x_for_index(cursor_index),
+            content_width,
+            bounds.size.width,
+            focused,
+        );
+        let text_origin = point(bounds.left() - px(horizontal_scroll_px), bounds.top());
+        let selection = has_selection.then(|| {
+            let mut selection_color = rgb(self.palette.accent);
+            selection_color.a = 0.32;
+            let left = f32::from(text_origin.x + line.x_for_index(selection_range.start))
+                .clamp(f32::from(bounds.left()), f32::from(bounds.right()));
+            let right = f32::from(text_origin.x + line.x_for_index(selection_range.end))
+                .clamp(f32::from(bounds.left()), f32::from(bounds.right()));
+            fill(
+                Bounds::from_corners(
+                    point(px(left.min(right)), bounds.top()),
+                    point(px(left.max(right)), bounds.bottom()),
+                ),
+                selection_color,
+            )
+        });
+        let cursor = (focused && !has_selection).then(|| {
+            let cursor_right_limit = (f32::from(bounds.right()) - SINGLE_LINE_INPUT_CARET_WIDTH)
+                .max(f32::from(bounds.left()));
+            let cursor_x = f32::from(text_origin.x + line.x_for_index(cursor_index))
+                .clamp(f32::from(bounds.left()), cursor_right_limit);
+            fill(
+                Bounds::new(
+                    point(px(cursor_x), bounds.top()),
+                    size(
+                        px(SINGLE_LINE_INPUT_CARET_WIDTH),
+                        bounds.bottom() - bounds.top(),
+                    ),
+                ),
+                rgb(self.palette.accent),
+            )
+        });
+
+        Some(PluginTableFilterInputPrepaint {
+            line,
+            selection,
+            cursor,
+            horizontal_scroll_px,
+        })
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        context: &mut App,
+    ) {
+        window.handle_input(
+            &self.focus_handle,
+            ElementInputHandler::new(bounds, self.view.clone()),
+            context,
+        );
+        let Some(prepaint) = prepaint.take() else {
+            return;
+        };
+        if let Some(selection) = prepaint.selection {
+            window.paint_quad(selection);
+        }
+        prepaint
+            .line
+            .paint(
+                point(
+                    bounds.left() - px(prepaint.horizontal_scroll_px),
+                    bounds.top(),
+                ),
+                bounds.bottom() - bounds.top(),
+                window,
+                context,
+            )
+            .ok();
+        if let Some(cursor) = prepaint.cursor {
+            window.paint_quad(cursor);
+        }
+        self.view.update(context, |view, _context| {
+            view.store_table_filter_layout(PluginTableFilterInputLayout {
+                line: prepaint.line,
+                bounds,
+                horizontal_scroll_px: prepaint.horizontal_scroll_px,
+            });
+        });
+        if self.focus_handle.is_focused(window) {
+            window.request_animation_frame();
+        }
+    }
+}
+
 impl<'a> PluginContentLineWriter<'a> {
     /// 创建按行转换 writer。
     fn new(
@@ -412,12 +682,33 @@ pub(in crate::app) struct PluginPageWindowView {
     /// - `None` 表示按插件返回顺序显示；这对 weaver-logext 的默认耗时降序仍然生效。
     /// - 点击表头后才生成宿主侧排序，不要求插件重新执行，避免大数据结果重复解析。
     table_sort: Option<PluginTableSortState>,
+    /// 插件表格过滤输入状态。
+    ///
+    /// 业务意图：
+    /// - 过滤只作用于当前插件窗口内已有表格数据，不回传插件、不重新读取日志，也不写入任何配置。
+    /// - 使用 `SingleLineTextInputState` 统一 UTF-8 选区、IME 组合文本和水平滚动处理，保证中文关键字输入稳定。
+    table_filter_input: SingleLineTextInputState,
+    /// 插件表格过滤输入框焦点。
+    ///
+    /// 边界条件：
+    /// - 过滤框聚焦时键盘事件优先用于编辑过滤关键字，不能触发表格复制或行按钮快捷行为。
+    table_filter_focus: gpui::FocusHandle,
+    /// 插件表格过滤输入框鼠标拖选锚点。
+    table_filter_selection_drag: Option<usize>,
+    /// 插件表格过滤输入框最近一次文本布局。
+    table_filter_layout: Option<PluginTableFilterInputLayout>,
     /// 插件表格当前可见行顺序。
     ///
     /// 业务意图：
     /// - 大结果集排序时只保存原始行下标，不复制整张表，降低窗口滚动和重排时的内存压力。
     /// - `uniform_list` 渲染时按该下标映射到原始行，仍只创建可见行元素。
     table_row_order: Vec<usize>,
+    /// 当前表格的列宽缓存。
+    ///
+    /// 业务意图：
+    /// - 列宽需要参考表格内容，但大表格滚动时不能每帧扫描所有行；页面替换时计算一次并缓存。
+    /// - 过滤只改变可见行，不改变列宽，避免输入关键字时表格横向布局来回跳动。
+    table_column_widths: Vec<f32>,
     /// 插件表格虚拟列表滚动句柄。
     ///
     /// 业务意图：
@@ -460,15 +751,21 @@ impl PluginPageWindowView {
         _context: &mut Context<Self>,
     ) -> Self {
         let table_row_order = Self::initial_table_row_order(&page);
+        let table_column_widths = Self::initial_table_column_widths(&page);
         Self {
             focus_handle: _context.focus_handle(),
+            table_filter_focus: _context.focus_handle(),
             title,
             page,
             palette,
             origin_plugin,
             origin_log_sources,
             table_sort: None,
+            table_filter_input: SingleLineTextInputState::empty(),
+            table_filter_selection_drag: None,
+            table_filter_layout: None,
             table_row_order,
+            table_column_widths,
             table_scroll_handle: UniformListScrollHandle::new(),
             table_x_scroll_handle: ScrollHandle::new(),
             table_scrollbar_drag: None,
@@ -496,7 +793,11 @@ impl PluginPageWindowView {
         self.origin_plugin = origin_plugin;
         self.origin_log_sources = origin_log_sources;
         self.table_sort = None;
+        self.table_filter_input = SingleLineTextInputState::empty();
+        self.table_filter_selection_drag = None;
+        self.table_filter_layout = None;
         self.table_row_order = Self::initial_table_row_order(&self.page);
+        self.table_column_widths = Self::initial_table_column_widths(&self.page);
         self.table_scroll_handle = UniformListScrollHandle::new();
         self.table_x_scroll_handle = ScrollHandle::new();
         self.table_scrollbar_drag = None;
@@ -530,6 +831,48 @@ impl PluginPageWindowView {
             .unwrap_or_default()
     }
 
+    /// 初始化插件表格列宽缓存。
+    ///
+    /// 业务意图：
+    /// - 横向滚动是否出现取决于整张表的最小内容宽度；页面加载时一次性估算列宽，可以避免滚动虚拟列表时反复扫描所有行。
+    /// - 估算保守覆盖长请求路径和 SQL 文本，保证内容放不下时生成横向滚动条，而不是只在固定小列内截断。
+    fn initial_table_column_widths(page: &PluginPage) -> Vec<f32> {
+        page.table
+            .as_ref()
+            .map(|table| Self::plugin_table_column_widths(table, table.headers.len().max(1)))
+            .unwrap_or_default()
+    }
+
+    /// 读取表格过滤输入框绘制快照。
+    fn table_filter_snapshot(&self) -> SingleLineTextInputSnapshot {
+        SingleLineTextInputSnapshot {
+            text: self.table_filter_input.text.clone(),
+            selection_range: self.table_filter_input.selection_range.clone(),
+            marked_range: self.table_filter_input.marked_range.clone(),
+            horizontal_scroll_px: self.table_filter_input.horizontal_scroll_px,
+        }
+    }
+
+    /// 记录过滤输入框当前布局。
+    fn store_table_filter_layout(&mut self, layout: PluginTableFilterInputLayout) {
+        self.table_filter_input.horizontal_scroll_px = layout.horizontal_scroll_px;
+        self.table_filter_layout = Some(layout);
+    }
+
+    /// 过滤关键字发生变化后刷新可见行。
+    ///
+    /// 业务意图：
+    /// - 插件表格过滤只改变本地行索引顺序，不修改插件返回数据和行内动作，确保“详情/显示 SQL”等按钮仍指向原始行。
+    /// - 过滤后重置滚动和文本选区，避免旧可见行的滚动位置或选中文本落到新结果上造成错位。
+    fn rebuild_table_after_filter_change(&mut self, context: &mut Context<Self>) {
+        self.rebuild_table_row_order();
+        self.table_scroll_handle = UniformListScrollHandle::new();
+        self.table_scrollbar_drag = None;
+        self.table_text_selection = None;
+        self.table_cell_bounds.clear();
+        context.notify();
+    }
+
     /// 点击表头后更新表格排序。
     ///
     /// 边界条件：
@@ -560,6 +903,253 @@ impl PluginPageWindowView {
         self.table_text_selection = None;
         self.table_cell_bounds.clear();
         context.notify();
+    }
+
+    /// 处理插件表格过滤输入框键盘事件。
+    ///
+    /// 业务意图：
+    /// - 过滤框是插件窗口内部的本地输入控件，普通字符交给 `EntityInputHandler` 和平台 IME，删除、方向键、复制粘贴等编辑键在这里维护状态。
+    /// - 每次文本变化都只重建可见行索引，不重新执行插件命令，保证上万行表格过滤仍是可预期的本地操作。
+    fn handle_table_filter_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if MainView::is_paste_keystroke(&event.keystroke) {
+            let clipboard_text = context
+                .read_from_clipboard()
+                .and_then(|item| item.text())
+                .map(|text| MainView::sanitize_search_input_text(&text));
+            if let Some(text) = clipboard_text
+                && !text.is_empty()
+            {
+                self.replace_table_filter_selection(&text);
+                self.rebuild_table_after_filter_change(context);
+            }
+            context.stop_propagation();
+            return;
+        }
+
+        if MainView::is_copy_keystroke(&event.keystroke) {
+            let range = MainView::clamp_search_text_range(
+                &self.table_filter_input.text,
+                self.table_filter_input.selection_range.clone(),
+            );
+            if range.start < range.end {
+                context.write_to_clipboard(ClipboardItem::new_string(
+                    self.table_filter_input.text[range].to_string(),
+                ));
+            }
+            context.stop_propagation();
+            return;
+        }
+
+        if MainView::is_select_all_keystroke(&event.keystroke) {
+            self.table_filter_input.marked_range = None;
+            self.table_filter_input.selection_range = 0..self.table_filter_input.text.len();
+            context.stop_propagation();
+            context.notify();
+            return;
+        }
+
+        match event.keystroke.key.as_str() {
+            "left" => {
+                self.table_filter_input.marked_range = None;
+                if event.keystroke.modifiers.shift {
+                    self.table_filter_input.selection_range.end =
+                        MainView::previous_search_text_boundary(
+                            &self.table_filter_input.text,
+                            self.table_filter_input.selection_range.end,
+                        );
+                    self.table_filter_input.selection_range = MainView::clamp_search_text_range(
+                        &self.table_filter_input.text,
+                        self.table_filter_input.selection_range.clone(),
+                    );
+                } else if self.table_filter_input.selection_range.start
+                    != self.table_filter_input.selection_range.end
+                {
+                    let cursor = self.table_filter_input.selection_range.start;
+                    self.table_filter_input.selection_range = cursor..cursor;
+                } else {
+                    let cursor = MainView::previous_search_text_boundary(
+                        &self.table_filter_input.text,
+                        self.table_filter_input.selection_range.end,
+                    );
+                    self.table_filter_input.selection_range = cursor..cursor;
+                }
+                context.stop_propagation();
+                context.notify();
+            }
+            "right" => {
+                self.table_filter_input.marked_range = None;
+                if event.keystroke.modifiers.shift {
+                    self.table_filter_input.selection_range.end =
+                        MainView::next_search_text_boundary(
+                            &self.table_filter_input.text,
+                            self.table_filter_input.selection_range.end,
+                        );
+                    self.table_filter_input.selection_range = MainView::clamp_search_text_range(
+                        &self.table_filter_input.text,
+                        self.table_filter_input.selection_range.clone(),
+                    );
+                } else if self.table_filter_input.selection_range.start
+                    != self.table_filter_input.selection_range.end
+                {
+                    let cursor = self.table_filter_input.selection_range.end;
+                    self.table_filter_input.selection_range = cursor..cursor;
+                } else {
+                    let cursor = MainView::next_search_text_boundary(
+                        &self.table_filter_input.text,
+                        self.table_filter_input.selection_range.end,
+                    );
+                    self.table_filter_input.selection_range = cursor..cursor;
+                }
+                context.stop_propagation();
+                context.notify();
+            }
+            "up" => {
+                self.table_filter_input.marked_range = None;
+                self.table_filter_input.selection_range = 0..0;
+                context.stop_propagation();
+                context.notify();
+            }
+            "down" => {
+                self.table_filter_input.marked_range = None;
+                let cursor = self.table_filter_input.text.len();
+                self.table_filter_input.selection_range = cursor..cursor;
+                context.stop_propagation();
+                context.notify();
+            }
+            "backspace" => {
+                if let Some(range) = self.table_filter_input.marked_range.take().or_else(|| {
+                    (self.table_filter_input.selection_range.start
+                        != self.table_filter_input.selection_range.end)
+                        .then(|| self.table_filter_input.selection_range.clone())
+                }) {
+                    self.table_filter_input
+                        .text
+                        .replace_range(range.clone(), "");
+                    self.table_filter_input.selection_range = range.start..range.start;
+                } else if let Some((previous_index, _)) = self.table_filter_input.text
+                    [..self.table_filter_input.selection_range.end]
+                    .char_indices()
+                    .next_back()
+                {
+                    self.table_filter_input.text.replace_range(
+                        previous_index..self.table_filter_input.selection_range.end,
+                        "",
+                    );
+                    self.table_filter_input.selection_range = previous_index..previous_index;
+                }
+                self.rebuild_table_after_filter_change(context);
+                context.stop_propagation();
+            }
+            "delete" => {
+                if let Some(range) = self.table_filter_input.marked_range.take().or_else(|| {
+                    (self.table_filter_input.selection_range.start
+                        != self.table_filter_input.selection_range.end)
+                        .then(|| self.table_filter_input.selection_range.clone())
+                }) {
+                    self.table_filter_input
+                        .text
+                        .replace_range(range.clone(), "");
+                    self.table_filter_input.selection_range = range.start..range.start;
+                } else if let Some((next_index, next_character)) = self.table_filter_input.text
+                    [self.table_filter_input.selection_range.end..]
+                    .char_indices()
+                    .next()
+                {
+                    let start = self.table_filter_input.selection_range.end + next_index;
+                    let end = start + next_character.len_utf8();
+                    self.table_filter_input.text.replace_range(start..end, "");
+                    self.table_filter_input.selection_range = start..start;
+                }
+                self.rebuild_table_after_filter_change(context);
+                context.stop_propagation();
+            }
+            "escape" => {
+                if !self.table_filter_input.text.is_empty() {
+                    self.table_filter_input.set_text(String::new());
+                    self.rebuild_table_after_filter_change(context);
+                }
+                context.stop_propagation();
+            }
+            "enter" => {
+                context.stop_propagation();
+            }
+            _ => {}
+        }
+    }
+
+    /// 替换过滤输入框当前选区。
+    fn replace_table_filter_selection(&mut self, replacement: &str) {
+        let replacement = MainView::sanitize_search_input_text(replacement);
+        let range = self
+            .table_filter_input
+            .marked_range
+            .take()
+            .unwrap_or_else(|| self.table_filter_input.selection_range.clone());
+        let range = MainView::clamp_search_text_range(&self.table_filter_input.text, range);
+        self.table_filter_input
+            .text
+            .replace_range(range.clone(), &replacement);
+        let cursor = range.start + replacement.len();
+        self.table_filter_input.selection_range = cursor..cursor;
+    }
+
+    /// 处理过滤输入框鼠标按下。
+    fn start_table_filter_mouse_selection(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let index = self.table_filter_index_at_position(event.position);
+        let range = match event.click_count {
+            0 | 1 => index..index,
+            2 => MainView::search_text_word_range_for_index(&self.table_filter_input.text, index),
+            _ => 0..self.table_filter_input.text.len(),
+        };
+        self.table_filter_input.selection_range =
+            MainView::clamp_search_text_range(&self.table_filter_input.text, range.clone());
+        self.table_filter_input.marked_range = None;
+        self.table_filter_selection_drag = (event.click_count <= 1).then_some(index);
+        window.focus(&self.table_filter_focus);
+        context.notify();
+    }
+
+    /// 根据鼠标位置更新过滤输入框拖选范围。
+    fn update_table_filter_mouse_selection(
+        &mut self,
+        position: Point<Pixels>,
+        context: &mut Context<Self>,
+    ) {
+        let Some(anchor) = self.table_filter_selection_drag else {
+            return;
+        };
+        let index = self.table_filter_index_at_position(position);
+        self.table_filter_input.selection_range =
+            MainView::clamp_search_text_range(&self.table_filter_input.text, anchor..index);
+        context.notify();
+    }
+
+    /// 结束过滤输入框拖选。
+    fn finish_table_filter_mouse_selection(&mut self, context: &mut Context<Self>) {
+        if self.table_filter_selection_drag.take().is_some() {
+            context.notify();
+        }
+    }
+
+    /// 将窗口坐标转换为过滤输入框 UTF-8 字节下标。
+    fn table_filter_index_at_position(&self, position: Point<Pixels>) -> usize {
+        let Some(layout) = self.table_filter_layout.as_ref() else {
+            return self.table_filter_input.text.len();
+        };
+        let relative_x =
+            position.x - layout.bounds.left() + px(layout.horizontal_scroll_px).max(px(0.0));
+        let index = layout.line.closest_index_for_x(relative_x.max(px(0.0)));
+        MainView::clamp_search_text_range(&self.table_filter_input.text, index..index).start
     }
 
     /// 开始选择插件表格单元格文本。
@@ -646,6 +1236,8 @@ impl PluginPageWindowView {
             return text.len();
         };
         let line = PluginTableSelectableTextElement::shape_text(text, self.palette, window);
+        // `bounds` 是 GPUI 在横向滚动偏移后写回的窗口坐标；这里不能再叠加横向滚动量，
+        // 否则表格横向滚动后点击/拖选会命中到更靠后的字符，表现为选区错位。
         let relative_x = (position.x - bounds.left()).max(px(0.0));
         let index = line.closest_index_for_x(relative_x);
         MainView::clamp_search_text_range(text, index..index).start
@@ -731,7 +1323,13 @@ impl PluginPageWindowView {
             self.table_row_order.clear();
             return;
         };
-        self.table_row_order = (0..table.rows.len()).collect();
+        self.table_row_order = (0..table.rows.len())
+            .filter(|row_index| {
+                table.rows.get(*row_index).is_some_and(|row| {
+                    Self::plugin_table_row_matches_filter(row, &self.table_filter_input.text)
+                })
+            })
+            .collect();
         let Some(sort) = self.table_sort else {
             return;
         };
@@ -756,6 +1354,30 @@ impl PluginPageWindowView {
             };
             ordered_value.then_with(|| left_index.cmp(right_index))
         });
+    }
+
+    /// 判断表格行是否命中过滤关键字。
+    ///
+    /// 业务意图：
+    /// - “模糊搜索”面向插件表格的快速定位，不改变插件业务搜索语义；用户输入的每个空白分隔关键字都在整行任意列中做忽略大小写包含匹配。
+    /// - 多关键字采用全部命中规则，方便在 SQL、用户、请求路径等多列之间逐步收窄结果。
+    fn plugin_table_row_matches_filter(row: &[String], query: &str) -> bool {
+        let tokens = Self::plugin_table_filter_tokens(query);
+        if tokens.is_empty() {
+            return true;
+        }
+        let row_text = row.join("\u{1f}").to_lowercase();
+        tokens.iter().all(|token| row_text.contains(token))
+    }
+
+    /// 规范化插件表格过滤关键字。
+    fn plugin_table_filter_tokens(query: &str) -> Vec<String> {
+        query
+            .split_whitespace()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(str::to_lowercase)
+            .collect()
     }
 
     /// 计算插件表格列宽。
@@ -787,24 +1409,87 @@ impl PluginPageWindowView {
     /// 业务意图：
     /// - 表格应优先撑满容器并让主文本列动态吸收剩余宽度；只有所有列的最小宽度确实超过视口时才出现横向滚动。
     /// - 请求地址、请求路径和 SQL 文本列的实际宽度由 flex 布局动态决定，这里的宽度只是最小可读宽度。
+    #[cfg(test)]
     fn plugin_table_min_width(table: &PluginPageTable, column_count: usize) -> f32 {
+        Self::plugin_table_min_width_from_widths(&Self::plugin_table_column_widths(
+            table,
+            column_count,
+        ))
+    }
+
+    /// 根据已缓存列宽计算表格最小宽度。
+    fn plugin_table_min_width_from_widths(column_widths: &[f32]) -> f32 {
+        column_widths.iter().sum::<f32>().max(720.0)
+    }
+
+    /// 返回当前渲染应使用的列宽。
+    ///
+    /// 边界条件：
+    /// - 旧插件或测试构造的窗口可能没有缓存列宽；此时回退到即时计算，保证兼容性。
+    fn table_column_widths_for_render(
+        &self,
+        table: &PluginPageTable,
+        column_count: usize,
+    ) -> Vec<f32> {
+        if self.table_column_widths.len() == column_count {
+            return self.table_column_widths.clone();
+        }
         Self::plugin_table_column_widths(table, column_count)
-            .iter()
-            .sum::<f32>()
-            .max(720.0)
     }
 
     /// 计算当前表格所有列宽。
     fn plugin_table_column_widths(table: &PluginPageTable, column_count: usize) -> Vec<f32> {
         (0..column_count)
             .map(|column_index| {
-                table
+                let base_width = table
                     .headers
                     .get(column_index)
                     .map(|header| Self::plugin_table_column_width(header))
-                    .unwrap_or(PLUGIN_TABLE_FALLBACK_COLUMN_WIDTH)
+                    .unwrap_or(PLUGIN_TABLE_FALLBACK_COLUMN_WIDTH);
+                Self::plugin_table_content_column_width(table, column_index, base_width)
             })
             .collect()
+    }
+
+    /// 按表格内容估算指定列宽。
+    ///
+    /// 业务意图：
+    /// - weaver-logext 的 SQL 文本和请求路径可能远长于表头固定宽度；如果不参考内容，横向滚动永远不会出现，用户只能看到截断文本。
+    /// - 估算只在页面切换或测试中调用，不在虚拟列表每行渲染时调用，避免大表格滚动卡顿。
+    fn plugin_table_content_column_width(
+        table: &PluginPageTable,
+        column_index: usize,
+        base_width: f32,
+    ) -> f32 {
+        if Self::plugin_table_action_column_index(table) == Some(column_index) {
+            return base_width;
+        }
+        let header = table
+            .headers
+            .get(column_index)
+            .map(String::as_str)
+            .unwrap_or_default();
+        let max_width = match header {
+            "请求地址" | "请求路径" | "SQL文本" => PLUGIN_TABLE_MAX_CONTENT_COLUMN_WIDTH,
+            _ => 620.0,
+        };
+        let preferred = table
+            .rows
+            .iter()
+            .filter_map(|row| row.get(column_index))
+            .map(|text| Self::plugin_table_text_estimated_width(text))
+            .fold(base_width, f32::max);
+        preferred.clamp(base_width, max_width)
+    }
+
+    /// 估算单元格文本宽度。
+    ///
+    /// 边界条件：
+    /// - 中文、emoji 和宽字符在不同平台字体下宽度不同；这里按字符数做近似，只用于决定是否需要横向滚动，不用于精确光标命中。
+    fn plugin_table_text_estimated_width(text: &str) -> f32 {
+        let content_chars = text.chars().count() as f32;
+        (content_chars * PLUGIN_TABLE_APPROX_CHAR_WIDTH + 32.0)
+            .min(PLUGIN_TABLE_MAX_CONTENT_COLUMN_WIDTH)
     }
 
     /// 返回插件表格中的操作列下标。
@@ -980,6 +1665,131 @@ impl PluginPageWindowView {
                             .child(stat.value.clone()),
                     )
             }))
+    }
+
+    /// 渲染插件表格过滤栏。
+    ///
+    /// 业务意图：
+    /// - 插件协议只提供最终表格数据；宿主过滤栏在本地对任意插件表格做快速收窄，避免用户为了找一条 SQL 或路径重新执行插件。
+    /// - 过滤栏必须消费鼠标和键盘事件，防止输入、拖选或清空按钮点击穿透到表格行按钮。
+    fn render_table_filter_bar(
+        &self,
+        table: &PluginPageTable,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let total_count = table.rows.len();
+        let filtered_count = self.table_row_order.len().min(total_count);
+        let has_filter = !self.table_filter_input.text.trim().is_empty();
+        div()
+            .id("plugin-table-filter-bar")
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(PLUGIN_TABLE_FILTER_HEIGHT))
+            .flex_none()
+            .child(
+                div()
+                    .id("plugin-table-filter-input")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .h_full()
+                    .flex_1()
+                    .min_w_0()
+                    .px_2()
+                    .rounded(px(7.0))
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.input))
+                    .track_focus(&self.table_filter_focus)
+                    .key_context("plugin-table-filter-input")
+                    .on_key_down(context.listener(Self::handle_table_filter_key_down))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        context.listener(|view, event: &MouseDownEvent, window, context| {
+                            view.start_table_filter_mouse_selection(event, window, context);
+                            context.stop_propagation();
+                        }),
+                    )
+                    .on_mouse_move(context.listener(
+                        |view, event: &MouseMoveEvent, _window, context| {
+                            if event.dragging() {
+                                view.update_table_filter_mouse_selection(event.position, context);
+                                context.stop_propagation();
+                            }
+                        },
+                    ))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        context.listener(|view, _event: &MouseUpEvent, _window, context| {
+                            view.finish_table_filter_mouse_selection(context);
+                            context.stop_propagation();
+                        }),
+                    )
+                    .child(MainView::render_lucide_icon(
+                        Some(Icon::Search),
+                        15.0,
+                        15.0,
+                        palette.muted_text,
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .line_height(px(20.0))
+                            .text_size(px(13.0))
+                            .text_color(rgb(palette.text))
+                            .child(PluginTableFilterInputElement {
+                                view: context.entity(),
+                                focus_handle: self.table_filter_focus.clone(),
+                                palette,
+                            }),
+                    )
+                    .when(has_filter, |input| {
+                        input.child(
+                            div()
+                                .id("plugin-table-filter-clear")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .w(px(22.0))
+                                .h(px(22.0))
+                                .rounded(px(5.0))
+                                .text_color(rgb(palette.muted_text))
+                                .cursor_pointer()
+                                .hover(move |button| button.bg(rgb(palette.hover)))
+                                .child(MainView::render_lucide_icon(
+                                    Some(Icon::X),
+                                    14.0,
+                                    14.0,
+                                    palette.muted_text,
+                                ))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    context.listener(
+                                        |view, _event: &MouseDownEvent, _window, context| {
+                                            view.table_filter_input.set_text(String::new());
+                                            view.rebuild_table_after_filter_change(context);
+                                            context.stop_propagation();
+                                        },
+                                    ),
+                                ),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(rgb(palette.muted_text))
+                    .child(if has_filter {
+                        format!("{filtered_count} / {total_count} 行")
+                    } else {
+                        format!("{total_count} 行")
+                    }),
+            )
     }
 
     /// 渲染插件表格纵向滚动条。
@@ -1295,6 +2105,14 @@ impl PluginPageWindowView {
         context: &mut Context<Self>,
     ) {
         let mut handled = false;
+        if self.table_filter_selection_drag.is_some() {
+            if event.dragging() {
+                self.update_table_filter_mouse_selection(event.position, context);
+            } else {
+                self.finish_table_filter_mouse_selection(context);
+            }
+            handled = true;
+        }
         if self.table_scrollbar_drag.is_some() {
             self.update_plugin_table_scrollbar_drag(event, context);
             handled = true;
@@ -1324,15 +2142,33 @@ impl PluginPageWindowView {
         context: &mut Context<Self>,
     ) {
         let had_drag = self.table_scrollbar_drag.is_some()
+            || self.table_filter_selection_drag.is_some()
             || self
                 .table_text_selection
                 .as_ref()
                 .is_some_and(|selection| selection.dragging);
         self.finish_plugin_table_scrollbar_drag(context);
+        self.finish_table_filter_mouse_selection(context);
         self.finish_table_cell_text_selection(context);
         if had_drag {
             context.stop_propagation();
         }
+    }
+
+    /// 限制单轴滚动容器只响应真实滚轮轴向。
+    ///
+    /// 业务意图：
+    /// - 插件表格同时存在外层横向滚动和内层纵向虚拟列表滚动；纵向滚轮应只驱动纵向列表，不能顺带改变横向位置。
+    /// - GPUI 默认会在只有横向滚动的容器上把纵向滚轮量转换成横向滚动量，这会导致用户向下滚动时表格横向漂移。
+    ///
+    /// 边界条件：
+    /// - 真实横向滚动手势、Shift + 滚轮以及自绘横向滚动条仍然可用。
+    /// - 该约束只加在插件表格的横向滚动容器上，不改变主窗口、日志正文或其它列表的滚动行为。
+    fn restrict_scroll_to_wheel_axis(
+        mut element: gpui::Stateful<gpui::Div>,
+    ) -> gpui::Stateful<gpui::Div> {
+        element.style().restrict_scroll_to_axis = Some(true);
+        element
     }
 
     /// 渲染插件表格。
@@ -1347,10 +2183,10 @@ impl PluginPageWindowView {
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let column_count = table.headers.len().max(1);
-        let column_widths = Self::plugin_table_column_widths(table, column_count);
+        let column_widths = self.table_column_widths_for_render(table, column_count);
         let stretch_column_index = Self::plugin_table_stretch_column_index(table);
         let row_count = self.table_row_order.len().min(table.rows.len());
-        let min_table_width = Self::plugin_table_min_width(table, column_count);
+        let min_table_width = Self::plugin_table_min_width_from_widths(&column_widths);
         let scroll_handle = self.table_scroll_handle.clone();
         let x_scroll_handle = self.table_x_scroll_handle.clone();
         div()
@@ -1364,7 +2200,7 @@ impl PluginPageWindowView {
             .border_1()
             .border_color(rgb(palette.border))
             .bg(rgb(palette.surface))
-            .child(
+            .child(Self::restrict_scroll_to_wheel_axis(
                 div()
                     .id("plugin-page-table-x-scroll")
                     .flex()
@@ -1413,8 +2249,8 @@ impl PluginPageWindowView {
                                                         return Vec::new();
                                                     };
                                                     let column_count = table.headers.len().max(1);
-                                                    let column_widths =
-                                                        Self::plugin_table_column_widths(
+                                                    let column_widths = view
+                                                        .table_column_widths_for_render(
                                                             table,
                                                             column_count,
                                                         );
@@ -1484,7 +2320,7 @@ impl PluginPageWindowView {
                                     ))
                             }),
                     ),
-            )
+            ))
             .child(self.render_plugin_table_horizontal_scrollbar(
                 &self.table_x_scroll_handle,
                 palette,
@@ -2050,6 +2886,185 @@ impl PluginPageWindowView {
     }
 }
 
+impl EntityInputHandler for PluginPageWindowView {
+    /// 返回过滤输入框指定 UTF-16 范围内的文本。
+    ///
+    /// 业务意图：
+    /// - macOS 和 Windows 的平台输入协议按 UTF-16 位置回调，Rust 字符串按 UTF-8 存储；这里统一做安全边界转换。
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        window: &mut Window,
+        _context: &mut Context<Self>,
+    ) -> Option<String> {
+        if !self.table_filter_focus.is_focused(window) {
+            return None;
+        }
+        let range =
+            MainView::search_input_range_from_utf16(&self.table_filter_input.text, range_utf16);
+        adjusted_range.replace(MainView::search_input_range_to_utf16(
+            &self.table_filter_input.text,
+            range.clone(),
+        ));
+        Some(self.table_filter_input.text[range].to_string())
+    }
+
+    /// 返回过滤输入框当前选区。
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        window: &mut Window,
+        _context: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        if !self.table_filter_focus.is_focused(window) {
+            return None;
+        }
+        Some(UTF16Selection {
+            range: MainView::search_input_range_to_utf16(
+                &self.table_filter_input.text,
+                self.table_filter_input.selection_range.clone(),
+            ),
+            reversed: false,
+        })
+    }
+
+    /// 返回输入法组合文本范围。
+    fn marked_text_range(
+        &self,
+        window: &mut Window,
+        _context: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        if !self.table_filter_focus.is_focused(window) {
+            return None;
+        }
+        self.table_filter_input.marked_range.clone().map(|range| {
+            MainView::search_input_range_to_utf16(&self.table_filter_input.text, range)
+        })
+    }
+
+    /// 清除输入法组合文本状态。
+    fn unmark_text(&mut self, window: &mut Window, context: &mut Context<Self>) {
+        if !self.table_filter_focus.is_focused(window) {
+            return;
+        }
+        self.table_filter_input.marked_range = None;
+        context.notify();
+    }
+
+    /// 用平台提交文本替换过滤输入框中的指定范围。
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if !self.table_filter_focus.is_focused(window) {
+            return;
+        }
+        let replacement = MainView::sanitize_search_input_text(text);
+        let range = range_utf16
+            .map(|range| {
+                MainView::search_input_range_from_utf16(&self.table_filter_input.text, range)
+            })
+            .or_else(|| self.table_filter_input.marked_range.clone())
+            .unwrap_or_else(|| self.table_filter_input.selection_range.clone());
+        let range = MainView::clamp_search_text_range(&self.table_filter_input.text, range);
+        self.table_filter_input
+            .text
+            .replace_range(range.clone(), &replacement);
+        let cursor = range.start + replacement.len();
+        self.table_filter_input.selection_range = cursor..cursor;
+        self.table_filter_input.marked_range = None;
+        self.rebuild_table_after_filter_change(context);
+    }
+
+    /// 用平台组合文本替换过滤输入框中的指定范围，并保留组合状态。
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range_utf16: Option<Range<usize>>,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if !self.table_filter_focus.is_focused(window) {
+            return;
+        }
+        let replacement = MainView::sanitize_search_input_text(new_text);
+        let range = range_utf16
+            .map(|range| {
+                MainView::search_input_range_from_utf16(&self.table_filter_input.text, range)
+            })
+            .or_else(|| self.table_filter_input.marked_range.clone())
+            .unwrap_or_else(|| self.table_filter_input.selection_range.clone());
+        let range = MainView::clamp_search_text_range(&self.table_filter_input.text, range);
+        self.table_filter_input
+            .text
+            .replace_range(range.clone(), &replacement);
+        self.table_filter_input.marked_range = if replacement.is_empty() {
+            None
+        } else {
+            Some(range.start..range.start + replacement.len())
+        };
+        let selected_range = new_selected_range_utf16
+            .map(|utf16_range| MainView::search_input_range_from_utf16(&replacement, utf16_range))
+            .map(|relative_range| {
+                range.start + relative_range.start..range.start + relative_range.end
+            })
+            .unwrap_or_else(|| {
+                let cursor = range.start + replacement.len();
+                cursor..cursor
+            });
+        self.table_filter_input.selection_range =
+            MainView::clamp_search_text_range(&self.table_filter_input.text, selected_range);
+        self.rebuild_table_after_filter_change(context);
+    }
+
+    /// 返回指定文本范围在窗口中的边界，用于 IME 候选框定位。
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        window: &mut Window,
+        _context: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        if !self.table_filter_focus.is_focused(window) {
+            return None;
+        }
+        let Some(layout) = self.table_filter_layout.as_ref() else {
+            return Some(element_bounds);
+        };
+        let range =
+            MainView::search_input_range_from_utf16(&self.table_filter_input.text, range_utf16);
+        let cursor = range.start;
+        let cursor_x = layout.bounds.left() - px(layout.horizontal_scroll_px)
+            + layout.line.x_for_index(cursor);
+        Some(Bounds::new(
+            point(cursor_x, layout.bounds.top()),
+            size(px(1.0), layout.bounds.bottom() - layout.bounds.top()),
+        ))
+    }
+
+    /// 根据鼠标位置返回过滤输入框插入点。
+    fn character_index_for_point(
+        &mut self,
+        point: Point<Pixels>,
+        window: &mut Window,
+        _context: &mut Context<Self>,
+    ) -> Option<usize> {
+        if !self.table_filter_focus.is_focused(window) {
+            return None;
+        }
+        let utf8_index = self.table_filter_index_at_position(point);
+        Some(MainView::search_input_utf16_offset_from_byte(
+            &self.table_filter_input.text,
+            utf8_index,
+        ))
+    }
+}
+
 /// 比较插件表格单元格。
 ///
 /// 业务意图：
@@ -2154,6 +3169,48 @@ mod tests {
         );
     }
 
+    /// 覆盖插件表格过滤按任意列关键字收窄结果。
+    ///
+    /// 业务意图：
+    /// - 第三方插件表格列语义不固定，过滤必须扫描整行所有单元格，而不是只看 weaver-logext 的请求地址列。
+    /// - 多关键字同时命中才能保留，方便用户用路径、用户或 SQL 片段逐步缩小范围。
+    #[test]
+    fn 插件表格过滤支持任意列多关键字() {
+        let row = vec![
+            "/api/workflow/request".to_string(),
+            "alice".to_string(),
+            "select table_a".to_string(),
+        ];
+        assert!(PluginPageWindowView::plugin_table_row_matches_filter(
+            &row,
+            "WORKFLOW alice"
+        ));
+        assert!(PluginPageWindowView::plugin_table_row_matches_filter(
+            &row, "table_a"
+        ));
+        assert!(!PluginPageWindowView::plugin_table_row_matches_filter(
+            &row,
+            "workflow bob"
+        ));
+    }
+
+    /// 覆盖长 SQL 内容会扩大列宽以触发横向滚动。
+    ///
+    /// 业务意图：
+    /// - weaver-logext 的 SQL 明细通常无法在默认列宽内完整展示，宿主需要根据内容估算列宽，让表格在必要时出现横向滚动条。
+    #[test]
+    fn 插件表格长内容会扩大列宽() {
+        let long_sql = format!("select {} from very_long_table", "x".repeat(180));
+        let table = PluginPageTable {
+            headers: vec!["SQL文本".to_string()],
+            rows: vec![vec![long_sql]],
+            row_actions: Vec::new(),
+        };
+
+        let widths = PluginPageWindowView::plugin_table_column_widths(&table, 1);
+        assert!(widths[0] > PluginPageWindowView::plugin_table_column_width("SQL文本"));
+    }
+
     /// 覆盖插件表格文本选区不会切断 UTF-8 字符。
     ///
     /// 业务意图：
@@ -2210,7 +3267,8 @@ impl Render for PluginPageWindowView {
                         body.child(self.render_stat_grid(palette))
                     })
                     .when_some(self.page.table.as_ref(), |body, table| {
-                        body.child(self.render_table(table, palette, context))
+                        body.child(self.render_table_filter_bar(table, palette, context))
+                            .child(self.render_table(table, palette, context))
                     }),
             )
     }

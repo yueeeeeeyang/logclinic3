@@ -931,6 +931,33 @@ fn 重复对象id会返回格式错误() {
     assert!(error.to_string().contains("重复定义"));
 }
 
+/// 验证延迟对象索引路径仍会拒绝重复对象 ID。
+///
+/// 业务意图：
+/// - 大 HPROF 解析读取阶段为了性能不再实时写入对象索引，但损坏 dump 的重复对象 ID 仍必须在统一建索引阶段报错。
+#[test]
+fn 延迟对象索引会在重建阶段拒绝重复id() {
+    let header = HprofHeader {
+        label: "JAVA PROFILE 1.0.2".to_string(),
+        identifier_size: 8,
+        timestamp_millis: 0,
+    };
+    let size_model = HprofSizeModel::mat_compatible(&header, 1024);
+    let mut graph = HprofObjectGraph::new(header, size_model);
+    let object = HprofHeapObject {
+        id: 1,
+        class_id: 100,
+        shallow_size: 8,
+        kind: HprofObjectKind::Instance,
+    };
+    graph.insert_object_deferred_index(object.clone(), Vec::new());
+    graph.insert_object_deferred_index(object, Vec::new());
+    let error = graph
+        .rebuild_object_indices()
+        .expect_err("延迟索引重建仍应拒绝重复对象 ID");
+    assert!(error.to_string().contains("重复定义"));
+}
+
 /// 验证低内存索引会拒绝超过 `u32` 哨兵上限的节点数。
 #[test]
 fn 低内存节点索引超过上限会返回中文错误() {
@@ -963,6 +990,15 @@ fn 大量子记录进度单调增长() {
         assert!(window[1].object_count >= window[0].object_count);
         assert!(window[1].edge_count >= window[0].edge_count);
     }
+    assert!(progresses.iter().any(|progress| {
+        progress.stage == HprofAnalysisStage::ReadingRecords
+            && progress.heap_record_counts.instance_dump > 0
+    }));
+    assert!(
+        progresses
+            .iter()
+            .any(|progress| progress.stage == HprofAnalysisStage::BuildingObjectIndex)
+    );
     assert_eq!(result.total_objects, 5001);
     assert_eq!(result.edge_count, 4999);
     let _ = fs::remove_file(path);
@@ -986,6 +1022,7 @@ fn 计算阶段会报告紧凑图和lt细分进度() {
 
     for expected in [
         "添加紧凑图节点",
+        "建立对象 ID 索引",
         "添加 GC Root 边",
         "添加对象引用边",
         "DFS 编号",

@@ -103,21 +103,17 @@ where
         parser::parse_hprof_object_graph(&path, progress, &mut progress_reporter, &cancel_flag)?;
     check_cancel(&cancel_flag)?;
 
-    let mut progress = HprofProgress {
-        stage: HprofAnalysisStage::BuildingDominatorGraph,
-        message: "正在构建对象引用图".to_string(),
-        total_bytes: file_size_for_progress(&path),
-        bytes_read: file_size_for_progress(&path),
-        record_count: 0,
-        object_count: graph.object_count(),
-        class_count: graph.class_count(),
-        gc_root_count: graph.gc_roots.len(),
-        edge_count: graph.edge_count(),
-        phase_done: 0,
-        phase_total: graph.object_count() as u64,
-        phase_unit: "对象",
-        sub_message: "准备构建紧凑图节点".to_string(),
-    };
+    let mut progress = HprofProgress::new(file_size_for_progress(&path));
+    progress.stage = HprofAnalysisStage::BuildingDominatorGraph;
+    progress.message = "正在构建对象引用图".to_string();
+    progress.bytes_read = progress.total_bytes;
+    progress.object_count = graph.object_count();
+    progress.class_count = graph.class_count();
+    progress.gc_root_count = graph.gc_roots.len();
+    progress.edge_count = graph.edge_count();
+    progress.phase_total = graph.object_count() as u64;
+    progress.phase_unit = "对象";
+    progress.sub_message = "准备构建紧凑图节点".to_string();
     progress_reporter(progress.clone());
 
     let mut result = build_hprof_dominator_result(
@@ -335,6 +331,7 @@ where
     F: FnMut(HprofAnalysisStage, &str, &str, u64, u64, &'static str),
 {
     check_cancel(cancel_flag)?;
+    graph.ensure_object_indices()?;
     report_work_progress(
         &mut stage_reporter,
         HprofAnalysisStage::BuildingDominatorGraph,
