@@ -1243,6 +1243,10 @@ fn add_archive_entry(
 ///
 /// 业务意图：
 /// - 压缩包扫描阶段需要保留与日志目录树一致的文件大小展示文本，但不能依赖加载器私有函数。
+///
+/// 边界条件：
+/// - 小于 1KB 使用字节；KB 保留整数，保证大量小文件在左侧树里仍然紧凑。
+/// - MB 和 GB 固定保留三位小数，和普通文件扫描路径保持一致，避免压缩包内部日志仍显示成整数 MB。
 fn format_byte_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
@@ -1250,12 +1254,30 @@ fn format_byte_size(bytes: u64) -> String {
 
     let bytes_f64 = bytes as f64;
     if bytes_f64 >= GB {
-        format!("{:.0} GB", bytes_f64 / GB)
+        format!("{:.3} GB", bytes_f64 / GB)
     } else if bytes_f64 >= MB {
-        format!("{:.0} MB", bytes_f64 / MB)
+        format!("{:.3} MB", bytes_f64 / MB)
     } else if bytes_f64 >= KB {
         format!("{:.0} KB", bytes_f64 / KB)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 验证压缩包内部文件大小和普通日志树使用同一展示规则。
+    ///
+    /// 业务意图：
+    /// - 用户在左侧树中看到的文件可能来自普通目录，也可能来自 ZIP/RAR/7Z 等压缩包内部；两条加载路径必须保持同样的 MB/GB 三位小数格式。
+    /// - KB 及以下维持紧凑格式，避免小文件列表因为无意义小数占用过多横向空间。
+    #[test]
+    fn 压缩包条目大小在_mb_和_gb_保留三位小数() {
+        assert_eq!(format_byte_size(999), "999 B");
+        assert_eq!(format_byte_size(19 * 1024), "19 KB");
+        assert_eq!(format_byte_size(1_389_363), "1.325 MB");
+        assert_eq!(format_byte_size(2_846_331_297), "2.651 GB");
     }
 }

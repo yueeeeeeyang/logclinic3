@@ -507,7 +507,8 @@ fn path_components_for_tree(path: &Path) -> Vec<String> {
 /// - 该格式只用于展示，不用于排序或精确计算。
 ///
 /// 边界条件：
-/// - 小于 1KB 使用字节；KB 以上保留整数，避免过长小数影响窄面板布局。
+/// - 小于 1KB 使用字节；KB 保留整数，延续小文件在窄目录树里的紧凑展示。
+/// - MB 和 GB 固定保留三位小数，满足用户在左侧树中快速区分 1MB 以上日志大小差异的需求。
 fn format_byte_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
@@ -515,9 +516,9 @@ fn format_byte_size(bytes: u64) -> String {
 
     let bytes_f64 = bytes as f64;
     if bytes_f64 >= GB {
-        format!("{:.0} GB", bytes_f64 / GB)
+        format!("{:.3} GB", bytes_f64 / GB)
     } else if bytes_f64 >= MB {
-        format!("{:.0} MB", bytes_f64 / MB)
+        format!("{:.3} MB", bytes_f64 / MB)
     } else if bytes_f64 >= KB {
         format!("{:.0} KB", bytes_f64 / KB)
     } else {
@@ -958,6 +959,19 @@ mod tests {
             normalized_rar_nested_archive_member_path("../inner.zip", false, 1024),
             None
         );
+    }
+
+    /// 验证左侧日志树文件大小会在 MB 和 GB 级别保留三位小数。
+    ///
+    /// 业务意图：
+    /// - 左侧树的大小文本用于用户扫描日志体量；超过 1MB 后整数展示会丢失差异，例如 1.3MB 和 1.8MB 都可能显示为 1MB。
+    /// - B 和 KB 仍保持原有紧凑格式，避免大量小文件在窄树面板中产生过长文本。
+    #[test]
+    fn 日志树文件大小在_mb_和_gb_保留三位小数() {
+        assert_eq!(format_byte_size(999), "999 B");
+        assert_eq!(format_byte_size(19 * 1024), "19 KB");
+        assert_eq!(format_byte_size(1_389_363), "1.325 MB");
+        assert_eq!(format_byte_size(2_846_331_297), "2.651 GB");
     }
 
     /// 验证树构建会补齐隐式目录并保持目录优先排序。
