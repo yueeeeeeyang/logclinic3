@@ -104,6 +104,13 @@ pub(in crate::app) struct MainView {
     /// - 句柄只服务当前会话；关闭窗口后由回调清空。
     pub(in crate::app) thread_analysis_window: Option<WindowHandle<ThreadAnalysisWindowView>>,
 
+    /// 当前线程日志分析后台任务代次。
+    ///
+    /// 业务意图：
+    /// - 用户可能在旧解析尚未完成时再次启动线程日志分析；代次用于丢弃旧任务迟到的进度和结果，避免旧窗口覆盖新分析。
+    /// - 该值只在当前 UI 会话内使用，不写入配置；溢出时饱和加一即可。
+    pub(in crate::app) thread_analysis_generation: usize,
+
     /// 日志智能分析独立窗口句柄。
     ///
     /// 业务意图：
@@ -191,6 +198,7 @@ impl MainView {
             model_config,
             plugins: PluginWorkspaceState::load(),
             thread_analysis_window: None,
+            thread_analysis_generation: 0,
             log_ai_analysis_window: None,
             hprof_analysis_view: None,
             ai_chat,

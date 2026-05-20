@@ -24,7 +24,8 @@ use self::nested::*;
 mod types;
 use self::types::NESTED_ARCHIVE_SCAN_MAX_BYTES;
 pub(crate) use self::types::{
-    ArchiveMemberSource, ArchiveScanEntryKind, ArchiveScanError, ArchiveScanNode, ArchiveScanResult,
+    ArchiveMemberSource, ArchiveScanEntryKind, ArchiveScanError, ArchiveScanNode,
+    ArchiveScanProgress, ArchiveScanResult,
 };
 
 use flate2::read::GzDecoder;
@@ -36,20 +37,37 @@ use super::{
     single_gzip_member_display_name, single_gzip_member_path_for_archive, split_archive_entry_path,
 };
 
-/// 扫描单个压缩包，返回与 UI 无关的扫描结果。
-pub(crate) fn scan_archive(
+/// 扫描单个压缩包，返回与 UI 无关的扫描结果，并持续回传条目级进度。
+///
+/// 业务意图：
+/// - 加载压缩包时顶层来源通常只有一个，单纯按来源计数会让进度条一直停在 0%。
+/// - 该入口把 ZIP/7Z 的已知总条目数和 TAR/RAR/GZIP 的顺序扫描进度回传给加载器，让 UI 可以展示真实推进状态。
+///
+/// 边界条件：
+/// - 回调只接收轻量快照，不允许持有压缩包 reader 或成员正文，避免 UI 层错误跨线程访问 I/O 状态。
+/// - 对于无法预先知道总数的格式，`total_entries` 保持 `None`，上层会按已扫描条目给出非线性估算进度。
+pub(crate) fn scan_archive_with_progress<F>(
     path: &Path,
     format: ArchiveFormat,
-) -> Result<ArchiveScanResult, ArchiveScanError> {
+    mut report_progress: F,
+) -> Result<ArchiveScanResult, ArchiveScanError>
+where
+    F: FnMut(ArchiveScanProgress),
+{
     let mut root = ArchiveScanNode::new(String::new(), ArchiveScanEntryKind::Directory);
     let mut error_count = 0usize;
     let mut temporary_paths = Vec::new();
+    report_progress(ArchiveScanProgress::new(
+        format,
+        format!("准备扫描 {} 压缩包", format.label()),
+    ));
     scan_archive_into(
         path,
         format,
         &mut root,
         &mut error_count,
         &mut temporary_paths,
+        &mut report_progress,
     )?;
     Ok(ArchiveScanResult {
         children: root.children,
@@ -83,21 +101,65 @@ pub(crate) fn nested_archive_scan_format(
 /// - 格式相关 API 差异集中在本函数附近，调用方只关心压缩包根节点和错误处理。
 /// - ZIP/RAR/TAR.GZ 默认读取条目列表，GZ 挂载唯一解压日志；遇到需要路径型 API 的内层压缩包时，会先物化到临时目录再扫描。
 /// - 7Z 为改善点击内部小文件的速度，会在这里顺序物化成员到临时目录。
-fn scan_archive_into(
+fn scan_archive_into<F>(
     path: &Path,
     format: ArchiveFormat,
     root: &mut ArchiveScanNode,
     error_count: &mut usize,
     temporary_paths: &mut Vec<PathBuf>,
-) -> Result<(), ArchiveScanError> {
+    report_progress: &mut F,
+) -> Result<(), ArchiveScanError>
+where
+    F: FnMut(ArchiveScanProgress),
+{
     match format {
-        ArchiveFormat::Zip => scan_zip_archive(path, root, error_count, temporary_paths),
-        ArchiveFormat::Rar => scan_rar_archive(path, root, error_count, temporary_paths),
-        ArchiveFormat::Tar => scan_tar_archive(path, root, error_count, temporary_paths),
-        ArchiveFormat::TarGz => scan_tar_gz_archive(path, root, error_count, temporary_paths),
-        ArchiveFormat::Gzip => scan_gzip_archive(path, root),
-        ArchiveFormat::SevenZ => scan_7z_archive(path, root, error_count, temporary_paths),
+        ArchiveFormat::Zip => {
+            scan_zip_archive(path, root, error_count, temporary_paths, report_progress)
+        }
+        ArchiveFormat::Rar => {
+            scan_rar_archive(path, root, error_count, temporary_paths, report_progress)
+        }
+        ArchiveFormat::Tar => {
+            scan_tar_archive(path, root, error_count, temporary_paths, report_progress)
+        }
+        ArchiveFormat::TarGz => {
+            scan_tar_gz_archive(path, root, error_count, temporary_paths, report_progress)
+        }
+        ArchiveFormat::Gzip => scan_gzip_archive(path, root, report_progress),
+        ArchiveFormat::SevenZ => {
+            scan_7z_archive(path, root, error_count, temporary_paths, report_progress)
+        }
     }
+}
+
+/// 汇报压缩包扫描过程中的当前条目状态。
+///
+/// 业务意图：
+/// - 各格式扫描函数的 API 差异很大，但 UI 需要统一的“当前条目、已处理数量、总数量、已发现节点”快照。
+/// - 集中封装可以保证错误节点、目录节点和普通文件节点使用同一套计数口径。
+///
+/// 边界条件：
+/// - `total_entries` 为 `None` 时表示该格式无法低成本预知总数，调用方只能展示已扫描条目或估算比例。
+/// - `current_entry` 只用于提示文案，保留原始压缩包成员名，不在这里做路径归一化。
+fn report_archive_progress<F>(
+    report_progress: &mut F,
+    format: ArchiveFormat,
+    step: impl Into<String>,
+    current_entry: Option<String>,
+    processed_entries: usize,
+    total_entries: Option<usize>,
+    root: &ArchiveScanNode,
+    error_count: usize,
+) where
+    F: FnMut(ArchiveScanProgress),
+{
+    let mut progress = ArchiveScanProgress::new(format, step);
+    progress.current_entry = current_entry;
+    progress.processed_entries = processed_entries;
+    progress.total_entries = total_entries;
+    progress.discovered_nodes = root.descendant_node_count();
+    progress.error_count = error_count;
+    report_progress(progress);
 }
 
 /// 扫描 ZIP 压缩包目录项。
@@ -108,17 +170,32 @@ fn scan_archive_into(
 ///
 /// 边界条件：
 /// - ZIP 条目名可能包含不安全路径，必须交给 `add_archive_entry` 统一校验。
-fn scan_zip_archive(
+fn scan_zip_archive<F>(
     path: &Path,
     root: &mut ArchiveScanNode,
     error_count: &mut usize,
     temporary_paths: &mut Vec<PathBuf>,
-) -> Result<(), ArchiveScanError> {
+    report_progress: &mut F,
+) -> Result<(), ArchiveScanError>
+where
+    F: FnMut(ArchiveScanProgress),
+{
     let file = File::open(path).map_err(|error| {
         ArchiveScanError::new(format!("无法打开 ZIP 压缩包 {}：{}", path.display(), error))
     })?;
     let mut archive = ZipArchive::new(BufReader::new(file))
         .map_err(|error| ArchiveScanError::new(format!("无法读取 ZIP 目录：{}", error)))?;
+    let total_entries = archive.len();
+    report_archive_progress(
+        report_progress,
+        ArchiveFormat::Zip,
+        "读取 ZIP 目录完成",
+        None,
+        0,
+        Some(total_entries),
+        root,
+        *error_count,
+    );
 
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(|error| {
@@ -143,6 +220,16 @@ fn scan_zip_archive(
             )
         {
             add_nested_archive_tree(root, &raw_name, nested_tree, error_count);
+            report_archive_progress(
+                report_progress,
+                ArchiveFormat::Zip,
+                "展开 ZIP 内层压缩包",
+                Some(raw_name),
+                index.saturating_add(1),
+                Some(total_entries),
+                root,
+                *error_count,
+            );
             continue;
         }
 
@@ -154,6 +241,16 @@ fn scan_zip_archive(
             is_directory,
             Some(size),
             error_count,
+        );
+        report_archive_progress(
+            report_progress,
+            ArchiveFormat::Zip,
+            "扫描 ZIP 条目",
+            Some(raw_name),
+            index.saturating_add(1),
+            Some(total_entries),
+            root,
+            *error_count,
         );
     }
 
@@ -169,23 +266,49 @@ fn scan_zip_archive(
 /// 边界条件：
 /// - 加密文件没有密码规则，当前以错误节点展示，后续需要用户确认密码输入和缓存策略后再支持。
 /// - `unrar` 依赖底层 unrar 实现，跨平台构建如遇工具链问题需要在对应平台单独验收。
-fn scan_rar_archive(
+fn scan_rar_archive<F>(
     path: &Path,
     root: &mut ArchiveScanNode,
     error_count: &mut usize,
     temporary_paths: &mut Vec<PathBuf>,
-) -> Result<(), ArchiveScanError> {
+    report_progress: &mut F,
+) -> Result<(), ArchiveScanError>
+where
+    F: FnMut(ArchiveScanProgress),
+{
     let archive = unrar::Archive::new(path)
         .open_for_listing()
         .map_err(|error| ArchiveScanError::new(format!("无法打开 RAR 目录：{}", error)))?;
     let mut materialized_root: Option<PathBuf> = None;
+    let mut processed_entries = 0usize;
+    report_archive_progress(
+        report_progress,
+        ArchiveFormat::Rar,
+        "开始顺序读取 RAR 条目",
+        None,
+        processed_entries,
+        None,
+        root,
+        *error_count,
+    );
 
     for entry in archive {
+        processed_entries = processed_entries.saturating_add(1);
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
                 *error_count += 1;
                 root.add_error_child("RAR 条目读取失败", "读取失败", error.to_string());
+                report_archive_progress(
+                    report_progress,
+                    ArchiveFormat::Rar,
+                    "RAR 条目读取失败",
+                    None,
+                    processed_entries,
+                    None,
+                    root,
+                    *error_count,
+                );
                 continue;
             }
         };
@@ -194,6 +317,16 @@ fn scan_rar_archive(
         if entry.is_encrypted() {
             *error_count += 1;
             root.add_archive_error_entry(&raw_name, "加密条目", "加密 RAR 条目暂不支持读取");
+            report_archive_progress(
+                report_progress,
+                ArchiveFormat::Rar,
+                "跳过加密 RAR 条目",
+                Some(raw_name.to_string()),
+                processed_entries,
+                None,
+                root,
+                *error_count,
+            );
             continue;
         }
 
@@ -205,6 +338,16 @@ fn scan_rar_archive(
             else {
                 *error_count += 1;
                 root.add_archive_error_entry(&raw_name, "非法路径", "压缩包成员路径非法");
+                report_archive_progress(
+                    report_progress,
+                    ArchiveFormat::Rar,
+                    "RAR 条目路径非法",
+                    Some(raw_name.to_string()),
+                    processed_entries,
+                    None,
+                    root,
+                    *error_count,
+                );
                 continue;
             };
             match materialize_rar_member_for_nested_scan(
@@ -229,6 +372,16 @@ fn scan_rar_archive(
                             nested_tree,
                             error_count,
                         );
+                        report_archive_progress(
+                            report_progress,
+                            ArchiveFormat::Rar,
+                            "展开 RAR 内层压缩包",
+                            Some(nested_member_path),
+                            processed_entries,
+                            None,
+                            root,
+                            *error_count,
+                        );
                         continue;
                     }
                 }
@@ -238,6 +391,16 @@ fn scan_rar_archive(
                         &raw_name,
                         "内层压缩包读取失败",
                         error.to_string(),
+                    );
+                    report_archive_progress(
+                        report_progress,
+                        ArchiveFormat::Rar,
+                        "RAR 内层压缩包读取失败",
+                        Some(raw_name.to_string()),
+                        processed_entries,
+                        None,
+                        root,
+                        *error_count,
                     );
                     continue;
                 }
@@ -253,6 +416,16 @@ fn scan_rar_archive(
             Some(entry.unpacked_size),
             error_count,
         );
+        report_archive_progress(
+            report_progress,
+            ArchiveFormat::Rar,
+            "扫描 RAR 条目",
+            Some(raw_name.to_string()),
+            processed_entries,
+            None,
+            root,
+            *error_count,
+        );
     }
 
     Ok(())
@@ -267,12 +440,16 @@ fn scan_rar_archive(
 /// 边界条件：
 /// - TAR 是顺序格式，扫描目录时仍需消费每个文件条目正文，才能继续读取后续条目。
 /// - 嵌套压缩包会先尝试小文件内存扫描，多文件内层压缩包作为目录展开。
-fn scan_tar_archive(
+fn scan_tar_archive<F>(
     path: &Path,
     root: &mut ArchiveScanNode,
     error_count: &mut usize,
     temporary_paths: &mut Vec<PathBuf>,
-) -> Result<(), ArchiveScanError> {
+    report_progress: &mut F,
+) -> Result<(), ArchiveScanError>
+where
+    F: FnMut(ArchiveScanProgress),
+{
     let file = File::open(path).map_err(|error| {
         ArchiveScanError::new(format!("无法打开 TAR 压缩包 {}：{}", path.display(), error))
     })?;
@@ -280,13 +457,35 @@ fn scan_tar_archive(
     let entries = archive
         .entries()
         .map_err(|error| ArchiveScanError::new(format!("无法读取 TAR 目录：{}", error)))?;
+    let mut processed_entries = 0usize;
+    report_archive_progress(
+        report_progress,
+        ArchiveFormat::Tar,
+        "开始顺序读取 TAR 条目",
+        None,
+        processed_entries,
+        None,
+        root,
+        *error_count,
+    );
 
     for entry in entries {
+        processed_entries = processed_entries.saturating_add(1);
         let mut entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
                 *error_count += 1;
                 root.add_error_child("TAR 条目读取失败", "读取失败", error.to_string());
+                report_archive_progress(
+                    report_progress,
+                    ArchiveFormat::Tar,
+                    "TAR 条目读取失败",
+                    None,
+                    processed_entries,
+                    None,
+                    root,
+                    *error_count,
+                );
                 continue;
             }
         };
@@ -296,6 +495,16 @@ fn scan_tar_archive(
             Err(error) => {
                 *error_count += 1;
                 root.add_error_child("TAR 路径读取失败", "路径错误", error.to_string());
+                report_archive_progress(
+                    report_progress,
+                    ArchiveFormat::Tar,
+                    "TAR 路径读取失败",
+                    None,
+                    processed_entries,
+                    None,
+                    root,
+                    *error_count,
+                );
                 continue;
             }
         };
@@ -326,10 +535,30 @@ fn scan_tar_archive(
             if let Err(error) = drain_tar_entry(&mut entry) {
                 *error_count += 1;
                 root.add_error_child("TAR 条目跳过失败", "读取失败", error.to_string());
+                report_archive_progress(
+                    report_progress,
+                    ArchiveFormat::Tar,
+                    "TAR 条目跳过失败",
+                    Some(raw_name),
+                    processed_entries,
+                    None,
+                    root,
+                    *error_count,
+                );
                 continue;
             }
             entry_drained = true;
             if replaced_with_nested_tree {
+                report_archive_progress(
+                    report_progress,
+                    ArchiveFormat::Tar,
+                    "展开 TAR 内层压缩包",
+                    Some(raw_name),
+                    processed_entries,
+                    None,
+                    root,
+                    *error_count,
+                );
                 continue;
             }
         }
@@ -340,6 +569,16 @@ fn scan_tar_archive(
         {
             *error_count += 1;
             root.add_error_child("TAR 条目跳过失败", "读取失败", error.to_string());
+            report_archive_progress(
+                report_progress,
+                ArchiveFormat::Tar,
+                "TAR 条目跳过失败",
+                Some(raw_name),
+                processed_entries,
+                None,
+                root,
+                *error_count,
+            );
             continue;
         }
 
@@ -351,6 +590,16 @@ fn scan_tar_archive(
             is_directory,
             Some(size),
             error_count,
+        );
+        report_archive_progress(
+            report_progress,
+            ArchiveFormat::Tar,
+            "扫描 TAR 条目",
+            Some(raw_name),
+            processed_entries,
+            None,
+            root,
+            *error_count,
         );
     }
 
@@ -365,12 +614,16 @@ fn scan_tar_archive(
 ///
 /// 边界条件：
 /// - tar 路径可能包含平台分隔符或危险片段，必须交给 `add_archive_entry` 校验。
-fn scan_tar_gz_archive(
+fn scan_tar_gz_archive<F>(
     path: &Path,
     root: &mut ArchiveScanNode,
     error_count: &mut usize,
     temporary_paths: &mut Vec<PathBuf>,
-) -> Result<(), ArchiveScanError> {
+    report_progress: &mut F,
+) -> Result<(), ArchiveScanError>
+where
+    F: FnMut(ArchiveScanProgress),
+{
     let file = File::open(path).map_err(|error| {
         ArchiveScanError::new(format!(
             "无法打开 TAR.GZ 压缩包 {}：{}",
@@ -384,6 +637,16 @@ fn scan_tar_gz_archive(
         Ok(entries) => entries,
         Err(error) => {
             if add_single_gzip_payload_entry(path, ArchiveFormat::TarGz, root) {
+                report_archive_progress(
+                    report_progress,
+                    ArchiveFormat::TarGz,
+                    "按单文件 GZIP 日志加载",
+                    None,
+                    1,
+                    Some(1),
+                    root,
+                    *error_count,
+                );
                 return Ok(());
             }
             return Err(ArchiveScanError::new(format!(
@@ -393,9 +656,21 @@ fn scan_tar_gz_archive(
         }
     };
     let mut valid_entry_count = 0usize;
+    let mut processed_entries = 0usize;
     let mut deferred_entry_errors = Vec::new();
+    report_archive_progress(
+        report_progress,
+        ArchiveFormat::TarGz,
+        "开始顺序读取 TAR.GZ 条目",
+        None,
+        processed_entries,
+        None,
+        root,
+        *error_count,
+    );
 
     for entry in entries {
+        processed_entries = processed_entries.saturating_add(1);
         let mut entry = match entry {
             Ok(entry) => {
                 valid_entry_count += 1;
@@ -405,6 +680,16 @@ fn scan_tar_gz_archive(
                 // tar crate 会在 gzip 内容不是 tar 头时从迭代器返回条目错误。
                 // 这里先延迟展示错误，等循环结束后确认是否可以按“单文件 gzip 日志”降级处理。
                 deferred_entry_errors.push(error.to_string());
+                report_archive_progress(
+                    report_progress,
+                    ArchiveFormat::TarGz,
+                    "等待 TAR.GZ 降级判断",
+                    None,
+                    processed_entries,
+                    None,
+                    root,
+                    *error_count,
+                );
                 continue;
             }
         };
@@ -414,6 +699,16 @@ fn scan_tar_gz_archive(
             Err(error) => {
                 *error_count += 1;
                 root.add_error_child("TAR.GZ 路径读取失败", "路径错误", error.to_string());
+                report_archive_progress(
+                    report_progress,
+                    ArchiveFormat::TarGz,
+                    "TAR.GZ 路径读取失败",
+                    None,
+                    processed_entries,
+                    None,
+                    root,
+                    *error_count,
+                );
                 continue;
             }
         };
@@ -443,10 +738,30 @@ fn scan_tar_gz_archive(
             if let Err(error) = drain_tar_entry(&mut entry) {
                 *error_count += 1;
                 root.add_error_child("TAR.GZ 条目跳过失败", "读取失败", error.to_string());
+                report_archive_progress(
+                    report_progress,
+                    ArchiveFormat::TarGz,
+                    "TAR.GZ 条目跳过失败",
+                    Some(raw_name),
+                    processed_entries,
+                    None,
+                    root,
+                    *error_count,
+                );
                 continue;
             }
             entry_drained = true;
             if replaced_with_nested_tree {
+                report_archive_progress(
+                    report_progress,
+                    ArchiveFormat::TarGz,
+                    "展开 TAR.GZ 内层压缩包",
+                    Some(raw_name),
+                    processed_entries,
+                    None,
+                    root,
+                    *error_count,
+                );
                 continue;
             }
         }
@@ -457,6 +772,16 @@ fn scan_tar_gz_archive(
         {
             *error_count += 1;
             root.add_error_child("TAR.GZ 条目跳过失败", "读取失败", error.to_string());
+            report_archive_progress(
+                report_progress,
+                ArchiveFormat::TarGz,
+                "TAR.GZ 条目跳过失败",
+                Some(raw_name),
+                processed_entries,
+                None,
+                root,
+                *error_count,
+            );
             continue;
         }
 
@@ -469,12 +794,32 @@ fn scan_tar_gz_archive(
             Some(size),
             error_count,
         );
+        report_archive_progress(
+            report_progress,
+            ArchiveFormat::TarGz,
+            "扫描 TAR.GZ 条目",
+            Some(raw_name),
+            processed_entries,
+            None,
+            root,
+            *error_count,
+        );
     }
 
     if valid_entry_count == 0
         && !deferred_entry_errors.is_empty()
         && add_single_gzip_payload_entry(path, ArchiveFormat::TarGz, root)
     {
+        report_archive_progress(
+            report_progress,
+            ArchiveFormat::TarGz,
+            "按单文件 GZIP 日志加载",
+            None,
+            1,
+            Some(1),
+            root,
+            *error_count,
+        );
         return Ok(());
     }
 
@@ -482,6 +827,16 @@ fn scan_tar_gz_archive(
         *error_count += 1;
         root.add_error_child("TAR.GZ 条目读取失败", "读取失败", error);
     }
+    report_archive_progress(
+        report_progress,
+        ArchiveFormat::TarGz,
+        "完成 TAR.GZ 条目扫描",
+        None,
+        processed_entries,
+        None,
+        root,
+        *error_count,
+    );
 
     Ok(())
 }
@@ -495,8 +850,35 @@ fn scan_tar_gz_archive(
 /// 边界条件：
 /// - 损坏或非 gzip 内容不能降级为普通日志，否则用户会看到压缩二进制乱码。
 /// - 空 gzip 文件允许作为空日志打开，探测读取到 0 字节但没有错误时视为有效。
-fn scan_gzip_archive(path: &Path, root: &mut ArchiveScanNode) -> Result<(), ArchiveScanError> {
+fn scan_gzip_archive<F>(
+    path: &Path,
+    root: &mut ArchiveScanNode,
+    report_progress: &mut F,
+) -> Result<(), ArchiveScanError>
+where
+    F: FnMut(ArchiveScanProgress),
+{
+    report_archive_progress(
+        report_progress,
+        ArchiveFormat::Gzip,
+        "验证 GZIP 日志流",
+        None,
+        0,
+        Some(1),
+        root,
+        0,
+    );
     if add_single_gzip_payload_entry(path, ArchiveFormat::Gzip, root) {
+        report_archive_progress(
+            report_progress,
+            ArchiveFormat::Gzip,
+            "挂载 GZIP 日志文件",
+            None,
+            1,
+            Some(1),
+            root,
+            0,
+        );
         return Ok(());
     }
 
@@ -578,14 +960,29 @@ fn drain_tar_entry<R: Read>(entry: &mut tar::Entry<'_, R>) -> io::Result<()> {
 /// 边界条件：
 /// - 加密 7z 或损坏头部会返回读取错误，当前展示为压缩包根节点下的错误节点。
 /// - 物化会占用磁盘空间；路径记录在 `temporary_paths` 中，由 UI 在重新加载或启动期过期清理时释放。
-fn scan_7z_archive(
+fn scan_7z_archive<F>(
     path: &Path,
     root: &mut ArchiveScanNode,
     error_count: &mut usize,
     temporary_paths: &mut Vec<PathBuf>,
-) -> Result<(), ArchiveScanError> {
+    report_progress: &mut F,
+) -> Result<(), ArchiveScanError>
+where
+    F: FnMut(ArchiveScanProgress),
+{
     let mut reader = sevenz_rust::SevenZReader::open(path, sevenz_rust::Password::empty())
         .map_err(|error| ArchiveScanError::new(format!("无法读取 7Z 内容：{}", error)))?;
+    let total_entries = reader.archive().files.len();
+    report_archive_progress(
+        report_progress,
+        ArchiveFormat::SevenZ,
+        "读取 7Z 目录完成",
+        None,
+        0,
+        Some(total_entries),
+        root,
+        *error_count,
+    );
     let materialized_root = sevenz_materialized_root(path)?;
     fs::create_dir_all(&materialized_root).map_err(|error| {
         ArchiveScanError::new(format!(
@@ -596,11 +993,23 @@ fn scan_7z_archive(
     })?;
     temporary_paths.push(materialized_root.clone());
 
+    let mut processed_entries = 0usize;
     let scan_result = reader
         .for_each_entries(|entry, entry_reader| {
+            processed_entries = processed_entries.saturating_add(1);
             let raw_name = entry.name().to_string();
             if entry.is_directory() {
                 add_archive_directory_entry(root, &raw_name, error_count);
+                report_archive_progress(
+                    report_progress,
+                    ArchiveFormat::SevenZ,
+                    "扫描 7Z 目录",
+                    Some(raw_name),
+                    processed_entries,
+                    Some(total_entries),
+                    root,
+                    *error_count,
+                );
                 return Ok(true);
             }
 
@@ -612,6 +1021,16 @@ fn scan_7z_archive(
                     *error_count += 1;
                     root.add_archive_error_entry(&raw_name, "非法路径", reason);
                     io::copy(entry_reader, &mut io::sink()).map_err(sevenz_rust::Error::io)?;
+                    report_archive_progress(
+                        report_progress,
+                        ArchiveFormat::SevenZ,
+                        "7Z 条目路径非法",
+                        Some(raw_name),
+                        processed_entries,
+                        Some(total_entries),
+                        root,
+                        *error_count,
+                    );
                     return Ok(true);
                 }
             };
@@ -635,10 +1054,30 @@ fn scan_7z_archive(
                 )
             {
                 add_nested_archive_tree(root, &raw_name, nested_tree, error_count);
+                report_archive_progress(
+                    report_progress,
+                    ArchiveFormat::SevenZ,
+                    "展开 7Z 内层压缩包",
+                    Some(raw_name),
+                    processed_entries,
+                    Some(total_entries),
+                    root,
+                    *error_count,
+                );
                 return Ok(true);
             }
 
             add_materialized_7z_file_entry(root, path, &segments, entry.size, temp_path);
+            report_archive_progress(
+                report_progress,
+                ArchiveFormat::SevenZ,
+                "物化 7Z 条目",
+                Some(raw_name),
+                processed_entries,
+                Some(total_entries),
+                root,
+                *error_count,
+            );
             Ok(true)
         })
         .map_err(|error| ArchiveScanError::new(format!("读取 7Z 内容失败：{}", error)));

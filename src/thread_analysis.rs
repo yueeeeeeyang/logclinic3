@@ -31,9 +31,15 @@ pub(crate) struct ThreadAnalysisData {
     pub(crate) title: String,
     /// 面向用户的摘要。
     pub(crate) summary: String,
+    /// 后台解析中的进度快照。
+    ///
+    /// 业务意图：
+    /// - 线程日志分析会读取和解码多个来源，耗时期间独立窗口需要展示确定进度，避免用户误以为界面卡住。
+    /// - `None` 表示已经完成或失败到最终摘要态，窗口只展示结果矩阵。
+    pub(crate) progress: Option<ThreadAnalysisProgress>,
     /// 横轴快照标签。
     pub(crate) snapshots: Vec<ThreadSnapshot>,
-    /// 纵轴线程名，按首次出现顺序去重。
+    /// 纵轴线程名，按命中次数从高到低排序，次数相同再按首次出现顺序排序。
     pub(crate) thread_names: Vec<String>,
     /// 线程名到每个快照详情的矩阵。
     ///
@@ -41,6 +47,77 @@ pub(crate) struct ThreadAnalysisData {
     /// - 单个色块既要展示状态，也要支持悬浮查看线程片段、单击回到主窗口定位原始日志行。
     /// - 因此矩阵保存可定位的单元详情，而不是只保存颜色所需的状态枚举。
     pub(crate) matrix: Vec<Vec<Option<Arc<ThreadTimelineCell>>>>,
+}
+
+/// 线程日志分析后台解析进度。
+///
+/// 业务意图：
+/// - 进度以“文件”为主单位，因为读取、解码和 thread dump 解析都按日志来源顺序执行。
+/// - 同时记录已经解析出的快照和线程样本数量，让用户能看到大文件解析确实在推进，而不是只有百分比变化。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ThreadAnalysisProgress {
+    /// 总文件数。
+    pub(crate) total_files: usize,
+    /// 已完成读取、解码和解析的文件数。
+    pub(crate) processed_files: usize,
+    /// 已跳过的不可读或不可解码文件数。
+    pub(crate) skipped_files: usize,
+    /// 当前正在处理的文件名。
+    pub(crate) current_file: Option<String>,
+    /// 已识别的 thread dump 快照数。
+    pub(crate) parsed_snapshots: usize,
+    /// 已识别的线程样本数。
+    pub(crate) parsed_threads: usize,
+}
+
+impl ThreadAnalysisProgress {
+    /// 创建线程分析初始进度。
+    ///
+    /// 边界条件：
+    /// - 空来源不会启动分析，但纯函数仍把空总数视为完成，避免进度条出现 NaN 或除零。
+    pub(crate) fn new(total_files: usize) -> Self {
+        Self {
+            total_files,
+            processed_files: 0,
+            skipped_files: 0,
+            current_file: None,
+            parsed_snapshots: 0,
+            parsed_threads: 0,
+        }
+    }
+
+    /// 返回当前文件处理进度比例。
+    pub(crate) fn ratio(&self) -> f32 {
+        if self.total_files == 0 {
+            1.0
+        } else {
+            (self.processed_files as f32 / self.total_files as f32).clamp(0.0, 1.0)
+        }
+    }
+
+    /// 返回进度条右侧用户可见文案。
+    pub(crate) fn label(&self) -> String {
+        let percent = self.ratio() * 100.0;
+        format!(
+            "{} / {} 文件 · {:.0}% · {} 个快照 · {} 个线程",
+            self.processed_files.min(self.total_files),
+            self.total_files,
+            percent,
+            self.parsed_snapshots,
+            self.parsed_threads
+        )
+    }
+
+    /// 返回当前解析阶段说明。
+    pub(crate) fn message(&self) -> String {
+        match &self.current_file {
+            Some(file) if self.processed_files < self.total_files => {
+                format!("正在解析：{file}")
+            }
+            _ if self.processed_files >= self.total_files => "正在整理分析结果...".to_string(),
+            _ => "正在准备线程日志分析...".to_string(),
+        }
+    }
 }
 
 /// 单个 thread dump 快照。
@@ -54,7 +131,8 @@ pub(crate) struct ThreadSnapshot {
     /// 当前快照所属的日志文件序号。
     ///
     /// 业务意图：
-    /// - 多文件线程分析需要判断线程是否出现在多个选中日志文件中；该字段用于区分快照序号和来源文件序号。
+    /// - 该字段保留快照与选中来源的对应关系，便于后续摘要、调试或恢复跨文件统计时区分快照序号和来源文件序号。
+    /// - 当前默认过滤规则按线程样本出现次数判断，不再直接依赖该字段。
     pub(crate) source_index: usize,
     /// 当前快照所属日志来源。
     ///
@@ -115,6 +193,12 @@ pub(crate) struct ThreadTimelineCell {
     pub(crate) line_index: usize,
     /// 线程头开始的前 5 行日志预览。
     pub(crate) preview_lines: Vec<String>,
+    /// 线程头开始直到下一个线程头或下一个快照前的完整堆栈片段。
+    ///
+    /// 业务意图：
+    /// - 点击时间线色块会打开独立堆栈详情窗口，详情窗口必须展示完整原始片段，而不是悬浮气泡的 5 行预览。
+    /// - 该字段在矩阵构建阶段从解析样本复制，点击时不再回读日志文件，避免压缩包和大文件随机读取影响交互。
+    pub(crate) stack_lines: Vec<String>,
 }
 
 /// 线程头已识别但状态行尚未出现时的临时解析状态。
@@ -141,13 +225,32 @@ pub(crate) struct ThreadStateSamplePending {
     pub(crate) state: Option<ThreadStateKind>,
 }
 
+/// 线程日志分析过滤规则类型。
+///
+/// 业务意图：
+/// - 线程分析过滤同时支持“线程名通配”和“完整堆栈片段”两种方式；显式类型可以避免匹配阶段反复猜测规则含义。
+/// - 设置页仍使用一个多行文本框保存配置，解析后再拆成稳定类型，保持旧配置文件兼容。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ThreadAnalysisFilterRuleKind {
+    /// 按线程名匹配，支持 `*` 作为任意长度通配符。
+    ThreadNamePattern,
+    /// 按线程完整堆栈中的连续非空行匹配。
+    StackLines,
+}
+
 /// 线程日志分析过滤规则。
 ///
 /// 业务意图：
-/// - 设置页中一段粘贴的堆栈会转换为一条规则；规则中的非空行必须连续命中同一个线程完整堆栈才过滤。
+/// - 设置页中一段粘贴的堆栈会转换为堆栈规则；规则中的非空行必须连续命中同一个线程完整堆栈才过滤。
+/// - 单行线程名或线程名通配符会转换为线程名规则，用于过滤 `C2 CompilerThread*` 这类 JVM 常驻线程噪声。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ThreadAnalysisFilterRule {
+    /// 当前规则匹配方式。
+    pub(crate) kind: ThreadAnalysisFilterRuleKind,
     /// 已去除首尾空白的非空规则行。
+    ///
+    /// 边界条件：
+    /// - 线程名规则只使用第一行作为模式；堆栈规则保留多行连续片段。
     pub(crate) lines: Vec<String>,
 }
 
@@ -224,38 +327,54 @@ impl ThreadStateKind {
     }
 }
 
-/// 读取并分析多个日志来源中的 Java thread dump。
+/// 读取并分析多个日志来源中的 Java thread dump，并在每个文件边界上汇报进度。
 ///
 /// 业务意图：
-/// - 分析入口接受 `LogFileSource`，复用现有读取和自动编码识别逻辑，避免另建一套文件/压缩包读取路径。
-///
-/// 边界条件：
-/// - 某个文件读取或解码失败时跳过该文件，继续分析其它文件，避免单个坏文件阻断整批分析。
-/// - 如果没有识别到任何快照，返回空分析数据，窗口会展示“未识别到快照”的摘要。
-pub(crate) fn analyze_thread_dump_sources(
+/// - UI 层可以把进度快照写入独立窗口，避免大批量日志解析期间只显示静态“正在分析”文案。
+/// - 进度回调只在文件开始和文件结束时触发，不在每一行解析时触发，避免超大日志解析时频繁跨线程同步影响吞吐。
+pub(crate) fn analyze_thread_dump_sources_with_progress<F>(
     sources: &[LogFileSource],
     filter_rules: &[ThreadAnalysisFilterRule],
-) -> ThreadAnalysisData {
+    mut report_progress: F,
+) -> ThreadAnalysisData
+where
+    F: FnMut(ThreadAnalysisProgress),
+{
     let mut snapshots = Vec::new();
     let mut skipped_files = 0usize;
+    let mut progress = ThreadAnalysisProgress::new(sources.len());
+    report_progress(progress.clone());
     for (source_index, source) in sources.iter().enumerate() {
         let source_name = source.display_name();
+        progress.current_file = Some(source_name.clone());
+        report_progress(progress.clone());
         let result = read_log_source_bytes(source)
             .and_then(|bytes| decode_log_bytes(&bytes, EncodingChoice::Auto, &source_name));
         match result {
             Ok(document) => {
-                snapshots.extend(parse_thread_dump_snapshots(
+                let parsed_snapshots = parse_thread_dump_snapshots(
                     &document.lines,
                     &source_name,
                     source_index,
                     source,
-                ));
+                );
+                progress.parsed_threads += parsed_snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.threads.len())
+                    .sum::<usize>();
+                progress.parsed_snapshots += parsed_snapshots.len();
+                snapshots.extend(parsed_snapshots);
             }
             Err(_) => {
                 skipped_files += 1;
+                progress.skipped_files = skipped_files;
             }
         }
+        progress.processed_files = source_index + 1;
+        report_progress(progress.clone());
     }
+    progress.current_file = None;
+    report_progress(progress);
 
     build_thread_analysis_data(sources.len(), skipped_files, snapshots, filter_rules)
 }
@@ -474,6 +593,7 @@ pub(crate) fn parse_thread_header_details(line: &str) -> Option<(String, Option<
 ///
 /// 业务意图：
 /// - 设置页允许用户用空行分隔多段堆栈；每段堆栈去除行首尾空白后形成一条连续片段匹配规则。
+/// - 线程名过滤已经拆到独立输入框，堆栈过滤入口必须始终生成 `StackLines`，避免单行线程头或方法片段被误当作线程名通配。
 /// - 空段和空行不形成规则，避免用户粘贴时多余空白导致所有线程都不匹配或产生无意义规则。
 pub(crate) fn parse_thread_analysis_filter_rules(raw: &str) -> Vec<ThreadAnalysisFilterRule> {
     let normalized = normalize_thread_analysis_filter_text(raw);
@@ -484,6 +604,7 @@ pub(crate) fn parse_thread_analysis_filter_rules(raw: &str) -> Vec<ThreadAnalysi
         if trimmed.is_empty() {
             if !current_lines.is_empty() {
                 rules.push(ThreadAnalysisFilterRule {
+                    kind: ThreadAnalysisFilterRuleKind::StackLines,
                     lines: std::mem::take(&mut current_lines),
                 });
             }
@@ -493,10 +614,33 @@ pub(crate) fn parse_thread_analysis_filter_rules(raw: &str) -> Vec<ThreadAnalysi
     }
     if !current_lines.is_empty() {
         rules.push(ThreadAnalysisFilterRule {
+            kind: ThreadAnalysisFilterRuleKind::StackLines,
             lines: current_lines,
         });
     }
     rules
+}
+
+/// 解析线程日志分析线程名过滤配置文本。
+///
+/// 业务意图：
+/// - 设置页现在把线程名过滤拆成独立输入框；该输入框只表达线程名通配，不再和堆栈片段混排。
+/// - 为了方便从说明或旧配置中复制，除逐行规则外也接受英文逗号分隔，例如 `C1*,C2*` 会形成两条规则。
+///
+/// 边界条件：
+/// - 空行、连续逗号和纯空白片段都会被忽略，避免误生成空模式；单独 `*` 仍作为用户显式配置保留。
+pub(crate) fn parse_thread_analysis_name_filter_rules(raw: &str) -> Vec<ThreadAnalysisFilterRule> {
+    normalize_thread_analysis_filter_text(raw)
+        .lines()
+        .flat_map(|line| line.split(','))
+        .filter_map(|part| {
+            let pattern = part.trim();
+            (!pattern.is_empty()).then(|| ThreadAnalysisFilterRule {
+                kind: ThreadAnalysisFilterRuleKind::ThreadNamePattern,
+                lines: vec![pattern.to_string()],
+            })
+        })
+        .collect()
 }
 
 /// 判断某个线程完整堆栈是否命中过滤规则。
@@ -507,6 +651,9 @@ pub(crate) fn thread_stack_matches_filter_rule(
     stack_lines: &[String],
     rule: &ThreadAnalysisFilterRule,
 ) -> bool {
+    if rule.kind != ThreadAnalysisFilterRuleKind::StackLines {
+        return false;
+    }
     if rule.lines.is_empty() || stack_lines.len() < rule.lines.len() {
         return false;
     }
@@ -518,27 +665,103 @@ pub(crate) fn thread_stack_matches_filter_rule(
     })
 }
 
+/// 判断某个线程名是否命中过滤规则。
+///
+/// 业务意图：
+/// - 线程名过滤用于提前移除 JVM 常驻线程，例如 `C1 CompilerThread*`、`Service Thread` 和 `Attach Listener`。
+/// - 匹配保持大小写敏感，避免把业务线程中大小写不同的名称意外过滤掉；`*` 只表示任意长度文本。
+pub(crate) fn thread_name_matches_filter_rule(
+    thread_name: &str,
+    rule: &ThreadAnalysisFilterRule,
+) -> bool {
+    if rule.kind != ThreadAnalysisFilterRuleKind::ThreadNamePattern {
+        return false;
+    }
+    let Some(pattern) = rule.lines.first() else {
+        return false;
+    };
+    wildcard_pattern_matches_text(pattern, thread_name)
+}
+
+/// 使用简单 `*` 通配符匹配文本。
+///
+/// 业务意图：
+/// - 线程名过滤只需要前缀、后缀或中间片段匹配，不引入正则依赖，避免设置页把普通 `.`、`[` 等线程名字符解释成正则语法。
+///
+/// 边界条件：
+/// - 空模式不匹配任何线程；单独 `*` 匹配所有线程，保留给高级用户临时清空分析结果使用。
+/// - 多个 `*` 会被当成多个任意长度间隔处理，算法只按片段顺序扫描，不会产生指数级回溯。
+pub(crate) fn wildcard_pattern_matches_text(pattern: &str, text: &str) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
+    if pattern == "*" {
+        return true;
+    }
+    if !pattern.contains('*') {
+        return pattern == text;
+    }
+
+    let anchored_start = !pattern.starts_with('*');
+    let anchored_end = !pattern.ends_with('*');
+    let parts = pattern
+        .split('*')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return true;
+    }
+
+    let mut search_start = 0usize;
+    for (part_index, part) in parts.iter().enumerate() {
+        let Some(found_offset) = text[search_start..].find(part) else {
+            return false;
+        };
+        let found_index = search_start + found_offset;
+        if part_index == 0 && anchored_start && found_index != 0 {
+            return false;
+        }
+        search_start = found_index + part.len();
+    }
+
+    if anchored_end {
+        let Some(last_part) = parts.last() else {
+            return true;
+        };
+        text.ends_with(last_part)
+    } else {
+        true
+    }
+}
+
 /// 判断某个线程是否应被线程日志分析过滤规则移除。
 fn thread_sample_matches_filter_rules(
     sample: &ThreadStateSample,
     filter_rules: &[ThreadAnalysisFilterRule],
 ) -> bool {
-    filter_rules
-        .iter()
-        .any(|rule| thread_stack_matches_filter_rule(&sample.stack_lines, rule))
+    filter_rules.iter().any(|rule| {
+        thread_name_matches_filter_rule(&sample.name, rule)
+            || thread_stack_matches_filter_rule(&sample.stack_lines, rule)
+    })
 }
 
 /// 构建线程分析窗口可直接渲染的数据矩阵。
 ///
 /// 业务意图：
 /// - 解析阶段按快照保存线程列表；渲染阶段需要按线程名聚合成二维矩阵，横轴为快照，纵轴为线程。
-/// - 多文件分析时只保留在多个选中日志文件中出现的线程，过滤只在单个日志中出现的线程，降低纵轴噪声。
+/// - 默认只保留在选中日志快照中出现超过一次的线程，过滤单次线程，降低纵轴噪声。
+/// - 纵轴按命中次数从高到低排序，优先把持续出现的线程放到顶部，便于用户先看高频问题线程。
 pub(crate) fn build_thread_analysis_data(
     source_count: usize,
     skipped_files: usize,
     mut snapshots: Vec<ThreadSnapshot>,
     filter_rules: &[ThreadAnalysisFilterRule],
 ) -> ThreadAnalysisData {
+    // `source_index` 仍是快照来源定位元数据；虽然当前“只出现一次”过滤不再按文件数判断，
+    // 构建阶段仍读取一次以保持字段参与主流程，避免后续恢复跨文件统计时误删该边界信息。
+    let _has_snapshot_source_index = snapshots
+        .iter()
+        .any(|snapshot| snapshot.source_index < source_count);
     let mut filtered_threads = 0usize;
     if !filter_rules.is_empty() {
         for snapshot in &mut snapshots {
@@ -551,17 +774,43 @@ pub(crate) fn build_thread_analysis_data(
     }
     let _has_snapshot_labels = snapshots.iter().any(|snapshot| !snapshot.label.is_empty());
     let visible_thread_name_set = default_visible_thread_names(&snapshots, source_count);
-    let mut thread_names = Vec::new();
-    let mut seen_thread_names = BTreeSet::new();
+    let all_thread_name_set = snapshots
+        .iter()
+        .flat_map(|snapshot| snapshot.threads.iter().map(|sample| sample.name.clone()))
+        .collect::<BTreeSet<_>>();
+    let auto_filtered_threads = all_thread_name_set
+        .iter()
+        .filter(|thread_name| !visible_thread_name_set.contains(*thread_name))
+        .count();
+    let total_filtered_threads = filtered_threads.saturating_add(auto_filtered_threads);
+    let mut thread_stats = HashMap::<String, (usize, usize)>::new();
+    let mut next_first_seen_order = 0usize;
     for snapshot in &snapshots {
         for sample in &snapshot.threads {
-            if visible_thread_name_set.contains(&sample.name)
-                && seen_thread_names.insert(sample.name.clone())
-            {
-                thread_names.push(sample.name.clone());
+            if !visible_thread_name_set.contains(&sample.name) {
+                continue;
             }
+            let entry = thread_stats.entry(sample.name.clone()).or_insert_with(|| {
+                let first_seen_order = next_first_seen_order;
+                next_first_seen_order = next_first_seen_order.saturating_add(1);
+                (0, first_seen_order)
+            });
+            entry.0 = entry.0.saturating_add(1);
         }
     }
+    let mut thread_names = thread_stats.into_iter().collect::<Vec<_>>();
+    thread_names.sort_by(
+        |(left_name, (left_hits, left_order)), (right_name, (right_hits, right_order))| {
+            right_hits
+                .cmp(left_hits)
+                .then_with(|| left_order.cmp(right_order))
+                .then_with(|| left_name.cmp(right_name))
+        },
+    );
+    let thread_names = thread_names
+        .into_iter()
+        .map(|(thread_name, _)| thread_name)
+        .collect::<Vec<_>>();
 
     let thread_index_by_name = thread_names
         .iter()
@@ -580,6 +829,7 @@ pub(crate) fn build_thread_analysis_data(
                     source: snapshot.source.clone(),
                     line_index: sample.line_index,
                     preview_lines: sample.preview_lines.clone(),
+                    stack_lines: sample.stack_lines.clone(),
                 }));
             }
         }
@@ -597,12 +847,13 @@ pub(crate) fn build_thread_analysis_data(
             snapshots.len(),
             thread_names.len(),
             skipped_files,
-            filtered_threads
+            total_filtered_threads
         )
     };
     ThreadAnalysisData {
         title: "线程日志分析".to_string(),
         summary,
+        progress: None,
         snapshots,
         thread_names,
         matrix,
@@ -612,49 +863,68 @@ pub(crate) fn build_thread_analysis_data(
 /// 返回线程分析默认可见线程名集合。
 ///
 /// 业务意图：
-/// - 多个线程日志一起分析时，默认只展示在多个选中日志文件中出现的线程，突出跨文件重复出现的问题线程。
-/// - 同一个日志文件内多个快照重复出现不算跨文件重复，仍按单文件线程过滤，避免单个文件撑大时间线纵轴。
-/// - 单文件分析时没有“跨文件”可比较对象，因此保留该文件内所有线程，避免窗口空白。
+/// - 用户要求选中日志中只出现一次的线程默认过滤，避免短暂线程或单次噪声撑大线程分析纵轴。
+/// - 判断单位是线程样本出现次数，不再要求跨不同文件；同一文件多个快照中重复出现也视为值得展示。
+/// - `_source_count` 保留在签名中，兼容旧调用点和测试语义；当前规则只依赖解析后的快照样本。
 pub(crate) fn default_visible_thread_names(
     snapshots: &[ThreadSnapshot],
-    source_count: usize,
+    _source_count: usize,
 ) -> HashSet<String> {
-    let mut sources_by_thread = HashMap::<String, HashSet<usize>>::new();
+    let mut sample_count_by_thread = HashMap::<String, usize>::new();
     for snapshot in snapshots {
         for sample in &snapshot.threads {
-            sources_by_thread
+            *sample_count_by_thread
                 .entry(sample.name.clone())
-                .or_default()
-                .insert(snapshot.source_index);
+                .or_insert(0) += 1;
         }
     }
 
-    sources_by_thread
+    sample_count_by_thread
         .into_iter()
-        .filter_map(|(thread_name, source_indexes)| {
-            (source_count <= 1 || source_indexes.len() > 1).then_some(thread_name)
-        })
+        .filter_map(|(thread_name, sample_count)| (sample_count > 1).then_some(thread_name))
         .collect()
 }
 
 /// 根据状态集合计算可见线程行下标。
 ///
 /// 业务意图：
-/// - 状态过滤发生在线程行维度；只要某个线程在任一快照中出现了已勾选状态，该线程就保留在纵轴中。
+/// - 状态过滤发生在线程行维度；只有某个线程在当前勾选状态下出现超过一次，才保留在纵轴中。
+/// - 这条规则和“选中日志中只出现一次的线程默认过滤”保持一致，但统计口径改成当前窗口实际可见的数据。
+/// - 线程分析窗口的图例允许用户只看 RUNNABLE、WAITING 等部分状态，因此最终展示顺序必须按“当前可见状态”
+///   的命中次数重新排序；否则默认只显示 RUNNABLE 时，可能把只有一个绿色色块的线程排在高频 RUNNABLE 线程前面。
+///
+/// 边界条件：
+/// - 空矩阵或没有勾选任何状态时返回空列表，避免 UI 渲染无意义的空行。
+/// - 当前状态下只有一个命中的线程会被隐藏；如果用户切换图例后累计可见命中超过一次，该线程会重新显示。
+/// - 命中次数相同时保留 `analysis.thread_names` 的原始顺序，原始顺序已经按全量命中数和首次出现顺序稳定排序。
 pub(crate) fn visible_thread_indexes_for_state_kinds(
     analysis: &ThreadAnalysisData,
     visible_state_kinds: &HashSet<ThreadStateKind>,
 ) -> Vec<usize> {
-    analysis
+    let mut visible_rows = analysis
         .matrix
         .iter()
         .enumerate()
         .filter_map(|(row_index, cells)| {
-            cells
+            // 统计当前状态筛选条件下真正会显示为色块的命中数量；隐藏状态不参与排序，
+            // 这样用户切换图例后看到的行顺序始终对应当前画面里的命中密度。
+            let visible_hit_count = cells
                 .iter()
                 .flatten()
-                .any(|cell| visible_state_kinds.contains(&cell.state))
-                .then_some(row_index)
+                .filter(|cell| visible_state_kinds.contains(&cell.state))
+                .count();
+            (visible_hit_count > 1).then_some((row_index, visible_hit_count))
         })
+        .collect::<Vec<_>>();
+
+    visible_rows.sort_by(|(left_index, left_hits), (right_index, right_hits)| {
+        right_hits
+            .cmp(left_hits)
+            .then_with(|| left_index.cmp(right_index))
+    });
+
+    visible_rows
+        .into_iter()
+        .map(|(row_index, _visible_hit_count)| row_index)
         .collect()
 }

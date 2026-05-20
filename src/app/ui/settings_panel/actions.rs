@@ -42,11 +42,23 @@ impl MainView {
         })
     }
 
-    /// 返回当前应参与线程日志分析过滤的已保存文本。
+    /// 返回当前应参与线程日志分析线程名过滤的已保存文本。
+    ///
+    /// 业务意图：
+    /// - 设置页编辑态中的线程名规则属于草稿，必须等用户点击保存后才影响下一次线程分析。
+    /// - 如果用户一边编辑设置一边从主窗口启动线程分析，这里仍使用进入编辑前的快照，避免半成品通配规则过滤掉真实线程。
+    pub(in crate::app) fn thread_analysis_name_filter_effective_text(&self) -> &str {
+        self.settings
+            .thread_analysis_name_filter_saved_text_before_edit
+            .as_deref()
+            .unwrap_or(&self.settings.thread_analysis_name_filter_text)
+    }
+
+    /// 返回当前应参与线程日志分析堆栈过滤的已保存文本。
     ///
     /// 业务意图：
     /// - 设置页编辑态中的内容属于草稿，必须等用户点击保存后才影响下一次线程分析。
-    /// - 如果用户一边编辑设置一边从主窗口启动线程分析，这里仍使用进入编辑前的快照，避免半成品堆栈过滤掉真实线程。
+    /// - 如果用户一边编辑设置一边从主窗口启动线程分析，这里仍使用进入编辑前的快照，避免半成品堆栈规则过滤掉真实线程。
     pub(in crate::app) fn thread_analysis_filter_effective_text(&self) -> &str {
         self.settings
             .thread_analysis_filter_saved_text_before_edit
@@ -916,6 +928,156 @@ impl MainView {
         }
     }
 
+    /// 返回指定线程分析过滤输入框的原文。
+    ///
+    /// 业务意图：
+    /// - 线程名过滤和堆栈过滤共享自绘多行输入组件；这里统一按输入类型读取状态，避免 UI 层直接判断具体字段。
+    pub(in crate::app) fn thread_analysis_filter_input_text(
+        &self,
+        kind: ThreadAnalysisFilterInputKind,
+    ) -> &String {
+        match kind {
+            ThreadAnalysisFilterInputKind::ThreadName => {
+                &self.settings.thread_analysis_name_filter_text
+            }
+            ThreadAnalysisFilterInputKind::Stack => &self.settings.thread_analysis_filter_text,
+        }
+    }
+
+    /// 返回指定线程分析过滤输入框的可变原文。
+    ///
+    /// 实现原因：
+    /// - 平台输入法、键盘编辑和粘贴都需要写入当前聚焦输入框；集中封装字段选择可以避免两个输入框行为分叉。
+    pub(in crate::app) fn thread_analysis_filter_input_text_mut(
+        &mut self,
+        kind: ThreadAnalysisFilterInputKind,
+    ) -> &mut String {
+        match kind {
+            ThreadAnalysisFilterInputKind::ThreadName => {
+                &mut self.settings.thread_analysis_name_filter_text
+            }
+            ThreadAnalysisFilterInputKind::Stack => &mut self.settings.thread_analysis_filter_text,
+        }
+    }
+
+    /// 返回指定线程分析过滤输入框的选择范围。
+    pub(in crate::app) fn thread_analysis_filter_input_selection_range(
+        &self,
+        kind: ThreadAnalysisFilterInputKind,
+    ) -> Range<usize> {
+        match kind {
+            ThreadAnalysisFilterInputKind::ThreadName => self
+                .settings
+                .thread_analysis_name_filter_selection_range
+                .clone(),
+            ThreadAnalysisFilterInputKind::Stack => {
+                self.settings.thread_analysis_filter_selection_range.clone()
+            }
+        }
+    }
+
+    /// 设置指定线程分析过滤输入框的选择范围。
+    pub(in crate::app) fn set_thread_analysis_filter_input_selection_range(
+        &mut self,
+        kind: ThreadAnalysisFilterInputKind,
+        range: Range<usize>,
+    ) {
+        match kind {
+            ThreadAnalysisFilterInputKind::ThreadName => {
+                self.settings.thread_analysis_name_filter_selection_range = range;
+            }
+            ThreadAnalysisFilterInputKind::Stack => {
+                self.settings.thread_analysis_filter_selection_range = range;
+            }
+        }
+    }
+
+    /// 返回指定线程分析过滤输入框的输入法组合范围。
+    pub(in crate::app) fn thread_analysis_filter_input_marked_range(
+        &self,
+        kind: ThreadAnalysisFilterInputKind,
+    ) -> Option<Range<usize>> {
+        match kind {
+            ThreadAnalysisFilterInputKind::ThreadName => self
+                .settings
+                .thread_analysis_name_filter_marked_range
+                .clone(),
+            ThreadAnalysisFilterInputKind::Stack => {
+                self.settings.thread_analysis_filter_marked_range.clone()
+            }
+        }
+    }
+
+    /// 设置指定线程分析过滤输入框的输入法组合范围。
+    pub(in crate::app) fn set_thread_analysis_filter_input_marked_range(
+        &mut self,
+        kind: ThreadAnalysisFilterInputKind,
+        range: Option<Range<usize>>,
+    ) {
+        match kind {
+            ThreadAnalysisFilterInputKind::ThreadName => {
+                self.settings.thread_analysis_name_filter_marked_range = range;
+            }
+            ThreadAnalysisFilterInputKind::Stack => {
+                self.settings.thread_analysis_filter_marked_range = range;
+            }
+        }
+    }
+
+    /// 根据当前窗口焦点判断哪个线程分析过滤输入框正在接收平台输入。
+    pub(in crate::app) fn active_thread_analysis_filter_input_kind(
+        &self,
+        window: &Window,
+    ) -> Option<ThreadAnalysisFilterInputKind> {
+        if self
+            .settings
+            .thread_analysis_name_filter_focus
+            .is_focused(window)
+        {
+            Some(ThreadAnalysisFilterInputKind::ThreadName)
+        } else if self
+            .settings
+            .thread_analysis_filter_focus
+            .is_focused(window)
+        {
+            Some(ThreadAnalysisFilterInputKind::Stack)
+        } else {
+            None
+        }
+    }
+
+    /// 估算线程分析过滤输入区的内容宽度。
+    ///
+    /// 业务意图：
+    /// - 自绘多行输入元素的真实字形宽度要到绘制阶段才可得，但 GPUI 横向滚动条需要在布局阶段知道子元素宽度。
+    /// - 这里用等宽字体的近似列宽估算最长行，保证长线程名和长堆栈行会撑开滚动内容并显示横向滚动条。
+    ///
+    /// 边界条件：
+    /// - 空文本仍返回一个最小宽度，避免输入框塌陷；估算只影响滚动范围，不改变真实文本匹配。
+    pub(in crate::app) fn thread_analysis_filter_estimated_content_width(
+        &self,
+        kind: ThreadAnalysisFilterInputKind,
+    ) -> Pixels {
+        Self::estimated_thread_analysis_filter_text_width(
+            self.thread_analysis_filter_input_text(kind),
+        )
+    }
+
+    /// 根据过滤文本估算横向滚动内容宽度。
+    pub(in crate::app) fn estimated_thread_analysis_filter_text_width(text: &str) -> Pixels {
+        let max_columns = Self::thread_analysis_filter_line_ranges(text)
+            .into_iter()
+            .map(|range| {
+                text[range]
+                    .chars()
+                    .map(|character| if character == '\t' { 4 } else { 1 })
+                    .sum::<usize>()
+            })
+            .max()
+            .unwrap_or(0);
+        px((max_columns as f32 * 7.5).max(320.0))
+    }
+
     /// 读取线程日志分析过滤输入区当前文本、选择范围和组合文本范围的快照。
     ///
     /// 业务意图：
@@ -923,14 +1085,16 @@ impl MainView {
     /// - 快照使用规范化后的 LF 文本，确保绘制行数、鼠标命中和后续过滤规则拆分一致。
     pub(in crate::app) fn thread_analysis_filter_text_snapshot(
         &self,
+        kind: ThreadAnalysisFilterInputKind,
     ) -> (String, Range<usize>, Option<Range<usize>>) {
+        let text = self.thread_analysis_filter_input_text(kind).clone();
         (
-            self.settings.thread_analysis_filter_text.clone(),
+            text.clone(),
             Self::clamp_search_text_range(
-                &self.settings.thread_analysis_filter_text,
-                self.settings.thread_analysis_filter_selection_range.clone(),
+                &text,
+                self.thread_analysis_filter_input_selection_range(kind),
             ),
-            self.settings.thread_analysis_filter_marked_range.clone(),
+            self.thread_analysis_filter_input_marked_range(kind),
         )
     }
 
@@ -940,17 +1104,26 @@ impl MainView {
     /// - 鼠标点击和拖拽需要用上一帧真实字形位置换算文本下标；该缓存只服务当前会话，不参与持久化。
     pub(in crate::app) fn store_thread_analysis_filter_text_layouts(
         &mut self,
+        kind: ThreadAnalysisFilterInputKind,
         layouts: Vec<ThreadAnalysisFilterLineLayout>,
         bounds: Bounds<Pixels>,
     ) {
-        self.settings.thread_analysis_filter_last_layouts = layouts;
-        self.settings.thread_analysis_filter_last_bounds = Some(bounds);
+        match kind {
+            ThreadAnalysisFilterInputKind::ThreadName => {
+                self.settings.thread_analysis_name_filter_last_layouts = layouts;
+                self.settings.thread_analysis_name_filter_last_bounds = Some(bounds);
+            }
+            ThreadAnalysisFilterInputKind::Stack => {
+                self.settings.thread_analysis_filter_last_layouts = layouts;
+                self.settings.thread_analysis_filter_last_bounds = Some(bounds);
+            }
+        }
     }
 
     /// 返回线程日志分析过滤文本的可视行范围。
     ///
     /// 业务意图：
-    /// - 输入区按原始换行展示堆栈；空行也必须占一行，因为空行同时用于分隔多条过滤规则。
+    /// - 输入区按原始换行展示线程名规则和堆栈片段；空行也必须占一行，因为空行同时用于分隔多条过滤规则。
     /// - 返回范围不包含换行符本身，便于每行单独排版和命中。
     pub(in crate::app) fn thread_analysis_filter_line_ranges(text: &str) -> Vec<Range<usize>> {
         let mut ranges = Vec::new();
@@ -965,9 +1138,12 @@ impl MainView {
         ranges
     }
 
-    /// 返回线程日志分析过滤输入区当前内容需要的可视行数。
-    pub(in crate::app) fn thread_analysis_filter_visual_line_count(&self) -> usize {
-        Self::thread_analysis_filter_line_ranges(&self.settings.thread_analysis_filter_text)
+    /// 返回指定线程日志分析过滤输入区当前内容需要的可视行数。
+    pub(in crate::app) fn thread_analysis_filter_visual_line_count_for(
+        &self,
+        kind: ThreadAnalysisFilterInputKind,
+    ) -> usize {
+        Self::thread_analysis_filter_line_ranges(self.thread_analysis_filter_input_text(kind))
             .len()
             .max(1)
     }
@@ -978,38 +1154,39 @@ impl MainView {
     /// - 单击定位光标，Shift+单击扩展选择，双击选中连续非空白片段，三连击全选，保持和搜索输入框一致的基础文本习惯。
     pub(in crate::app) fn start_thread_analysis_filter_mouse_selection(
         &mut self,
+        kind: ThreadAnalysisFilterInputKind,
         event: &MouseDownEvent,
         context: &mut Context<Self>,
     ) {
-        let index = self.thread_analysis_filter_index_for_point(event.position);
-        self.settings.thread_analysis_filter_marked_range = None;
+        let index = self.thread_analysis_filter_index_for_point(kind, event.position);
+        self.set_thread_analysis_filter_input_marked_range(kind, None);
+        let text = self.thread_analysis_filter_input_text(kind).clone();
+        let mut selection_range = self.thread_analysis_filter_input_selection_range(kind);
+        let mut selection_drag = None;
         match event.click_count {
             0 | 1 => {
                 if event.modifiers.shift {
-                    self.settings.thread_analysis_filter_selection_range.end = index;
-                    self.settings.thread_analysis_filter_selection_range =
-                        Self::clamp_search_text_range(
-                            &self.settings.thread_analysis_filter_text,
-                            self.settings.thread_analysis_filter_selection_range.clone(),
-                        );
+                    selection_range.end = index;
+                    selection_range = Self::clamp_search_text_range(&text, selection_range);
                 } else {
-                    self.settings.thread_analysis_filter_selection_range = index..index;
+                    selection_range = index..index;
                 }
-                self.settings.thread_analysis_filter_selection_drag =
-                    Some(self.settings.thread_analysis_filter_selection_range.start);
+                selection_drag = Some(selection_range.start);
             }
             2 => {
-                self.settings.thread_analysis_filter_selection_range =
-                    Self::search_text_word_range_for_index(
-                        &self.settings.thread_analysis_filter_text,
-                        index,
-                    );
-                self.settings.thread_analysis_filter_selection_drag = None;
+                selection_range = Self::search_text_word_range_for_index(&text, index);
             }
             _ => {
-                self.settings.thread_analysis_filter_selection_range =
-                    0..self.settings.thread_analysis_filter_text.len();
-                self.settings.thread_analysis_filter_selection_drag = None;
+                selection_range = 0..text.len();
+            }
+        }
+        self.set_thread_analysis_filter_input_selection_range(kind, selection_range);
+        match kind {
+            ThreadAnalysisFilterInputKind::ThreadName => {
+                self.settings.thread_analysis_name_filter_selection_drag = selection_drag;
+            }
+            ThreadAnalysisFilterInputKind::Stack => {
+                self.settings.thread_analysis_filter_selection_drag = selection_drag;
             }
         }
         self.touch_search_text_cursor_activity();
@@ -1019,18 +1196,28 @@ impl MainView {
     /// 鼠标拖拽时更新线程日志分析过滤输入区选区终点。
     pub(in crate::app) fn update_thread_analysis_filter_mouse_selection(
         &mut self,
+        kind: ThreadAnalysisFilterInputKind,
         position: Point<Pixels>,
         context: &mut Context<Self>,
     ) {
-        let Some(anchor) = self.settings.thread_analysis_filter_selection_drag else {
+        let anchor = match kind {
+            ThreadAnalysisFilterInputKind::ThreadName => {
+                self.settings.thread_analysis_name_filter_selection_drag
+            }
+            ThreadAnalysisFilterInputKind::Stack => {
+                self.settings.thread_analysis_filter_selection_drag
+            }
+        };
+        let Some(anchor) = anchor else {
             return;
         };
-        let index = self.thread_analysis_filter_index_for_point(position);
-        self.settings.thread_analysis_filter_marked_range = None;
-        self.settings.thread_analysis_filter_selection_range = Self::clamp_search_text_range(
-            &self.settings.thread_analysis_filter_text,
+        let index = self.thread_analysis_filter_index_for_point(kind, position);
+        self.set_thread_analysis_filter_input_marked_range(kind, None);
+        let selection = Self::clamp_search_text_range(
+            self.thread_analysis_filter_input_text(kind),
             anchor..index,
         );
+        self.set_thread_analysis_filter_input_selection_range(kind, selection);
         self.touch_search_text_cursor_activity();
         context.notify();
     }
@@ -1038,14 +1225,22 @@ impl MainView {
     /// 结束线程日志分析过滤输入区鼠标拖拽选择。
     pub(in crate::app) fn finish_thread_analysis_filter_mouse_selection(
         &mut self,
+        kind: ThreadAnalysisFilterInputKind,
         context: &mut Context<Self>,
     ) {
-        if self
-            .settings
-            .thread_analysis_filter_selection_drag
-            .take()
-            .is_some()
-        {
+        let had_drag = match kind {
+            ThreadAnalysisFilterInputKind::ThreadName => self
+                .settings
+                .thread_analysis_name_filter_selection_drag
+                .take()
+                .is_some(),
+            ThreadAnalysisFilterInputKind::Stack => self
+                .settings
+                .thread_analysis_filter_selection_drag
+                .take()
+                .is_some(),
+        };
+        if had_drag {
             context.notify();
         }
     }
@@ -1057,18 +1252,31 @@ impl MainView {
     /// - 点击在整体输入区上方或下方时，分别夹到开头或末尾，符合多行文本框的常见行为。
     pub(in crate::app) fn thread_analysis_filter_index_for_point(
         &self,
+        kind: ThreadAnalysisFilterInputKind,
         position: Point<Pixels>,
     ) -> usize {
-        let Some(bounds) = self.settings.thread_analysis_filter_last_bounds.as_ref() else {
-            return self.settings.thread_analysis_filter_text.len();
+        let (text, layouts, bounds) = match kind {
+            ThreadAnalysisFilterInputKind::ThreadName => (
+                &self.settings.thread_analysis_name_filter_text,
+                &self.settings.thread_analysis_name_filter_last_layouts,
+                &self.settings.thread_analysis_name_filter_last_bounds,
+            ),
+            ThreadAnalysisFilterInputKind::Stack => (
+                &self.settings.thread_analysis_filter_text,
+                &self.settings.thread_analysis_filter_last_layouts,
+                &self.settings.thread_analysis_filter_last_bounds,
+            ),
+        };
+        let Some(bounds) = bounds.as_ref() else {
+            return text.len();
         };
         if position.y < bounds.top() {
             return 0;
         }
         if position.y > bounds.bottom() {
-            return self.settings.thread_analysis_filter_text.len();
+            return text.len();
         }
-        for layout in &self.settings.thread_analysis_filter_last_layouts {
+        for layout in layouts {
             if position.y >= layout.bounds.top() && position.y <= layout.bounds.bottom() {
                 let local_index = layout
                     .line
@@ -1082,7 +1290,7 @@ impl MainView {
                 return layout.byte_range.start + local_index;
             }
         }
-        self.settings.thread_analysis_filter_text.len()
+        text.len()
     }
 
     /// 进入快搜关键字编辑状态。
@@ -1164,8 +1372,8 @@ impl MainView {
     /// 进入线程日志分析过滤编辑状态。
     ///
     /// 业务意图：
-    /// - 设置页默认只读展示过滤堆栈，用户明确点击编辑后才把多行文本框切换为可写，降低误粘贴和输入法误提交风险。
-    /// - 光标放到文本末尾，便于用户继续追加新的过滤堆栈；已有选择和组合文本会被清理，避免从只读态遗留不可见编辑上下文。
+    /// - 设置页默认只读展示线程名和堆栈过滤规则，用户明确点击编辑后才把多行文本框切换为可写，降低误粘贴和输入法误提交风险。
+    /// - 光标放到文本末尾，便于用户继续追加新的线程名通配或过滤堆栈；已有选择和组合文本会被清理，避免从只读态遗留不可见编辑上下文。
     pub(in crate::app) fn begin_thread_analysis_filter_edit(
         &mut self,
         context: &mut Context<Self>,
@@ -1173,9 +1381,16 @@ impl MainView {
         if self.settings.thread_analysis_filter_is_editing {
             return;
         }
+        self.settings
+            .thread_analysis_name_filter_saved_text_before_edit =
+            Some(self.settings.thread_analysis_name_filter_text.clone());
         self.settings.thread_analysis_filter_saved_text_before_edit =
             Some(self.settings.thread_analysis_filter_text.clone());
         self.settings.thread_analysis_filter_is_editing = true;
+        let name_cursor = self.settings.thread_analysis_name_filter_text.len();
+        self.settings.thread_analysis_name_filter_selection_range = name_cursor..name_cursor;
+        self.settings.thread_analysis_name_filter_marked_range = None;
+        self.settings.thread_analysis_name_filter_selection_drag = None;
         let cursor = self.settings.thread_analysis_filter_text.len();
         self.settings.thread_analysis_filter_selection_range = cursor..cursor;
         self.settings.thread_analysis_filter_marked_range = None;
@@ -1188,13 +1403,26 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 用户点击保存时才把当前多行文本写入配置文件，符合“默认只读、显式编辑、显式保存”的设置语义。
-    /// - 保存前再次规范化换行，确保从 Windows 粘贴的 CRLF 不会影响后续规则拆分和线程堆栈连续匹配。
+    /// - 保存前再次规范化换行，确保从 Windows 粘贴的 CRLF 不会影响后续线程名规则拆分和线程堆栈连续匹配。
     pub(in crate::app) fn save_thread_analysis_filter_edit(&mut self, context: &mut Context<Self>) {
+        let normalized_name =
+            normalize_thread_analysis_filter_text(&self.settings.thread_analysis_name_filter_text);
+        if normalized_name != self.settings.thread_analysis_name_filter_text {
+            self.settings.thread_analysis_name_filter_text = normalized_name;
+        }
         let normalized =
             normalize_thread_analysis_filter_text(&self.settings.thread_analysis_filter_text);
         if normalized != self.settings.thread_analysis_filter_text {
             self.settings.thread_analysis_filter_text = normalized;
         }
+        self.settings.thread_analysis_name_filter_selection_range = Self::clamp_search_text_range(
+            &self.settings.thread_analysis_name_filter_text,
+            self.settings
+                .thread_analysis_name_filter_selection_range
+                .clone(),
+        );
+        self.settings.thread_analysis_name_filter_marked_range = None;
+        self.settings.thread_analysis_name_filter_selection_drag = None;
         self.settings.thread_analysis_filter_selection_range = Self::clamp_search_text_range(
             &self.settings.thread_analysis_filter_text,
             self.settings.thread_analysis_filter_selection_range.clone(),
@@ -1202,7 +1430,12 @@ impl MainView {
         self.settings.thread_analysis_filter_marked_range = None;
         self.settings.thread_analysis_filter_selection_drag = None;
         self.settings.thread_analysis_filter_is_editing = false;
+        self.settings
+            .thread_analysis_name_filter_saved_text_before_edit = None;
         self.settings.thread_analysis_filter_saved_text_before_edit = None;
+        save_thread_analysis_name_filter_preference(
+            &self.settings.thread_analysis_name_filter_text,
+        );
         save_thread_analysis_filter_preference(&self.settings.thread_analysis_filter_text);
         self.touch_search_text_cursor_activity();
         context.notify();
@@ -1219,12 +1452,27 @@ impl MainView {
     ) {
         if let Some(saved_text) = self
             .settings
+            .thread_analysis_name_filter_saved_text_before_edit
+            .take()
+        {
+            self.settings.thread_analysis_name_filter_text = saved_text;
+        }
+        if let Some(saved_text) = self
+            .settings
             .thread_analysis_filter_saved_text_before_edit
             .take()
         {
             self.settings.thread_analysis_filter_text = saved_text;
         }
         self.settings.thread_analysis_filter_is_editing = false;
+        self.settings.thread_analysis_name_filter_selection_range = Self::clamp_search_text_range(
+            &self.settings.thread_analysis_name_filter_text,
+            self.settings
+                .thread_analysis_name_filter_selection_range
+                .clone(),
+        );
+        self.settings.thread_analysis_name_filter_marked_range = None;
+        self.settings.thread_analysis_name_filter_selection_drag = None;
         self.settings.thread_analysis_filter_selection_range = Self::clamp_search_text_range(
             &self.settings.thread_analysis_filter_text,
             self.settings.thread_analysis_filter_selection_range.clone(),
@@ -1951,11 +2199,12 @@ impl MainView {
     /// 处理线程日志分析过滤多行输入区的基础编辑按键。
     ///
     /// 业务意图：
-    /// - 该输入区用于粘贴完整线程堆栈，必须保留换行，并支持复制、剪切、粘贴、删除、全选和回车换行。
+    /// - 该输入区用于维护线程名通配和完整线程堆栈，必须保留换行，并支持复制、剪切、粘贴、删除、全选和回车换行。
     /// - 设置页默认只读展示过滤规则，因此只有编辑态才允许修改文本；只读态仍允许选中和复制，方便用户核对内置规则。
     /// - 普通字符输入交给 `EntityInputHandler`，这里不处理 `key_char`，从而保留中文 IME 的平台提交路径。
     pub(in crate::app) fn handle_thread_analysis_filter_key_down(
         &mut self,
+        kind: ThreadAnalysisFilterInputKind,
         event: &KeyDownEvent,
         context: &mut Context<Self>,
     ) {
@@ -1964,7 +2213,7 @@ impl MainView {
                 && let Some(text) = context.read_from_clipboard().and_then(|item| item.text())
             {
                 let replacement = normalize_thread_analysis_filter_text(&text);
-                self.replace_thread_analysis_filter_selection(&replacement);
+                self.replace_thread_analysis_filter_selection(kind, &replacement);
                 self.touch_search_text_cursor_activity();
                 context.stop_propagation();
                 context.notify();
@@ -1975,7 +2224,7 @@ impl MainView {
         }
 
         if Self::is_copy_keystroke(&event.keystroke) {
-            if let Some(text) = self.selected_thread_analysis_filter_text() {
+            if let Some(text) = self.selected_thread_analysis_filter_text(kind) {
                 context.write_to_clipboard(ClipboardItem::new_string(text));
             }
             context.stop_propagation();
@@ -1984,10 +2233,10 @@ impl MainView {
 
         if Self::is_cut_keystroke(&event.keystroke) {
             if self.settings.thread_analysis_filter_is_editing
-                && let Some(text) = self.selected_thread_analysis_filter_text()
+                && let Some(text) = self.selected_thread_analysis_filter_text(kind)
             {
                 context.write_to_clipboard(ClipboardItem::new_string(text));
-                self.replace_thread_analysis_filter_selection("");
+                self.replace_thread_analysis_filter_selection(kind, "");
                 self.touch_search_text_cursor_activity();
                 context.notify();
             }
@@ -1996,9 +2245,9 @@ impl MainView {
         }
 
         if Self::is_select_all_keystroke(&event.keystroke) {
-            self.settings.thread_analysis_filter_marked_range = None;
-            self.settings.thread_analysis_filter_selection_range =
-                0..self.settings.thread_analysis_filter_text.len();
+            self.set_thread_analysis_filter_input_marked_range(kind, None);
+            let len = self.thread_analysis_filter_input_text(kind).len();
+            self.set_thread_analysis_filter_input_selection_range(kind, 0..len);
             self.touch_search_text_cursor_activity();
             context.stop_propagation();
             context.notify();
@@ -2007,76 +2256,55 @@ impl MainView {
 
         match event.keystroke.key.as_str() {
             "left" => {
-                self.settings.thread_analysis_filter_marked_range = None;
-                if event.keystroke.modifiers.shift {
-                    self.settings.thread_analysis_filter_selection_range.end =
-                        Self::previous_search_text_boundary(
-                            &self.settings.thread_analysis_filter_text,
-                            self.settings.thread_analysis_filter_selection_range.end,
-                        );
-                    self.settings.thread_analysis_filter_selection_range =
-                        Self::clamp_search_text_range(
-                            &self.settings.thread_analysis_filter_text,
-                            self.settings.thread_analysis_filter_selection_range.clone(),
-                        );
-                } else if self.settings.thread_analysis_filter_selection_range.start
-                    != self.settings.thread_analysis_filter_selection_range.end
-                {
-                    self.settings.thread_analysis_filter_selection_range =
-                        self.settings.thread_analysis_filter_selection_range.start
-                            ..self.settings.thread_analysis_filter_selection_range.start;
+                let text = self.thread_analysis_filter_input_text(kind).clone();
+                let selection = self.thread_analysis_filter_input_selection_range(kind);
+                self.set_thread_analysis_filter_input_marked_range(kind, None);
+                let new_selection = if event.keystroke.modifiers.shift {
+                    let mut next_selection = selection;
+                    next_selection.end =
+                        Self::previous_search_text_boundary(&text, next_selection.end);
+                    Self::clamp_search_text_range(&text, next_selection)
+                } else if selection.start != selection.end {
+                    selection.start..selection.start
                 } else {
-                    let cursor = Self::previous_search_text_boundary(
-                        &self.settings.thread_analysis_filter_text,
-                        self.settings.thread_analysis_filter_selection_range.end,
-                    );
-                    self.settings.thread_analysis_filter_selection_range = cursor..cursor;
-                }
+                    let cursor = Self::previous_search_text_boundary(&text, selection.end);
+                    cursor..cursor
+                };
+                self.set_thread_analysis_filter_input_selection_range(kind, new_selection);
                 self.touch_search_text_cursor_activity();
                 context.stop_propagation();
                 context.notify();
             }
             "right" => {
-                self.settings.thread_analysis_filter_marked_range = None;
-                if event.keystroke.modifiers.shift {
-                    self.settings.thread_analysis_filter_selection_range.end =
-                        Self::next_search_text_boundary(
-                            &self.settings.thread_analysis_filter_text,
-                            self.settings.thread_analysis_filter_selection_range.end,
-                        );
-                    self.settings.thread_analysis_filter_selection_range =
-                        Self::clamp_search_text_range(
-                            &self.settings.thread_analysis_filter_text,
-                            self.settings.thread_analysis_filter_selection_range.clone(),
-                        );
-                } else if self.settings.thread_analysis_filter_selection_range.start
-                    != self.settings.thread_analysis_filter_selection_range.end
-                {
-                    self.settings.thread_analysis_filter_selection_range =
-                        self.settings.thread_analysis_filter_selection_range.end
-                            ..self.settings.thread_analysis_filter_selection_range.end;
+                let text = self.thread_analysis_filter_input_text(kind).clone();
+                let selection = self.thread_analysis_filter_input_selection_range(kind);
+                self.set_thread_analysis_filter_input_marked_range(kind, None);
+                let new_selection = if event.keystroke.modifiers.shift {
+                    let mut next_selection = selection;
+                    next_selection.end = Self::next_search_text_boundary(&text, next_selection.end);
+                    Self::clamp_search_text_range(&text, next_selection)
+                } else if selection.start != selection.end {
+                    selection.end..selection.end
                 } else {
-                    let cursor = Self::next_search_text_boundary(
-                        &self.settings.thread_analysis_filter_text,
-                        self.settings.thread_analysis_filter_selection_range.end,
-                    );
-                    self.settings.thread_analysis_filter_selection_range = cursor..cursor;
-                }
+                    let cursor = Self::next_search_text_boundary(&text, selection.end);
+                    cursor..cursor
+                };
+                self.set_thread_analysis_filter_input_selection_range(kind, new_selection);
                 self.touch_search_text_cursor_activity();
                 context.stop_propagation();
                 context.notify();
             }
             "up" => {
-                self.settings.thread_analysis_filter_marked_range = None;
-                self.settings.thread_analysis_filter_selection_range = 0..0;
+                self.set_thread_analysis_filter_input_marked_range(kind, None);
+                self.set_thread_analysis_filter_input_selection_range(kind, 0..0);
                 self.touch_search_text_cursor_activity();
                 context.stop_propagation();
                 context.notify();
             }
             "down" => {
-                self.settings.thread_analysis_filter_marked_range = None;
-                let cursor = self.settings.thread_analysis_filter_text.len();
-                self.settings.thread_analysis_filter_selection_range = cursor..cursor;
+                self.set_thread_analysis_filter_input_marked_range(kind, None);
+                let cursor = self.thread_analysis_filter_input_text(kind).len();
+                self.set_thread_analysis_filter_input_selection_range(kind, cursor..cursor);
                 self.touch_search_text_cursor_activity();
                 context.stop_propagation();
                 context.notify();
@@ -2086,23 +2314,26 @@ impl MainView {
                     context.stop_propagation();
                     return;
                 }
-                if self.settings.thread_analysis_filter_selection_range.start
-                    != self.settings.thread_analysis_filter_selection_range.end
-                    || self.settings.thread_analysis_filter_marked_range.is_some()
+                let selection = self.thread_analysis_filter_input_selection_range(kind);
+                if selection.start != selection.end
+                    || self
+                        .thread_analysis_filter_input_marked_range(kind)
+                        .is_some()
                 {
-                    self.replace_thread_analysis_filter_selection("");
-                } else if let Some((previous_index, _)) = self.settings.thread_analysis_filter_text
-                    [..self.settings.thread_analysis_filter_selection_range.end]
+                    self.replace_thread_analysis_filter_selection(kind, "");
+                } else if let Some((previous_index, _)) = self
+                    .thread_analysis_filter_input_text(kind)[..selection.end]
                     .char_indices()
                     .next_back()
                 {
-                    let cursor = self.settings.thread_analysis_filter_selection_range.end;
-                    self.settings
-                        .thread_analysis_filter_text
+                    let cursor = selection.end;
+                    self.thread_analysis_filter_input_text_mut(kind)
                         .replace_range(previous_index..cursor, "");
-                    self.settings.thread_analysis_filter_selection_range =
-                        previous_index..previous_index;
-                    self.settings.thread_analysis_filter_marked_range = None;
+                    self.set_thread_analysis_filter_input_selection_range(
+                        kind,
+                        previous_index..previous_index,
+                    );
+                    self.set_thread_analysis_filter_input_marked_range(kind, None);
                 }
                 self.touch_search_text_cursor_activity();
                 context.stop_propagation();
@@ -2113,25 +2344,24 @@ impl MainView {
                     context.stop_propagation();
                     return;
                 }
-                if self.settings.thread_analysis_filter_selection_range.start
-                    != self.settings.thread_analysis_filter_selection_range.end
-                    || self.settings.thread_analysis_filter_marked_range.is_some()
+                let selection = self.thread_analysis_filter_input_selection_range(kind);
+                if selection.start != selection.end
+                    || self
+                        .thread_analysis_filter_input_marked_range(kind)
+                        .is_some()
                 {
-                    self.replace_thread_analysis_filter_selection("");
-                } else if let Some((next_index, next_character)) =
-                    self.settings.thread_analysis_filter_text
-                        [self.settings.thread_analysis_filter_selection_range.end..]
-                        .char_indices()
-                        .next()
+                    self.replace_thread_analysis_filter_selection(kind, "");
+                } else if let Some((next_index, next_character)) = self
+                    .thread_analysis_filter_input_text(kind)[selection.end..]
+                    .char_indices()
+                    .next()
                 {
-                    let start =
-                        self.settings.thread_analysis_filter_selection_range.end + next_index;
+                    let start = selection.end + next_index;
                     let end = start + next_character.len_utf8();
-                    self.settings
-                        .thread_analysis_filter_text
+                    self.thread_analysis_filter_input_text_mut(kind)
                         .replace_range(start..end, "");
-                    self.settings.thread_analysis_filter_selection_range = start..start;
-                    self.settings.thread_analysis_filter_marked_range = None;
+                    self.set_thread_analysis_filter_input_selection_range(kind, start..start);
+                    self.set_thread_analysis_filter_input_marked_range(kind, None);
                 }
                 self.touch_search_text_cursor_activity();
                 context.stop_propagation();
@@ -2142,7 +2372,7 @@ impl MainView {
                     context.stop_propagation();
                     return;
                 }
-                self.replace_thread_analysis_filter_selection("\n");
+                self.replace_thread_analysis_filter_selection(kind, "\n");
                 self.touch_search_text_cursor_activity();
                 context.stop_propagation();
                 context.notify();
@@ -2153,36 +2383,56 @@ impl MainView {
     }
 
     /// 返回线程日志分析过滤输入区当前选中文本。
-    pub(in crate::app) fn selected_thread_analysis_filter_text(&self) -> Option<String> {
+    pub(in crate::app) fn selected_thread_analysis_filter_text(
+        &self,
+        kind: ThreadAnalysisFilterInputKind,
+    ) -> Option<String> {
+        let text = self.thread_analysis_filter_input_text(kind);
         let range = Self::clamp_search_text_range(
-            &self.settings.thread_analysis_filter_text,
-            self.settings.thread_analysis_filter_selection_range.clone(),
+            text,
+            self.thread_analysis_filter_input_selection_range(kind),
         );
-        (range.start < range.end)
-            .then(|| self.settings.thread_analysis_filter_text[range].to_string())
+        (range.start < range.end).then(|| text[range].to_string())
     }
 
     /// 用给定文本替换线程日志分析过滤输入区当前选区。
     ///
     /// 业务意图：
     /// - 平台 IME、快捷键粘贴和普通编辑都通过同一函数更新文本、组合范围和光标，保证多行输入状态一致。
-    pub(in crate::app) fn replace_thread_analysis_filter_selection(&mut self, replacement: &str) {
+    pub(in crate::app) fn replace_thread_analysis_filter_selection(
+        &mut self,
+        kind: ThreadAnalysisFilterInputKind,
+        replacement: &str,
+    ) {
         let replacement = normalize_thread_analysis_filter_text(replacement);
-        let range = self
-            .settings
-            .thread_analysis_filter_marked_range
-            .take()
-            .unwrap_or_else(|| {
-                Self::clamp_search_text_range(
-                    &self.settings.thread_analysis_filter_text,
-                    self.settings.thread_analysis_filter_selection_range.clone(),
-                )
-            });
-        self.settings
-            .thread_analysis_filter_text
-            .replace_range(range.clone(), &replacement);
+        let marked_range = self.thread_analysis_filter_input_marked_range(kind);
+        self.set_thread_analysis_filter_input_marked_range(kind, None);
+        let range = marked_range.unwrap_or_else(|| {
+            Self::clamp_search_text_range(
+                self.thread_analysis_filter_input_text(kind),
+                self.thread_analysis_filter_input_selection_range(kind),
+            )
+        });
+        self.replace_thread_analysis_filter_byte_range(kind, range, &replacement);
+    }
+
+    /// 用给定文本替换指定线程分析过滤输入区的 UTF-8 字节范围。
+    ///
+    /// 业务意图：
+    /// - 平台 IME 会直接给出替换范围，快捷键编辑则使用当前选区；两种路径最终都通过这里写入，保证光标和组合范围同步。
+    pub(in crate::app) fn replace_thread_analysis_filter_byte_range(
+        &mut self,
+        kind: ThreadAnalysisFilterInputKind,
+        range: Range<usize>,
+        replacement: &str,
+    ) {
+        let range =
+            Self::clamp_search_text_range(self.thread_analysis_filter_input_text(kind), range);
+        self.thread_analysis_filter_input_text_mut(kind)
+            .replace_range(range.clone(), replacement);
         let cursor = range.start + replacement.len();
-        self.settings.thread_analysis_filter_selection_range = cursor..cursor;
+        self.set_thread_analysis_filter_input_selection_range(kind, cursor..cursor);
+        self.set_thread_analysis_filter_input_marked_range(kind, None);
     }
 
     /// 返回指定输入槽位的可变文本、选择范围和组合范围。

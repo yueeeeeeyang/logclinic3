@@ -15,7 +15,7 @@ use crate::theme::ThemePreference;
 use super::paths::{
     log_minimap_enabled_preference_path, log_viewer_font_size_preference_path,
     main_window_size_preference_path, quick_search_keywords_preference_path, theme_preference_path,
-    thread_analysis_filter_preference_path,
+    thread_analysis_filter_preference_path, thread_analysis_name_filter_preference_path,
 };
 
 /// 日志正文默认字号。
@@ -55,14 +55,27 @@ pub(crate) const LOG_MINIMAP_DEFAULT_ENABLED: bool = false;
 pub(crate) const DEFAULT_QUICK_SEARCH_KEYWORDS_TEXT: &str =
     "excel,import,export,wbi,convertFile,waterMark";
 
-/// 线程日志分析默认过滤配置。
+/// 线程日志分析默认线程名过滤配置。
+///
+/// 业务意图：
+/// - JVM 编译线程、Service Thread 和 Attach Listener 在大多数排障场景中属于常驻基础设施线程，默认过滤可以减少纵轴噪声。
+/// - 线程名规则独立于堆栈片段保存和编辑，用户可以快速维护通配列表，不需要在大段堆栈文本中穿插短规则。
+///
+/// 边界条件：
+/// - 该默认值只在配置文件不存在时使用；如果用户保存空配置，后续启动必须尊重用户显式选择。
+/// - 每行表示一个线程名规则；解析时也兼容英文逗号分隔，方便用户从说明文本中直接复制默认列表。
+pub(crate) const DEFAULT_THREAD_ANALYSIS_NAME_FILTER_TEXT: &str =
+    "C1 CompilerThread*\nC2 CompilerThread*\nService Thread\nAttach Listener\n";
+
+/// 线程日志分析默认堆栈过滤配置。
 ///
 /// 业务意图：
 /// - Resin 的网络 accept 和 keepalive 线程在大量 thread dump 中经常长期存在，通常不代表业务阻塞根因。
-/// - 首次使用线程分析时默认过滤这些稳定噪声线程，减少时间线中的无效线程；用户仍可在设置页清空或改写配置文件。
+/// - 首次使用线程分析时默认过滤这些稳定噪声堆栈，减少时间线中的无效线程；用户仍可在设置页清空或改写配置文件。
 ///
 /// 边界条件：
 /// - 该默认值只在配置文件不存在时使用；如果用户点击“清空”，会写入空文件，后续启动必须尊重用户显式选择。
+/// - 空行分隔多段堆栈片段；旧版本混在该文件里的线程名规则仍由解析层兼容，避免升级后已有配置失效。
 /// - 文本使用 LF 作为内置换行，粘贴或保存路径仍会通过统一规范化函数处理 CRLF。
 pub(crate) const DEFAULT_THREAD_ANALYSIS_FILTER_TEXT: &str = concat!(
     "java.lang.Thread.State: RUNNABLE\n",
@@ -417,7 +430,7 @@ pub(crate) fn save_log_minimap_enabled_preference(enabled: bool) {
 /// 规范化线程日志分析过滤配置文本。
 ///
 /// 业务意图：
-/// - 用户可能从 Windows、macOS、终端或网页复制堆栈，换行格式不稳定；内部统一使用 LF，保证规则拆分和匹配可预测。
+/// - 用户可能从 Windows、macOS、终端或网页复制线程名列表或堆栈，换行格式不稳定；内部统一使用 LF，保证规则拆分和匹配可预测。
 /// - 不裁剪首尾空白，避免破坏用户粘贴的原始堆栈文本；真正匹配时再按行去首尾空白。
 pub(crate) fn normalize_thread_analysis_filter_text(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
@@ -426,13 +439,28 @@ pub(crate) fn normalize_thread_analysis_filter_text(text: &str) -> String {
 /// 从指定文件读取线程日志分析过滤配置。
 ///
 /// 错误处理：
-/// - 配置缺失时使用内置默认过滤堆栈，降低首次分析时的噪声线程数量。
+/// - 配置缺失时使用内置默认堆栈过滤规则，降低首次分析时的噪声线程数量。
 /// - 其它读取失败通常来自权限或文件系统异常，此时回退为空文本，避免默认内容覆盖用户已有但暂时不可读的配置。
 pub(crate) fn read_thread_analysis_filter_preference(path: &Path) -> String {
     match fs::read_to_string(path) {
         Ok(raw) => normalize_thread_analysis_filter_text(&raw),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             DEFAULT_THREAD_ANALYSIS_FILTER_TEXT.to_string()
+        }
+        Err(_) => String::new(),
+    }
+}
+
+/// 从指定文件读取线程日志分析线程名过滤配置。
+///
+/// 错误处理：
+/// - 配置缺失时使用内置线程名噪声规则，保证首次分析能过滤 JVM 常驻线程。
+/// - 权限或文件系统异常时回退为空文本，避免用默认值覆盖用户已有但暂时不可读的配置意图。
+pub(crate) fn read_thread_analysis_name_filter_preference(path: &Path) -> String {
+    match fs::read_to_string(path) {
+        Ok(raw) => normalize_thread_analysis_filter_text(&raw),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            DEFAULT_THREAD_ANALYSIS_NAME_FILTER_TEXT.to_string()
         }
         Err(_) => String::new(),
     }
@@ -449,11 +477,32 @@ pub(crate) fn write_thread_analysis_filter_preference(path: &Path, text: &str) -
     fs::write(path, normalize_thread_analysis_filter_text(text))
 }
 
+/// 将线程日志分析线程名过滤配置写入指定文件。
+///
+/// 业务意图：
+/// - 线程名通配列表是用户明确维护的偏好，应和堆栈过滤一样跨会话保存。
+pub(crate) fn write_thread_analysis_name_filter_preference(
+    path: &Path,
+    text: &str,
+) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, normalize_thread_analysis_filter_text(text))
+}
+
 /// 读取线程日志分析过滤配置。
 pub(crate) fn load_thread_analysis_filter_preference() -> String {
     thread_analysis_filter_preference_path()
         .map(|path| read_thread_analysis_filter_preference(&path))
         .unwrap_or_else(|| DEFAULT_THREAD_ANALYSIS_FILTER_TEXT.to_string())
+}
+
+/// 读取线程日志分析线程名过滤配置。
+pub(crate) fn load_thread_analysis_name_filter_preference() -> String {
+    thread_analysis_name_filter_preference_path()
+        .map(|path| read_thread_analysis_name_filter_preference(&path))
+        .unwrap_or_else(|| DEFAULT_THREAD_ANALYSIS_NAME_FILTER_TEXT.to_string())
 }
 
 /// 保存线程日志分析过滤配置。
@@ -467,6 +516,23 @@ pub(crate) fn save_thread_analysis_filter_preference(text: &str) {
     if let Err(error) = write_thread_analysis_filter_preference(&path, text) {
         eprintln!(
             "保存线程日志分析过滤配置失败：{}：{}",
+            path.display(),
+            error
+        );
+    }
+}
+
+/// 保存线程日志分析线程名过滤配置。
+///
+/// 错误处理：
+/// - 写入失败不影响当前会话输入和后续分析，仅输出开发期诊断，避免配置目录权限问题阻断设置窗口操作。
+pub(crate) fn save_thread_analysis_name_filter_preference(text: &str) {
+    let Some(path) = thread_analysis_name_filter_preference_path() else {
+        return;
+    };
+    if let Err(error) = write_thread_analysis_name_filter_preference(&path, text) {
+        eprintln!(
+            "保存线程日志分析线程名过滤配置失败：{}：{}",
             path.display(),
             error
         );

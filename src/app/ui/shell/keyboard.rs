@@ -128,8 +128,12 @@ impl MainView {
     ///   这些按键必须优先交给设置输入框，不能误触发搜索或关闭搜索窗口。
     pub(in crate::app) fn settings_text_input_focused(&self, window: &Window) -> bool {
         self.settings
-            .thread_analysis_filter_focus
+            .thread_analysis_name_filter_focus
             .is_focused(window)
+            || self
+                .settings
+                .thread_analysis_filter_focus
+                .is_focused(window)
             || self.settings.quick_search_keywords_focus.is_focused(window)
             || self.active_model_config_input_kind(window).is_some()
     }

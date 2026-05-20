@@ -80,20 +80,11 @@ impl EntityInputHandler for MainView {
             ));
             return Some(self.settings.quick_search_keywords_input.text[range].to_string());
         }
-        if self
-            .settings
-            .thread_analysis_filter_focus
-            .is_focused(window)
-        {
-            let range = Self::search_input_range_from_utf16(
-                &self.settings.thread_analysis_filter_text,
-                range_utf16,
-            );
-            adjusted_range.replace(Self::search_input_range_to_utf16(
-                &self.settings.thread_analysis_filter_text,
-                range.clone(),
-            ));
-            return Some(self.settings.thread_analysis_filter_text[range].to_string());
+        if let Some(kind) = self.active_thread_analysis_filter_input_kind(window) {
+            let text = self.thread_analysis_filter_input_text(kind);
+            let range = Self::search_input_range_from_utf16(text, range_utf16);
+            adjusted_range.replace(Self::search_input_range_to_utf16(text, range.clone()));
+            return Some(text[range].to_string());
         }
         let input_kind = self.active_search_text_input_kind(window);
         let dialog = self.search.search_dialog.as_ref()?;
@@ -178,15 +169,12 @@ impl EntityInputHandler for MainView {
                 reversed: false,
             });
         }
-        if self
-            .settings
-            .thread_analysis_filter_focus
-            .is_focused(window)
-        {
+        if let Some(kind) = self.active_thread_analysis_filter_input_kind(window) {
+            let text = self.thread_analysis_filter_input_text(kind);
             return Some(UTF16Selection {
                 range: Self::search_input_range_to_utf16(
-                    &self.settings.thread_analysis_filter_text,
-                    self.settings.thread_analysis_filter_selection_range.clone(),
+                    text,
+                    self.thread_analysis_filter_input_selection_range(kind),
                 ),
                 reversed: false,
             });
@@ -268,21 +256,11 @@ impl EntityInputHandler for MainView {
                     )
                 });
         }
-        if self
-            .settings
-            .thread_analysis_filter_focus
-            .is_focused(window)
-        {
+        if let Some(kind) = self.active_thread_analysis_filter_input_kind(window) {
+            let text = self.thread_analysis_filter_input_text(kind);
             return self
-                .settings
-                .thread_analysis_filter_marked_range
-                .clone()
-                .map(|range| {
-                    Self::search_input_range_to_utf16(
-                        &self.settings.thread_analysis_filter_text,
-                        range,
-                    )
-                });
+                .thread_analysis_filter_input_marked_range(kind)
+                .map(|range| Self::search_input_range_to_utf16(text, range));
         }
         let input_kind = self.active_search_text_input_kind(window);
         let dialog = self.search.search_dialog.as_ref()?;
@@ -327,12 +305,8 @@ impl EntityInputHandler for MainView {
             context.notify();
             return;
         }
-        if self
-            .settings
-            .thread_analysis_filter_focus
-            .is_focused(window)
-        {
-            self.settings.thread_analysis_filter_marked_range = None;
+        if let Some(kind) = self.active_thread_analysis_filter_input_kind(window) {
+            self.set_thread_analysis_filter_input_marked_range(kind, None);
             context.notify();
             return;
         }
@@ -502,32 +476,18 @@ impl EntityInputHandler for MainView {
             context.notify();
             return;
         }
-        if self
-            .settings
-            .thread_analysis_filter_focus
-            .is_focused(window)
-        {
+        if let Some(kind) = self.active_thread_analysis_filter_input_kind(window) {
             if !self.settings.thread_analysis_filter_is_editing {
                 return;
             }
             let replacement = normalize_thread_analysis_filter_text(text);
+            let text = self.thread_analysis_filter_input_text(kind);
             let range = range_utf16
-                .map(|range| {
-                    Self::search_input_range_from_utf16(
-                        &self.settings.thread_analysis_filter_text,
-                        range,
-                    )
-                })
-                .or_else(|| self.settings.thread_analysis_filter_marked_range.clone())
-                .unwrap_or_else(|| self.settings.thread_analysis_filter_selection_range.clone());
-            let range =
-                Self::clamp_search_text_range(&self.settings.thread_analysis_filter_text, range);
-            self.settings
-                .thread_analysis_filter_text
-                .replace_range(range.clone(), &replacement);
-            let cursor = range.start + replacement.len();
-            self.settings.thread_analysis_filter_selection_range = cursor..cursor;
-            self.settings.thread_analysis_filter_marked_range = None;
+                .map(|range| Self::search_input_range_from_utf16(text, range))
+                .or_else(|| self.thread_analysis_filter_input_marked_range(kind))
+                .unwrap_or_else(|| self.thread_analysis_filter_input_selection_range(kind));
+            let range = Self::clamp_search_text_range(text, range);
+            self.replace_thread_analysis_filter_byte_range(kind, range, &replacement);
             self.touch_search_text_cursor_activity();
             context.notify();
             return;
@@ -821,35 +781,27 @@ impl EntityInputHandler for MainView {
             context.notify();
             return;
         }
-        if self
-            .settings
-            .thread_analysis_filter_focus
-            .is_focused(window)
-        {
+        if let Some(kind) = self.active_thread_analysis_filter_input_kind(window) {
             if !self.settings.thread_analysis_filter_is_editing {
                 return;
             }
             let replacement = normalize_thread_analysis_filter_text(new_text);
+            let text = self.thread_analysis_filter_input_text(kind);
             let range = range_utf16
-                .map(|range| {
-                    Self::search_input_range_from_utf16(
-                        &self.settings.thread_analysis_filter_text,
-                        range,
-                    )
-                })
-                .or_else(|| self.settings.thread_analysis_filter_marked_range.clone())
-                .unwrap_or_else(|| self.settings.thread_analysis_filter_selection_range.clone());
-            let range =
-                Self::clamp_search_text_range(&self.settings.thread_analysis_filter_text, range);
-            self.settings
-                .thread_analysis_filter_text
+                .map(|range| Self::search_input_range_from_utf16(text, range))
+                .or_else(|| self.thread_analysis_filter_input_marked_range(kind))
+                .unwrap_or_else(|| self.thread_analysis_filter_input_selection_range(kind));
+            let range = Self::clamp_search_text_range(text, range);
+            self.thread_analysis_filter_input_text_mut(kind)
                 .replace_range(range.clone(), &replacement);
 
             if replacement.is_empty() {
-                self.settings.thread_analysis_filter_marked_range = None;
+                self.set_thread_analysis_filter_input_marked_range(kind, None);
             } else {
-                self.settings.thread_analysis_filter_marked_range =
-                    Some(range.start..range.start + replacement.len());
+                self.set_thread_analysis_filter_input_marked_range(
+                    kind,
+                    Some(range.start..range.start + replacement.len()),
+                );
             }
 
             let selected_range = new_selected_range_utf16
@@ -861,7 +813,7 @@ impl EntityInputHandler for MainView {
                     let cursor = range.start + replacement.len();
                     cursor..cursor
                 });
-            self.settings.thread_analysis_filter_selection_range = selected_range;
+            self.set_thread_analysis_filter_input_selection_range(kind, selected_range);
             self.touch_search_text_cursor_activity();
             context.notify();
             return;
@@ -1039,17 +991,19 @@ impl EntityInputHandler for MainView {
                 ),
             ));
         }
-        if self
-            .settings
-            .thread_analysis_filter_focus
-            .is_focused(window)
-        {
-            let range = Self::search_input_range_from_utf16(
-                &self.settings.thread_analysis_filter_text,
-                range_utf16,
-            );
+        if let Some(kind) = self.active_thread_analysis_filter_input_kind(window) {
+            let text = self.thread_analysis_filter_input_text(kind);
+            let range = Self::search_input_range_from_utf16(text, range_utf16);
             let cursor = range.start;
-            for layout in &self.settings.thread_analysis_filter_last_layouts {
+            let layouts = match kind {
+                ThreadAnalysisFilterInputKind::ThreadName => {
+                    &self.settings.thread_analysis_name_filter_last_layouts
+                }
+                ThreadAnalysisFilterInputKind::Stack => {
+                    &self.settings.thread_analysis_filter_last_layouts
+                }
+            };
+            for layout in layouts {
                 if cursor >= layout.byte_range.start && cursor <= layout.byte_range.end {
                     let x = layout
                         .line
@@ -1139,14 +1093,10 @@ impl EntityInputHandler for MainView {
                 utf8_index,
             ));
         }
-        if self
-            .settings
-            .thread_analysis_filter_focus
-            .is_focused(window)
-        {
-            let utf8_index = self.thread_analysis_filter_index_for_point(point);
+        if let Some(kind) = self.active_thread_analysis_filter_input_kind(window) {
+            let utf8_index = self.thread_analysis_filter_index_for_point(kind, point);
             return Some(Self::search_input_utf16_offset_from_byte(
-                &self.settings.thread_analysis_filter_text,
+                self.thread_analysis_filter_input_text(kind),
                 utf8_index,
             ));
         }

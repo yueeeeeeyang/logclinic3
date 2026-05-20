@@ -6,6 +6,12 @@
 
 use super::*;
 
+/// 线程日志分析窗口进度轮询间隔。
+///
+/// 业务意图：
+/// - 后台解析只在文件边界更新共享进度，UI 轮询不需要高频；80ms 能让进度条及时响应，同时避免持续唤醒主线程。
+const THREAD_ANALYSIS_PROGRESS_POLL_INTERVAL: Duration = Duration::from_millis(80);
+
 impl MainView {
     /// 打开日志智能分析独立窗口。
     ///
@@ -142,52 +148,119 @@ impl MainView {
             return;
         }
         let source_count = sources.len();
-        let filter_rules =
-            Self::parse_thread_analysis_filter_rules(self.thread_analysis_filter_effective_text());
+        self.thread_analysis_generation = self.thread_analysis_generation.saturating_add(1);
+        let generation = self.thread_analysis_generation;
+        let mut filter_rules = Self::parse_thread_analysis_name_filter_rules(
+            self.thread_analysis_name_filter_effective_text(),
+        );
+        filter_rules.extend(Self::parse_thread_analysis_filter_rules(
+            self.thread_analysis_filter_effective_text(),
+        ));
         let main_view = context.entity();
         let main_view_for_loading = main_view.clone();
+        let initial_progress = ThreadAnalysisProgress::new(source_count);
+        let progress_snapshot = Arc::new(std::sync::Mutex::new(initial_progress.clone()));
+        let task_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let loading_analysis = ThreadAnalysisData {
             title: "线程日志分析".to_string(),
             summary: format!("正在分析 {} 个文件...", source_count),
+            progress: Some(initial_progress),
             snapshots: Vec::new(),
             thread_names: Vec::new(),
             matrix: Vec::new(),
         };
         // 先在当前事件循环结束后打开窗口，给用户即时反馈；后台读取和解析完成后再替换为真实结果。
         window.defer(context, move |_window, app| {
-            Self::open_thread_analysis_window_after_main_update(
+            Self::open_thread_analysis_window_if_current_after_main_update(
                 main_view_for_loading,
+                generation,
                 loading_analysis,
                 app,
             );
         });
+        let main_view_for_progress = main_view.clone();
+        let progress_snapshot_for_poll = Arc::clone(&progress_snapshot);
+        let task_finished_for_poll = Arc::clone(&task_finished);
+        context
+            .spawn(async move |_view, app| {
+                loop {
+                    app.background_executor()
+                        .timer(THREAD_ANALYSIS_PROGRESS_POLL_INTERVAL)
+                        .await;
+                    if task_finished_for_poll.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let progress = progress_snapshot_for_poll
+                        .lock()
+                        .ok()
+                        .map(|guard| guard.clone());
+                    let Some(progress) = progress else {
+                        continue;
+                    };
+                    let progress_analysis = ThreadAnalysisData {
+                        title: "线程日志分析".to_string(),
+                        summary: progress.message(),
+                        progress: Some(progress),
+                        snapshots: Vec::new(),
+                        thread_names: Vec::new(),
+                        matrix: Vec::new(),
+                    };
+                    let main_view_for_update = main_view_for_progress.clone();
+                    app.update(move |app| {
+                        Self::open_thread_analysis_window_if_current_after_main_update(
+                            main_view_for_update,
+                            generation,
+                            progress_analysis,
+                            app,
+                        );
+                    })
+                    .ok();
+                }
+            })
+            .detach();
         context
             .spawn(async move |view, app| {
+                let progress_for_worker = Arc::clone(&progress_snapshot);
                 let analysis = app
                     .background_executor()
-                    .spawn(
-                        async move { Self::analyze_thread_dump_sources(&sources, &filter_rules) },
-                    )
+                    .spawn(async move {
+                        Self::analyze_thread_dump_sources_with_progress(
+                            &sources,
+                            &filter_rules,
+                            |progress| {
+                                if let Ok(mut current_progress) = progress_for_worker.lock() {
+                                    *current_progress = progress;
+                                }
+                            },
+                        )
+                    })
                     .await;
+                task_finished.store(true, std::sync::atomic::Ordering::Relaxed);
 
                 let _ = view;
                 app.update(move |app| {
-                    Self::open_thread_analysis_window_after_main_update(main_view, analysis, app);
+                    Self::open_thread_analysis_window_if_current_after_main_update(
+                        main_view, generation, analysis, app,
+                    );
                 })
                 .ok();
             })
             .detach();
     }
 
-    /// 读取并分析多个日志来源中的 Java thread dump。
+    /// 读取并分析多个日志来源中的 Java thread dump，并汇报文件级进度。
     ///
     /// 业务意图：
-    /// - MainView 只保留兼容旧调用点的薄适配，真实解析和矩阵构建由顶层 `thread_analysis` 业务域负责。
-    pub(in crate::app) fn analyze_thread_dump_sources(
+    /// - 主视图后台任务通过该薄适配把进度写入共享快照，窗口轮询后显示进度条。
+    pub(in crate::app) fn analyze_thread_dump_sources_with_progress<F>(
         sources: &[LogFileSource],
         filter_rules: &[ThreadAnalysisFilterRule],
-    ) -> ThreadAnalysisData {
-        analyze_thread_dump_sources(sources, filter_rules)
+        report_progress: F,
+    ) -> ThreadAnalysisData
+    where
+        F: FnMut(ThreadAnalysisProgress),
+    {
+        analyze_thread_dump_sources_with_progress(sources, filter_rules, report_progress)
     }
 
     /// 解析线程日志分析过滤配置文本。
@@ -198,6 +271,16 @@ impl MainView {
         raw: &str,
     ) -> Vec<ThreadAnalysisFilterRule> {
         parse_thread_analysis_filter_rules(raw)
+    }
+
+    /// 解析线程日志分析线程名过滤配置文本。
+    ///
+    /// 业务意图：
+    /// - MainView 只保留兼容 UI 调用点的薄适配，真实解析由顶层 `thread_analysis` 业务域负责。
+    pub(in crate::app) fn parse_thread_analysis_name_filter_rules(
+        raw: &str,
+    ) -> Vec<ThreadAnalysisFilterRule> {
+        parse_thread_analysis_name_filter_rules(raw)
     }
 
     /// 在主视图更新租借结束后打开或更新线程分析独立窗口。
@@ -254,6 +337,17 @@ impl MainView {
         match app.open_window(window_options, move |window, app| {
             window.on_window_should_close(app, move |_, app| {
                 main_view_for_close.update(app, |view, context| {
+                    if let Some(thread_window) = view.thread_analysis_window {
+                        let _ = thread_window.update(context, |thread_view, _window, context| {
+                            // 线程堆栈详情窗口的数据完全来自线程分析窗口；父窗口关闭时必须同步关闭，
+                            // 否则加载新日志后主视图已经失去父窗口句柄，无法再清理旧详情窗口。
+                            if let Some(stack_window) = thread_view.stack_window.take() {
+                                let _ = stack_window.update(context, |_, stack_window, _| {
+                                    stack_window.remove_window();
+                                });
+                            }
+                        });
+                    }
                     view.thread_analysis_window = None;
                     context.notify();
                 });
@@ -275,6 +369,24 @@ impl MainView {
                     context.notify();
                 });
             }
+        }
+    }
+
+    /// 仅当线程分析代次仍然有效时打开或更新分析窗口。
+    ///
+    /// 业务意图：
+    /// - 旧后台任务的进度或结果可能晚于新任务返回；代次检查可以防止旧分析覆盖用户刚启动的新分析。
+    pub(in crate::app) fn open_thread_analysis_window_if_current_after_main_update(
+        main_view: Entity<MainView>,
+        generation: usize,
+        analysis: ThreadAnalysisData,
+        app: &mut App,
+    ) {
+        let is_current = main_view.update(app, |view, _context| {
+            view.thread_analysis_generation == generation
+        });
+        if is_current {
+            Self::open_thread_analysis_window_after_main_update(main_view, analysis, app);
         }
     }
 

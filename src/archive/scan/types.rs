@@ -39,6 +39,52 @@ pub(crate) struct ArchiveScanResult {
     pub(crate) temporary_paths: Vec<PathBuf>,
 }
 
+/// 压缩包扫描过程中的条目级进度快照。
+///
+/// 业务意图：
+/// - 加载单个大型压缩包时，顶层来源数量通常只有 1 个；如果只按来源计数，中央进度条会长时间停在 0%。
+/// - 扫描模块通过该结构把当前格式、当前条目、已扫描条目数和已发现节点数回传给加载器，UI 就能展示“压缩包内部正在推进”的详细进度。
+///
+/// 关键约束：
+/// - 不保存压缩包 reader、文件句柄或正文内容，只保存可跨线程克隆的轻量文本和计数。
+/// - `total_entries` 只有 ZIP 和 7Z 这类能提前知道目录数量的格式才有值；TAR/RAR 是顺序流，无法低成本预统计总数。
+/// - `current_entry` 只用于用户可见提示，不能反向作为安全路径或读取来源。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ArchiveScanProgress {
+    /// 当前正在扫描的压缩包格式。
+    pub(crate) format: ArchiveFormat,
+    /// 当前扫描阶段的中文说明。
+    pub(crate) step: String,
+    /// 当前正在处理的压缩包成员名。
+    pub(crate) current_entry: Option<String>,
+    /// 已经完成处理的成员数量。
+    pub(crate) processed_entries: usize,
+    /// 可预知的成员总数；顺序格式无法预知时为 `None`。
+    pub(crate) total_entries: Option<usize>,
+    /// 当前扫描树中已经发现的节点数量，不包含内部隐藏根节点。
+    pub(crate) discovered_nodes: usize,
+    /// 当前扫描阶段已经发现的非致命错误数量。
+    pub(crate) error_count: usize,
+}
+
+impl ArchiveScanProgress {
+    /// 创建一个压缩包扫描进度快照。
+    ///
+    /// 边界条件：
+    /// - 初始快照通常还没有当前条目和总条目数，调用方可在打开目录后继续补充。
+    pub(super) fn new(format: ArchiveFormat, step: impl Into<String>) -> Self {
+        Self {
+            format,
+            step: step.into(),
+            current_entry: None,
+            processed_entries: 0,
+            total_entries: None,
+            discovered_nodes: 0,
+            error_count: 0,
+        }
+    }
+}
+
 /// 与 UI 无关的压缩包扫描树节点。
 ///
 /// 业务意图：
@@ -265,5 +311,29 @@ impl ArchiveScanNode {
             }
             ArchiveScanEntryKind::Error => 0,
         }
+    }
+
+    /// 递归统计当前节点下所有可展示节点数量，不包含当前隐藏根节点。
+    ///
+    /// 业务意图：
+    /// - 加载压缩包时需要在目录树真正挂载前向用户展示“已发现多少节点”。
+    /// - 扫描入口使用一个空标签根节点承载所有成员，该根节点不会出现在 UI 中，因此这里只统计子树。
+    pub(super) fn descendant_node_count(&self) -> usize {
+        self.children
+            .iter()
+            .map(Self::node_count_including_self)
+            .sum()
+    }
+
+    /// 递归统计包含当前节点在内的节点数量。
+    ///
+    /// 边界条件：
+    /// - 错误节点也会显示在目录树中，因此同样计入节点数，帮助用户理解坏条目并非扫描停滞。
+    fn node_count_including_self(&self) -> usize {
+        1 + self
+            .children
+            .iter()
+            .map(Self::node_count_including_self)
+            .sum::<usize>()
     }
 }

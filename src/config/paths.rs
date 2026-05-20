@@ -45,6 +45,13 @@ pub(crate) const LOG_MINIMAP_ENABLED_FILE_NAME: &str = "log-minimap-enabled.txt"
 /// - 文件保存原始多行文本而不是结构化格式，方便用户直接打开配置文件排查或批量替换。
 pub(crate) const THREAD_ANALYSIS_FILTER_FILE_NAME: &str = "thread-analysis-filter.txt";
 
+/// 线程日志分析线程名过滤配置文件名。
+///
+/// 业务意图：
+/// - 线程名通配规则比完整堆栈片段更短、更常改，单独落盘可以让设置页用独立输入框维护，避免用户在大段堆栈文本中找规则。
+/// - 文件仍保存纯文本多行列表，跨平台路径和权限处理继续由应用配置目录统一承担。
+pub(crate) const THREAD_ANALYSIS_NAME_FILTER_FILE_NAME: &str = "thread-analysis-name-filter.txt";
+
 /// 快搜关键字配置文件名。
 ///
 /// 业务意图：
@@ -134,6 +141,14 @@ pub(crate) fn log_minimap_enabled_preference_path() -> Option<PathBuf> {
 /// 获取线程日志分析过滤配置文件路径。
 pub(crate) fn thread_analysis_filter_preference_path() -> Option<PathBuf> {
     app_config_dir().map(|dir| dir.join(THREAD_ANALYSIS_FILTER_FILE_NAME))
+}
+
+/// 获取线程日志分析线程名过滤配置文件路径。
+///
+/// 跨平台约束：
+/// - macOS 和 Windows 使用不同配置目录，但文件名保持稳定，便于用户和维护脚本定位。
+pub(crate) fn thread_analysis_name_filter_preference_path() -> Option<PathBuf> {
+    app_config_dir().map(|dir| dir.join(THREAD_ANALYSIS_NAME_FILTER_FILE_NAME))
 }
 
 /// 获取快搜关键字配置文件路径。

@@ -59,6 +59,157 @@ pub struct LoadedLogTree {
     pub temporary_paths: Vec<PathBuf>,
 }
 
+/// 日志来源加载过程中的进度快照。
+///
+/// 业务意图：
+/// - 加载日志来源时，目录扫描、压缩包索引和 7Z 临时物化都在后台线程执行；UI 需要一个可跨线程克隆的轻量快照来展示“正在处理哪一项、已经完成多少项”。
+/// - 该结构只描述加载阶段的总体进度，不持有文件句柄、压缩包 reader 或任何日志正文，避免把后台 I/O 状态泄漏给 GPUI 渲染层。
+///
+/// 边界条件：
+/// - `total_sources` 可能为 0，例如用户取消路径选择后调用方仍传入空集合；百分比计算必须退化为 100%，避免除零。
+/// - `processed_sources` 会被夹紧到总数以内；即使未来某个加载分支重复汇报进度，UI 也不会显示超过 100%。
+/// - 单个目录内部文件数量在递归前未知，因此当前进度以用户选择的来源数量为主；节点数量只供逻辑和最终摘要使用，不进入加载浮层。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogLoadProgress {
+    /// 用户本轮选择的来源总数。
+    pub total_sources: usize,
+    /// 已经完成扫描的来源数量。
+    pub processed_sources: usize,
+    /// 当前正在扫描的来源名称。
+    ///
+    /// 业务意图：
+    /// - 只保存面向用户的短名称，不保存绝对路径，避免中央加载提示被长路径撑破。
+    /// - `None` 表示还未开始扫描或正在整理最终目录树。
+    pub current_source: Option<String>,
+    /// 当前来源内部的扫描阶段。
+    ///
+    /// 业务意图：
+    /// - 压缩包属于单个顶层来源，但内部可能有成百上千个成员；该字段让 UI 能提示正在读取目录、扫描成员或物化 7Z 条目。
+    /// - 普通文件和普通目录没有稳定的内部总量时保持 `None`，避免制造不准确的进度信息。
+    pub current_source_step: Option<String>,
+    /// 当前来源内部正在处理的条目名称。
+    ///
+    /// 边界条件：
+    /// - 该名称来自压缩包原始成员名，只用于展示，不能作为安全路径或日志来源使用。
+    /// - 文案展示会截断过长条目，避免中央进度条被长路径撑破。
+    pub current_entry: Option<String>,
+    /// 当前来源内部已经完成的工作量。
+    ///
+    /// 业务意图：
+    /// - ZIP/7Z 表示已扫描成员数量；TAR/RAR 表示顺序流已推进的条目数量。
+    pub current_source_work_done: usize,
+    /// 当前来源内部可预知的工作总量。
+    ///
+    /// 边界条件：
+    /// - 顺序压缩格式无法低成本获取总条目数时为 `None`，进度条会使用保守的非线性估算，保证用户能看到推进但不会承诺准确百分比。
+    pub current_source_work_total: Option<usize>,
+    /// 当前已经整理出的节点数量估算。
+    ///
+    /// 边界条件：
+    /// - 扫描过程中该值按来源根节点累计，最终完成后会用扁平树行数覆盖。
+    pub discovered_nodes: usize,
+    /// 当前已经发现的非致命错误数量。
+    pub error_count: usize,
+    /// 顶部或中央提示使用的中文状态文案。
+    pub message: String,
+}
+
+impl LogLoadProgress {
+    /// 创建加载进度初始快照。
+    ///
+    /// 业务意图：
+    /// - 系统路径选择器返回后立即进入加载态，即使后台线程尚未开始扫描，也要让用户看到确定的总来源数和加载文案。
+    pub fn new(total_sources: usize, message: impl Into<String>) -> Self {
+        Self {
+            total_sources,
+            processed_sources: 0,
+            current_source: None,
+            current_source_step: None,
+            current_entry: None,
+            current_source_work_done: 0,
+            current_source_work_total: None,
+            discovered_nodes: 0,
+            error_count: 0,
+            message: message.into(),
+        }
+    }
+
+    /// 返回进度条使用的完成比例。
+    ///
+    /// 边界条件：
+    /// - 空来源按完成处理；已完成数量超过总数时夹紧到 1.0，避免 UI 宽度越界。
+    pub fn fraction(&self) -> f32 {
+        if self.total_sources == 0 {
+            return 1.0;
+        }
+        if self.processed_sources >= self.total_sources {
+            return 1.0;
+        }
+
+        let completed_sources = self.processed_sources.min(self.total_sources) as f32;
+        let current_source_fraction = self.current_source_fraction();
+        ((completed_sources + current_source_fraction) / self.total_sources as f32).clamp(0.0, 1.0)
+    }
+
+    /// 返回四舍五入后的百分比。
+    ///
+    /// 业务意图：
+    /// - 中央加载提示需要比单纯动效更具体，百分比让用户知道本轮加载是否仍在推进。
+    pub fn percent(&self) -> usize {
+        (self.fraction() * 100.0).round().clamp(0.0, 100.0) as usize
+    }
+
+    /// 返回加载浮层底部使用的条目明细。
+    ///
+    /// 业务意图：
+    /// - 底部行按需求只显示百分比和条目进度，不能再包含来源。
+    pub fn entry_detail(&self) -> String {
+        format!("条目：{}", self.entry_progress_text())
+    }
+
+    /// 返回加载浮层使用的条目进度文本。
+    ///
+    /// 业务意图：
+    /// - ZIP/7Z 这类已知总数的压缩格式展示精确 `已处理 / 总数`。
+    /// - TAR/RAR 等顺序格式无法低成本预知总数，只展示已扫描条目数。
+    /// - 普通文件或目录没有压缩包条目概念时显示 `-`，避免把节点数或阶段文案混入加载浮层。
+    fn entry_progress_text(&self) -> String {
+        if let Some(total) = self.current_source_work_total.filter(|total| *total > 0) {
+            return format!("{} / {}", self.current_source_work_done.min(total), total);
+        }
+
+        if self.current_source_work_done > 0 {
+            return self.current_source_work_done.to_string();
+        }
+
+        "-".to_string()
+    }
+
+    /// 返回当前来源内部的完成比例。
+    ///
+    /// 业务意图：
+    /// - 多来源加载按“已完成来源 + 当前来源内部进度”合成总体百分比，避免单个大压缩包扫描时进度条不动。
+    ///
+    /// 边界条件：
+    /// - 已知总量时使用精确比例，并夹紧到 0.99，直到该来源真正完成才显示 100%。
+    /// - 未知总量时采用随条目数递增但不会到 1.0 的估算曲线，让 TAR/RAR 这类顺序格式展示“仍在推进”，同时不伪造准确完成时间。
+    fn current_source_fraction(&self) -> f32 {
+        if let Some(total) = self.current_source_work_total
+            && total > 0
+        {
+            return (self.current_source_work_done.min(total) as f32 / total as f32)
+                .clamp(0.0, 0.99);
+        }
+
+        if self.current_source_work_done == 0 {
+            return 0.0;
+        }
+
+        let done = self.current_source_work_done as f32;
+        (done / (done + 32.0)).clamp(0.0, 0.95)
+    }
+}
+
 /// 左侧目录树的一行真实加载节点。
 ///
 /// 业务意图：

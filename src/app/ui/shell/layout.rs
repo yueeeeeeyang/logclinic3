@@ -112,10 +112,10 @@ pub(in crate::app) const THREAD_ANALYSIS_SNAPSHOT_COLUMN_WIDTH: f32 = 24.0;
 /// - 用户要求色块高度保持不变且宽度与高度一致，因此使用固定 18px 正方形。
 pub(in crate::app) const THREAD_ANALYSIS_STATE_BLOCK_SIZE: f32 = 18.0;
 
-/// 线程分析图中最近一次点击跳转色块的强调色。
+/// 线程分析图中最近一次点击打开详情色块的强调色。
 ///
 /// 业务意图：
-/// - 点击跳转后的色块需要和 Java 线程状态色区分开，帮助用户回到分析窗口时快速确认刚才定位过哪一段日志。
+/// - 点击打开堆栈详情后的色块需要和 Java 线程状态色区分开，帮助用户快速确认当前详情窗口对应哪一段日志。
 /// - 这里使用玫红色，避开当前状态色中的绿色、红色、橙色、青色、紫色和灰色；明暗主题下都保持可辨识。
 pub(in crate::app) const THREAD_ANALYSIS_JUMPED_CELL_COLOR: u32 = 0xec4899;
 
@@ -809,6 +809,12 @@ pub(in crate::app) const SETTINGS_TAB_SIDEBAR_WIDTH: f32 = 132.0;
 /// 业务意图：
 /// - 线程堆栈通常包含多行调用栈，输入区需要在设置窗口内提供足够预览空间，同时不能挤掉标题和说明。
 pub(in crate::app) const THREAD_ANALYSIS_FILTER_TEXTAREA_HEIGHT: f32 = 300.0;
+
+/// 线程日志分析线程名过滤输入框高度。
+///
+/// 业务意图：
+/// - 默认线程名过滤只有数行，但用户可能维护更多通配规则；固定较矮高度并显示双向滚动条，避免日志设置页被短规则列表过度撑高。
+pub(in crate::app) const THREAD_ANALYSIS_NAME_FILTER_TEXTAREA_HEIGHT: f32 = 112.0;
 
 /// 设置页线程过滤输入区单行高度。
 ///

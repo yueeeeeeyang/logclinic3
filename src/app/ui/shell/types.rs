@@ -1528,6 +1528,19 @@ pub(in crate::app) struct ThreadAnalysisFilterLineLayout {
     pub(in crate::app) bounds: Bounds<Pixels>,
 }
 
+/// 线程日志分析设置页中可编辑的过滤输入类型。
+///
+/// 业务意图：
+/// - 线程名通配和完整堆栈片段现在分别使用独立输入框，但两者仍共享多行自绘、IME、选择和滚动逻辑。
+/// - 用显式枚举作为状态索引，避免后续新增输入框时继续复制大段键盘和鼠标处理代码。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::app) enum ThreadAnalysisFilterInputKind {
+    /// 线程名通配列表输入框，每行或英文逗号分隔一个线程名规则。
+    ThreadName,
+    /// 线程堆栈片段输入框，空行分隔多段连续匹配片段。
+    Stack,
+}
+
 /// 系统右键菜单集成在设置页中的异步状态。
 ///
 /// 业务意图：

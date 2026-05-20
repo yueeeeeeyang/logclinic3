@@ -7,6 +7,13 @@
 use super::*;
 use std::sync::mpsc;
 
+/// 日志来源加载进度轮询间隔。
+///
+/// 业务意图：
+/// - 后台目录扫描不能直接从工作线程操作 GPUI 状态；主线程以固定节奏读取最新进度快照即可让中央进度条平滑更新。
+/// - 80ms 对用户来说足够及时，同时不会在加载大量小文件时造成无意义的重绘风暴。
+const LOG_SOURCE_LOAD_PROGRESS_POLL_INTERVAL: Duration = Duration::from_millis(80);
+
 /// 插件主导航按钮渲染快照。
 ///
 /// 业务意图：
@@ -823,7 +830,7 @@ impl MainView {
     ///
     /// 边界条件：
     /// - 用户取消选择时保持现有目录树不变。
-    /// - 当前不支持取消后台扫描；如果用户连续触发多次加载，后完成的任务会覆盖先完成的任务。
+    /// - 当前不主动取消后台扫描；如果用户连续触发多次加载，加载代次会丢弃旧任务迟到的结果。
     pub(in crate::app) fn begin_path_prompt(
         &mut self,
         prompt_kind: LoadPromptKind,
@@ -842,6 +849,7 @@ impl MainView {
                     Ok(receiver) => receiver,
                     Err(error) => {
                         view.update(app, |view, context| {
+                            view.log.load_progress = None;
                             view.log.load_state = LogTreeLoadState::Failed {
                                 message: format!("无法打开系统路径选择器：{}", error),
                             };
@@ -857,6 +865,7 @@ impl MainView {
                     Ok(Ok(_)) => return,
                     Ok(Err(error)) => {
                         view.update(app, |view, context| {
+                            view.log.load_progress = None;
                             view.log.load_state = LogTreeLoadState::Failed {
                                 message: format!("路径选择器返回错误：{}", error),
                             };
@@ -867,6 +876,7 @@ impl MainView {
                     }
                     Err(error) => {
                         view.update(app, |view, context| {
+                            view.log.load_progress = None;
                             view.log.load_state = LogTreeLoadState::Failed {
                                 message: format!("路径选择器被中断：{}", error),
                             };
@@ -905,19 +915,68 @@ impl MainView {
         }
 
         self.clear_workspace_for_new_log_load(context);
+        self.log.load_generation = self.log.load_generation.saturating_add(1);
+        let generation = self.log.load_generation;
+        let initial_progress = LogLoadProgress::new(selected_paths.len(), loading_message.clone());
+        let progress_snapshot = Arc::new(std::sync::Mutex::new(initial_progress.clone()));
+        let task_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.log.load_state = LogTreeLoadState::Loading {
             message: loading_message,
         };
+        self.log.load_progress = Some(initial_progress);
         context.notify();
+
+        let progress_snapshot_for_poll = Arc::clone(&progress_snapshot);
+        let task_finished_for_poll = Arc::clone(&task_finished);
+        context
+            .spawn(async move |view, app| {
+                loop {
+                    app.background_executor()
+                        .timer(LOG_SOURCE_LOAD_PROGRESS_POLL_INTERVAL)
+                        .await;
+                    if task_finished_for_poll.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let progress = progress_snapshot_for_poll
+                        .lock()
+                        .ok()
+                        .map(|guard| guard.clone());
+                    let Some(progress) = progress else {
+                        continue;
+                    };
+                    view.update(app, move |view, context| {
+                        if view.log.load_generation == generation
+                            && matches!(view.log.load_state, LogTreeLoadState::Loading { .. })
+                        {
+                            view.log.load_progress = Some(progress);
+                            context.notify();
+                        }
+                    })
+                    .ok();
+                }
+            })
+            .detach();
 
         context
             .spawn(async move |view, app| {
+                let progress_for_worker = Arc::clone(&progress_snapshot);
                 let load_result = app
                     .background_executor()
-                    .spawn(async move { load_log_sources(selected_paths) })
+                    .spawn(async move {
+                        load_log_sources_with_progress(selected_paths, |progress| {
+                            if let Ok(mut current_progress) = progress_for_worker.lock() {
+                                *current_progress = progress;
+                            }
+                        })
+                    })
                     .await;
+                task_finished.store(true, std::sync::atomic::Ordering::Relaxed);
 
                 view.update(app, |view, context| {
+                    if view.log.load_generation != generation {
+                        return;
+                    }
+                    view.log.load_progress = None;
                     view.log.load_state = match load_result {
                         Ok(tree) => {
                             view.log.log_tree_scroll_handle = UniformListScrollHandle::new();
@@ -957,15 +1016,17 @@ impl MainView {
     /// - 清理集中在一个函数里，避免后续新增右侧工作区状态时只清 tab、漏掉搜索结果或弹层。
     ///
     /// 边界条件：
-    /// - 搜索窗口本身不强制关闭，保留用户输入的关键字；但正在运行的搜索会被置为无效，旧后台回调无法继续写回结果面板。
+    /// - 依赖旧日志来源的独立窗口会被关闭；设置、插件和笔记等会话级窗口不属于旧日志上下文，不在这里处理。
     /// - 只清理会引用旧日志来源的数据，不重置主题、窗口、左侧宽度等会话级偏好。
     pub(in crate::app) fn clear_workspace_for_new_log_load(&mut self, context: &mut Context<Self>) {
+        self.close_log_related_windows_for_new_log_load(context);
         for tab in &self.log.open_tabs {
             Self::cleanup_tab_paged_resources(tab);
         }
         if let LogTreeLoadState::Loaded(tree_state) = &self.log.load_state {
             tree_state.cleanup_temporary_paths();
         }
+        self.log.load_progress = None;
         self.log.open_tabs.clear();
         self.clear_log_minimap_cache(context);
         self.log.active_tab_id = None;
@@ -989,6 +1050,43 @@ impl MainView {
         self.search.next_search_job_id += 1;
         if let Some(dialog) = self.search.search_dialog.as_mut() {
             Self::reset_search_dialog_for_log_reload(dialog);
+        }
+    }
+
+    /// 关闭依赖旧日志来源的辅助窗口。
+    ///
+    /// 业务意图：
+    /// - 重新加载日志后，搜索窗口、线程分析窗口、线程堆栈详情窗口和日志智能分析窗口里的内容都来自旧来源，继续显示会造成误判。
+    /// - 统一在加载前关闭这些窗口，同时清理主视图保存的窗口句柄，避免后续点击复用已经失效的旧窗口。
+    ///
+    /// 边界条件：
+    /// - 设置窗口、插件声明式页面、笔记窗口和 HPROF 页面不一定依赖当前日志来源，不在这里强制关闭。
+    /// - 旧线程分析后台任务可能稍后返回，因此这里同步递增分析代次，确保迟到结果不会重新打开已关闭窗口。
+    fn close_log_related_windows_for_new_log_load(&mut self, context: &mut Context<Self>) {
+        if let Some(search_window) = self.search.search_dialog_window.take() {
+            let _ = search_window.update(context, |_, window, _| {
+                window.remove_window();
+            });
+        }
+        self.search.search_dialog_open_pending = false;
+        self.clear_search_dialog_state(true, context);
+
+        self.thread_analysis_generation = self.thread_analysis_generation.saturating_add(1);
+        if let Some(thread_window) = self.thread_analysis_window.take() {
+            let _ = thread_window.update(context, |thread_view, window, context| {
+                if let Some(stack_window) = thread_view.stack_window.take() {
+                    let _ = stack_window.update(context, |_, stack_window, _| {
+                        stack_window.remove_window();
+                    });
+                }
+                window.remove_window();
+            });
+        }
+
+        if let Some(analysis_window) = self.log_ai_analysis_window.take() {
+            let _ = analysis_window.update(context, |_, window, _| {
+                window.remove_window();
+            });
         }
     }
 

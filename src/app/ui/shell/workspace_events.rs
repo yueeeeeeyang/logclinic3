@@ -445,23 +445,63 @@ impl MainView {
     pub(in crate::app) fn render_primary_content_message(&self) -> impl IntoElement {
         let palette = self.palette();
         if let LogTreeLoadState::Loading { message } = &self.log.load_state {
+            // 加载状态仍保留原始 message 给失败兜底和状态流转使用；当前浮层按需求只展示百分比、来源和条目进度。
+            let _loading_state_message = message;
+            let progress = self.log.load_progress.as_ref();
+            let progress_fraction = progress
+                .map(LogLoadProgress::fraction)
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+            let progress_percent = progress.map(LogLoadProgress::percent).unwrap_or(0);
+            let progress_detail = progress
+                .map(LogLoadProgress::entry_detail)
+                .unwrap_or_else(|| "条目：-".to_string());
             return div()
                 .id("primary-content-loading-message")
                 .flex()
                 .flex_col()
                 .items_center()
                 .justify_center()
-                .gap_2()
+                .gap_3()
                 .size_full()
                 .px_4()
                 .bg(rgb(palette.background))
                 .child(Self::render_loading_spinner(palette.accent))
                 .child(
                     div()
-                        .text_sm()
-                        .text_color(rgb(palette.muted_text))
+                        .w(px(360.0))
+                        .max_w(relative(0.56))
+                        .flex()
+                        .flex_col()
+                        .gap_2()
                         .text_center()
-                        .child(message.clone()),
+                        .child(
+                            div()
+                                .relative()
+                                .h(px(8.0))
+                                .w_full()
+                                .overflow_hidden()
+                                .rounded(px(999.0))
+                                .bg(rgb(palette.panel))
+                                .border_1()
+                                .border_color(rgb(palette.border))
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left(px(0.0))
+                                        .top(px(0.0))
+                                        .bottom(px(0.0))
+                                        .w(relative(progress_fraction))
+                                        .rounded(px(999.0))
+                                        .bg(rgb(palette.accent)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(palette.muted_text))
+                                .child(format!("{progress_percent}% · {progress_detail}")),
+                        ),
                 );
         }
 

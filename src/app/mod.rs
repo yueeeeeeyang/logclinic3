@@ -51,18 +51,21 @@ use crate::shell_integration::{
 };
 use crate::theme::{AppThemePalette, EffectiveTheme, ThemePreference};
 use crate::thread_analysis::{
-    ThreadAnalysisData, ThreadAnalysisFilterRule, ThreadStateKind, ThreadTimelineCell,
-    analyze_thread_dump_sources, parse_thread_analysis_filter_rules,
+    ThreadAnalysisData, ThreadAnalysisFilterRule, ThreadAnalysisProgress, ThreadStateKind,
+    ThreadTimelineCell, analyze_thread_dump_sources_with_progress,
+    parse_thread_analysis_filter_rules, parse_thread_analysis_name_filter_rules,
     visible_thread_indexes_for_state_kinds,
 };
 #[cfg(test)]
 use crate::thread_analysis::{
-    ThreadSnapshot, ThreadStateSample, build_thread_analysis_data, parse_thread_dump_snapshots,
-    thread_stack_matches_filter_rule,
+    ThreadAnalysisFilterRuleKind, ThreadSnapshot, ThreadStateSample, build_thread_analysis_data,
+    parse_thread_dump_snapshots, thread_name_matches_filter_rule, thread_stack_matches_filter_rule,
+    wildcard_pattern_matches_text,
 };
 use crate::{
     log_loader::{
-        LoadedLogTree, LogTreeEntryKind, LogTreeRow as LoadedLogTreeRow, load_log_sources,
+        LoadedLogTree, LogLoadProgress, LogTreeEntryKind, LogTreeRow as LoadedLogTreeRow,
+        load_log_sources_with_progress,
     },
     log_source::LogFileSource,
 };

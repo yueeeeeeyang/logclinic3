@@ -47,6 +47,21 @@ impl NavigationState {
 pub(in crate::app) struct LogWorkspaceState {
     /// 左侧日志目录树当前的数据状态。
     pub(in crate::app) load_state: LogTreeLoadState,
+    /// 当前日志来源加载进度。
+    ///
+    /// 业务意图：
+    /// - 目录树加载在后台线程执行，UI 通过该快照在屏幕中央展示具体来源进度和节点数量。
+    /// - 该字段只在 `Loading` 状态下有意义；加载完成、失败或重新清理工作区时必须置空，避免旧进度覆盖新状态。
+    ///
+    /// 边界条件：
+    /// - 进度来自后台线程的克隆快照，不直接持有路径遍历器或压缩包资源，跨平台不会引入额外文件句柄生命周期问题。
+    pub(in crate::app) load_progress: Option<LogLoadProgress>,
+    /// 当前日志来源加载任务代次。
+    ///
+    /// 业务意图：
+    /// - 用户可能在上一轮后台扫描尚未完成时再次加载新日志；代次用于丢弃旧任务迟到的进度和结果。
+    /// - 重新加载日志时也会用它让旧线程分析窗口和后台进度失效，避免旧窗口在新工作区中重新出现。
+    pub(in crate::app) load_generation: usize,
     /// 左侧目录树虚拟列表的滚动句柄。
     pub(in crate::app) log_tree_scroll_handle: UniformListScrollHandle,
     /// 左侧目录树当前选中的节点 ID 集合。
@@ -112,6 +127,8 @@ impl LogWorkspaceState {
     pub(in crate::app) fn new(context: &mut Context<MainView>) -> Self {
         Self {
             load_state: LogTreeLoadState::Empty,
+            load_progress: None,
+            load_generation: 0,
             log_tree_scroll_handle: UniformListScrollHandle::new(),
             log_tree_selected_node_ids: HashSet::new(),
             log_tree_search: LogTreeSearchState::new(context),
@@ -245,7 +262,18 @@ pub(in crate::app) struct SettingsState {
     /// - 注册和卸载右键菜单是跨会话平台副作用，设置页需要明确展示当前状态和执行中反馈。
     /// - 状态只存在于当前 UI 会话，不写入配置文件；真实来源始终是平台注册表或 LaunchServices 查询结果。
     pub(in crate::app) shell_integration_state: ShellIntegrationUiState,
-    /// 线程日志分析过滤配置原文。
+    /// 线程日志分析线程名过滤配置原文。
+    ///
+    /// 业务意图：
+    /// - 线程名规则通常是短通配列表，和完整堆栈过滤分开保存，便于设置页用独立输入框编辑。
+    /// - 文本仍保持多行原文，解析时按行和英文逗号拆分，避免 UI 状态提前固化规则结构。
+    pub(in crate::app) thread_analysis_name_filter_text: String,
+    /// 进入编辑前的线程名过滤配置快照。
+    ///
+    /// 业务意图：
+    /// - 设置页两个过滤输入框共享一个编辑/保存按钮；保存前如果关闭窗口，需要同时恢复线程名和堆栈草稿。
+    pub(in crate::app) thread_analysis_name_filter_saved_text_before_edit: Option<String>,
+    /// 线程日志分析堆栈过滤配置原文。
     pub(in crate::app) thread_analysis_filter_text: String,
     /// 线程日志分析过滤输入区是否处于编辑状态。
     pub(in crate::app) thread_analysis_filter_is_editing: bool,
@@ -265,17 +293,30 @@ pub(in crate::app) struct SettingsState {
     pub(in crate::app) quick_search_keywords_last_bounds: Option<Bounds<Pixels>>,
     /// 快搜关键字输入区拖拽选择锚点。
     pub(in crate::app) quick_search_keywords_selection_drag: Option<usize>,
-    /// 线程日志分析过滤输入区的选择范围。
+    /// 线程名过滤输入区的选择范围。
+    pub(in crate::app) thread_analysis_name_filter_selection_range: Range<usize>,
+    /// 线程名过滤输入区的输入法组合文本范围。
+    pub(in crate::app) thread_analysis_name_filter_marked_range: Option<Range<usize>>,
+    /// 线程名过滤输入区焦点句柄。
+    pub(in crate::app) thread_analysis_name_filter_focus: gpui::FocusHandle,
+    /// 线程名过滤输入区最近一次绘制的逐行布局。
+    pub(in crate::app) thread_analysis_name_filter_last_layouts:
+        Vec<ThreadAnalysisFilterLineLayout>,
+    /// 线程名过滤输入区最近一次整体绘制边界。
+    pub(in crate::app) thread_analysis_name_filter_last_bounds: Option<Bounds<Pixels>>,
+    /// 线程名过滤输入区拖拽选择锚点。
+    pub(in crate::app) thread_analysis_name_filter_selection_drag: Option<usize>,
+    /// 线程堆栈过滤输入区的选择范围。
     pub(in crate::app) thread_analysis_filter_selection_range: Range<usize>,
-    /// 线程日志分析过滤输入区的输入法组合文本范围。
+    /// 线程堆栈过滤输入区的输入法组合文本范围。
     pub(in crate::app) thread_analysis_filter_marked_range: Option<Range<usize>>,
-    /// 线程日志分析过滤输入区焦点句柄。
+    /// 线程堆栈过滤输入区焦点句柄。
     pub(in crate::app) thread_analysis_filter_focus: gpui::FocusHandle,
-    /// 线程日志分析过滤输入区最近一次绘制的逐行布局。
+    /// 线程堆栈过滤输入区最近一次绘制的逐行布局。
     pub(in crate::app) thread_analysis_filter_last_layouts: Vec<ThreadAnalysisFilterLineLayout>,
-    /// 线程日志分析过滤输入区最近一次整体绘制边界。
+    /// 线程堆栈过滤输入区最近一次整体绘制边界。
     pub(in crate::app) thread_analysis_filter_last_bounds: Option<Bounds<Pixels>>,
-    /// 线程日志分析过滤输入区拖拽选择锚点。
+    /// 线程堆栈过滤输入区拖拽选择锚点。
     pub(in crate::app) thread_analysis_filter_selection_drag: Option<usize>,
     /// 存储页扫描和操作状态。
     ///
@@ -474,6 +515,8 @@ impl SettingsState {
             log_viewer_font_size: load_log_viewer_font_size_preference(),
             log_minimap_enabled: load_log_minimap_enabled_preference(),
             shell_integration_state: ShellIntegrationUiState::Unknown,
+            thread_analysis_name_filter_text: load_thread_analysis_name_filter_preference(),
+            thread_analysis_name_filter_saved_text_before_edit: None,
             thread_analysis_filter_text: load_thread_analysis_filter_preference(),
             thread_analysis_filter_is_editing: false,
             thread_analysis_filter_saved_text_before_edit: None,
@@ -486,6 +529,12 @@ impl SettingsState {
             quick_search_keywords_last_layout: None,
             quick_search_keywords_last_bounds: None,
             quick_search_keywords_selection_drag: None,
+            thread_analysis_name_filter_selection_range: 0..0,
+            thread_analysis_name_filter_marked_range: None,
+            thread_analysis_name_filter_focus: context.focus_handle(),
+            thread_analysis_name_filter_last_layouts: Vec::new(),
+            thread_analysis_name_filter_last_bounds: None,
+            thread_analysis_name_filter_selection_drag: None,
             thread_analysis_filter_selection_range: 0..0,
             thread_analysis_filter_marked_range: None,
             thread_analysis_filter_focus: context.focus_handle(),

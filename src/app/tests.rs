@@ -1654,12 +1654,12 @@ mod state_tests {
         }
     }
 
-    /// 验证线程分析过滤配置缺失时回退到内置默认堆栈。
+    /// 验证线程分析堆栈过滤配置缺失时回退到内置默认堆栈规则。
     ///
     /// 业务意图：
-    /// - 首次使用线程分析时应默认过滤常见 Resin 网络线程，减少时间线噪声，同时不要求用户先进入设置维护规则。
+    /// - 首次使用线程分析时应默认过滤 Resin 网络线程堆栈，减少时间线噪声，同时不要求用户先进入设置维护规则。
     #[test]
-    fn 线程分析过滤配置缺失返回默认堆栈() {
+    fn 线程分析过滤配置缺失返回默认规则() {
         let path =
             test_thread_analysis_filter_file_path("missing").join(THREAD_ANALYSIS_FILTER_FILE_NAME);
 
@@ -1667,6 +1667,23 @@ mod state_tests {
         assert_eq!(text, DEFAULT_THREAD_ANALYSIS_FILTER_TEXT);
         assert!(text.contains("TcpSocketAcceptThread.run"));
         assert!(text.contains("SocketInputStream.socketRead0"));
+    }
+
+    /// 验证线程分析线程名过滤配置缺失时回退到内置默认线程名规则。
+    ///
+    /// 业务意图：
+    /// - 线程名过滤已经独立成单独输入框和配置文件，缺失文件时仍要默认过滤常见 JVM 常驻线程。
+    #[test]
+    fn 线程分析线程名过滤配置缺失返回默认规则() {
+        let path = test_thread_analysis_filter_file_path("name-missing")
+            .join(THREAD_ANALYSIS_NAME_FILTER_FILE_NAME);
+
+        let text = read_thread_analysis_name_filter_preference(&path);
+        assert_eq!(text, DEFAULT_THREAD_ANALYSIS_NAME_FILTER_TEXT);
+        assert!(text.contains("C1 CompilerThread*"));
+        assert!(text.contains("C2 CompilerThread*"));
+        assert!(text.contains("Service Thread"));
+        assert!(text.contains("Attach Listener"));
     }
 
     /// 验证线程分析过滤配置的空文件会覆盖默认堆栈。
@@ -1701,6 +1718,28 @@ mod state_tests {
         assert_eq!(
             read_thread_analysis_filter_preference(&path),
             "\"worker\" #1\n  at demo.A.run\n"
+        );
+
+        let _ = fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    /// 验证线程名过滤配置可以保存多行文本并规范化换行。
+    ///
+    /// 业务意图：
+    /// - 线程名规则在设置页单独输入，读写函数必须和堆栈过滤保持相同 CRLF 规范化行为。
+    #[test]
+    fn 线程分析线程名过滤配置多行读写往返并规范化换行() {
+        let path = test_thread_analysis_filter_file_path("name-roundtrip")
+            .join(THREAD_ANALYSIS_NAME_FILTER_FILE_NAME);
+
+        write_thread_analysis_name_filter_preference(&path, "C1 CompilerThread*\r\nService Thread")
+            .expect("线程名过滤配置应能写入临时目录");
+        assert_eq!(
+            read_thread_analysis_name_filter_preference(&path),
+            "C1 CompilerThread*\nService Thread"
         );
 
         let _ = fs::remove_file(&path);
@@ -2311,6 +2350,12 @@ mod state_tests {
             "   java.lang.Thread.State: RUNNABLE".to_string(),
             "\"worker\" #2 prio=5".to_string(),
             "   java.lang.Thread.State: WAITING (parking)".to_string(),
+            "线程日志打印时间：2026-05-07 11:02:10".to_string(),
+            "Full thread dump Java HotSpot(TM) 64-Bit Server VM:".to_string(),
+            "\"pool-1-thread-1\" #1 prio=5".to_string(),
+            "   java.lang.Thread.State: RUNNABLE".to_string(),
+            "\"worker\" #2 prio=5".to_string(),
+            "   java.lang.Thread.State: WAITING (parking)".to_string(),
         ];
 
         let source = LogFileSource::LocalFile {
@@ -2319,7 +2364,7 @@ mod state_tests {
         let snapshots = parse_thread_dump_snapshots(&lines, "thread.log", 0, &source);
         let analysis = build_thread_analysis_data(1, 0, snapshots, &[]);
 
-        assert_eq!(analysis.snapshots.len(), 1);
+        assert_eq!(analysis.snapshots.len(), 2);
         assert_eq!(analysis.snapshots[0].label, "2026-05-07 11:01:10");
         assert_eq!(analysis.thread_names, vec!["pool-1-thread-1", "worker"]);
         let first_cell = analysis.matrix[0][0]
@@ -2329,6 +2374,7 @@ mod state_tests {
         assert_eq!(first_cell.thread_id.as_deref(), Some("#1"));
         assert_eq!(first_cell.line_index, 2);
         assert_eq!(first_cell.preview_lines.len(), 2);
+        assert_eq!(first_cell.stack_lines.len(), 2);
         assert_eq!(
             analysis.matrix[1][0].as_ref().map(|cell| cell.state),
             Some(ThreadStateKind::Waiting)
@@ -2352,6 +2398,7 @@ mod state_tests {
             "\"worker\" #1\r\n  at demo.A.run\r\n\r\n\"timer\" #2\n  at demo.Timer.sleep",
         );
         assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].kind, ThreadAnalysisFilterRuleKind::StackLines);
         assert_eq!(
             rules[0].lines,
             vec!["\"worker\" #1".to_string(), "at demo.A.run".to_string()]
@@ -2375,25 +2422,114 @@ mod state_tests {
         ));
     }
 
-    /// 验证内置默认过滤堆栈会解析为两条独立规则。
+    /// 验证堆栈过滤输入框中的单行规则不会被误解析为线程名通配。
     ///
     /// 业务意图：
-    /// - 默认配置包含 accept 和 keepalive 两类 Resin 网络线程，必须用空行拆成两条规则，避免用户只想调整其中一类时难以理解匹配结果。
+    /// - 线程名过滤已经拆成独立输入框；堆栈过滤输入框里即使只有一行线程头或方法片段，也必须按堆栈连续片段匹配。
+    /// - 这能避免用户只粘贴线程头时规则变成 `ThreadNamePattern` 后被堆栈匹配逻辑忽略。
     #[test]
-    fn 线程分析默认过滤堆栈解析为两条规则() {
-        let rules =
-            MainView::parse_thread_analysis_filter_rules(DEFAULT_THREAD_ANALYSIS_FILTER_TEXT);
+    fn 线程分析单行堆栈过滤仍保持堆栈规则() {
+        let rules = MainView::parse_thread_analysis_filter_rules("\"worker\" #1 prio=5");
 
-        assert_eq!(rules.len(), 2);
-        assert_eq!(rules[0].lines[0], "java.lang.Thread.State: RUNNABLE");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].kind, ThreadAnalysisFilterRuleKind::StackLines);
+        assert_eq!(rules[0].lines, vec!["\"worker\" #1 prio=5".to_string()]);
+        assert!(thread_stack_matches_filter_rule(
+            &[
+                "\"worker\" #1 prio=5".to_string(),
+                "java.lang.Thread.State: RUNNABLE".to_string(),
+            ],
+            &rules[0],
+        ));
+        assert!(!thread_name_matches_filter_rule("worker", &rules[0]));
+    }
+
+    /// 验证线程名通配过滤规则支持精确和星号匹配。
+    ///
+    /// 业务意图：
+    /// - 用户可以在设置页直接配置 `C2 CompilerThread*` 这类 JVM 常驻线程名模式，不需要粘贴完整线程堆栈。
+    #[test]
+    fn 线程分析过滤规则支持线程名通配匹配() {
+        let rules = MainView::parse_thread_analysis_name_filter_rules(
+            "C2 CompilerThread*\nService Thread, Attach Listener",
+        );
+
+        assert_eq!(rules.len(), 3);
+        assert_eq!(
+            rules[0].kind,
+            ThreadAnalysisFilterRuleKind::ThreadNamePattern
+        );
+        assert!(thread_name_matches_filter_rule(
+            "C2 CompilerThread7",
+            &rules[0]
+        ));
+        assert!(!thread_name_matches_filter_rule(
+            "C1 CompilerThread7",
+            &rules[0]
+        ));
+        assert!(thread_name_matches_filter_rule("Service Thread", &rules[1]));
+        assert!(thread_name_matches_filter_rule(
+            "Attach Listener",
+            &rules[2]
+        ));
+        assert!(wildcard_pattern_matches_text(
+            "pool-*-thread-*",
+            "pool-2-thread-16"
+        ));
+        assert!(!wildcard_pattern_matches_text(
+            "pool-*-worker",
+            "pool-2-thread-16"
+        ));
+    }
+
+    /// 验证线程分析过滤输入区宽度估算会随最长行增长。
+    ///
+    /// 业务意图：
+    /// - 设置页线程名和堆栈输入框都要求在内容超出可视范围时显示横向滚动条；布局阶段需要根据最长行估算子元素宽度。
+    /// - 制表符按四列估算，避免含 tab 的堆栈行被低估后右侧内容无法滚动查看。
+    #[test]
+    fn 线程分析过滤输入区宽度估算随长行增长() {
+        let short_width = MainView::estimated_thread_analysis_filter_text_width("short");
+        let long_width = MainView::estimated_thread_analysis_filter_text_width(
+            "short\nvery-long-thread-name-with-many-columns\tend",
+        );
+
+        assert!(long_width > short_width);
+    }
+
+    /// 验证内置默认过滤规则会解析为独立线程名规则和两条堆栈规则。
+    ///
+    /// 业务意图：
+    /// - 默认线程名配置和默认堆栈配置分开保存，但分析时会合并成同一组规则；这里锁定合并后的规则类型顺序。
+    #[test]
+    fn 线程分析默认过滤规则解析为线程名和堆栈规则() {
+        let mut rules = MainView::parse_thread_analysis_name_filter_rules(
+            DEFAULT_THREAD_ANALYSIS_NAME_FILTER_TEXT,
+        );
+        rules.extend(MainView::parse_thread_analysis_filter_rules(
+            DEFAULT_THREAD_ANALYSIS_FILTER_TEXT,
+        ));
+
+        assert_eq!(rules.len(), 6);
+        assert_eq!(
+            rules[0].kind,
+            ThreadAnalysisFilterRuleKind::ThreadNamePattern
+        );
+        assert_eq!(rules[0].lines[0], "C1 CompilerThread*");
+        assert_eq!(rules[1].lines[0], "C2 CompilerThread*");
+        assert_eq!(rules[2].lines[0], "Service Thread");
+        assert_eq!(rules[3].lines[0], "Attach Listener");
+        assert_eq!(rules[4].kind, ThreadAnalysisFilterRuleKind::StackLines);
+        assert_eq!(rules[4].lines[0], "java.lang.Thread.State: RUNNABLE");
         assert!(
-            rules[0]
+            rules[4]
                 .lines
                 .iter()
                 .any(|line| line.contains("PlainSocketImpl.socketAccept"))
         );
+        assert_eq!(rules[5].kind, ThreadAnalysisFilterRuleKind::StackLines);
         assert!(
-            rules[1]
+            rules[5]
                 .lines
                 .iter()
                 .any(|line| line.contains("SocketInputStream.socketRead0"))
@@ -2414,6 +2550,10 @@ mod state_tests {
             "\"business-thread\" #2 prio=5".to_string(),
             "   java.lang.Thread.State: RUNNABLE".to_string(),
             "        at demo.Business.run(Business.java:20)".to_string(),
+            "Full thread dump Java HotSpot(TM) 64-Bit Server VM:".to_string(),
+            "\"business-thread\" #2 prio=5".to_string(),
+            "   java.lang.Thread.State: RUNNABLE".to_string(),
+            "        at demo.Business.run(Business.java:20)".to_string(),
         ];
         let source = LogFileSource::LocalFile {
             path: PathBuf::from("thread.log"),
@@ -2422,6 +2562,37 @@ mod state_tests {
         let rules = MainView::parse_thread_analysis_filter_rules(
             "\"noise-thread\" #1 prio=5\njava.lang.Thread.State: RUNNABLE\nat demo.Noise.loop(Noise.java:10)",
         );
+
+        let analysis = build_thread_analysis_data(1, 0, snapshots, &rules);
+
+        assert_eq!(analysis.thread_names, vec!["business-thread"]);
+        assert_eq!(analysis.matrix.len(), 1);
+        assert!(analysis.summary.contains("过滤 1 个线程"));
+    }
+
+    /// 验证线程分析会把命中线程名通配规则的线程从矩阵中移除。
+    ///
+    /// 业务意图：
+    /// - JVM 编译线程、Service Thread 和 Attach Listener 这类线程通常只靠线程名即可识别，过滤必须发生在线程名聚合之前。
+    #[test]
+    fn 线程分析过滤命中线程名通配后移除线程() {
+        let lines = vec![
+            "Full thread dump Java HotSpot(TM) 64-Bit Server VM:".to_string(),
+            "\"C2 CompilerThread7\" #1 prio=9".to_string(),
+            "   java.lang.Thread.State: RUNNABLE".to_string(),
+            "\"business-thread\" #2 prio=5".to_string(),
+            "   java.lang.Thread.State: RUNNABLE".to_string(),
+            "        at demo.Business.run(Business.java:20)".to_string(),
+            "Full thread dump Java HotSpot(TM) 64-Bit Server VM:".to_string(),
+            "\"business-thread\" #2 prio=5".to_string(),
+            "   java.lang.Thread.State: RUNNABLE".to_string(),
+            "        at demo.Business.run(Business.java:20)".to_string(),
+        ];
+        let source = LogFileSource::LocalFile {
+            path: PathBuf::from("thread.log"),
+        };
+        let snapshots = parse_thread_dump_snapshots(&lines, "thread.log", 0, &source);
+        let rules = MainView::parse_thread_analysis_name_filter_rules("C2 CompilerThread*");
 
         let analysis = build_thread_analysis_data(1, 0, snapshots, &rules);
 
@@ -2456,6 +2627,193 @@ mod state_tests {
         assert!(analysis.matrix.is_empty());
         assert!(analysis.summary.contains("1 个快照"));
         assert!(analysis.summary.contains("过滤 1 个线程"));
+    }
+
+    /// 验证线程分析默认隐藏在选中日志中只出现一次的线程。
+    ///
+    /// 业务意图：
+    /// - 单次出现的线程通常是短暂任务或噪声；默认隐藏可以减少时间线纵轴数量，突出重复出现的线程。
+    /// - 该规则不再依赖线程是否跨文件，只要同一线程在选中日志快照中出现超过一次就保留。
+    #[test]
+    fn 线程分析默认隐藏只出现一次的线程() {
+        let sample = |name: &str, state: ThreadStateKind| ThreadStateSample {
+            name: name.to_string(),
+            thread_id: None,
+            state,
+            line_index: 0,
+            preview_lines: vec![format!("\"{name}\"")],
+            stack_lines: vec![format!("\"{name}\"")],
+        };
+        let source = LogFileSource::LocalFile {
+            path: PathBuf::from("thread.log"),
+        };
+        let snapshots = vec![
+            ThreadSnapshot {
+                label: "第一个快照".to_string(),
+                source_index: 0,
+                source: source.clone(),
+                threads: vec![
+                    sample("repeat-thread", ThreadStateKind::Runnable),
+                    sample("once-thread", ThreadStateKind::Runnable),
+                ],
+            },
+            ThreadSnapshot {
+                label: "第二个快照".to_string(),
+                source_index: 0,
+                source,
+                threads: vec![sample("repeat-thread", ThreadStateKind::Waiting)],
+            },
+        ];
+
+        let analysis = build_thread_analysis_data(1, 0, snapshots, &[]);
+
+        assert_eq!(analysis.thread_names, vec!["repeat-thread"]);
+        assert_eq!(analysis.matrix.len(), 1);
+        assert!(analysis.summary.contains("过滤 1 个线程"));
+    }
+
+    /// 验证线程分析结果按线程命中次数从高到低排序。
+    ///
+    /// 业务意图：
+    /// - 高频出现的线程更可能是排障入口，结果列表应把这类线程放在上方，而不是只按首次出现顺序排列。
+    /// - 命中次数相同时仍保持首次出现顺序，避免相同数据在重复解析时排序抖动。
+    #[test]
+    fn 线程分析结果按命中次数降序排序() {
+        let sample = |name: &str, state: ThreadStateKind| ThreadStateSample {
+            name: name.to_string(),
+            thread_id: None,
+            state,
+            line_index: 0,
+            preview_lines: vec![format!("\"{name}\"")],
+            stack_lines: vec![format!("\"{name}\"")],
+        };
+        let source = LogFileSource::LocalFile {
+            path: PathBuf::from("thread.log"),
+        };
+        let snapshots = vec![
+            ThreadSnapshot {
+                label: "第一个快照".to_string(),
+                source_index: 0,
+                source: source.clone(),
+                threads: vec![
+                    sample("warm-thread", ThreadStateKind::Runnable),
+                    sample("hot-thread", ThreadStateKind::Runnable),
+                ],
+            },
+            ThreadSnapshot {
+                label: "第二个快照".to_string(),
+                source_index: 0,
+                source: source.clone(),
+                threads: vec![
+                    sample("warm-thread", ThreadStateKind::Waiting),
+                    sample("hot-thread", ThreadStateKind::Runnable),
+                ],
+            },
+            ThreadSnapshot {
+                label: "第三个快照".to_string(),
+                source_index: 0,
+                source,
+                threads: vec![sample("hot-thread", ThreadStateKind::Blocked)],
+            },
+        ];
+
+        let analysis = build_thread_analysis_data(1, 0, snapshots, &[]);
+
+        assert_eq!(analysis.thread_names, vec!["hot-thread", "warm-thread"]);
+        assert_eq!(
+            analysis.matrix[0][2]
+                .as_ref()
+                .map(|cell| cell.thread_name.as_str()),
+            Some("hot-thread")
+        );
+    }
+
+    /// 验证线程分析窗口按当前可见状态的命中次数排序。
+    ///
+    /// 业务意图：
+    /// - 数据矩阵会按所有状态的总命中次数排序，但窗口默认只显示 RUNNABLE 状态。
+    /// - 当用户只看 RUNNABLE 时，行顺序应按绿色色块数量从高到低排列，隐藏的 WAITING/BLOCKED 命中不能把低频可见线程顶到前面。
+    /// - 当前状态下只有一个可见命中的线程也应隐藏，避免单次 RUNNABLE 噪声继续出现在默认结果里。
+    #[test]
+    fn 线程分析可见行按当前状态命中次数降序排序() {
+        let sample = |name: &str, state: ThreadStateKind| ThreadStateSample {
+            name: name.to_string(),
+            thread_id: None,
+            state,
+            line_index: 0,
+            preview_lines: vec![format!("\"{name}\"")],
+            stack_lines: vec![format!("\"{name}\"")],
+        };
+        let source = LogFileSource::LocalFile {
+            path: PathBuf::from("thread.log"),
+        };
+        let snapshots = vec![
+            ThreadSnapshot {
+                label: "第一个快照".to_string(),
+                source_index: 0,
+                source: source.clone(),
+                threads: vec![
+                    sample("mostly-waiting", ThreadStateKind::Waiting),
+                    sample("hot-runnable", ThreadStateKind::Runnable),
+                ],
+            },
+            ThreadSnapshot {
+                label: "第二个快照".to_string(),
+                source_index: 0,
+                source: source.clone(),
+                threads: vec![
+                    sample("mostly-waiting", ThreadStateKind::Waiting),
+                    sample("hot-runnable", ThreadStateKind::Runnable),
+                    sample("warm-runnable", ThreadStateKind::Runnable),
+                ],
+            },
+            ThreadSnapshot {
+                label: "第三个快照".to_string(),
+                source_index: 0,
+                source,
+                threads: vec![
+                    sample("mostly-waiting", ThreadStateKind::Runnable),
+                    sample("warm-runnable", ThreadStateKind::Waiting),
+                ],
+            },
+        ];
+
+        let analysis = build_thread_analysis_data(1, 0, snapshots, &[]);
+
+        assert_eq!(
+            analysis.thread_names,
+            vec!["mostly-waiting", "hot-runnable", "warm-runnable"]
+        );
+        let visible_thread_names =
+            ThreadAnalysisWindowView::visible_thread_indexes_for_state_kinds(
+                &analysis,
+                &ThreadAnalysisWindowView::default_visible_state_kinds(),
+            )
+            .into_iter()
+            .map(|thread_index| analysis.thread_names[thread_index].as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(visible_thread_names, vec!["hot-runnable"]);
+    }
+
+    /// 验证线程分析进度比例和文案在边界条件下稳定。
+    ///
+    /// 业务意图：
+    /// - 解析窗口进度条直接消费该进度快照；空文件、完成态和百分比都不能出现除零或越界。
+    #[test]
+    fn 线程分析进度比例和文案稳定() {
+        let empty_progress = ThreadAnalysisProgress::new(0);
+        assert_eq!(empty_progress.ratio(), 1.0);
+
+        let mut progress = ThreadAnalysisProgress::new(4);
+        progress.processed_files = 2;
+        progress.parsed_snapshots = 3;
+        progress.parsed_threads = 12;
+        progress.current_file = Some("thread.log".to_string());
+
+        assert_eq!(progress.ratio(), 0.5);
+        assert!(progress.label().contains("2 / 4 文件"));
+        assert!(progress.message().contains("thread.log"));
     }
 
     /// 验证多文件线程分析默认隐藏只在单个日志中出现的线程。
@@ -2586,27 +2944,231 @@ mod state_tests {
         );
     }
 
-    /// 验证线程分析色块单击即可触发日志跳转。
+    /// 验证线程分析色块单击即可打开堆栈详情。
     ///
     /// 业务意图：
-    /// - 线程信息气泡已经改为悬浮显示，左键单击不再用于固定气泡，必须直接定位对应原始日志行。
-    /// - 双击会产生第二次鼠标按下事件；继续允许多击触发跳转，保证用户沿用旧双击习惯时不会失效。
+    /// - 线程色块点击不再自动跳转主日志窗口；左键单击只负责打开堆栈详情窗口。
+    /// - 双击会产生第二次鼠标按下事件；继续允许多击更新详情窗口，保证用户沿用旧双击习惯时不会失效。
     #[test]
-    fn 线程分析色块单击即可跳转日志() {
-        assert!(!ThreadAnalysisWindowView::timeline_cell_click_should_jump(
-            0
-        ));
-        assert!(ThreadAnalysisWindowView::timeline_cell_click_should_jump(1));
-        assert!(ThreadAnalysisWindowView::timeline_cell_click_should_jump(2));
+    fn 线程分析色块单击即可打开堆栈详情() {
+        assert!(!ThreadAnalysisWindowView::timeline_cell_click_should_open_stack_window(0));
+        assert!(ThreadAnalysisWindowView::timeline_cell_click_should_open_stack_window(1));
+        assert!(ThreadAnalysisWindowView::timeline_cell_click_should_open_stack_window(2));
     }
 
-    /// 验证线程分析跳转高亮色不会和任一状态色冲突。
+    /// 验证线程堆栈详情窗口只在当前线程的堆栈样本之间切换。
     ///
     /// 业务意图：
-    /// - 点击跳转后的色块会覆盖原状态色；如果强调色和某个状态色相同，用户无法区分“最近跳转目标”和“线程状态”。
+    /// - 点击某个线程色块后，左右按钮应沿同一线程在选中日志中的快照顺序切换，不能跳到其它线程。
+    /// - 详情窗口展示完整堆栈，应优先使用解析阶段保存的 `stack_lines`。
+    #[test]
+    fn 线程堆栈详情按当前线程收集可切换堆栈() {
+        let source = LogFileSource::LocalFile {
+            path: PathBuf::from("thread.log"),
+        };
+        let sample = |name: &str, line_index: usize| ThreadStateSample {
+            name: name.to_string(),
+            thread_id: Some(format!("#{line_index}")),
+            state: ThreadStateKind::Runnable,
+            line_index,
+            preview_lines: vec![format!("\"{name}\" #{line_index}")],
+            stack_lines: vec![
+                format!("\"{name}\" #{line_index}"),
+                format!("        at demo.Worker.run({line_index})"),
+            ],
+        };
+        let snapshots = vec![
+            ThreadSnapshot {
+                label: "第一个快照".to_string(),
+                source_index: 0,
+                source: source.clone(),
+                threads: vec![sample("repeat-thread", 10), sample("other-thread", 11)],
+            },
+            ThreadSnapshot {
+                label: "第二个快照".to_string(),
+                source_index: 0,
+                source: source.clone(),
+                threads: vec![sample("repeat-thread", 20)],
+            },
+            ThreadSnapshot {
+                label: "第三个快照".to_string(),
+                source_index: 0,
+                source,
+                threads: vec![sample("repeat-thread", 30)],
+            },
+        ];
+        let analysis = build_thread_analysis_data(1, 0, snapshots, &[]);
+        let clicked_cell = analysis.matrix[0][1]
+            .as_ref()
+            .expect("第二个快照的重复线程应形成可点击色块")
+            .clone();
+
+        let (stacks, active_index) =
+            ThreadAnalysisWindowView::thread_stack_cells_for_clicked_cell(&analysis, &clicked_cell);
+
+        assert_eq!(stacks.len(), 3);
+        assert_eq!(active_index, 1);
+        assert!(
+            stacks
+                .iter()
+                .all(|cell| cell.thread_name == "repeat-thread")
+        );
+        assert_eq!(
+            ThreadStackWindowView::thread_stack_lines_for_cell(&clicked_cell)[1],
+            "        at demo.Worker.run(20)"
+        );
+        assert_eq!(
+            ThreadStackWindowView::clamped_active_index(&stacks, usize::MAX),
+            2
+        );
+    }
+
+    /// 验证线程堆栈详情按命中线程的日志文件数计算行出现率。
+    ///
+    /// 业务意图：
+    /// - 详情窗口每行后的小百分比用于区分共性栈帧和少数文件才出现的差异栈帧。
+    /// - 分母应是命中当前线程的不同日志来源数；同一来源内动态线程号和 `0x...` 地址变化不应降低语义相同行的出现率。
+    #[test]
+    fn 线程堆栈详情行出现率按命中文件数计算() {
+        let stack =
+            |file_name: &str, thread_id: &str, lock_address: &str, extra_line: Option<&str>| {
+                let mut stack_lines = vec![
+                    format!("\"Thread-342\" {thread_id} daemon tid={lock_address} runnable"),
+                    "   java.lang.Thread.State: RUNNABLE".to_string(),
+                    "        at demo.Worker.run(Worker.java:20)".to_string(),
+                    format!("        - locked <{lock_address}> (a java.lang.Object)"),
+                ];
+                if let Some(extra_line) = extra_line {
+                    stack_lines.push(extra_line.to_string());
+                }
+                std::sync::Arc::new(ThreadTimelineCell {
+                    state: ThreadStateKind::Runnable,
+                    time_label: file_name.to_string(),
+                    thread_name: "Thread-342".to_string(),
+                    thread_id: Some(thread_id.to_string()),
+                    source: LogFileSource::LocalFile {
+                        path: PathBuf::from(file_name),
+                    },
+                    line_index: 0,
+                    preview_lines: stack_lines.iter().take(5).cloned().collect(),
+                    stack_lines,
+                })
+            };
+        let stacks = vec![
+            stack(
+                "a.log",
+                "#1",
+                "0x000000001111",
+                Some("        at demo.OnlyA.run(OnlyA.java:1)"),
+            ),
+            stack("b.log", "#2", "0x000000002222", None),
+            stack("c.log", "#3", "0x000000003333", None),
+        ];
+
+        let display_lines =
+            ThreadStackWindowView::thread_stack_display_lines_for_active_stack(&stacks, 0);
+
+        assert_eq!(display_lines[0].presence_percent, 100);
+        assert_eq!(display_lines[2].presence_percent, 100);
+        assert_eq!(display_lines[3].presence_percent, 100);
+        assert_eq!(display_lines[4].presence_percent, 33);
+        assert_eq!(
+            ThreadStackWindowView::normalized_stack_line_presence_key(
+                "        - locked <0x00000000ffff> (a java.lang.Object)",
+                "Thread-342",
+            ),
+            "- locked <0x*> (a java.lang.Object)"
+        );
+    }
+
+    /// 验证线程堆栈详情会为长行估算横向内容宽度。
+    ///
+    /// 业务意图：
+    /// - 详情窗口使用虚拟列表渲染堆栈，如果最长行暂时不在可视范围，仍需要提前撑出横向滚动范围，保证横向滚动条稳定显示。
+    /// - 制表符按四列展开，避免包含 tab 的堆栈行低估宽度后右侧内容无法通过滚动条查看。
+    #[test]
+    fn 线程堆栈详情长行会撑出横向滚动范围() {
+        let short_lines = vec!["at a.B.run(B.java:1)".to_string()];
+        let long_lines = vec![
+            "at a.B.run(B.java:1)".to_string(),
+            "        at oracle.jdbc.driver.T4CConnection.doCommit(T4CConnection.java:961)"
+                .to_string(),
+        ];
+
+        assert_eq!(
+            ThreadStackWindowView::stack_line_display_columns("ab\tc"),
+            5
+        );
+        assert!(
+            ThreadStackWindowView::estimated_stack_content_width(&long_lines)
+                > ThreadStackWindowView::estimated_stack_content_width(&short_lines)
+        );
+    }
+
+    /// 验证线程堆栈详情选区复制按真实文本行截取。
+    ///
+    /// 业务意图：
+    /// - 详情窗口每行还会显示出现率标签，但复制应只包含原始堆栈文本，不能把 UI 辅助百分比混入诊断内容。
+    /// - 跨行选择需要保留换行，并按字符列截取中文内容，避免 UTF-8 边界错误。
+    #[test]
+    fn 线程堆栈详情选区复制只包含原始堆栈文本() {
+        let lines = vec![
+            "\"线程-A\" runnable".to_string(),
+            "    at demo.Worker.run(Worker.java:1)".to_string(),
+            "    at demo.End.run(End.java:2)".to_string(),
+        ];
+        let selection = LogTextSelection {
+            anchor: LogTextPosition {
+                line_index: 0,
+                column: 1,
+            },
+            focus: LogTextPosition {
+                line_index: 1,
+                column: 11,
+            },
+        };
+
+        assert_eq!(
+            ThreadStackWindowView::selected_stack_text_from_lines(&lines, &selection),
+            Some("线程-A\" runnable\n    at demo".to_string())
+        );
+    }
+
+    /// 验证线程堆栈详情全选范围覆盖当前全部正文行。
+    ///
+    /// 业务意图：
+    /// - `Ctrl/Cmd+A` 是复制完整线程堆栈的高频入口，范围必须从第一行第 0 列覆盖到最后一行末尾。
+    /// - 空堆栈行集合不应生成选择，避免窗口空状态下快捷键制造无意义选区。
+    #[test]
+    fn 线程堆栈详情全选覆盖全部正文行() {
+        let lines = vec!["first".to_string(), "".to_string(), "最后".to_string()];
+        let selection = ThreadStackWindowView::full_stack_selection_for_lines(&lines)
+            .expect("非空堆栈应能构造全选范围");
+
+        assert_eq!(
+            selection.anchor,
+            LogTextPosition {
+                line_index: 0,
+                column: 0,
+            }
+        );
+        assert_eq!(
+            selection.focus,
+            LogTextPosition {
+                line_index: 2,
+                column: 2,
+            }
+        );
+        assert!(ThreadStackWindowView::full_stack_selection_for_lines(&[]).is_none());
+    }
+
+    /// 验证线程分析详情选中色不会和任一状态色冲突。
+    ///
+    /// 业务意图：
+    /// - 点击打开详情后的色块会覆盖原状态色；如果强调色和某个状态色相同，用户无法区分“当前详情目标”和“线程状态”。
     /// - 明暗主题下 OTHER 状态颜色不同，因此两个主题都需要覆盖。
     #[test]
-    fn 线程分析跳转高亮色不与状态色冲突() {
+    fn 线程分析详情选中色不与状态色冲突() {
         let states = [
             ThreadStateKind::Runnable,
             ThreadStateKind::Blocked,
@@ -2622,7 +3184,7 @@ mod state_tests {
                 assert_ne!(
                     ThreadAnalysisWindowView::timeline_cell_fill_color(state, true, theme),
                     ThreadAnalysisWindowView::timeline_cell_fill_color(state, false, theme),
-                    "跳转高亮色不能和状态 {:?} 在 {:?} 主题下的颜色相同",
+                    "详情选中色不能和状态 {:?} 在 {:?} 主题下的颜色相同",
                     state,
                     theme
                 );

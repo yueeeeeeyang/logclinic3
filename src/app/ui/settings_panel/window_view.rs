@@ -47,7 +47,9 @@ struct SettingsContentSnapshot {
     quick_search_keywords_focus: gpui::FocusHandle,
     /// 线程过滤规则是否处于编辑态。
     thread_analysis_filter_is_editing: bool,
-    /// 线程过滤规则输入焦点。
+    /// 线程名过滤规则输入焦点。
+    thread_analysis_name_filter_focus: gpui::FocusHandle,
+    /// 线程堆栈过滤规则输入焦点。
     thread_analysis_filter_focus: gpui::FocusHandle,
     /// 当前主题色板。
     palette: AppThemePalette,
@@ -261,12 +263,13 @@ impl SettingsWindowView {
     /// 处理线程日志分析过滤输入区键盘编辑。
     pub(in crate::app) fn handle_thread_analysis_filter_key_down(
         &mut self,
+        kind: ThreadAnalysisFilterInputKind,
         event: &KeyDownEvent,
         _window: &mut Window,
         context: &mut Context<Self>,
     ) {
         self.main_view.update(context, |view, context| {
-            view.handle_thread_analysis_filter_key_down(event, context);
+            view.handle_thread_analysis_filter_key_down(kind, event, context);
         });
         context.notify();
     }
@@ -274,13 +277,21 @@ impl SettingsWindowView {
     /// 处理线程日志分析过滤输入区鼠标按下。
     pub(in crate::app) fn handle_thread_analysis_filter_mouse_down(
         &mut self,
+        kind: ThreadAnalysisFilterInputKind,
         event: &MouseDownEvent,
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
         let focus_handle = self.main_view.update(context, |view, context| {
-            view.start_thread_analysis_filter_mouse_selection(event, context);
-            view.settings.thread_analysis_filter_focus.clone()
+            view.start_thread_analysis_filter_mouse_selection(kind, event, context);
+            match kind {
+                ThreadAnalysisFilterInputKind::ThreadName => {
+                    view.settings.thread_analysis_name_filter_focus.clone()
+                }
+                ThreadAnalysisFilterInputKind::Stack => {
+                    view.settings.thread_analysis_filter_focus.clone()
+                }
+            }
         });
         window.focus(&focus_handle);
         context.notify();
@@ -289,11 +300,12 @@ impl SettingsWindowView {
     /// 拖动扩展线程日志分析过滤输入区的选择范围。
     pub(in crate::app) fn handle_thread_analysis_filter_mouse_move(
         &mut self,
+        kind: ThreadAnalysisFilterInputKind,
         event: &MouseMoveEvent,
         context: &mut Context<Self>,
     ) {
         self.main_view.update(context, |view, context| {
-            view.update_thread_analysis_filter_mouse_selection(event.position, context);
+            view.update_thread_analysis_filter_mouse_selection(kind, event.position, context);
         });
         context.notify();
     }
@@ -301,10 +313,11 @@ impl SettingsWindowView {
     /// 结束线程日志分析过滤输入区鼠标选择。
     pub(in crate::app) fn handle_thread_analysis_filter_mouse_up(
         &mut self,
+        kind: ThreadAnalysisFilterInputKind,
         context: &mut Context<Self>,
     ) {
         self.main_view.update(context, |view, context| {
-            view.finish_thread_analysis_filter_mouse_selection(context);
+            view.finish_thread_analysis_filter_mouse_selection(kind, context);
         });
         context.notify();
     }
@@ -324,7 +337,7 @@ impl SettingsWindowView {
                 None
             } else {
                 view.begin_thread_analysis_filter_edit(context);
-                Some(view.settings.thread_analysis_filter_focus.clone())
+                Some(view.settings.thread_analysis_name_filter_focus.clone())
             }
         });
         context.notify();
@@ -551,6 +564,7 @@ impl SettingsWindowView {
             quick_search_keywords_is_editing,
             quick_search_keywords_focus,
             thread_analysis_filter_is_editing,
+            thread_analysis_name_filter_focus,
             thread_analysis_filter_focus,
             palette,
         } = snapshot;
@@ -567,6 +581,7 @@ impl SettingsWindowView {
                 quick_search_keywords_is_editing,
                 quick_search_keywords_focus,
                 thread_analysis_filter_is_editing,
+                thread_analysis_name_filter_focus,
                 thread_analysis_filter_focus,
                 palette,
                 context,
@@ -594,6 +609,7 @@ impl Render for SettingsWindowView {
             quick_search_keywords_is_editing,
             quick_search_keywords_focus,
             thread_analysis_filter_is_editing,
+            thread_analysis_name_filter_focus,
             thread_analysis_filter_focus,
             palette,
         ) = {
@@ -607,6 +623,7 @@ impl Render for SettingsWindowView {
                 main_view.settings.quick_search_keywords_is_editing,
                 main_view.settings.quick_search_keywords_focus.clone(),
                 main_view.settings.thread_analysis_filter_is_editing,
+                main_view.settings.thread_analysis_name_filter_focus.clone(),
                 main_view.settings.thread_analysis_filter_focus.clone(),
                 main_view.palette(),
             )
@@ -634,6 +651,7 @@ impl Render for SettingsWindowView {
                             quick_search_keywords_is_editing,
                             quick_search_keywords_focus,
                             thread_analysis_filter_is_editing,
+                            thread_analysis_name_filter_focus,
                             thread_analysis_filter_focus,
                             palette,
                         },

@@ -30,11 +30,16 @@ pub(in crate::app) struct ThreadAnalysisFilterTextAreaPrepaint {
 ///
 /// 业务意图：
 /// - GPUI 0.2.2 没有现成多行文本框；该元素复用搜索输入框的自定义元素方案，注册平台输入协议并手动绘制文本、选区和光标。
-/// - 输入内容可能是完整 Java 堆栈，必须保留换行并使用等宽字体，方便用户核对过滤片段。
+/// - 输入内容可能是线程名通配列表或完整 Java 堆栈，必须保留换行并使用等宽字体，方便用户核对过滤片段。
 ///
 /// 边界条件：
-/// - 当前不做自动换行，长堆栈行横向超出时由输入区裁切；过滤匹配仍使用完整原文，不受显示裁切影响。
+/// - 当前不做自动换行，长线程名或长堆栈行横向超出时由输入区裁切；过滤匹配仍使用完整原文，不受显示裁切影响。
 pub(in crate::app) struct ThreadAnalysisFilterTextAreaElement {
+    /// 当前元素绑定的过滤输入类型。
+    ///
+    /// 业务意图：
+    /// - 同一个自绘文本框既用于线程名规则，也用于堆栈片段；元素只保存类型，不直接持有文本，避免渲染阶段复制状态分支。
+    pub(in crate::app) kind: ThreadAnalysisFilterInputKind,
     /// 主视图实体，用于读取和写回过滤输入状态。
     pub(in crate::app) view: Entity<MainView>,
     /// 过滤输入区焦点句柄。
@@ -80,7 +85,7 @@ impl Element for ThreadAnalysisFilterTextAreaElement {
         let line_count = self
             .view
             .read(context)
-            .thread_analysis_filter_visual_line_count();
+            .thread_analysis_filter_visual_line_count_for(self.kind);
         let mut style = Style::default();
         style.size.width = relative(1.0).into();
         style.size.height = px(
@@ -102,7 +107,8 @@ impl Element for ThreadAnalysisFilterTextAreaElement {
     ) -> Self::PrepaintState {
         let (text, selection_range, marked_range, cursor_visible_by_activity) = {
             let view = self.view.read(context);
-            let (text, selection_range, marked_range) = view.thread_analysis_filter_text_snapshot();
+            let (text, selection_range, marked_range) =
+                view.thread_analysis_filter_text_snapshot(self.kind);
             (
                 text,
                 selection_range,
@@ -304,7 +310,7 @@ impl Element for ThreadAnalysisFilterTextAreaElement {
             window.request_animation_frame();
         }
         self.view.update(context, |view, _context| {
-            view.store_thread_analysis_filter_text_layouts(layouts, bounds);
+            view.store_thread_analysis_filter_text_layouts(self.kind, layouts, bounds);
         });
     }
 }

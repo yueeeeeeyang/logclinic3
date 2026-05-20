@@ -165,12 +165,16 @@ pub(super) fn read_nested_archive_tree_from_path(
     let segments = split_archive_entry_path(archive_member_path).ok()?;
     let label = segments.last()?.clone();
     let mut nested_root = ArchiveScanNode::new(label, ArchiveScanEntryKind::Directory);
+    // 内层压缩包扫描发生在外层条目处理期间；当前加载进度已经由外层条目推进负责展示。
+    // 这里使用空回调，避免把内层条目数误算成顶层压缩包的总进度，导致中央进度条来回跳动。
+    let mut ignore_nested_progress = |_progress| {};
     scan_archive_into(
         archive_path,
         nested_format,
         &mut nested_root,
         error_count,
         temporary_paths,
+        &mut ignore_nested_progress,
     )
     .ok()?;
 

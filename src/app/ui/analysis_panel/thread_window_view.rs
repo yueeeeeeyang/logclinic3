@@ -78,13 +78,19 @@ pub(in crate::app) struct ThreadAnalysisWindowView {
     /// - 气泡跟随用户当前悬浮的色块展示线程详情；窗口重绘或滚动时不重新解析日志。
     /// - `None` 表示鼠标未停留在可见状态色块上，或分析数据已被替换。
     pub(in crate::app) cell_popup: Option<ThreadAnalysisCellPopup>,
-    /// 最近一次点击跳转到主日志窗口的线程色块。
+    /// 最近一次点击打开堆栈详情的线程色块。
     ///
     /// 业务意图：
-    /// - 用户从主日志窗口返回线程分析窗口时，需要快速确认上一次定位的是哪个快照中的哪个线程。
+    /// - 用户打开堆栈详情后，需要快速确认当前详情窗口对应的是哪个快照中的哪个线程。
     /// - 使用矩阵内 `Arc` 的指针身份记录目标，不复制日志来源或线程名，避免同一线程在多个快照中出现时误高亮其它色块。
-    /// - `None` 表示当前分析结果还没有执行过色块跳转，或分析数据已被替换。
+    /// - `None` 表示当前分析结果还没有执行过色块点击，或分析数据已被替换。
     pub(in crate::app) jumped_cell: Option<Arc<ThreadTimelineCell>>,
+    /// 当前线程堆栈详情窗口句柄。
+    ///
+    /// 业务意图：
+    /// - 点击时间线色块时需要额外弹出完整堆栈窗口；句柄保存在分析窗口中，便于后续点击复用同一个详情窗口。
+    /// - 详情窗口关闭后会清空该字段；分析结果替换时会把详情窗口置为空状态，避免继续展示旧结果。
+    pub(in crate::app) stack_window: Option<WindowHandle<ThreadStackWindowView>>,
     /// 当前线程分析图中允许显示的线程状态集合。
     ///
     /// 业务意图：
@@ -139,6 +145,7 @@ impl ThreadAnalysisWindowView {
             scrollbar_drag: None,
             cell_popup: None,
             jumped_cell: None,
+            stack_window: None,
             visible_state_kinds: Self::default_visible_state_kinds(),
             _main_view_subscription: main_view_subscription,
         }
@@ -153,13 +160,98 @@ impl ThreadAnalysisWindowView {
         analysis: ThreadAnalysisData,
         context: &mut Context<Self>,
     ) {
+        let replacing_progress_with_progress =
+            self.analysis.progress.is_some() && analysis.progress.is_some();
         self.analysis = analysis;
-        self.scroll_handle = UniformListScrollHandle::new();
-        self.scrollbar_drag = None;
-        self.cell_popup = None;
-        self.jumped_cell = None;
-        self.visible_state_kinds = Self::default_visible_state_kinds();
+        if !replacing_progress_with_progress {
+            self.scroll_handle = UniformListScrollHandle::new();
+            self.scrollbar_drag = None;
+            self.cell_popup = None;
+            self.jumped_cell = None;
+            if let Some(stack_window) = self.stack_window {
+                if stack_window
+                    .update(context, |stack_view, window, context| {
+                        stack_view.update_stacks(Vec::new(), 0, context);
+                        window
+                            .set_window_title(&ThreadStackWindowView::window_title_for_cell(None));
+                    })
+                    .is_err()
+                {
+                    self.stack_window = None;
+                }
+            }
+            self.visible_state_kinds = Self::default_visible_state_kinds();
+        }
         context.notify();
+    }
+
+    /// 渲染线程日志解析进度条。
+    ///
+    /// 业务意图：
+    /// - 解析过程运行在后台线程，窗口中央用短进度条展示当前文件、已完成文件数和已解析快照数。
+    /// - 进度只在 `ThreadAnalysisData.progress` 存在时显示；最终结果不会占用额外布局空间。
+    ///
+    /// 布局约束：
+    /// - 进度条宽度固定在较短的面板内，并限制最大相对宽度，避免大窗口下横向铺满影响阅读。
+    /// - 使用绝对居中覆盖内容区，保证解析期间用户视线集中在进度反馈上，而不是顶部标题栏。
+    fn render_progress_bar(
+        &self,
+        progress: &ThreadAnalysisProgress,
+        palette: AppThemePalette,
+    ) -> impl IntoElement {
+        let ratio = progress.ratio();
+        div()
+            .absolute()
+            .left(px(0.0))
+            .right(px(0.0))
+            .top(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(360.0))
+                    .max_w(relative(0.56))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_3()
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.panel))
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(palette.muted_text))
+                                    .truncate()
+                                    .child(progress.message()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(palette.muted_text))
+                                    .child(progress.label()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .h(px(6.0))
+                            .w_full()
+                            .rounded(px(999.0))
+                            .bg(rgb(palette.surface))
+                            .overflow_hidden()
+                            .child(div().h_full().w(relative(ratio)).bg(rgb(palette.accent))),
+                    ),
+            )
     }
 
     /// 渲染线程状态图例。
@@ -345,8 +437,8 @@ impl ThreadAnalysisWindowView {
     /// 返回线程时间线色块的填充色。
     ///
     /// 业务意图：
-    /// - 普通色块使用线程状态色；最近一次点击跳转的色块使用独立强调色，避免和状态语义混淆。
-    /// - 该函数保持纯计算，便于单元测试锁定强调色不会和任一状态色冲突。
+    /// - 普通色块使用线程状态色；最近一次点击打开详情的色块使用独立强调色，避免和状态语义混淆。
+    /// - 该函数保持纯计算，便于单元测试锁定选中色不会和任一状态色冲突。
     pub(in crate::app) fn timeline_cell_fill_color(
         state: ThreadStateKind,
         is_jump_target: bool,
@@ -359,7 +451,7 @@ impl ThreadAnalysisWindowView {
         }
     }
 
-    /// 判断指定色块是否是最近一次点击跳转目标。
+    /// 判断指定色块是否是最近一次点击打开详情的目标。
     ///
     /// 业务意图：
     /// - 同一个线程可能跨多个快照重复出现，只比较线程名或行号容易误高亮；指针身份能精确定位矩阵中的单个色块。
@@ -373,7 +465,7 @@ impl ThreadAnalysisWindowView {
     /// 处理线程分析色块悬浮状态变化。
     ///
     /// 业务意图：
-    /// - 鼠标悬浮用于展示线程信息气泡，避免单击既展开详情又跳转主日志窗口造成操作冲突。
+    /// - 鼠标悬浮用于展示线程信息气泡，避免单击时用户还没决定是否打开详情窗口就打断阅读。
     /// - 离开色块时只关闭同一个色块打开的气泡，避免快速移动到相邻色块时旧的离开事件误关新气泡。
     fn handle_timeline_cell_hover(
         &mut self,
@@ -413,39 +505,144 @@ impl ThreadAnalysisWindowView {
     /// 处理线程分析色块点击。
     ///
     /// 业务意图：
-    /// - 单击用于回到主日志窗口并定位线程头；线程详情改由鼠标悬浮气泡展示，避免一个点击承载两种行为。
-    /// - 鼠标多击会产生多次按下事件，按普通点击重复执行跳转，确保旧双击习惯仍能到达目标日志。
+    /// - 单击只打开或更新堆栈详情窗口，不再自动驱动主日志窗口跳转，避免分析窗口和主窗口焦点被意外切换。
+    /// - 鼠标多击会产生多次按下事件，继续按普通点击更新详情窗口，保证旧双击习惯不会失效。
     fn handle_timeline_cell_mouse_down(
         &mut self,
         cell: Arc<ThreadTimelineCell>,
         event: &MouseDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         context: &mut Context<Self>,
     ) {
-        if Self::timeline_cell_click_should_jump(event.click_count) {
+        if Self::timeline_cell_click_should_open_stack_window(event.click_count) {
             self.jumped_cell = Some(cell.clone());
-            let source = cell.source.clone();
-            let line_index = cell.line_index;
-            let main_window = self.main_view.update(context, |view, context| {
-                view.open_log_source_at_line(source, line_index, context);
-                view.main_window
-            });
-            if let Some(main_window) = main_window {
-                let _ = main_window.update(context, |_view, window, _context| {
-                    window.activate_window();
-                });
-            }
+            self.open_thread_stack_window(cell, window, context);
             context.notify();
         }
         context.stop_propagation();
     }
 
-    /// 判断线程分析色块的一次鼠标按下是否应触发日志跳转。
+    /// 打开或复用线程堆栈详情窗口。
     ///
     /// 业务意图：
-    /// - 新交互要求单击直接跳转；GPUI 在双击时仍会继续递增点击次数，因此所有有效左键点击次数都按跳转处理。
-    /// - 点击次数为 0 只可能来自测试或异常平台事件，不能触发定位，避免错误事件打开日志。
-    pub(in crate::app) fn timeline_cell_click_should_jump(click_count: usize) -> bool {
+    /// - 色块点击只弹出详情窗口展示当前线程完整堆栈，主日志打开由详情窗口右上角按钮显式触发。
+    /// - 详情窗口复用同一线程在当前分析结果中的所有堆栈样本，左右按钮按时间线顺序切换。
+    fn open_thread_stack_window(
+        &mut self,
+        cell: Arc<ThreadTimelineCell>,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let (stacks, active_index) =
+            Self::thread_stack_cells_for_clicked_cell(&self.analysis, &cell);
+        let window_title = ThreadStackWindowView::window_title_for_cell(stacks.get(active_index));
+        if let Some(stack_window) = self.stack_window {
+            if stack_window
+                .update(context, |stack_view, window, context| {
+                    stack_view.update_stacks(stacks.clone(), active_index, context);
+                    window.set_window_title(&window_title);
+                    stack_view.focus_stack_body(window);
+                    window.activate_window();
+                })
+                .is_ok()
+            {
+                return;
+            }
+            self.stack_window = None;
+        }
+
+        let main_view_for_window = self.main_view.clone();
+        let owner_view = context.weak_entity();
+        let window_options = WindowOptions {
+            titlebar: Some(TitlebarOptions {
+                title: Some(window_title.into()),
+                ..Default::default()
+            }),
+            window_bounds: Some(WindowBounds::centered(
+                size(
+                    px(THREAD_STACK_WINDOW_WIDTH),
+                    px(THREAD_STACK_WINDOW_HEIGHT),
+                ),
+                context,
+            )),
+            is_resizable: true,
+            is_minimizable: true,
+            window_min_size: Some(size(
+                px(THREAD_STACK_WINDOW_MIN_WIDTH),
+                px(THREAD_STACK_WINDOW_MIN_HEIGHT),
+            )),
+            ..Default::default()
+        };
+
+        if let Ok(stack_window) = context.open_window(window_options, move |window, app| {
+            window.on_window_should_close(app, move |_, app| {
+                if let Some(owner_view) = owner_view.upgrade() {
+                    owner_view.update(app, |view, context| {
+                        view.stack_window = None;
+                        context.notify();
+                    });
+                }
+                true
+            });
+            app.new(|context| {
+                ThreadStackWindowView::new(main_view_for_window, stacks, active_index, context)
+            })
+        }) {
+            let _ = stack_window.update(context, |stack_view, window, _| {
+                stack_view.focus_stack_body(window);
+                window.activate_window();
+            });
+            self.stack_window = Some(stack_window);
+        }
+    }
+
+    /// 收集点击色块所属线程的所有可切换堆栈样本。
+    ///
+    /// 业务意图：
+    /// - 详情窗口左右按钮应在“当前线程”维度切换，而不是跨所有线程混排；这样用户从某个线程色块进入后上下文保持稳定。
+    /// - 遍历矩阵时保持快照列顺序，和线程分析主窗口横轴一致。
+    ///
+    /// 边界条件：
+    /// - 如果分析数据已经被替换或矩阵里找不到该线程，至少返回当前点击色块，保证详情窗口仍能打开。
+    pub(in crate::app) fn thread_stack_cells_for_clicked_cell(
+        analysis: &ThreadAnalysisData,
+        clicked_cell: &Arc<ThreadTimelineCell>,
+    ) -> (Vec<Arc<ThreadTimelineCell>>, usize) {
+        let mut cells = Vec::new();
+        if let Some(row_index) = analysis
+            .thread_names
+            .iter()
+            .position(|thread_name| thread_name == &clicked_cell.thread_name)
+            && let Some(row) = analysis.matrix.get(row_index)
+        {
+            cells.extend(row.iter().flatten().cloned());
+        }
+        if cells.is_empty() {
+            cells.push(clicked_cell.clone());
+        }
+        let active_index = cells
+            .iter()
+            .position(|cell| Arc::ptr_eq(cell, clicked_cell))
+            .unwrap_or_else(|| {
+                cells
+                    .iter()
+                    .position(|cell| {
+                        cell.thread_name == clicked_cell.thread_name
+                            && cell.time_label == clicked_cell.time_label
+                            && cell.source == clicked_cell.source
+                            && cell.line_index == clicked_cell.line_index
+                    })
+                    .unwrap_or(0)
+            });
+        (cells, active_index)
+    }
+
+    /// 判断线程分析色块的一次鼠标按下是否应打开堆栈详情窗口。
+    ///
+    /// 业务意图：
+    /// - 新交互要求单击直接打开详情；GPUI 在双击时仍会继续递增点击次数，因此所有有效左键点击次数都按打开详情处理。
+    /// - 点击次数为 0 只可能来自测试或异常平台事件，不能触发详情窗口，避免错误事件创建窗口。
+    pub(in crate::app) fn timeline_cell_click_should_open_stack_window(click_count: usize) -> bool {
         click_count >= 1
     }
 
@@ -815,36 +1012,44 @@ impl Render for ThreadAnalysisWindowView {
             .child(
                 div()
                     .flex()
-                    .items_center()
-                    .justify_between()
-                    .h(px(54.0))
+                    .flex_col()
+                    .gap_2()
+                    .min_h(px(54.0))
                     .px_4()
+                    .py_3()
                     .border_b_1()
                     .border_color(rgb(palette.border))
                     .bg(rgb(palette.panel))
                     .child(
                         div()
                             .flex()
-                            .flex_col()
-                            .gap_1()
-                            .min_w_0()
+                            .items_center()
+                            .justify_between()
+                            .gap_4()
                             .child(
                                 div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(palette.text))
-                                    .truncate()
-                                    .child(self.analysis.title.clone()),
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(palette.text))
+                                            .truncate()
+                                            .child(self.analysis.title.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(palette.muted_text))
+                                            .truncate()
+                                            .child(self.analysis.summary.clone()),
+                                    ),
                             )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(palette.muted_text))
-                                    .truncate()
-                                    .child(self.analysis.summary.clone()),
-                            ),
-                    )
-                    .child(self.render_legend(palette, theme, context)),
+                            .child(self.render_legend(palette, theme, context)),
+                    ),
             )
             .child(
                 div()
@@ -902,7 +1107,10 @@ impl Render for ThreadAnalysisWindowView {
                         .track_scroll(scroll_handle),
                     )
                     .child(self.render_vertical_scrollbar(palette, context))
-                    .child(self.render_horizontal_scrollbar(palette, context)),
+                    .child(self.render_horizontal_scrollbar(palette, context))
+                    .when_some(self.analysis.progress.as_ref(), |content, progress| {
+                        content.child(self.render_progress_bar(progress, palette))
+                    }),
             )
             .when(self.cell_popup.is_some(), |root| {
                 root.child(self.render_cell_popup(palette, context).unwrap_or_else(div))

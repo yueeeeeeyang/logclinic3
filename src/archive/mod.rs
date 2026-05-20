@@ -32,5 +32,6 @@ pub(crate) use self::read::{
 #[cfg(test)]
 pub(crate) use self::scan::normalized_rar_nested_archive_member_path;
 pub(crate) use self::scan::{
-    ArchiveMemberSource, ArchiveScanEntryKind, ArchiveScanNode, ArchiveScanResult, scan_archive,
+    ArchiveMemberSource, ArchiveScanEntryKind, ArchiveScanNode, ArchiveScanProgress,
+    ArchiveScanResult, scan_archive_with_progress,
 };

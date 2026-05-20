@@ -28,6 +28,8 @@ mod settings_panel;
 /// 主窗口外壳、导航、输入和工作区协调。
 mod shell;
 
+#[cfg(test)]
+pub(in crate::app) use analysis_panel::ThreadStackWindowView;
 pub(in crate::app) use analysis_panel::{
     HprofAnalysisView, LOG_AI_ANALYSIS_WINDOW_HEIGHT, LOG_AI_ANALYSIS_WINDOW_WIDTH,
     LogAiAnalysisWindowView, SearchResultsResizeDrag, SearchTarget, ThreadAnalysisWindowView,

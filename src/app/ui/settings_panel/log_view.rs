@@ -18,6 +18,7 @@ impl SettingsWindowView {
         quick_search_keywords_is_editing: bool,
         quick_search_keywords_focus: gpui::FocusHandle,
         thread_analysis_filter_is_editing: bool,
+        thread_analysis_name_filter_focus: gpui::FocusHandle,
         focus_handle: gpui::FocusHandle,
         palette: AppThemePalette,
         context: &mut Context<Self>,
@@ -58,6 +59,7 @@ impl SettingsWindowView {
             ))
             .child(self.render_thread_analysis_filter_setting(
                 thread_analysis_filter_is_editing,
+                thread_analysis_name_filter_focus,
                 focus_handle,
                 palette,
                 context,
@@ -75,7 +77,7 @@ impl SettingsWindowView {
         focus_handle: gpui::FocusHandle,
         palette: AppThemePalette,
         context: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
+    ) -> impl IntoElement {
         let input_background = if quick_search_keywords_is_editing {
             palette.input
         } else {
@@ -249,11 +251,13 @@ impl SettingsWindowView {
     /// 渲染线程日志分析过滤设置项。
     ///
     /// 业务意图：
-    /// - 用户点击编辑后可以粘贴一个或多个完整线程堆栈，保存后的下一次线程日志分析会按这些片段过滤无效线程。
+    /// - 用户点击编辑后可以维护线程名通配规则，也可以粘贴一个或多个完整线程堆栈。
+    /// - 保存后的下一次线程日志分析会先按线程名和堆栈片段过滤无效线程，再执行默认的单次出现过滤。
     /// - 输入区使用等宽字体和滚动容器，便于核对 Java 堆栈中的类名、方法名和锁信息。
     pub(in crate::app) fn render_thread_analysis_filter_setting(
         &self,
         thread_analysis_filter_is_editing: bool,
+        name_focus_handle: gpui::FocusHandle,
         focus_handle: gpui::FocusHandle,
         palette: AppThemePalette,
         context: &mut Context<Self>,
@@ -262,6 +266,17 @@ impl SettingsWindowView {
             palette.input
         } else {
             palette.panel
+        };
+        let (name_content_width, stack_content_width) = {
+            let main_view = self.main_view.read(context);
+            (
+                main_view.thread_analysis_filter_estimated_content_width(
+                    ThreadAnalysisFilterInputKind::ThreadName,
+                ),
+                main_view.thread_analysis_filter_estimated_content_width(
+                    ThreadAnalysisFilterInputKind::Stack,
+                ),
+            )
         };
         div()
             .id("settings-thread-analysis-filter")
@@ -305,7 +320,7 @@ impl SettingsWindowView {
                                         div()
                                             .text_xs()
                                             .text_color(rgb(palette.muted_text))
-                                            .child("空行分隔多段堆栈，命中连续片段的线程不会显示"),
+                                            .child("线程名支持 * 通配；堆栈过滤按空行分隔连续片段"),
                                     ),
                             ),
                     )
@@ -315,15 +330,93 @@ impl SettingsWindowView {
                         context,
                     )),
             )
+            .child(self.render_thread_analysis_filter_textarea(
+                ThreadAnalysisFilterInputKind::ThreadName,
+                "settings-thread-analysis-name-filter",
+                "settings-thread-analysis-name-filter-scroll",
+                "线程名过滤",
+                "每行一个线程名或通配规则，也支持英文逗号分隔",
+                "输入线程名通配，如 C2 CompilerThread*",
+                THREAD_ANALYSIS_NAME_FILTER_TEXTAREA_HEIGHT,
+                name_content_width,
+                thread_analysis_filter_is_editing,
+                name_focus_handle,
+                input_background,
+                palette,
+                context,
+            ))
+            .child(self.render_thread_analysis_filter_textarea(
+                ThreadAnalysisFilterInputKind::Stack,
+                "settings-thread-analysis-stack-filter",
+                "settings-thread-analysis-stack-filter-scroll",
+                "线程堆栈过滤",
+                "空行分隔多段堆栈片段，片段内按连续行匹配",
+                "粘贴线程堆栈；多段堆栈之间用空行分隔",
+                THREAD_ANALYSIS_FILTER_TEXTAREA_HEIGHT,
+                stack_content_width,
+                thread_analysis_filter_is_editing,
+                focus_handle,
+                input_background,
+                palette,
+                context,
+            ))
+    }
+
+    /// 渲染线程日志分析过滤的独立多行输入框。
+    ///
+    /// 业务意图：
+    /// - 线程名过滤和堆栈过滤使用相同交互组件，但标题、说明、占位文案和高度不同；封装后可以保证双向滚动条、焦点和事件消费一致。
+    /// - 输入内容超过可视区域时同时启用横向和纵向滚动，长线程名、长类名和深堆栈都不会被隐藏在不可达区域。
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::app) fn render_thread_analysis_filter_textarea(
+        &self,
+        kind: ThreadAnalysisFilterInputKind,
+        container_id: &'static str,
+        scroll_id: &'static str,
+        title: &'static str,
+        description: &'static str,
+        placeholder: &'static str,
+        height: f32,
+        content_width: Pixels,
+        is_editing: bool,
+        focus_handle: gpui::FocusHandle,
+        input_background: u32,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .mb_3()
             .child(
                 div()
-                    .id("settings-thread-analysis-filter-input")
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(palette.text))
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(palette.muted_text))
+                            .child(description),
+                    ),
+            )
+            .child(
+                div()
+                    .id(container_id)
                     .relative()
-                    .h(px(THREAD_ANALYSIS_FILTER_TEXTAREA_HEIGHT))
+                    .h(px(height))
                     .w_full()
                     .rounded(px(6.0))
                     .border_1()
-                    .border_color(rgb(if thread_analysis_filter_is_editing {
+                    .border_color(rgb(if is_editing {
                         palette.accent
                     } else {
                         palette.border
@@ -331,49 +424,57 @@ impl SettingsWindowView {
                     .bg(rgb(input_background))
                     .track_focus(&focus_handle)
                     .key_context("thread-analysis-filter-input")
-                    .on_key_down(context.listener(Self::handle_thread_analysis_filter_key_down))
+                    .on_key_down(context.listener(move |view, event, window, context| {
+                        view.handle_thread_analysis_filter_key_down(kind, event, window, context);
+                    }))
                     .on_mouse_down(
                         MouseButton::Left,
-                        context.listener(|view, event: &MouseDownEvent, window, context| {
-                            view.handle_thread_analysis_filter_mouse_down(event, window, context);
+                        context.listener(move |view, event: &MouseDownEvent, window, context| {
+                            view.handle_thread_analysis_filter_mouse_down(
+                                kind, event, window, context,
+                            );
                         }),
                     )
                     .on_mouse_move(context.listener(
-                        |view, event: &MouseMoveEvent, _window, context| {
-                            view.handle_thread_analysis_filter_mouse_move(event, context);
+                        move |view, event: &MouseMoveEvent, _window, context| {
+                            view.handle_thread_analysis_filter_mouse_move(kind, event, context);
                         },
                     ))
                     .on_mouse_up(
                         MouseButton::Left,
-                        context.listener(|view, _event: &MouseUpEvent, _window, context| {
-                            view.handle_thread_analysis_filter_mouse_up(context);
+                        context.listener(move |view, _event: &MouseUpEvent, _window, context| {
+                            view.handle_thread_analysis_filter_mouse_up(kind, context);
                         }),
                     )
                     .on_mouse_up_out(
                         MouseButton::Left,
-                        context.listener(|view, _event: &MouseUpEvent, _window, context| {
-                            view.handle_thread_analysis_filter_mouse_up(context);
+                        context.listener(move |view, _event: &MouseUpEvent, _window, context| {
+                            view.handle_thread_analysis_filter_mouse_up(kind, context);
                         }),
                     )
                     .child(
                         div()
-                            .id("settings-thread-analysis-filter-scroll")
+                            .id(scroll_id)
                             .size_full()
                             .px_2()
                             .py_2()
+                            .overflow_x_scroll()
                             .overflow_y_scroll()
                             .scrollbar_width(px(6.0))
                             .text_size(px(12.0))
                             .line_height(px(THREAD_ANALYSIS_FILTER_TEXT_LINE_HEIGHT))
                             .text_color(rgb(palette.text))
                             .font_family(LOG_VIEWER_FONT_FAMILY)
-                            .child(ThreadAnalysisFilterTextAreaElement {
-                                view: self.main_view.clone(),
-                                focus_handle,
-                                editable: thread_analysis_filter_is_editing,
-                                placeholder: "粘贴需要过滤的线程堆栈；多段堆栈之间用空行分隔",
-                                palette,
-                            }),
+                            .child(div().min_w(content_width).w_full().child(
+                                ThreadAnalysisFilterTextAreaElement {
+                                    kind,
+                                    view: self.main_view.clone(),
+                                    focus_handle,
+                                    editable: is_editing,
+                                    placeholder,
+                                    palette,
+                                },
+                            )),
                     ),
             )
     }
