@@ -15,7 +15,7 @@ mod state_tests {
     //! - GPUI 渲染交互主要依赖手动验收，但目录树状态这类纯数据规则可以通过单元测试锁定。
     //! - 本模块只验证不需要窗口系统的行为，避免测试环境依赖 macOS 或 Windows 图形能力。
 
-    use crate::archive::ArchiveFormat;
+    use crate::archive::{ArchiveFormat, MaterializedLogSource};
 
     use super::*;
 
@@ -2949,6 +2949,364 @@ mod state_tests {
         );
 
         assert_eq!(scroll_top, max_scroll);
+    }
+
+    /// 验证 minimap 点击坐标会稳定映射到合法行号。
+    ///
+    /// 业务意图：
+    /// - 右侧 minimap 用鼠标 y 坐标跳转日志位置，必须处理空文件、单行文件和越界坐标，避免点击底部或顶部时产生非法行号。
+    #[test]
+    fn 日志_minimap_点击坐标会夹紧到合法行号() {
+        assert_eq!(
+            MainView::log_minimap_target_line_from_y(px(10.0), px(100.0), 0),
+            None
+        );
+        assert_eq!(
+            MainView::log_minimap_target_line_from_y(px(80.0), px(100.0), 1),
+            Some(0)
+        );
+        assert_eq!(
+            MainView::log_minimap_target_line_from_y(px(-20.0), px(100.0), 100),
+            Some(0)
+        );
+        assert_eq!(
+            MainView::log_minimap_target_line_from_y(px(120.0), px(100.0), 100),
+            Some(99)
+        );
+    }
+
+    /// 验证分页日志不会显示 minimap。
+    ///
+    /// 业务意图：
+    /// - 分页模式用于保护超大日志的内存和滚动性能，右侧 minimap 会在滚动时增加额外读取与高亮计算，因此必须从显示入口关闭。
+    /// - 内存日志仍允许显示 minimap，避免该性能保护误伤普通日志的右侧预览体验。
+    #[test]
+    fn 日志_minimap_分页模式不显示以避免性能问题() {
+        let in_memory_document =
+            decode_log_bytes(b"first\nsecond\nthird", EncodingChoice::Auto, "memory.log")
+                .expect("测试内存日志应能按 UTF-8 解码");
+        assert!(
+            MainView::log_minimap_document_allows_render(&LogTabDocument::InMemory(
+                in_memory_document
+            )),
+            "普通内存日志仍允许在存在纵向溢出时显示 minimap"
+        );
+
+        let path = env::temp_dir().join(format!(
+            "logclinic3-paged-minimap-disabled-test-{}.log",
+            std::process::id()
+        ));
+        fs::write(&path, b"first\nsecond\nthird").expect("测试分页日志临时文件应能写入");
+        let byte_len = fs::metadata(&path)
+            .expect("测试分页日志临时文件应能读取元数据")
+            .len();
+        let paged_document = crate::log_document::PagedLogDocument::open(
+            MaterializedLogSource {
+                original_source: LogFileSource::LocalFile { path: path.clone() },
+                temp_path: path.clone(),
+                byte_len,
+            },
+            EncodingChoice::Auto,
+            "paged.log",
+        )
+        .expect("测试分页日志应能建立行索引");
+        let paged_tab_document = LogTabDocument::Paged(paged_document);
+
+        assert!(
+            !MainView::log_minimap_document_allows_render(&paged_tab_document),
+            "分页日志必须关闭 minimap，避免滚动时产生额外分页读取和高亮成本"
+        );
+
+        drop(paged_tab_document);
+        let _ = fs::remove_file(path);
+    }
+
+    /// 验证 minimap 对超大日志只按视口高度采样。
+    ///
+    /// 业务意图：
+    /// - 千万级日志不能因为右侧预览栏回到逐行绘制；采样数量必须受 minimap 高度控制，并覆盖文件首尾位置。
+    #[test]
+    fn 日志_minimap_超大日志采样数量受视口高度限制() {
+        let viewport_height = px(900.0);
+        let indices = MainView::log_minimap_sample_line_indices(50_000_000, viewport_height);
+
+        assert!(!indices.is_empty());
+        assert!(indices.len() <= MainView::log_minimap_sample_capacity(viewport_height));
+        assert_eq!(indices.first().copied(), Some(0));
+        assert_eq!(indices.last().copied(), Some(49_999_999));
+
+        let line_height = MainView::log_minimap_sample_line_height(indices.len(), viewport_height);
+        assert!(
+            line_height <= f32::from(viewport_height) / indices.len() as f32,
+            "缩略线高度必须小于等于采样间距，避免右侧预览行重叠"
+        );
+    }
+
+    /// 验证 minimap 视口块保持真实正文窗口宽高比。
+    ///
+    /// 业务意图：
+    /// - VS Code 风格 minimap 的灰色视口块应像正文窗口的缩小版，而不是按全文比例变成极薄滑块。
+    #[test]
+    fn 日志_minimap_视口块保持正文宽高比() {
+        let scroll_info = LogMinimapScrollInfo {
+            scroll_top_px: 12_000.0,
+            max_scroll_px: 1_000_000.0,
+            viewport_width_px: 1280.0,
+            viewport_height_px: 720.0,
+        };
+
+        let block_height = MainView::log_minimap_viewport_block_height(
+            px(LOG_MINIMAP_WIDTH),
+            px(720.0),
+            scroll_info,
+        );
+        let expected_height = LOG_MINIMAP_WIDTH * scroll_info.viewport_height_px as f32
+            / scroll_info.viewport_width_px as f32;
+
+        assert!(
+            (f32::from(block_height) - expected_height).abs() < 0.01,
+            "110px 宽 minimap 对应 1280x720 正文窗口时，视口块高度应保持正文宽高比"
+        );
+    }
+
+    /// 验证 minimap 只绘制当前视口附近的局部窗口。
+    ///
+    /// 业务意图：
+    /// - 大日志不能再被压缩成一整张全文件缩略图；当前可见行应落在局部窗口的视口块位置，上下保留有限上下文。
+    #[test]
+    fn 日志_minimap_局部窗口不覆盖整份超大日志() {
+        let line_count = 50_000_000usize;
+        let scroll_info = LogMinimapScrollInfo {
+            scroll_top_px: 3_600_000.0,
+            max_scroll_px: 1_200_000_000.0,
+            viewport_width_px: 1200.0,
+            viewport_height_px: 900.0,
+        };
+
+        let layout = MainView::log_minimap_layout_for_scroll(
+            line_count,
+            px(LOG_MINIMAP_WIDTH),
+            px(900.0),
+            scroll_info,
+        )
+        .expect("有效尺寸和行数必须生成 minimap 局部窗口");
+        let current_top_line = scroll_info.scroll_top_px / f64::from(px(LOG_VIEWER_ROW_HEIGHT));
+        let current_top_y =
+            (current_top_line - layout.window_start_line_float) * layout.line_height_px as f64;
+
+        assert!(
+            layout.window_line_count < 1_000,
+            "局部窗口只应覆盖当前视口上下文，不能覆盖千万级全文"
+        );
+        assert!(
+            layout.window_start_line > 0
+                && layout.window_start_line + layout.window_line_count < line_count,
+            "中段滚动时局部窗口应位于文件内部，而不是从首尾强行显示整份日志"
+        );
+        assert!(
+            (current_top_y - f64::from(layout.viewport_block_top)).abs() < 0.5,
+            "正文当前顶部行应对齐到 minimap 视口块顶部"
+        );
+    }
+
+    /// 验证 minimap bucket 在千万级日志中不会溢出且覆盖首尾。
+    ///
+    /// 业务意图：
+    /// - 优化后的 minimap 使用固定数量 bucket 缓存静态内容层，行号换算必须能处理超大分页日志。
+    /// - 最后一段范围需要夹紧到真实末尾，避免预览底部点击、绘制或聚合时访问不存在的行。
+    #[test]
+    fn 日志_minimap_bucket_千万级行数范围稳定() {
+        let line_count = 50_000_000usize;
+        let bucket_count = 520usize;
+
+        let first = MainView::log_minimap_bucket_line_range(line_count, bucket_count, 0);
+        let middle =
+            MainView::log_minimap_bucket_line_range(line_count, bucket_count, bucket_count / 2);
+        let last =
+            MainView::log_minimap_bucket_line_range(line_count, bucket_count, bucket_count - 1);
+
+        assert_eq!(first.0, 0, "第一个 bucket 必须从文件首行开始");
+        assert!(
+            first.1 > first.0 && middle.1 > middle.0 && last.1 > last.0,
+            "每个 bucket 都必须覆盖至少一行，避免空范围导致预览缺块"
+        );
+        assert_eq!(
+            last.1, line_count,
+            "最后一个 bucket 必须夹紧到真实行数，不能越界"
+        );
+    }
+
+    /// 验证分页日志的 minimap 轮廓只使用行索引字节长度。
+    ///
+    /// 业务意图：
+    /// - 大日志分页模式不能为了右侧预览随机读取正文；字节长度轮廓必须可单独生成并按最大分析列数夹紧。
+    #[test]
+    fn 日志_minimap_分页轮廓按字节长度夹紧() {
+        let empty_line = MainView::log_minimap_segments_for_byte_len(0);
+        let long_line = MainView::log_minimap_segments_for_byte_len(50_000);
+
+        assert_eq!(empty_line.len(), 1, "空行也需要保留最小可见轮廓");
+        assert_eq!(empty_line[0].column_len, 1);
+        assert!(
+            long_line[0].column_len <= 160,
+            "超长行必须按 minimap 最大分析列数夹紧，避免宽度计算溢出"
+        );
+    }
+
+    /// 验证横向滚动条不会重复扣减右侧 minimap 宽度。
+    ///
+    /// 业务意图：
+    /// - minimap 和纵向滚动条已经作为正文内容区的并列 flex 子项存在，横向滚动条的视口测量天然排除了右侧栏。
+    /// - 如果这里继续传入右侧预留宽度，滑块轨道会被二次扣短，导致横向拖动比例和视觉长度都偏小。
+    #[test]
+    fn 日志_横向滚动条不重复扣减并列_minimap() {
+        assert_eq!(
+            MainView::log_horizontal_scrollbar_right_reserved_width_for_current_layout(),
+            0.0,
+            "当前并列布局下，横向滚动条不应额外扣除右侧 minimap 宽度"
+        );
+    }
+
+    /// 验证右侧纵向滚动条槽可以脱离 minimap 独立显示。
+    ///
+    /// 业务意图：
+    /// - 分页日志为了性能不显示 minimap，但仍需要保留右侧纵向滚动条作为精确拖动入口。
+    /// - 普通内存日志显示 minimap 时，首帧即使滚动条指标未回填也保留槽位；短日志则不显示无意义空槽。
+    #[test]
+    fn 日志_右侧纵向滚动条槽支持分页独立显示() {
+        assert!(
+            MainView::log_vertical_scrollbar_gutter_should_render(true, false),
+            "分页日志禁用 minimap 时，只要存在纵向滚动条指标仍应显示滚动条槽"
+        );
+        assert!(
+            MainView::log_vertical_scrollbar_gutter_should_render(false, true),
+            "minimap 可见但滚动条指标首帧暂缺时，应保留槽位避免布局抖动"
+        );
+        assert!(
+            !MainView::log_vertical_scrollbar_gutter_should_render(false, false),
+            "短日志既没有滚动条也没有 minimap 时，不应显示右侧空槽"
+        );
+    }
+
+    /// 验证 minimap 迷你文本使用单条轮廓并识别错误行。
+    ///
+    /// 业务意图：
+    /// - 小文件预览需要保留缩进和行长轮廓，但不能把表格列按空白拆成大量竖向条纹；错误日志仍需要在预览栏中有更强视觉信号。
+    #[test]
+    fn 日志_minimap_迷你文本保留片段和错误色调() {
+        let segments = MainView::log_minimap_segments_for_text("INFO  worker-1  ERROR failed");
+
+        assert_eq!(segments.len(), 1, "每个采样行最多绘制一条连续轮廓线");
+        assert!(segments[0].column_len > 10, "连续轮廓应保留行长变化");
+        assert_eq!(
+            format!(
+                "{:?}",
+                MainView::log_minimap_tone_for_line("2026-05-20 ERROR failed")
+            ),
+            "Error"
+        );
+    }
+
+    /// 验证 minimap 使用真实显示文本并复用正文高亮。
+    ///
+    /// 业务意图：
+    /// - 右侧预览不能只画行长横线；它需要拿到正文同源的显示文本和高亮范围，后续绘制阶段才能画出真实字符纹理。
+    #[test]
+    fn 日志_minimap_真实字符复用正文高亮() {
+        let (display_text, highlights) = MainView::log_minimap_display_text_and_highlights(
+            "2026-05-20 04:37:04 ERROR failed",
+            crate::highlighting::HighlightMode::Log,
+            None,
+            SyntaxTheme::Light,
+        );
+
+        assert!(
+            display_text.starts_with("2026-05-20"),
+            "minimap 应保留真实日志字符，而不是只保留长度轮廓"
+        );
+        assert!(
+            highlights.iter().any(|(_, style)| style.color.is_some()),
+            "minimap 高亮应复用正文语法高亮颜色"
+        );
+    }
+
+    /// 验证 minimap 拖动换算支持极大的分页滚动范围。
+    ///
+    /// 边界条件：
+    /// - 超大日志的最大滚动距离可能远超 `f32` 精度稳定区，拖动换算必须保留 `f64` 范围并夹紧到合法上下界。
+    #[test]
+    fn 日志_minimap_拖动换算支持超大滚动距离() {
+        let max_scroll = 1_500_000_000.0_f64;
+        let scroll_top = MainView::log_minimap_scroll_top_for_drag(
+            px(500.0),
+            px(10.0),
+            px(900.0),
+            px(18.0),
+            max_scroll,
+        );
+
+        assert!(scroll_top > 0.0);
+        assert!(scroll_top <= max_scroll);
+        assert_eq!(
+            MainView::log_minimap_scroll_top_for_drag(
+                px(-100.0),
+                px(10.0),
+                px(900.0),
+                px(18.0),
+                max_scroll,
+            ),
+            0.0
+        );
+    }
+
+    /// 验证 minimap 只绘制当前 tab 来源对应的搜索命中。
+    ///
+    /// 业务意图：
+    /// - 底部搜索结果面板会保留多文件、多轮搜索历史；右侧预览栏不能把其它文件的命中行画到当前日志上。
+    #[test]
+    fn 日志_minimap_搜索标记只使用当前来源() {
+        let current_source = test_local_file("/tmp/current.log");
+        let other_source = test_local_file("/tmp/other.log");
+        let current_key = current_source.stable_key();
+        let other_key = other_source.stable_key();
+        let record = SearchHistoryRecord {
+            job_id: 1,
+            query: "error".to_string(),
+            scope: SearchScope::CurrentDirectory,
+            directory_target: Some("/tmp".to_string()),
+            case_sensitive: false,
+            match_mode: SearchMatchMode::Literal,
+            progress: SearchProgress::default(),
+            results: vec![
+                SearchResultItem {
+                    source: current_source,
+                    source_key: current_key.clone(),
+                    file_name: "current.log".to_string(),
+                    location: "/tmp".to_string(),
+                    line_index: 12,
+                    line_text: "ERROR current".to_string(),
+                    match_range: 0..5,
+                },
+                SearchResultItem {
+                    source: other_source,
+                    source_key: other_key,
+                    file_name: "other.log".to_string(),
+                    location: "/tmp".to_string(),
+                    line_index: 88,
+                    line_text: "ERROR other".to_string(),
+                    match_range: 0..5,
+                },
+            ],
+            errors: Vec::new(),
+            canceled: false,
+            expanded: true,
+            expanded_file_keys: HashSet::new(),
+        };
+
+        let markers =
+            MainView::log_minimap_search_marker_lines_for_records(&current_key, Some(3), &[record]);
+
+        assert_eq!(markers, vec![3, 12]);
     }
 
     /// 验证千万级行号列不会被旧的窄上限裁切。

@@ -619,6 +619,45 @@ pub(in crate::app) const LOG_VIEWER_SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 36.0;
 /// - 让滚动条不贴到窗口边缘和 tab 内容边界，视觉上更轻量。
 pub(in crate::app) const LOG_VIEWER_SCROLLBAR_PADDING: f32 = 3.0;
 
+/// 日志正文右侧 VS Code 风格局部预览栏宽度。
+///
+/// 业务意图：
+/// - VS Code 风格 minimap 需要在正文右侧提供当前视口附近的缩略位置感，固定宽度可以避免不同日志内容导致布局抖动。
+/// - 当前对需要纵向滚动的 Ready 日志默认显示，不持久化开关；后续如果加入设置项，应继续以该值作为默认宽度。
+///
+/// 边界条件：
+/// - 宽度必须足够绘制迷你文本、搜索命中和当前视口块，同时不能明显挤压日志正文。
+/// - macOS 和 Windows 的逻辑像素由 GPUI 统一换算，这里只维护应用内部布局尺寸。
+pub(in crate::app) const LOG_MINIMAP_WIDTH: f32 = 110.0;
+
+/// 日志 minimap 右侧纵向滚动条槽宽度。
+///
+/// 业务意图：
+/// - 用户仍需要熟悉的纵向滚动条拖动入口；该槽放在 minimap 右侧，避免覆盖正文或缩略文本。
+/// - 宽度包含滑块本身和左右内缩，保证 macOS 与 Windows 上都能稳定命中 6px 滑块。
+pub(in crate::app) const LOG_MINIMAP_SCROLLBAR_GUTTER_WIDTH: f32 =
+    LOG_VIEWER_SCROLLBAR_WIDTH + LOG_VIEWER_SCROLLBAR_PADDING * 2.0;
+
+/// 日志 minimap 内迷你文本左右留白。
+///
+/// 业务意图：
+/// - 迷你文本线段不能贴住边框，否则搜索命中、当前视口块和正文轮廓会视觉混在一起。
+pub(in crate::app) const LOG_MINIMAP_HORIZONTAL_PADDING: f32 = 6.0;
+
+/// 日志 minimap 单条迷你文本线段高度。
+///
+/// 业务意图：
+/// - minimap 的文字不可读，只需要形成接近编辑器缩略图的行纹理；较细线段能在 110px 宽度内保持信息密度。
+pub(in crate::app) const LOG_MINIMAP_LINE_HEIGHT: f32 = 1.25;
+
+/// 日志 minimap 采样行的目标垂直间距。
+///
+/// 业务意图：
+/// - 预览栏不能为超大日志逐行创建或绘制内容；按视口高度采样可以把每帧绘制量限制在可见像素规模内。
+/// - 目标间距按 1px 纹理绘制，避免右侧预览出现明显大空隙；极端高窗口仍由硬上限保护。
+#[cfg(test)]
+pub(in crate::app) const LOG_MINIMAP_SAMPLE_ROW_HEIGHT: f32 = 1.0;
+
 /// 编码下拉框按钮宽度。
 ///
 /// 业务意图：

@@ -1182,6 +1182,22 @@ pub(in crate::app) struct LogScrollbarDrag {
     pub(in crate::app) cursor_offset: Pixels,
 }
 
+/// 日志 minimap 当前视口块正在被拖动时的临时状态。
+///
+/// 业务意图：
+/// - 右侧 minimap 把当前视口附近的日志缩略到一个窄栏内，用户拖动当前视口块时需要把鼠标位置稳定换算回正文滚动偏移。
+/// - 保存鼠标按下点相对视口块顶部的偏移，可以避免拖动开始瞬间视口块跳到鼠标中心。
+///
+/// 边界条件：
+/// - 该状态只在鼠标左键拖动期间有效；释放鼠标、关闭 tab、重新加载日志或正文不可滚动时都会清空。
+#[derive(Clone, Copy)]
+pub(in crate::app) struct LogMinimapDrag {
+    /// 正在拖动 minimap 的 tab ID。
+    pub(in crate::app) tab_id: usize,
+    /// 鼠标按下点相对 minimap 当前视口块顶部的偏移。
+    pub(in crate::app) cursor_offset: Pixels,
+}
+
 /// 日志正文自绘滚动条的布局测量结果。
 ///
 /// 业务意图：
@@ -2151,6 +2167,100 @@ pub(in crate::app) enum LogTabState {
         /// 中文错误说明。
         message: String,
     },
+}
+
+/// minimap 行色调。
+///
+/// 业务意图：
+/// - 右侧局部预览不做完整语法高亮，但错误、警告和低优先级日志需要在缩略图中保持基本可扫视差异。
+/// - 色调作为缓存数据保存，不绑定具体主题颜色；绘制阶段再根据当前明暗主题映射为真实颜色。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::app) enum LogMinimapLineTone {
+    /// 普通正文。
+    Text,
+    /// 调试或跟踪类低优先级日志。
+    Muted,
+    /// 警告日志。
+    Warning,
+    /// 错误、异常或失败日志。
+    Error,
+}
+
+/// minimap 缓存键。
+///
+/// 业务意图：
+/// - minimap 内容层只依赖文档来源、文档行数、文档类型和当前局部窗口；搜索高亮和标记行属于覆盖层，不参与该键。
+/// - VS Code 风格 minimap 不是把整份日志压缩到一栏里，而是绘制当前视口附近的局部文本窗口，因此滚动到新的行窗口时需要更新缓存。
+/// - 高度取整到逻辑像素，避免窗口高度微小浮点抖动导致缓存持续失效。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::app) struct LogMinimapCacheKey {
+    /// 当前 tab 的稳定来源键。
+    pub(in crate::app) source_key: String,
+    /// 文档行数。
+    pub(in crate::app) line_count: usize,
+    /// 当前正文视口宽度，单位为 GPUI 逻辑像素。
+    ///
+    /// 业务意图：
+    /// - minimap 视口块高度按正文宽高比计算，正文宽度变化会改变局部窗口能容纳的日志行数。
+    pub(in crate::app) viewport_width_px: u32,
+    /// minimap 视口高度，单位为 GPUI 逻辑像素。
+    pub(in crate::app) viewport_height_px: u32,
+    /// 当前 minimap 局部窗口起始真实行号。
+    pub(in crate::app) window_start_line: usize,
+    /// 当前 minimap 局部窗口覆盖的真实行数。
+    pub(in crate::app) window_line_count: usize,
+    /// 当前局部窗口聚合后的 bucket 数量。
+    pub(in crate::app) bucket_count: usize,
+    /// 当前缓存对应的语法高亮主题。
+    ///
+    /// 业务意图：
+    /// - minimap 缓存包含已经映射到主题色的高亮范围，主题变化时必须重建，避免亮色/暗色高亮串色。
+    pub(in crate::app) syntax_theme: SyntaxTheme,
+    /// 是否为分页大日志。
+    pub(in crate::app) paged: bool,
+}
+
+/// minimap 单个局部行 bucket 的聚合结果。
+///
+/// 业务意图：
+/// - 局部窗口中的一行或少量多行日志会被压缩到一个 bucket 中，优先缓存代表行的真实显示文本和正文同源高亮。
+/// - 分页日志读取失败或极端聚合场景仍保留缩进、行长和色调轮廓作为降级绘制数据，避免 minimap 阻塞主视图。
+#[derive(Clone, Debug)]
+pub(in crate::app) struct LogMinimapBucket {
+    /// bucket 覆盖的起始真实行号。
+    pub(in crate::app) start_line: usize,
+    /// bucket 覆盖的真实行数。
+    pub(in crate::app) line_count: usize,
+    /// 缩略线段起始列。
+    pub(in crate::app) start_column: usize,
+    /// 缩略线段长度。
+    pub(in crate::app) column_len: usize,
+    /// bucket 中最高优先级的日志色调。
+    pub(in crate::app) tone: LogMinimapLineTone,
+    /// 代表行展开制表符后的显示文本。
+    ///
+    /// 业务意图：
+    /// - minimap 需要绘制真实日志字符而不是纯长度横线；该字段和正文 `display_line` 一样只服务视觉展示，不参与复制或搜索。
+    /// - `None` 表示分页读取失败或当前 bucket 只能用长度轮廓降级绘制。
+    pub(in crate::app) display_text: Option<String>,
+    /// 与 `display_text` 对齐的正文同源高亮范围。
+    ///
+    /// 边界条件：
+    /// - 范围使用 `display_text` 的 UTF-8 字节偏移；文本被截断时必须同步夹紧高亮范围，避免 GPUI 文本排版越界。
+    pub(in crate::app) highlights: Vec<(Range<usize>, gpui::HighlightStyle)>,
+}
+
+/// minimap 内容层缓存。
+///
+/// 业务意图：
+/// - 内容层缓存和滚动覆盖层分离；普通滚动只需要重算视口块位置，不应重新采样日志文本。
+/// - buckets 使用 `Arc` 持有，GPUI canvas 的 prepaint/paint 状态可以廉价克隆并跨闭包传递。
+#[derive(Clone, Debug)]
+pub(in crate::app) struct LogMinimapRenderCache {
+    /// 当前缓存对应的键。
+    pub(in crate::app) key: LogMinimapCacheKey,
+    /// 按垂直顺序排列的像素 bucket。
+    pub(in crate::app) buckets: Arc<Vec<LogMinimapBucket>>,
 }
 
 /// 日志 tab 读取完成后回到 UI 线程的数据。

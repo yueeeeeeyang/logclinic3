@@ -290,6 +290,7 @@ impl MainView {
         self.resize_splitter(event, window, context);
         self.update_log_tree_scrollbar_drag(event, context);
         self.update_log_scrollbar_drag(event, context);
+        self.update_log_minimap_drag(event, context);
     }
 
     /// 处理内容区鼠标左键释放事件。
@@ -305,6 +306,7 @@ impl MainView {
         self.stop_resizing_splitter(event, window, context);
         self.stop_log_tree_scrollbar_drag(context);
         self.stop_log_scrollbar_drag(context);
+        self.stop_log_minimap_drag(context);
         self.stop_log_text_selection(context);
     }
 

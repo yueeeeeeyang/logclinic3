@@ -1,8 +1,8 @@
 // 日志正文滚动条和分页滚动辅助。
 //
 // 业务意图：
-// - 从日志正文查看器中拆出 纵横滚动条、分页视口和滚轮换算，让正文渲染、滚动、选区和菜单职责更清晰。
-// - 本轮只移动方法边界并保留原有中文注释，不改变虚拟列表、分页日志、右键菜单或复制行为。
+// - 横向滚动条仍覆盖在正文底部，纵向滚动条显示在右侧 minimap 旁边，避免遮挡正文和缩略预览。
+// - 纵向指标同时服务键盘滚动、minimap 拖动和标记跳转，所有入口必须共享同一套滚动范围换算。
 
 use super::*;
 
@@ -21,164 +21,10 @@ impl MainView {
             )
     }
 
-    /// 渲染日志正文的纵向可见滚动条。
-    ///
-    /// 业务意图：
-    /// - GPUI `uniform_list` 已经支持滚轮滚动，但长日志需要稳定可见的滚动位置提示和鼠标拖动入口。
-    /// - 滑块与列表共享同一个 `UniformListScrollHandle`，拖动时直接写入列表底层滚动偏移，不复制日志行数据。
-    pub(in crate::app) fn render_log_vertical_scrollbar(
-        &self,
-        tab_id: usize,
-        scroll_handle: &UniformListScrollHandle,
-        line_count: usize,
-        context: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let palette = self.palette();
-        let Some(metrics) = Self::log_vertical_scrollbar_metrics(scroll_handle)
-            .or_else(|| Self::fallback_log_vertical_scrollbar_metrics(line_count))
-        else {
-            return div().id("log-vertical-scrollbar-empty").hidden();
-        };
-
-        div()
-            .id(SharedString::from(format!(
-                "log-vertical-scrollbar-{}",
-                tab_id
-            )))
-            .absolute()
-            .top(metrics.thumb_start)
-            .right(px(LOG_VIEWER_SCROLLBAR_PADDING))
-            .w(px(LOG_VIEWER_SCROLLBAR_WIDTH))
-            .h(metrics.thumb_length)
-            .rounded(px(LOG_VIEWER_SCROLLBAR_WIDTH / 2.0))
-            .bg(rgb(palette.scrollbar))
-            .cursor_pointer()
-            .hover(move |thumb| thumb.bg(rgb(palette.scrollbar_hover)))
-            .on_mouse_down(
-                MouseButton::Left,
-                context.listener(move |view, event: &MouseDownEvent, _window, context| {
-                    view.start_log_scrollbar_drag(
-                        tab_id,
-                        LogScrollbarAxis::Vertical,
-                        event,
-                        context,
-                    );
-                    context.notify();
-                    // 日志滚动条覆盖在正文行上，按下滑块不应同时开始正文文本选择或触发浮层关闭。
-                    context.stop_propagation();
-                }),
-            )
-    }
-
-    /// 渲染日志正文的横向可见滚动条。
-    ///
-    /// 业务意图：
-    /// - 日志行可能包含长 JSON、堆栈或配置片段，正文宽度超过视口时必须提供横向滚动提示。
-    /// - 横向滚动条只在实际测量到内容超宽后显示，避免普通短日志底部出现无效控件。
-    pub(in crate::app) fn render_log_horizontal_scrollbar(
-        &self,
-        tab_id: usize,
-        scroll_handle: &UniformListScrollHandle,
-        line_number_width: f32,
-        context: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let palette = self.palette();
-        let Some(metrics) =
-            Self::log_horizontal_scrollbar_metrics(scroll_handle, line_number_width)
-        else {
-            return div().id("log-horizontal-scrollbar-empty").hidden();
-        };
-
-        div()
-            .id(SharedString::from(format!(
-                "log-horizontal-scrollbar-{}",
-                tab_id
-            )))
-            .absolute()
-            .left(metrics.thumb_start)
-            .bottom(px(LOG_VIEWER_SCROLLBAR_PADDING))
-            .w(metrics.thumb_length)
-            .h(px(LOG_VIEWER_SCROLLBAR_WIDTH))
-            .rounded(px(LOG_VIEWER_SCROLLBAR_WIDTH / 2.0))
-            .bg(rgb(palette.scrollbar))
-            .cursor_pointer()
-            .hover(move |thumb| thumb.bg(rgb(palette.scrollbar_hover)))
-            .on_mouse_down(
-                MouseButton::Left,
-                context.listener(move |view, event: &MouseDownEvent, _window, context| {
-                    view.start_log_scrollbar_drag(
-                        tab_id,
-                        LogScrollbarAxis::Horizontal,
-                        event,
-                        context,
-                    );
-                    context.notify();
-                    // 横向滚动条同样位于正文上方，拖动入口需要阻断事件继续传递。
-                    context.stop_propagation();
-                }),
-            )
-    }
-
-    /// 按 tab 当前文档类型渲染日志纵向滚动条。
-    ///
-    /// 业务意图：
-    /// - 分页日志的滚动位置由应用侧 `f64` 状态维护，不能再读取 `uniform_list` 的完整内容高度。
-    /// - 滚动条仍复用同一套拖动入口，让普通模式和分页模式的交互保持一致。
-    pub(in crate::app) fn render_log_vertical_scrollbar_for_tab(
-        &self,
-        tab: &OpenLogTab,
-        context: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let palette = self.palette();
-        let tab_id = tab.id;
-        let Some(metrics) = self
-            .log_scrollbar_metrics_for_tab(tab, LogScrollbarAxis::Vertical)
-            .or_else(|| match &tab.state {
-                LogTabState::Ready { document } => match document.as_ref() {
-                    LogTabDocument::Paged(document) => {
-                        Self::fallback_log_vertical_scrollbar_metrics(document.line_count())
-                    }
-                    LogTabDocument::InMemory(_) => None,
-                },
-                LogTabState::Loading { .. } | LogTabState::Failed { .. } => None,
-            })
-        else {
-            return div().id("log-vertical-scrollbar-empty").hidden();
-        };
-
-        div()
-            .id(SharedString::from(format!(
-                "log-vertical-scrollbar-{}",
-                tab_id
-            )))
-            .absolute()
-            .top(metrics.thumb_start)
-            .right(px(LOG_VIEWER_SCROLLBAR_PADDING))
-            .w(px(LOG_VIEWER_SCROLLBAR_WIDTH))
-            .h(metrics.thumb_length)
-            .rounded(px(LOG_VIEWER_SCROLLBAR_WIDTH / 2.0))
-            .bg(rgb(palette.scrollbar))
-            .cursor_pointer()
-            .hover(move |thumb| thumb.bg(rgb(palette.scrollbar_hover)))
-            .on_mouse_down(
-                MouseButton::Left,
-                context.listener(move |view, event: &MouseDownEvent, _window, context| {
-                    view.start_log_scrollbar_drag(
-                        tab_id,
-                        LogScrollbarAxis::Vertical,
-                        event,
-                        context,
-                    );
-                    context.notify();
-                    // 分页日志滚动条和普通日志一样覆盖正文区域，避免按下时穿透到日志行。
-                    context.stop_propagation();
-                }),
-            )
-    }
-
     /// 按 tab 当前文档类型渲染日志横向滚动条。
     ///
     /// 业务意图：
+    /// - 普通日志和分页日志共用同一套滑块元素，确保右侧 minimap 预留、按下拖动和可视位置完全一致。
     /// - 分页日志使用最长行估算横向内容宽度，只把可见行放进布局树，避免超大行数触发布局精度问题。
     pub(in crate::app) fn render_log_horizontal_scrollbar_for_tab(
         &self,
@@ -216,10 +62,117 @@ impl MainView {
                         context,
                     );
                     context.notify();
-                    // 分页日志横向滚动条启动拖拽后应独占本次鼠标按下事件。
+                    // 横向滚动条启动拖拽后应独占本次鼠标按下事件，避免下层日志行触发选区或右键菜单。
                     context.stop_propagation();
                 }),
             )
+    }
+
+    /// 渲染位于 minimap 右侧的日志纵向滚动条槽。
+    ///
+    /// 业务意图：
+    /// - 右侧预览栏负责全文件缩略图，传统纵向滚动条负责精确拖动入口，两者并排显示，避免互相覆盖。
+    /// - 即使首帧暂时没有滑块测量值，也保留滚动条槽宽度，防止 minimap 和正文宽度在测量回填时抖动。
+    ///
+    /// 边界条件：
+    /// - 短日志不会渲染 minimap，因此该槽只在存在纵向溢出时出现。
+    /// - 槽内空白区域消费鼠标事件，避免点击穿透到底层日志行或触发 minimap 跳转。
+    pub(in crate::app) fn render_log_vertical_scrollbar_for_tab(
+        &self,
+        tab: &OpenLogTab,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let palette = self.palette();
+        let tab_id = tab.id;
+        let metrics = self.log_scrollbar_metrics_for_tab(tab, LogScrollbarAxis::Vertical);
+        if !Self::log_vertical_scrollbar_gutter_should_render(
+            metrics.is_some(),
+            Self::log_minimap_should_render_for_tab(tab),
+        ) {
+            return div().id("log-vertical-scrollbar-empty").hidden();
+        }
+        let gutter = div()
+            .id(SharedString::from(format!(
+                "log-vertical-scrollbar-gutter-{}",
+                tab_id
+            )))
+            .relative()
+            .flex_none()
+            .h_full()
+            .w(px(LOG_MINIMAP_SCROLLBAR_GUTTER_WIDTH))
+            .bg(rgb(palette.panel))
+            .border_l_1()
+            .border_color(rgb(palette.border))
+            .on_scroll_wheel(context.listener(
+                move |view, event: &ScrollWheelEvent, _window, context| {
+                    view.handle_log_minimap_scroll_wheel(tab_id, event, context);
+                    context.stop_propagation();
+                },
+            ))
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    // 点击滚动条槽空白处暂不跳转；消费事件避免下层正文开始选区或打开菜单。
+                    context.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    // 纵向滚动条槽不提供右键菜单，必须阻断事件穿透到底层日志行。
+                    context.stop_propagation();
+                }),
+            );
+
+        let Some(metrics) = metrics else {
+            return gutter;
+        };
+
+        gutter.child(
+            div()
+                .id(SharedString::from(format!(
+                    "log-vertical-scrollbar-{}",
+                    tab_id
+                )))
+                .absolute()
+                .top(metrics.thumb_start)
+                .right(px(LOG_VIEWER_SCROLLBAR_PADDING))
+                .w(px(LOG_VIEWER_SCROLLBAR_WIDTH))
+                .h(metrics.thumb_length)
+                .rounded(px(LOG_VIEWER_SCROLLBAR_WIDTH / 2.0))
+                .bg(rgb(palette.scrollbar))
+                .cursor_pointer()
+                .hover(move |thumb| thumb.bg(rgb(palette.scrollbar_hover)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    context.listener(move |view, event: &MouseDownEvent, _window, context| {
+                        view.start_log_scrollbar_drag(
+                            tab_id,
+                            LogScrollbarAxis::Vertical,
+                            event,
+                            context,
+                        );
+                        context.notify();
+                        // 纵向滑块覆盖在 minimap 右侧，拖动入口需要独占事件，避免同时触发预览栏跳转。
+                        context.stop_propagation();
+                    }),
+                ),
+        )
+    }
+
+    /// 判断右侧纵向滚动条槽是否需要保留。
+    ///
+    /// 业务意图：
+    /// - 分页日志禁用 minimap 后，仍必须能单独显示纵向滚动条，保证大文件可以拖动定位。
+    /// - 普通内存日志显示 minimap 时，即使首帧滚动条指标尚未回填，也保留槽位避免 minimap 和正文宽度抖动。
+    ///
+    /// 边界条件：
+    /// - 短日志既没有滚动条指标也不显示 minimap，此时不渲染空槽，避免正文右侧出现无意义留白。
+    pub(in crate::app) fn log_vertical_scrollbar_gutter_should_render(
+        has_vertical_metrics: bool,
+        minimap_visible: bool,
+    ) -> bool {
+        has_vertical_metrics || minimap_visible
     }
 
     /// 计算日志纵向滚动条滑块位置和高度。
@@ -267,6 +220,23 @@ impl MainView {
         scroll_handle: &UniformListScrollHandle,
         line_number_width: f32,
     ) -> Option<LogScrollbarMetrics> {
+        Self::log_horizontal_scrollbar_metrics_with_reserved(scroll_handle, line_number_width, 0.0)
+    }
+
+    /// 计算带右侧预留区的日志横向滚动条滑块位置和宽度。
+    ///
+    /// 业务意图：
+    /// - 日志正文右侧可能显示 minimap，横向滚动条的滑块和可拖动轨道不能延伸到 minimap 下方。
+    /// - 真实横向滚动范围仍来自 GPUI `ScrollHandle` 的内容测量；这里只调整自绘滑块的可视轨道。
+    ///
+    /// 边界条件：
+    /// - 首帧尚未测量内容宽度时返回 None。
+    /// - 右侧预留宽度可能大于剩余窗口宽度，轨道最小仍保留 1px，避免除零和非法尺寸。
+    pub(in crate::app) fn log_horizontal_scrollbar_metrics_with_reserved(
+        scroll_handle: &UniformListScrollHandle,
+        line_number_width: f32,
+        right_reserved_width: f32,
+    ) -> Option<LogScrollbarMetrics> {
         let state = scroll_handle.0.borrow();
         let size = state.last_item_size?;
         let viewport_width = size.item.width;
@@ -278,15 +248,19 @@ impl MainView {
             return None;
         }
 
-        let content_width = viewport_width + max_scroll;
+        let visual_viewport_width =
+            (viewport_width - px(right_reserved_width.max(0.0))).max(px(1.0));
+        let content_width = visual_viewport_width + max_scroll;
         let scroll_left = (-state.base_handle.offset().x).clamp(px(0.0), max_scroll);
         let track_start = px(line_number_width + LOG_VIEWER_SCROLLBAR_PADDING);
-        let track_right_padding =
-            px(LOG_VIEWER_SCROLLBAR_WIDTH + LOG_VIEWER_SCROLLBAR_PADDING * 2.0);
-        let track_length = (viewport_width - track_start - track_right_padding).max(px(1.0));
+        let track_length = Self::log_horizontal_scrollbar_track_length(
+            viewport_width,
+            line_number_width,
+            right_reserved_width,
+        );
         let min_thumb_length = px(LOG_VIEWER_SCROLLBAR_MIN_THUMB_HEIGHT).min(track_length);
-        let thumb_length =
-            (track_length * (viewport_width / content_width)).clamp(min_thumb_length, track_length);
+        let thumb_length = (track_length * (visual_viewport_width / content_width))
+            .clamp(min_thumb_length, track_length);
         let movable_length = (track_length - thumb_length).max(px(0.0));
         let thumb_start = track_start + movable_length * (scroll_left / max_scroll);
 
@@ -298,6 +272,24 @@ impl MainView {
             max_scroll,
             max_scroll_px: f64::from(max_scroll),
         })
+    }
+
+    /// 计算横向滚动条可视轨道长度。
+    ///
+    /// 业务意图：
+    /// - 日志查看器和单元测试都需要验证右侧 minimap 预留区是否真正从滚动条轨道中扣除。
+    /// - 轨道左侧避开行号列，右侧避开自绘滚动条圆角留白和可选 minimap 区域。
+    pub(in crate::app) fn log_horizontal_scrollbar_track_length(
+        viewport_width: Pixels,
+        line_number_width: f32,
+        right_reserved_width: f32,
+    ) -> Pixels {
+        let track_start = px(line_number_width + LOG_VIEWER_SCROLLBAR_PADDING);
+        let track_right_padding =
+            px(LOG_VIEWER_SCROLLBAR_WIDTH + LOG_VIEWER_SCROLLBAR_PADDING * 2.0);
+        let visual_viewport_width =
+            (viewport_width - px(right_reserved_width.max(0.0))).max(px(1.0));
+        (visual_viewport_width - track_start - track_right_padding).max(px(1.0))
     }
 
     /// 计算分页日志当前视口需要渲染的行数。
@@ -456,21 +448,28 @@ impl MainView {
         })
     }
 
-    /// 计算分页日志横向滚动条滑块。
-    pub(in crate::app) fn paged_log_horizontal_scrollbar_metrics(
+    /// 计算带右侧预留区的分页日志横向滚动条滑块。
+    ///
+    /// 业务意图：
+    /// - 分页日志的正文行不进入完整虚拟列表，横向滚动条只能用最长行估算；右侧 minimap 可见时仍要让可视轨道避开预览栏。
+    /// - 预留区只影响滑块轨道和视口比例，不触发额外文件读取或重新扫描日志正文。
+    pub(in crate::app) fn paged_log_horizontal_scrollbar_metrics_with_reserved(
         tab: &OpenLogTab,
         document: &log_document::PagedLogDocument,
         font_size: f32,
+        right_reserved_width: f32,
     ) -> Option<LogScrollbarMetrics> {
         let viewport_width = tab.paged_viewport_handle.bounds().size.width;
         if viewport_width <= px(0.0) {
             return None;
         }
 
+        let visual_viewport_width =
+            (viewport_width - px(right_reserved_width.max(0.0))).max(px(1.0));
         let line_number_width = Self::log_viewer_line_number_width(document.line_count());
         let max_scroll_px = Self::paged_log_horizontal_max_scroll_px(
             document,
-            viewport_width,
+            visual_viewport_width,
             line_number_width,
             font_size,
         );
@@ -478,13 +477,16 @@ impl MainView {
             return None;
         }
 
-        let content_width = f64::from(viewport_width) + max_scroll_px;
+        let content_width = f64::from(visual_viewport_width) + max_scroll_px;
         let track_start = px(line_number_width + LOG_VIEWER_SCROLLBAR_PADDING);
-        let track_right_padding =
-            px(LOG_VIEWER_SCROLLBAR_WIDTH + LOG_VIEWER_SCROLLBAR_PADDING * 2.0);
-        let track_length = (viewport_width - track_start - track_right_padding).max(px(1.0));
+        let track_length = Self::log_horizontal_scrollbar_track_length(
+            viewport_width,
+            line_number_width,
+            right_reserved_width,
+        );
         let min_thumb_length = px(LOG_VIEWER_SCROLLBAR_MIN_THUMB_HEIGHT).min(track_length);
-        let thumb_length = (track_length * (f64::from(viewport_width) / content_width) as f32)
+        let thumb_length = (track_length
+            * (f64::from(visual_viewport_width) / content_width) as f32)
             .clamp(min_thumb_length, track_length);
         let movable_length = (track_length - thumb_length).max(px(0.0));
         let scroll_ratio = (tab.paged_scroll.left_px / max_scroll_px).clamp(0.0, 1.0) as f32;
@@ -497,28 +499,6 @@ impl MainView {
             track_length,
             max_scroll: px(max_scroll_px.min(f64::from(f32::MAX)) as f32),
             max_scroll_px,
-        })
-    }
-
-    /// 在列表首帧尚未写入布局测量时，给明显较长的日志提供一个临时纵向滚动条提示。
-    ///
-    /// 业务意图：
-    /// - `UniformListScrollHandle` 的内容高度需要等布局完成后才有值，首帧如果完全不显示滚动条会让长日志看起来不可滚动。
-    /// - 这里仅对超过常见单屏行数的日志显示顶部最小滑块，下一次滚动或重绘会被真实测量值替换。
-    pub(in crate::app) fn fallback_log_vertical_scrollbar_metrics(
-        line_count: usize,
-    ) -> Option<LogScrollbarMetrics> {
-        if line_count <= 40 {
-            return None;
-        }
-
-        Some(LogScrollbarMetrics {
-            thumb_start: px(LOG_VIEWER_SCROLLBAR_PADDING),
-            thumb_length: px(LOG_VIEWER_SCROLLBAR_MIN_THUMB_HEIGHT),
-            track_start: px(LOG_VIEWER_SCROLLBAR_PADDING),
-            track_length: px(LOG_VIEWER_SCROLLBAR_MIN_THUMB_HEIGHT),
-            max_scroll: px(0.0),
-            max_scroll_px: 0.0,
         })
     }
 

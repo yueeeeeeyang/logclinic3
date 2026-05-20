@@ -169,7 +169,7 @@ pub struct DecodedLogDocument {
     /// 业务意图：
     /// - Tree-sitter 需要整文件语法树才能准确高亮标签、属性和 properties key/value。
     /// - 大文件会保持 `None` 并降级为轻量规则，避免打开和滚动性能受影响。
-    pub precomputed_highlights: Option<PrecomputedHighlights>,
+    pub precomputed_highlights: Option<Arc<PrecomputedHighlights>>,
     /// 解码过程中是否出现替换字符。
     ///
     /// 业务意图：
@@ -751,7 +751,7 @@ fn decode_with_encoding(
         lines: Arc::new(lines),
         longest_line_index,
         highlight_mode: highlight_plan.mode,
-        precomputed_highlights: highlight_plan.precomputed,
+        precomputed_highlights: highlight_plan.precomputed.map(Arc::new),
         had_replacements: decoded.had_errors,
         warning,
     })

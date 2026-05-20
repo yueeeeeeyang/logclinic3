@@ -967,6 +967,7 @@ impl MainView {
             tree_state.cleanup_temporary_paths();
         }
         self.log.open_tabs.clear();
+        self.log.log_minimap_cache.borrow_mut().clear();
         self.log.active_tab_id = None;
         self.log.tab_context_menu = None;
         self.log.encoding_dropdown_menu = None;
@@ -977,6 +978,7 @@ impl MainView {
         self.log.log_tree_search.reset_for_new_tree();
         self.log.log_tree_selection_anchor = None;
         self.log.log_scrollbar_drag = None;
+        self.log.log_minimap_drag = None;
         self.log.log_tree_scrollbar_drag = None;
         self.log.tab_bar_scroll_handle = ScrollHandle::new();
 

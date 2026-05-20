@@ -574,6 +574,7 @@ impl MainView {
                 return;
             };
 
+            self.log.log_minimap_cache.borrow_mut().remove(&tab_id);
             tab.scroll_handle = UniformListScrollHandle::new();
             tab.paged_viewport_handle = ScrollHandle::new();
             tab.paged_scroll = PagedLogScrollState::default();
@@ -648,6 +649,7 @@ impl MainView {
         }
 
         tab.encoding_choice = encoding_choice;
+        self.log.log_minimap_cache.borrow_mut().remove(&tab_id);
         tab.scroll_handle = UniformListScrollHandle::new();
         tab.pending_scroll_to_line = None;
         tab.highlighted_search_line = None;
@@ -668,6 +670,13 @@ impl MainView {
             .is_some_and(|drag| drag.tab_id == tab_id)
         {
             self.log.log_scrollbar_drag = None;
+        }
+        if self
+            .log
+            .log_minimap_drag
+            .is_some_and(|drag| drag.tab_id == tab_id)
+        {
+            self.log.log_minimap_drag = None;
         }
         context.notify();
         if let Some(raw_bytes) = raw_bytes {
@@ -781,6 +790,7 @@ impl MainView {
                 return;
             }
 
+            self.log.log_minimap_cache.borrow_mut().remove(&tab_id);
             tab.scroll_handle = UniformListScrollHandle::new();
             tab.paged_viewport_handle = ScrollHandle::new();
             tab.paged_scroll = PagedLogScrollState::default();

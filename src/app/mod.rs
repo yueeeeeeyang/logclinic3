@@ -13,7 +13,7 @@
 use std::{
     borrow::Cow,
     cell::RefCell,
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     env, fs,
     ops::{Deref, DerefMut, Range},
     path::{Path, PathBuf},

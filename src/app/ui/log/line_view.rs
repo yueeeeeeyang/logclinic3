@@ -17,30 +17,51 @@ impl MainView {
         tab: &OpenLogTab,
         axis: LogScrollbarAxis,
     ) -> Option<LogScrollbarMetrics> {
+        let right_reserved_width =
+            Self::log_horizontal_scrollbar_right_reserved_width_for_current_layout();
         match &tab.state {
             LogTabState::Ready { document } => match document.as_ref() {
                 LogTabDocument::Paged(document) => match axis {
                     LogScrollbarAxis::Vertical => {
                         Self::paged_log_vertical_scrollbar_metrics(tab, document)
                     }
-                    LogScrollbarAxis::Horizontal => Self::paged_log_horizontal_scrollbar_metrics(
-                        tab,
-                        document,
-                        self.settings.log_viewer_font_size,
-                    ),
+                    LogScrollbarAxis::Horizontal => {
+                        Self::paged_log_horizontal_scrollbar_metrics_with_reserved(
+                            tab,
+                            document,
+                            self.settings.log_viewer_font_size,
+                            right_reserved_width,
+                        )
+                    }
                 },
                 LogTabDocument::InMemory(document) => match axis {
                     LogScrollbarAxis::Vertical => {
                         Self::log_vertical_scrollbar_metrics(&tab.scroll_handle)
                     }
-                    LogScrollbarAxis::Horizontal => Self::log_horizontal_scrollbar_metrics(
-                        &tab.scroll_handle,
-                        Self::log_viewer_line_number_width(document.line_count()),
-                    ),
+                    LogScrollbarAxis::Horizontal => {
+                        Self::log_horizontal_scrollbar_metrics_with_reserved(
+                            &tab.scroll_handle,
+                            Self::log_viewer_line_number_width(document.line_count()),
+                            right_reserved_width,
+                        )
+                    }
                 },
             },
             LogTabState::Loading { .. } | LogTabState::Failed { .. } => None,
         }
+    }
+
+    /// 返回横向滚动条计算时需要额外扣除的右侧覆盖宽度。
+    ///
+    /// 业务意图：
+    /// - 右侧 minimap 和纵向滚动条现在作为 `log-viewer-content` 的并列 flex 子项存在，正文内容区测量宽度已经天然排除了右侧栏。
+    /// - 横向滚动条也渲染在正文内容区内部，因此不能再额外扣除 minimap 宽度，否则滑块轨道会比真实正文区域更短。
+    ///
+    /// 边界条件：
+    /// - 如果后续把横向滚动条重新移动到覆盖整个 `log-viewer-body` 的父容器上，再在这里恢复对应的右侧预留宽度。
+    pub(in crate::app) fn log_horizontal_scrollbar_right_reserved_width_for_current_layout() -> f32
+    {
+        0.0
     }
 
     /// 取得日志正文滚动条视口在当前轴向上的窗口坐标起点。

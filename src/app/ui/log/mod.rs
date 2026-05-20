@@ -24,9 +24,14 @@ mod tree_search_input;
 mod tree_view;
 /// 日志正文右键菜单。
 mod viewer_menu;
+/// 日志正文右侧 VS Code 风格局部预览 minimap。
+mod viewer_minimap;
 /// 日志正文滚动条和分页滚动辅助。
 mod viewer_scrollbar;
 /// 日志正文视图。
 mod viewer_view;
 
 use tree_search_input::*;
+
+#[cfg(test)]
+pub(in crate::app) use viewer_minimap::LogMinimapScrollInfo;

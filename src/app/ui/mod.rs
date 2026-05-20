@@ -33,6 +33,8 @@ pub(in crate::app) use analysis_panel::{
     LogAiAnalysisWindowView, SearchResultsResizeDrag, SearchTarget, ThreadAnalysisWindowView,
 };
 pub(in crate::app) use chat_panel::*;
+#[cfg(test)]
+pub(in crate::app) use log::LogMinimapScrollInfo;
 pub(in crate::app) use markdown::*;
 pub(in crate::app) use notes_panel::*;
 pub(in crate::app) use plugin_panel::PluginPageWindowView;

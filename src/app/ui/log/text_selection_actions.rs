@@ -28,7 +28,9 @@ impl MainView {
         context: &mut Context<Self>,
     ) {
         self.note_keyboard_scroll_region(KeyboardScrollRegion::LogContent);
-        if self.search.search_results_resize_drag.is_some() || self.log.log_scrollbar_drag.is_some()
+        if self.search.search_results_resize_drag.is_some()
+            || self.log.log_scrollbar_drag.is_some()
+            || self.log.log_minimap_drag.is_some()
         {
             return;
         }
@@ -182,7 +184,9 @@ impl MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
-        if self.search.search_results_resize_drag.is_some() || self.log.log_scrollbar_drag.is_some()
+        if self.search.search_results_resize_drag.is_some()
+            || self.log.log_scrollbar_drag.is_some()
+            || self.log.log_minimap_drag.is_some()
         {
             self.stop_log_text_selection(context);
             return;

@@ -159,6 +159,7 @@ impl MainView {
         };
         let closed_tab = self.log.open_tabs.remove(index);
         Self::cleanup_tab_paged_resources(&closed_tab);
+        self.log.log_minimap_cache.borrow_mut().remove(&tab_id);
 
         if self.log.active_tab_id == Some(tab_id) {
             self.log.active_tab_id = self
@@ -193,6 +194,13 @@ impl MainView {
         }
         if self
             .log
+            .log_minimap_drag
+            .is_some_and(|drag| drag.tab_id == tab_id)
+        {
+            self.log.log_minimap_drag = None;
+        }
+        if self
+            .log
             .log_viewer_context_menu
             .as_ref()
             .is_some_and(|menu| menu.tab_id == tab_id)
@@ -215,6 +223,10 @@ impl MainView {
             }
         }
         self.log.open_tabs = retained;
+        self.log
+            .log_minimap_cache
+            .borrow_mut()
+            .retain(|cached_tab_id, _| *cached_tab_id == tab_id);
         self.log.active_tab_id = self.log.open_tabs.first().map(|tab| tab.id);
         self.clear_search_current_file_match_count();
         self.log
@@ -237,6 +249,13 @@ impl MainView {
         }
         if self
             .log
+            .log_minimap_drag
+            .is_some_and(|drag| drag.tab_id != tab_id)
+        {
+            self.log.log_minimap_drag = None;
+        }
+        if self
+            .log
             .log_viewer_context_menu
             .as_ref()
             .is_some_and(|menu| menu.tab_id != tab_id)
@@ -254,12 +273,14 @@ impl MainView {
             Self::cleanup_tab_paged_resources(tab);
         }
         self.log.open_tabs.clear();
+        self.log.log_minimap_cache.borrow_mut().clear();
         self.log.active_tab_id = None;
         self.log.tab_context_menu = None;
         self.log.encoding_dropdown_menu = None;
         self.search.search_results_context_menu = None;
         self.log.log_viewer_context_menu = None;
         self.log.log_scrollbar_drag = None;
+        self.log.log_minimap_drag = None;
         self.log.tab_bar_scroll_handle = ScrollHandle::new();
         self.clear_search_current_file_match_count();
     }

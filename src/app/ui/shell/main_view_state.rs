@@ -65,6 +65,15 @@ pub(in crate::app) struct LogWorkspaceState {
     pub(in crate::app) tab_bar_scroll_handle: ScrollHandle,
     /// 右侧已经打开的日志 tab 列表。
     pub(in crate::app) open_tabs: Vec<OpenLogTab>,
+    /// 日志 minimap 内容层缓存。
+    ///
+    /// 业务意图：
+    /// - minimap 的静态内容按 tab 缓存，滚动和拖动时只更新视口覆盖层，避免反复扫描小文件或分页索引。
+    /// - 使用内部可变性是因为 GPUI canvas 的 prepaint 阶段只有共享视图引用，但缓存刷新属于纯渲染派生数据，不改变业务状态。
+    ///
+    /// 边界条件：
+    /// - 关闭 tab、重新加载日志或切换编码后必须移除对应缓存，避免旧内容继续显示在新文档上。
+    pub(in crate::app) log_minimap_cache: Rc<RefCell<HashMap<usize, LogMinimapRenderCache>>>,
     /// 当前激活的日志 tab ID。
     pub(in crate::app) active_tab_id: Option<usize>,
     /// 下一个待分配的 tab ID。
@@ -81,6 +90,15 @@ pub(in crate::app) struct LogWorkspaceState {
     pub(in crate::app) save_overwrite_confirm_dialog: Option<SaveOverwriteConfirmDialog>,
     /// 日志正文自绘滚动条的拖动状态。
     pub(in crate::app) log_scrollbar_drag: Option<LogScrollbarDrag>,
+    /// 日志正文右侧 minimap 视口块的拖动状态。
+    ///
+    /// 业务意图：
+    /// - minimap 视口块和传统滚动条一样会跨过正文、空白和右侧预览区域拖动，必须保存到工作区状态中统一续传鼠标移动。
+    /// - 该状态只描述一次鼠标拖拽，不持久化，也不影响日志正文真实滚动位置；真实位置仍写入 tab 的滚动句柄或分页滚动状态。
+    ///
+    /// 边界条件：
+    /// - 关闭 tab、重新加载日志、鼠标释放或滚动范围消失时必须清空，避免后续普通鼠标移动继续改变日志位置。
+    pub(in crate::app) log_minimap_drag: Option<LogMinimapDrag>,
     /// 左侧目录树自绘滚动条的拖动状态。
     pub(in crate::app) log_tree_scrollbar_drag: Option<LogTreeScrollbarDrag>,
 }
@@ -101,6 +119,7 @@ impl LogWorkspaceState {
             log_tree_context_menu: None,
             tab_bar_scroll_handle: ScrollHandle::new(),
             open_tabs: Vec::new(),
+            log_minimap_cache: Rc::new(RefCell::new(HashMap::new())),
             active_tab_id: None,
             next_tab_id: 1,
             tab_context_menu: None,
@@ -109,6 +128,7 @@ impl LogWorkspaceState {
             log_viewer_context_menu: None,
             save_overwrite_confirm_dialog: None,
             log_scrollbar_drag: None,
+            log_minimap_drag: None,
             log_tree_scrollbar_drag: None,
         }
     }

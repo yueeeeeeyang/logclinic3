@@ -14,7 +14,7 @@ use super::*;
 /// 业务意图：
 /// - 搜索定位统一同时展示整行黄色背景和关键字片段背景；整行黄色负责定位行，关键字暖橙色负责定位列。
 /// - 使用固定色值而不是主题搜索色，避免关键字和整行同色后在长日志中难以区分命中位置，同时避免高饱和橘红色长时间阅读刺眼。
-const LOG_SEARCH_KEYWORD_HIGHLIGHT: u32 = 0xf2a65a;
+pub(in crate::app) const LOG_SEARCH_KEYWORD_HIGHLIGHT: u32 = 0xf2a65a;
 
 impl MainView {
     pub(in crate::app) fn render_log_tab_body(
@@ -323,227 +323,244 @@ impl MainView {
                 .flex_1()
                 .overflow_hidden()
                 .bg(rgb(palette.background))
-                .on_mouse_move(context.listener(
-                    |view, _event: &MouseMoveEvent, _window, _context| {
-                        view.note_keyboard_scroll_region(KeyboardScrollRegion::LogContent);
-                    },
-                ))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    context.listener(|view, _event: &MouseDownEvent, _window, _context| {
-                        view.note_keyboard_scroll_region(KeyboardScrollRegion::LogContent);
-                    }),
-                )
-                .on_mouse_down(
-                    MouseButton::Right,
-                    context.listener(move |view, event: &MouseDownEvent, _window, context| {
-                        view.note_keyboard_scroll_region(KeyboardScrollRegion::LogContent);
-                        view.open_log_viewer_context_menu(
-                            tab_id,
-                            f32::from(event.position.x),
-                            f32::from(event.position.y),
-                            context,
-                        );
-                        context.stop_propagation();
-                    }),
-                )
                 .child(
                     div()
-                        .absolute()
-                        .left(px(0.0))
-                        .top(px(0.0))
+                        .id("log-viewer-content")
+                        .relative()
+                        .flex_1()
+                        .min_w_0()
                         .h_full()
-                        .w(px(line_number_width))
-                        .bg(rgb(palette.panel))
-                        .border_r_1()
-                        .border_color(rgb(palette.border)),
-                )
-                .child(
-                    uniform_list(
-                        "log-document-virtual-list",
-                        line_count,
-                        context.processor(
-                            move |view, range: std::ops::Range<usize>, _window, context| {
-                                let palette = view.palette();
-                                let log_snapshot = view
-                                    .log
-                                    .open_tabs
-                                    .iter()
-                                    .find(|tab| tab.id == tab_id)
-                                    .and_then(|tab| match &tab.state {
-                                        LogTabState::Ready { document } => Some((
+                        .overflow_hidden()
+                        .bg(rgb(palette.background))
+                        .on_mouse_move(context.listener(
+                            |view, _event: &MouseMoveEvent, _window, _context| {
+                                view.note_keyboard_scroll_region(KeyboardScrollRegion::LogContent);
+                            },
+                        ))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            context.listener(|view, _event: &MouseDownEvent, _window, _context| {
+                                view.note_keyboard_scroll_region(KeyboardScrollRegion::LogContent);
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            context.listener(move |view, event: &MouseDownEvent, _window, context| {
+                                view.note_keyboard_scroll_region(KeyboardScrollRegion::LogContent);
+                                view.open_log_viewer_context_menu(
+                                    tab_id,
+                                    f32::from(event.position.x),
+                                    f32::from(event.position.y),
+                                    context,
+                                );
+                                context.stop_propagation();
+                            }),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .left(px(0.0))
+                                .top(px(0.0))
+                                .h_full()
+                                .w(px(line_number_width))
+                                .bg(rgb(palette.panel))
+                                .border_r_1()
+                                .border_color(rgb(palette.border)),
+                        )
+                        .child(
+                            uniform_list(
+                                "log-document-virtual-list",
+                                line_count,
+                                context.processor(
+                                    move |view, range: std::ops::Range<usize>, _window, context| {
+                                        let palette = view.palette();
+                                        let log_snapshot = view
+                                            .log
+                                            .open_tabs
+                                            .iter()
+                                            .find(|tab| tab.id == tab_id)
+                                            .and_then(|tab| match &tab.state {
+                                                LogTabState::Ready { document } => Some((
+                                                    document,
+                                                    tab.highlighted_search_line,
+                                                    tab.highlighted_search_match.clone(),
+                                                    tab.text_selection.clone(),
+                                                    tab.marked_lines.clone(),
+                                                )),
+                                                LogTabState::Loading { .. }
+                                                | LogTabState::Failed { .. } => None,
+                                            });
+                                        let lines = if let Some((
                                             document,
-                                            tab.highlighted_search_line,
-                                            tab.highlighted_search_match.clone(),
-                                            tab.text_selection.clone(),
-                                            tab.marked_lines.clone(),
-                                        )),
-                                        LogTabState::Loading { .. }
-                                        | LogTabState::Failed { .. } => None,
-                                    });
-                                let lines = if let Some((
-                                    document,
-                                    highlighted_search_line,
-                                    highlighted_search_match,
-                                    text_selection,
-                                    marked_lines,
-                                )) = log_snapshot
-                                {
-                                    range
-                                        .filter_map(|index| {
-                                            let line = match document.as_ref() {
-                                                LogTabDocument::InMemory(document) => {
-                                                    document.lines.get(index).cloned()
-                                                }
-                                                LogTabDocument::Paged(document) => {
-                                                    document.read_line(index).ok().flatten().map(
-                                                        |line| {
-                                                            let _ = (
-                                                                line.line_number,
-                                                                line.byte_offset,
-                                                                line.had_replacements,
-                                                            );
-                                                            line.text
-                                                        },
-                                                    )
-                                                }
-                                            }?;
-                                            let precomputed = match document.as_ref() {
-                                                LogTabDocument::InMemory(document) => document
-                                                    .precomputed_highlights
-                                                    .as_ref()
-                                                    .filter(|_| syntax_theme == SyntaxTheme::Light)
-                                                    .and_then(|highlights| {
-                                                        highlights.lines.get(index)
-                                                    }),
-                                                LogTabDocument::Paged(_) => None,
-                                            };
-                                            let highlight_mode = match document.as_ref() {
-                                                LogTabDocument::InMemory(document) => {
-                                                    document.highlight_mode
-                                                }
-                                                LogTabDocument::Paged(document) => {
-                                                    document.highlight_mode
-                                                }
-                                            };
-                                            let mut line_highlights = highlight_line(
-                                                highlight_mode,
-                                                &line,
-                                                precomputed,
-                                                syntax_theme,
-                                            );
-                                            if let Some((range, style)) =
-                                                Self::log_search_match_highlight_for_line(
-                                                    highlighted_search_match.as_ref(),
-                                                    index,
-                                                    &line,
-                                                    palette,
-                                                )
-                                            {
-                                                // 搜索命中片段是定位反馈，只给关键字本身增加背景；后续选区高亮仍可覆盖它。
-                                                line_highlights = gpui::combine_highlights(
-                                                    line_highlights,
-                                                    [(range, style)],
-                                                )
-                                                .collect();
-                                            }
-                                            if let Some(selection) = &text_selection
-                                                && let Some(range) =
-                                                    Self::selected_byte_range_for_line(
-                                                        selection, index, &line,
-                                                    )
-                                            {
-                                                // 搜索关键字背景和鼠标选区背景重叠时，选区必须优先显示；
-                                                // 否则用户拖选到关键字时会误以为关键字没有被选中。
-                                                line_highlights =
-                                                    Self::combine_log_highlights_with_selection(
-                                                        line_highlights,
-                                                        range,
+                                            highlighted_search_line,
+                                            highlighted_search_match,
+                                            text_selection,
+                                            marked_lines,
+                                        )) = log_snapshot
+                                        {
+                                            range
+                                                .filter_map(|index| {
+                                                    let line = match document.as_ref() {
+                                                        LogTabDocument::InMemory(document) => {
+                                                            document.lines.get(index).cloned()
+                                                        }
+                                                        LogTabDocument::Paged(document) => {
+                                                            document
+                                                                .read_line(index)
+                                                                .ok()
+                                                                .flatten()
+                                                                .map(|line| {
+                                                                    let _ = (
+                                                                        line.line_number,
+                                                                        line.byte_offset,
+                                                                        line.had_replacements,
+                                                                    );
+                                                                    line.text
+                                                                })
+                                                        }
+                                                    }?;
+                                                    let precomputed = match document.as_ref() {
+                                                        LogTabDocument::InMemory(document) => document
+                                                            .precomputed_highlights
+                                                            .as_ref()
+                                                            .filter(|_| {
+                                                                syntax_theme == SyntaxTheme::Light
+                                                            })
+                                                            .and_then(|highlights| {
+                                                                highlights.lines.get(index)
+                                                            }),
+                                                        LogTabDocument::Paged(_) => None,
+                                                    };
+                                                    let highlight_mode = match document.as_ref() {
+                                                        LogTabDocument::InMemory(document) => {
+                                                            document.highlight_mode
+                                                        }
+                                                        LogTabDocument::Paged(document) => {
+                                                            document.highlight_mode
+                                                        }
+                                                    };
+                                                    let mut line_highlights = highlight_line(
+                                                        highlight_mode,
+                                                        &line,
+                                                        precomputed,
+                                                        syntax_theme,
                                                     );
-                                            }
-                                            let expanded_line =
-                                                Self::expanded_log_line_for_display(&line);
-                                            let display_highlights =
-                                                Self::map_log_highlights_to_display(
-                                                    line_highlights,
-                                                    &expanded_line,
-                                                );
-                                            Some((
-                                                index,
-                                                line,
-                                                expanded_line.text,
-                                                display_highlights,
-                                                highlighted_search_line == Some(index),
-                                                marked_lines.contains(&index),
-                                            ))
-                                        })
-                                        .collect::<Vec<_>>()
-                                } else {
-                                    Vec::new()
-                                };
+                                                    if let Some((range, style)) =
+                                                        Self::log_search_match_highlight_for_line(
+                                                            highlighted_search_match.as_ref(),
+                                                            index,
+                                                            &line,
+                                                            palette,
+                                                        )
+                                                    {
+                                                        // 搜索命中片段是定位反馈，只给关键字本身增加背景；后续选区高亮仍可覆盖它。
+                                                        line_highlights = gpui::combine_highlights(
+                                                            line_highlights,
+                                                            [(range, style)],
+                                                        )
+                                                        .collect();
+                                                    }
+                                                    if let Some(selection) = &text_selection
+                                                        && let Some(range) =
+                                                            Self::selected_byte_range_for_line(
+                                                                selection, index, &line,
+                                                            )
+                                                    {
+                                                        // 搜索关键字背景和鼠标选区背景重叠时，选区必须优先显示；
+                                                        // 否则用户拖选到关键字时会误以为关键字没有被选中。
+                                                        line_highlights =
+                                                            Self::combine_log_highlights_with_selection(
+                                                                line_highlights,
+                                                                range,
+                                                            );
+                                                    }
+                                                    let expanded_line =
+                                                        Self::expanded_log_line_for_display(&line);
+                                                    let display_highlights =
+                                                        Self::map_log_highlights_to_display(
+                                                            line_highlights,
+                                                            &expanded_line,
+                                                        );
+                                                    Some((
+                                                        index,
+                                                        line,
+                                                        expanded_line.text,
+                                                        display_highlights,
+                                                        highlighted_search_line == Some(index),
+                                                        marked_lines.contains(&index),
+                                                    ))
+                                                })
+                                                .collect::<Vec<_>>()
+                                        } else {
+                                            Vec::new()
+                                        };
 
-                                lines
-                                    .into_iter()
-                                    .map(
-                                        |(
-                                            index,
-                                            line,
-                                            display_line,
-                                            highlights,
-                                            search_highlighted,
-                                            marked,
-                                        )| {
-                                            let horizontal_line_number_offset = -row_scroll_handle
-                                                .0
-                                                .borrow()
-                                                .base_handle
-                                                .offset()
-                                                .x;
-                                            Self::render_log_line(
-                                                LogLineRenderData {
-                                                    tab_id,
-                                                    line_index: index,
+                                        lines
+                                            .into_iter()
+                                            .map(
+                                                |(
+                                                    index,
                                                     line,
                                                     display_line,
                                                     highlights,
-                                                    line_number_width,
-                                                    font_size: view.settings.log_viewer_font_size,
-                                                    horizontal_line_number_offset,
-                                                    horizontal_content_offset: px(0.0),
                                                     search_highlighted,
                                                     marked,
-                                                    suppress_hover: view
-                                                        .search
-                                                        .search_results_resize_drag
-                                                        .is_some()
-                                                        || view.log.log_scrollbar_drag.is_some(),
-                                                    palette: view.palette(),
+                                                )| {
+                                                    let horizontal_line_number_offset =
+                                                        -row_scroll_handle
+                                                            .0
+                                                            .borrow()
+                                                            .base_handle
+                                                            .offset()
+                                                            .x;
+                                                    Self::render_log_line(
+                                                        LogLineRenderData {
+                                                            tab_id,
+                                                            line_index: index,
+                                                            line,
+                                                            display_line,
+                                                            highlights,
+                                                            line_number_width,
+                                                            font_size: view
+                                                                .settings
+                                                                .log_viewer_font_size,
+                                                            horizontal_line_number_offset,
+                                                            horizontal_content_offset: px(0.0),
+                                                            search_highlighted,
+                                                            marked,
+                                                            suppress_hover: view
+                                                                .search
+                                                                .search_results_resize_drag
+                                                                .is_some()
+                                                                || view
+                                                                    .log
+                                                                    .log_scrollbar_drag
+                                                                    .is_some()
+                                                                || view
+                                                                    .log
+                                                                    .log_minimap_drag
+                                                                    .is_some(),
+                                                            palette: view.palette(),
+                                                        },
+                                                        context,
+                                                    )
                                                 },
-                                                context,
                                             )
-                                        },
-                                    )
-                                    .collect::<Vec<_>>()
-                            },
-                        ),
-                    )
-                    .with_width_from_item(Some(horizontal_measure_line_index))
-                    .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
-                    .size_full()
-                    .track_scroll(scroll_handle.clone()),
+                                            .collect::<Vec<_>>()
+                                    },
+                                ),
+                            )
+                            .with_width_from_item(Some(horizontal_measure_line_index))
+                            .with_horizontal_sizing_behavior(
+                                ListHorizontalSizingBehavior::Unconstrained,
+                            )
+                            .size_full()
+                            .track_scroll(scroll_handle.clone()),
+                        )
+                        .child(self.render_log_horizontal_scrollbar_for_tab(tab, context)),
                 )
-                .child(self.render_log_vertical_scrollbar(
-                    tab_id,
-                    &scroll_handle,
-                    line_count,
-                    context,
-                ))
-                .child(self.render_log_horizontal_scrollbar(
-                    tab_id,
-                    &scroll_handle,
-                    line_number_width,
-                    context,
-                )),
+                .child(self.render_log_minimap(tab, document, context))
+                .child(self.render_log_vertical_scrollbar_for_tab(tab, context)),
         )
     }
 
@@ -649,7 +666,8 @@ impl MainView {
                                 search_highlighted: highlighted_search_line == Some(line_index),
                                 marked: marked_lines.contains(&line_index),
                                 suppress_hover: self.search.search_results_resize_drag.is_some()
-                                    || self.log.log_scrollbar_drag.is_some(),
+                                    || self.log.log_scrollbar_drag.is_some()
+                                    || self.log.log_minimap_drag.is_some(),
                                 palette,
                             },
                             context,
@@ -695,52 +713,71 @@ impl MainView {
                 .flex_1()
                 .overflow_hidden()
                 .bg(rgb(palette.background))
-                .track_scroll(&viewport_handle)
-                .on_scroll_wheel(context.listener(
-                    move |view, event: &ScrollWheelEvent, _window, context| {
-                        view.note_keyboard_scroll_region(KeyboardScrollRegion::LogContent);
-                        view.handle_paged_log_scroll_wheel(tab_id, event, context);
-                        context.stop_propagation();
-                    },
-                ))
-                .on_mouse_move(context.listener(
-                    |view, _event: &MouseMoveEvent, _window, _context| {
-                        view.note_keyboard_scroll_region(KeyboardScrollRegion::LogContent);
-                    },
-                ))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    context.listener(|view, _event: &MouseDownEvent, _window, _context| {
-                        view.note_keyboard_scroll_region(KeyboardScrollRegion::LogContent);
-                    }),
-                )
-                .on_mouse_down(
-                    MouseButton::Right,
-                    context.listener(move |view, event: &MouseDownEvent, _window, context| {
-                        view.note_keyboard_scroll_region(KeyboardScrollRegion::LogContent);
-                        view.open_log_viewer_context_menu(
-                            tab_id,
-                            f32::from(event.position.x),
-                            f32::from(event.position.y),
-                            context,
-                        );
-                        context.stop_propagation();
-                    }),
-                )
                 .child(
                     div()
-                        .absolute()
-                        .left(px(0.0))
-                        .top(px(0.0))
+                        .id("log-viewer-content")
+                        .relative()
+                        .flex_1()
+                        .min_w_0()
                         .h_full()
-                        .w(px(line_number_width))
-                        .bg(rgb(palette.panel))
-                        .border_r_1()
-                        .border_color(rgb(palette.border)),
+                        .overflow_hidden()
+                        .bg(rgb(palette.background))
+                        .track_scroll(&viewport_handle)
+                        .on_scroll_wheel(context.listener(
+                            move |view, event: &ScrollWheelEvent, _window, context| {
+                                view.note_keyboard_scroll_region(KeyboardScrollRegion::LogContent);
+                                view.handle_paged_log_scroll_wheel(tab_id, event, context);
+                                context.stop_propagation();
+                            },
+                        ))
+                        .on_mouse_move(context.listener(
+                            |view, _event: &MouseMoveEvent, _window, _context| {
+                                view.note_keyboard_scroll_region(KeyboardScrollRegion::LogContent);
+                            },
+                        ))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            context.listener(|view, _event: &MouseDownEvent, _window, _context| {
+                                view.note_keyboard_scroll_region(KeyboardScrollRegion::LogContent);
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            context.listener(
+                                move |view, event: &MouseDownEvent, _window, context| {
+                                    view.note_keyboard_scroll_region(
+                                        KeyboardScrollRegion::LogContent,
+                                    );
+                                    view.open_log_viewer_context_menu(
+                                        tab_id,
+                                        f32::from(event.position.x),
+                                        f32::from(event.position.y),
+                                        context,
+                                    );
+                                    context.stop_propagation();
+                                },
+                            ),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .left(px(0.0))
+                                .top(px(0.0))
+                                .h_full()
+                                .w(px(line_number_width))
+                                .bg(rgb(palette.panel))
+                                .border_r_1()
+                                .border_color(rgb(palette.border)),
+                        )
+                        .children(rows)
+                        .child(self.render_log_horizontal_scrollbar_for_tab(tab, context)),
                 )
-                .children(rows)
-                .child(self.render_log_vertical_scrollbar_for_tab(tab, context))
-                .child(self.render_log_horizontal_scrollbar_for_tab(tab, context)),
+                .child(self.render_log_minimap(
+                    tab,
+                    &LogTabDocument::Paged(document.clone()),
+                    context,
+                ))
+                .child(self.render_log_vertical_scrollbar_for_tab(tab, context)),
         )
     }
 }
