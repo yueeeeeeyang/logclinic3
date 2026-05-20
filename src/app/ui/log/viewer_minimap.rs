@@ -2,7 +2,7 @@
 //
 // 业务意图：
 // - 在日志正文右侧提供类似 VS Code 的局部缩略预览，让用户快速感知当前视口附近的日志结构、搜索命中和当前位置。
-// - 局部窗口优先绘制真实日志字符，并复用正文同源高亮；分页日志只读取当前局部窗口的连续行，读取失败时才退回字节长度轮廓。
+// - 局部窗口把真实日志字符和正文同源高亮先绘制到离屏位图；分页日志不显示 minimap，避免右侧预览影响大文件滚动性能。
 //
 // 关键约束：
 // - minimap 每帧绘制量必须受当前视口高度限制，不能按真实行数创建元素或逐行绘制。
@@ -18,6 +18,30 @@ use super::{viewer_view::LOG_SEARCH_KEYWORD_HIGHLIGHT, *};
 /// - 局部窗口不再压缩整份日志，而是绘制当前视口上下文；上限允许比旧全量压缩更多行，以免宽屏下局部窗口被截断。
 const LOG_MINIMAP_MAX_SAMPLE_LINES: usize = 1600;
 
+/// minimap 静态文本层的额外缓存行数。
+///
+/// 业务意图：
+/// - VS Code 的 minimap 内容层不是跟随每一个像素滚动都重建，而是缓存当前视口上下文的一段内容。
+/// - 这里在当前可见范围上下多缓存一些行，滚轮和拖动时只平移离屏位图，跨过缓存边界后才重新采样日志文本。
+///
+/// 边界条件：
+/// - 该值不能过大，否则打开普通日志时会一次性高亮和绘制过多不可见行；也不能过小，否则慢速滚动会频繁重建静态层。
+const LOG_MINIMAP_CACHE_OVERSCAN_LINES: usize = 160;
+
+/// minimap 静态文本层的起始行量化步长。
+///
+/// 业务意图：
+/// - 普通日志每滚动一行都会改变局部窗口的理论起点；如果缓存键直接使用真实起点，仍会出现逐行重建位图的卡顿。
+/// - 量化到固定行块后，同一小段滚动只改变图片偏移和视口覆盖层，显著降低滚轮与拖动时的主线程压力。
+const LOG_MINIMAP_CACHE_CHUNK_LINES: usize = 192;
+
+/// minimap 离屏位图允许的最大逻辑高度。
+///
+/// 业务意图：
+/// - 极高显示器或异常缩放下，局部窗口位图可能超过常见 GPU 贴图尺寸；设置上限可以保护跨平台渲染稳定性。
+/// - 超过上限时只裁剪远离当前视口的 overscan，当前可见区域仍优先保持完整。
+const LOG_MINIMAP_MAX_IMAGE_LOGICAL_HEIGHT: f32 = 4096.0;
+
 /// 单行迷你文本最多分析的字符列数。
 ///
 /// 边界条件：
@@ -30,18 +54,18 @@ const LOG_MINIMAP_MAX_ANALYZED_COLUMNS: usize = 160;
 /// - 该值只用于缩略线段宽度，不参与正文真实排版；使用固定宽度可以让 macOS 和 Windows 的 minimap 形态稳定。
 const LOG_MINIMAP_COLUMN_WIDTH: f32 = 0.72;
 
-/// minimap 真实字符绘制的最小字号。
+/// minimap 微缩字符图集的源网格宽度。
 ///
 /// 业务意图：
-/// - VS Code minimap 的字符非常小，但如果字号低于 1px，GPUI 和平台文本栅格化会接近不可见。
-/// - 这里仅限制字符绘制字号，不改变视口块按正文宽高比计算的高度。
-const LOG_MINIMAP_MIN_FONT_SIZE: f32 = 1.6;
+/// - 真实平台字体无法在 GPUI 公开 API 中预渲染到应用私有 atlas；这里使用稳定的微型点阵字形模拟 VS Code minimap 的字符纹理。
+/// - 点阵只用于右侧预览，正文仍使用正常字体和完整语法高亮。
+const LOG_MINIMAP_GLYPH_GRID_WIDTH: usize = 3;
 
-/// minimap 真实字符绘制的最大字号。
+/// minimap 微缩字符图集的源网格高度。
 ///
 /// 边界条件：
-/// - 当窗口很窄导致按比例计算出的行高偏大时，过大的 minimap 字体会挤占右侧栏并显得不像缩略图。
-const LOG_MINIMAP_MAX_FONT_SIZE: f32 = 4.0;
+/// - 实际绘制高度会按当前行高和设备缩放裁剪；源网格保持 5 行可以让数字、字母和常见标点保留最基本差异。
+const LOG_MINIMAP_GLYPH_GRID_HEIGHT: usize = 5;
 
 /// minimap 中最多绘制的搜索命中标记数。
 ///
@@ -59,7 +83,7 @@ const LOG_MINIMAP_MAX_MANUAL_MARKERS: usize = 240;
 ///
 /// 业务意图：
 /// - 内存日志可以廉价读取当前采样行文本，从而绘制更像编辑器缩略图的片段。
-/// - 分页日志不能随机读取采样行文本，只能使用行索引里的字节长度近似展示每行轮廓。
+/// - 分页日志默认不会显示 minimap；保留分页分支只用于测试纯函数和未来可选降级，不在渲染入口触发正文读取。
 #[derive(Clone)]
 enum LogMinimapDocumentSnapshot {
     /// 小文件完整行文本。
@@ -71,9 +95,7 @@ enum LogMinimapDocumentSnapshot {
         precomputed_highlights: Option<Arc<crate::highlighting::PrecomputedHighlights>>,
     },
     /// 超大文件分页文档。
-    Paged {
-        document: log_document::PagedLogDocument,
-    },
+    Paged,
 }
 
 /// minimap 单条迷你文本片段。
@@ -146,6 +168,170 @@ struct LogMinimapGeometry {
     max_scroll_px: f64,
 }
 
+/// minimap 离屏静态层的简单 BGRA 位图。
+///
+/// 业务意图：
+/// - GPUI 公开 API 不能直接复用内部字体 atlas；为了避免每帧 `shape_line`，minimap 先把微缩字符写入这块 CPU 位图。
+/// - 位图最终直接构造成 GPUI `RenderImage`，跳过异步图片解码；这样滚动热路径只处理一张图片和少量覆盖矩形。
+///
+/// 边界条件：
+/// - 位图始终按不透明背景初始化，避免 BMP 解码器和不同平台对 alpha 通道支持不一致导致右侧栏颜色发黑或透明。
+struct LogMinimapBitmap {
+    /// 位图宽度，单位为物理像素。
+    width: u32,
+    /// 位图高度，单位为物理像素。
+    height: u32,
+    /// BGRA8 像素数据，按从上到下、从左到右排列。
+    ///
+    /// 业务意图：
+    /// - GPUI 底层图片 atlas 期望 BGRA 字节；直接保存 BGRA 可以避免每次缓存重建再做整张图片通道转换。
+    pixels: Vec<u8>,
+}
+
+impl LogMinimapBitmap {
+    /// 创建填充背景色的离屏位图。
+    ///
+    /// 业务意图：
+    /// - minimap 静态层本身包含面板背景，图片平移时不会因为未绘制字符区域露出透明缝隙。
+    fn new(width: u32, height: u32, background: gpui::Rgba) -> Self {
+        let mut pixels = vec![0; width.saturating_mul(height).saturating_mul(4) as usize];
+        let background = Self::rgba_to_bgra_bytes(background, 1.0);
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&background);
+        }
+        Self {
+            width,
+            height,
+            pixels,
+        }
+    }
+
+    /// 按 alpha 覆盖一个像素。
+    ///
+    /// 边界条件：
+    /// - 字符缩放到极小尺寸时会产生大量亚像素位置；越界像素直接忽略，避免滚动到首尾时写出位图边界。
+    fn blend_pixel(&mut self, x: i32, y: i32, color: gpui::Rgba, coverage: f32) {
+        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+            return;
+        }
+
+        let alpha = (color.a * coverage).clamp(0.0, 1.0);
+        if alpha <= 0.0 {
+            return;
+        }
+        let index = ((y as u32 * self.width + x as u32) * 4) as usize;
+        let source = Self::rgba_to_bgra_bytes(color, alpha);
+        for (channel, source_channel) in source.iter().take(3).enumerate() {
+            let destination = self.pixels[index + channel] as f32;
+            self.pixels[index + channel] =
+                (destination * (1.0 - alpha) + *source_channel as f32 * alpha).round() as u8;
+        }
+        self.pixels[index + 3] = 255;
+    }
+
+    /// 绘制一个实心矩形。
+    ///
+    /// 业务意图：
+    /// - 当某个 bucket 没有真实文本时，仍需要用行长轮廓保留日志结构；矩形绘制比字符绘制更便宜。
+    fn fill_rect(&mut self, x: f32, y: f32, width: f32, height: f32, color: gpui::Rgba) {
+        if width <= 0.0 || height <= 0.0 {
+            return;
+        }
+        let left = x.floor().max(0.0) as i32;
+        let top = y.floor().max(0.0) as i32;
+        let right = (x + width).ceil().min(self.width as f32) as i32;
+        let bottom = (y + height).ceil().min(self.height as f32) as i32;
+        for pixel_y in top..bottom {
+            for pixel_x in left..right {
+                self.blend_pixel(pixel_x, pixel_y, color, 1.0);
+            }
+        }
+    }
+
+    /// 将 RGBA 颜色转换成 GPUI 图片 atlas 使用的 BGRA 字节。
+    fn rgba_to_bgra_bytes(color: gpui::Rgba, alpha_override: f32) -> [u8; 4] {
+        [
+            (color.b.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (color.g.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (color.r.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (alpha_override.clamp(0.0, 1.0) * 255.0).round() as u8,
+        ]
+    }
+
+    /// 直接构造 GPUI 可绘制的渲染图片。
+    ///
+    /// 业务意图：
+    /// - 旧实现会把位图编码成 BMP，再让 GPUI 资产系统异步解码；滚动时新图片尚未解码会导致 minimap 消失。
+    /// - 直接创建 `RenderImage` 后，paint 阶段可以同步提交到 GPU atlas，避免异步解码空窗和额外 CPU 开销。
+    fn into_render_image(self) -> Arc<gpui::RenderImage> {
+        let buffer = image::RgbaImage::from_raw(self.width, self.height, self.pixels)
+            .unwrap_or_else(|| image::RgbaImage::new(1, 1));
+        Arc::new(gpui::RenderImage::new(smallvec::SmallVec::from_elem(
+            image::Frame::new(buffer),
+            1,
+        )))
+    }
+}
+
+/// minimap 后台静态层构建使用的内存日志快照。
+///
+/// 业务意图：
+/// - 分页日志已经在入口关闭 minimap，后台任务只需要携带可安全共享的内存日志数据，避免误把分页文档的 I/O 状态带到预览线程。
+/// - 字段均为只读数据或 `Arc`，后台线程只生成派生位图，不修改正文文档、搜索结果或 UI 状态。
+#[derive(Clone)]
+struct LogMinimapStaticLayerSnapshot {
+    /// 完整解码后的日志行集合。
+    lines: Arc<Vec<String>>,
+    /// 与正文一致的高亮模式。
+    highlight_mode: crate::highlighting::HighlightMode,
+    /// 小文件预计算高亮；没有预计算时后台任务会按正文同一套规则即时高亮代表行。
+    precomputed_highlights: Option<Arc<crate::highlighting::PrecomputedHighlights>>,
+}
+
+/// minimap 后台静态层构建请求。
+///
+/// 业务意图：
+/// - canvas prepare 阶段只创建这个轻量请求并立即返回，真正的行采样、高亮和位图写入放到 GPUI 后台执行器。
+/// - 请求携带缓存键和序号，回到 UI 线程时可以精确判断是否仍然代表最新视口，避免快速拖动时旧结果覆盖新结果。
+struct LogMinimapStaticLayerTaskRequest {
+    /// 请求对应的缓存键。
+    key: LogMinimapCacheKey,
+    /// 请求派发时的任务序号。
+    generation: u64,
+    /// 只读内存日志快照。
+    snapshot: LogMinimapStaticLayerSnapshot,
+    /// 文档总行数。
+    line_count: usize,
+    /// 当前局部窗口布局。
+    layout: LogMinimapLayout,
+    /// 与正文一致的语法主题。
+    syntax_theme: SyntaxTheme,
+    /// minimap 逻辑宽度。
+    minimap_width: Pixels,
+    /// 当前窗口设备缩放因子。
+    scale_factor: f32,
+    /// 当前主题调色板。
+    palette: AppThemePalette,
+}
+
+/// minimap 后台静态层构建结果。
+///
+/// 业务意图：
+/// - 结果只包含可绘制图片和几何尺寸，不携带 bucket、高亮临时数据或日志文本，避免后台任务完成后长期占用额外内存。
+/// - UI 线程合并时会根据 key 和 generation 决定接收或丢弃。
+struct LogMinimapStaticLayerTaskResult {
+    /// 结果对应的缓存键。
+    key: LogMinimapCacheKey,
+    /// 结果对应的任务序号。
+    generation: u64,
+    /// 已经生成好的静态字符层图片。
+    static_image: Option<Arc<gpui::RenderImage>>,
+    /// 图片逻辑宽度。
+    image_logical_width_px: f32,
+    /// 图片逻辑高度。
+    image_logical_height_px: f32,
+}
+
 impl MainView {
     /// 渲染日志正文右侧 minimap。
     ///
@@ -170,7 +356,6 @@ impl MainView {
         let snapshot = Self::log_minimap_document_snapshot(document);
         let cache_store = self.log.log_minimap_cache.clone();
         let source_key = tab.source_key.clone();
-        let paged = matches!(document, LogTabDocument::Paged(_));
         let syntax_theme = self.effective_theme().syntax_theme();
         let search_markers = self.log_minimap_search_marker_lines_for_tab(tab);
         let marked_lines = tab
@@ -181,6 +366,7 @@ impl MainView {
             .collect::<Vec<_>>();
         let highlighted_line = tab.highlighted_search_line;
         let scroll_info = Self::log_minimap_scroll_info_for_tab(tab);
+        let view_entity = context.weak_entity();
 
         div()
             .id(SharedString::from(format!("log-minimap-area-{tab_id}")))
@@ -224,18 +410,21 @@ impl MainView {
                     ))
                     .child(
                         gpui::canvas(
-                            move |bounds, _window, _context| {
+                            move |bounds, window, context| {
                                 Self::log_minimap_render_cache(
                                     tab_id,
                                     &source_key,
-                                    paged,
                                     &snapshot,
                                     line_count,
                                     scroll_info,
                                     syntax_theme,
                                     bounds.size.width,
                                     bounds.size.height,
+                                    window.scale_factor(),
+                                    palette,
                                     &cache_store,
+                                    view_entity.clone(),
+                                    context,
                                 )
                             },
                             move |bounds, cache, window, _context| {
@@ -302,9 +491,7 @@ impl MainView {
                 highlight_mode: document.highlight_mode,
                 precomputed_highlights: document.precomputed_highlights.clone(),
             },
-            LogTabDocument::Paged(document) => LogMinimapDocumentSnapshot::Paged {
-                document: document.clone(),
-            },
+            LogTabDocument::Paged(_) => LogMinimapDocumentSnapshot::Paged,
         }
     }
 
@@ -460,8 +647,15 @@ impl MainView {
         let unclamped_start_line = top_line_float - f64::from(block_top) / line_height_px as f64;
         let max_start_line = (line_count as f64 - visible_window_lines).max(0.0);
         let window_start_line_float = unclamped_start_line.clamp(0.0, max_start_line);
-        let window_start_line = window_start_line_float.floor() as usize;
-        let window_line_count = ((visible_window_lines.ceil() as usize).saturating_add(2))
+        let desired_start_line = window_start_line_float.floor() as usize;
+        let window_start_line = Self::log_minimap_quantized_window_start_line(desired_start_line);
+        let visible_window_line_count = visible_window_lines.ceil() as usize;
+        let requested_window_line_count = LOG_MINIMAP_CACHE_OVERSCAN_LINES
+            .saturating_add(visible_window_line_count)
+            .saturating_add(LOG_MINIMAP_CACHE_CHUNK_LINES)
+            .saturating_add(LOG_MINIMAP_CACHE_OVERSCAN_LINES)
+            .saturating_add(2);
+        let window_line_count = requested_window_line_count
             .min(line_count.saturating_sub(window_start_line))
             .max(1);
         let bucket_count = window_line_count.min(LOG_MINIMAP_MAX_SAMPLE_LINES).max(1);
@@ -477,6 +671,18 @@ impl MainView {
         })
     }
 
+    /// 返回 minimap 静态文本层的量化起始行。
+    ///
+    /// 业务意图：
+    /// - 离屏文本层必须覆盖当前视口上方一段 overscan，同时起点按固定块对齐，避免每滚动一行就生成新图片。
+    /// - 该函数保持纯计算，测试可以直接验证小幅滚动是否复用同一个缓存窗口。
+    pub(in crate::app) fn log_minimap_quantized_window_start_line(
+        desired_start_line: usize,
+    ) -> usize {
+        let overscanned_start = desired_start_line.saturating_sub(LOG_MINIMAP_CACHE_OVERSCAN_LINES);
+        overscanned_start / LOG_MINIMAP_CACHE_CHUNK_LINES * LOG_MINIMAP_CACHE_CHUNK_LINES
+    }
+
     /// 返回当前 minimap 内容层缓存。
     ///
     /// 业务意图：
@@ -485,19 +691,22 @@ impl MainView {
     ///
     /// 边界条件：
     /// - 视口高度为 0 时返回空缓存，避免首帧布局尚未完成时产生除零。
-    /// - 缓存只保存内容轮廓，不包含搜索命中、手动标记和当前视口块，这些覆盖层每帧按最新状态绘制。
+    /// - 缓存只保存静态字符位图，不包含搜索命中、手动标记和当前视口块，这些覆盖层每帧按最新状态绘制。
     #[allow(clippy::too_many_arguments)]
     fn log_minimap_render_cache(
         tab_id: usize,
         source_key: &str,
-        paged: bool,
         snapshot: &LogMinimapDocumentSnapshot,
         line_count: usize,
         scroll_info: Option<LogMinimapScrollInfo>,
         syntax_theme: SyntaxTheme,
         minimap_width: Pixels,
         viewport_height: Pixels,
+        scale_factor: f32,
+        palette: AppThemePalette,
         cache_store: &Rc<RefCell<HashMap<usize, LogMinimapRenderCache>>>,
+        view_entity: gpui::WeakEntity<MainView>,
+        context: &mut App,
     ) -> LogMinimapRenderCache {
         let layout = scroll_info.and_then(|scroll_info| {
             Self::log_minimap_layout_for_scroll(
@@ -507,6 +716,9 @@ impl MainView {
                 scroll_info,
             )
         });
+        let scale_factor = scale_factor.clamp(1.0, 4.0);
+        let image_size = layout
+            .map(|layout| Self::log_minimap_static_image_size(minimap_width, layout, scale_factor));
         let key = LogMinimapCacheKey {
             source_key: source_key.to_string(),
             line_count,
@@ -517,32 +729,319 @@ impl MainView {
             window_start_line: layout.map(|layout| layout.window_start_line).unwrap_or(0),
             window_line_count: layout.map(|layout| layout.window_line_count).unwrap_or(0),
             bucket_count: layout.map(|layout| layout.bucket_count).unwrap_or(0),
+            image_width_px: image_size.map(|size| size.0).unwrap_or(0),
+            image_height_px: image_size.map(|size| size.1).unwrap_or(0),
+            scale_factor_milli: (scale_factor * 1000.0).round() as u32,
+            palette_signature: Self::log_minimap_palette_signature(palette),
             syntax_theme,
-            paged,
+            paged: matches!(snapshot, LogMinimapDocumentSnapshot::Paged),
         };
-        if let Some(cache) = cache_store.borrow().get(&tab_id)
-            && cache.key == key
-        {
-            return cache.clone();
-        }
+        let static_layer_snapshot = Self::log_minimap_static_layer_snapshot_from_document(snapshot);
+        let mut task_request = None;
+        let mut images_to_drop = Vec::new();
+        let cache = {
+            let mut cache_store = cache_store.borrow_mut();
+            let cache = cache_store
+                .entry(tab_id)
+                .or_insert_with(|| LogMinimapRenderCache {
+                    key: key.clone(),
+                    static_image_key: None,
+                    pending_key: None,
+                    pending_generation: 0,
+                    static_image: None,
+                    image_logical_width_px: 0.0,
+                    image_logical_height_px: 0.0,
+                });
 
-        let cache = LogMinimapRenderCache {
-            buckets: Arc::new(layout.map_or_else(Vec::new, |layout| {
-                Self::log_minimap_buckets(snapshot, line_count, layout, syntax_theme)
-            })),
-            key,
+            if cache.key != key {
+                cache.key = key.clone();
+            }
+
+            if layout.is_none() || static_layer_snapshot.is_none() {
+                cache.pending_key = None;
+                cache.static_image_key = None;
+                cache.image_logical_width_px = 0.0;
+                cache.image_logical_height_px = 0.0;
+                if let Some(image) = cache.static_image.take() {
+                    images_to_drop.push(image);
+                }
+            } else if cache.static_image_key.as_ref() != Some(&key)
+                && Self::log_minimap_should_request_static_layer_build(
+                    cache.static_image_key.as_ref(),
+                    cache.pending_key.as_ref(),
+                    &key,
+                )
+            {
+                cache.pending_generation = cache.pending_generation.saturating_add(1);
+                cache.pending_key = Some(key.clone());
+                task_request = Some(LogMinimapStaticLayerTaskRequest {
+                    key: key.clone(),
+                    generation: cache.pending_generation,
+                    snapshot: static_layer_snapshot.expect("上方已确认存在内存日志快照"),
+                    line_count,
+                    layout: layout.expect("上方已确认存在 minimap 布局"),
+                    syntax_theme,
+                    minimap_width,
+                    scale_factor,
+                    palette,
+                });
+            }
+
+            cache.clone()
         };
-        cache_store.borrow_mut().insert(tab_id, cache.clone());
+
+        for image in images_to_drop {
+            // 清理尺寸失效或文档失效的图片；正常跨块滚动时不在这里释放旧图，
+            // 这样后台新图生成期间仍能用上一张静态层维持视觉连续性。
+            context.drop_image(image, None);
+        }
+        if let Some(task_request) = task_request {
+            Self::spawn_log_minimap_static_layer_task(tab_id, task_request, view_entity, context);
+        }
         cache
     }
 
-    /// 构造 minimap 像素 bucket。
+    /// 从 minimap 缓存中取出需要释放的静态图片。
     ///
     /// 业务意图：
-    /// - 小文件使用当前局部窗口内的真实文本聚合缩进、长度和最高优先级色调，形成类似缩小文本块的密度变化。
-    /// - 分页日志只读取行索引字节长度，避免因为右侧预览栏引入随机 seek/read。
-    fn log_minimap_buckets(
+    /// - `LogMinimapRenderCache` 持有的 `RenderImage` 会被 GPUI 上传到窗口 sprite atlas；关闭 tab 或重新解码时只丢弃
+    ///   `Arc` 不能释放 atlas 里的纹理，必须集中取出图片并交给 `drop_image`。
+    /// - 该函数只取静态图片，不处理 `pending_key`；在途后台任务如果稍后返回，会在合并结果时发现 cache 已不存在并自行释放结果图片。
+    ///
+    /// 边界条件：
+    /// - 缓存可能只有 pending 任务还没有图片，返回 `None` 是正常状态。
+    pub(in crate::app) fn log_minimap_take_static_image(
+        cache: &mut LogMinimapRenderCache,
+    ) -> Option<Arc<gpui::RenderImage>> {
+        cache.static_image.take()
+    }
+
+    /// 释放一组 minimap 静态图片。
+    ///
+    /// 业务意图：
+    /// - 多个关闭入口都会清理 tab 缓存；集中释放可以避免遗漏 GPUI atlas 清理，减少长时间打开/关闭日志后的 GPU 资源累积。
+    fn drop_log_minimap_images(images: Vec<Arc<gpui::RenderImage>>, context: &mut Context<Self>) {
+        for image in images {
+            context.drop_image(image, None);
+        }
+    }
+
+    /// 移除指定 tab 的 minimap 缓存并释放静态图片。
+    ///
+    /// 业务意图：
+    /// - 日志重新加载、切换编码或关闭单个 tab 时，旧 minimap 位图已经不再对应任何可见正文，必须同步释放。
+    pub(in crate::app) fn drop_log_minimap_cache_for_tab(
+        &mut self,
+        tab_id: usize,
+        context: &mut Context<Self>,
+    ) {
+        let images = {
+            let mut cache_store = self.log.log_minimap_cache.borrow_mut();
+            cache_store
+                .remove(&tab_id)
+                .and_then(|mut cache| Self::log_minimap_take_static_image(&mut cache))
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        Self::drop_log_minimap_images(images, context);
+    }
+
+    /// 仅保留指定 tab 的 minimap 缓存，并释放其它 tab 的静态图片。
+    ///
+    /// 业务意图：
+    /// - “关闭其它 tab”会批量移除多个日志正文；对应 minimap 图片也要一次性从 GPUI atlas 中释放。
+    pub(in crate::app) fn retain_log_minimap_cache_for_tab(
+        &mut self,
+        tab_id: usize,
+        context: &mut Context<Self>,
+    ) {
+        let images = {
+            let mut images = Vec::new();
+            let mut cache_store = self.log.log_minimap_cache.borrow_mut();
+            cache_store.retain(|cached_tab_id, cache| {
+                if *cached_tab_id == tab_id {
+                    true
+                } else {
+                    if let Some(image) = Self::log_minimap_take_static_image(cache) {
+                        images.push(image);
+                    }
+                    false
+                }
+            });
+            images
+        };
+        Self::drop_log_minimap_images(images, context);
+    }
+
+    /// 清空所有 minimap 缓存并释放静态图片。
+    ///
+    /// 业务意图：
+    /// - “关闭所有 tab”和重新加载日志源会清空整个工作区；此时所有 minimap 位图都已失效，需要统一释放。
+    pub(in crate::app) fn clear_log_minimap_cache(&mut self, context: &mut Context<Self>) {
+        let images = {
+            let mut cache_store = self.log.log_minimap_cache.borrow_mut();
+            cache_store
+                .drain()
+                .filter_map(|(_, mut cache)| Self::log_minimap_take_static_image(&mut cache))
+                .collect::<Vec<_>>()
+        };
+        Self::drop_log_minimap_images(images, context);
+    }
+
+    /// 判断当前请求是否需要派发新的 minimap 静态层后台构建。
+    ///
+    /// 业务意图：
+    /// - 滚动热路径不能同步构建图片，也不能为同一个 key 重复派发任务；该纯函数集中表达去重规则，便于测试。
+    /// - 如果当前图片已经匹配请求 key，则无需任务；如果已有任意后台任务，也继续复用旧图等待任务完成，避免快速拖动时堆积大量过期构建。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::app) fn log_minimap_should_request_static_layer_build(
+        static_image_key: Option<&LogMinimapCacheKey>,
+        pending_key: Option<&LogMinimapCacheKey>,
+        requested_key: &LogMinimapCacheKey,
+    ) -> bool {
+        static_image_key != Some(requested_key) && pending_key.is_none()
+    }
+
+    /// 从 minimap 文档快照提取可后台构建的内存日志数据。
+    ///
+    /// 业务意图：
+    /// - 分页日志不显示 minimap，也不应该把分页读取句柄带入后台预览任务，避免右侧预览影响大文件滚动。
+    /// - 返回独立结构可以让后台任务的 `Send` 边界只覆盖内存日志数据，而不是覆盖完整文档枚举。
+    fn log_minimap_static_layer_snapshot_from_document(
         snapshot: &LogMinimapDocumentSnapshot,
+    ) -> Option<LogMinimapStaticLayerSnapshot> {
+        match snapshot {
+            LogMinimapDocumentSnapshot::InMemory {
+                lines,
+                highlight_mode,
+                precomputed_highlights,
+            } => Some(LogMinimapStaticLayerSnapshot {
+                lines: lines.clone(),
+                highlight_mode: *highlight_mode,
+                precomputed_highlights: precomputed_highlights.clone(),
+            }),
+            LogMinimapDocumentSnapshot::Paged => None,
+        }
+    }
+
+    /// 派发 minimap 静态文本层后台任务。
+    ///
+    /// 业务意图：
+    /// - UI 热路径只负责提交请求和绘制已有图片；后台任务完成后再回到主线程合并缓存并触发重绘。
+    /// - 任务不持有 `Rc<RefCell<_>>` 或其它 UI 状态，避免跨线程访问 GPUI 视图对象。
+    fn spawn_log_minimap_static_layer_task(
+        tab_id: usize,
+        request: LogMinimapStaticLayerTaskRequest,
+        view_entity: gpui::WeakEntity<MainView>,
+        context: &mut App,
+    ) {
+        context
+            .spawn(async move |app| {
+                let result = app
+                    .background_executor()
+                    .spawn(async move { Self::build_log_minimap_static_layer(request) })
+                    .await;
+
+                view_entity
+                    .update(app, |view, context| {
+                        view.apply_log_minimap_static_layer_result(tab_id, result, context);
+                        context.notify();
+                    })
+                    .ok();
+            })
+            .detach();
+    }
+
+    /// 在后台线程构建 minimap 静态文本层。
+    ///
+    /// 业务意图：
+    /// - 行采样、正文同源高亮、微缩字符写入位图是 minimap 最重的 CPU 工作，必须离开 UI 线程执行。
+    /// - 该函数不访问任何 UI 状态；所有输入都来自任务请求，输出只是一张静态图片和尺寸信息。
+    fn build_log_minimap_static_layer(
+        request: LogMinimapStaticLayerTaskRequest,
+    ) -> LogMinimapStaticLayerTaskResult {
+        let buckets = Self::log_minimap_buckets_from_static_snapshot(
+            &request.snapshot,
+            request.line_count,
+            request.layout,
+            request.syntax_theme,
+        );
+        let (static_image, image_logical_width_px, image_logical_height_px) =
+            Self::log_minimap_static_render_image(
+                buckets.as_slice(),
+                request.layout,
+                request.minimap_width,
+                request.scale_factor,
+                request.palette,
+            );
+
+        LogMinimapStaticLayerTaskResult {
+            key: request.key,
+            generation: request.generation,
+            static_image,
+            image_logical_width_px,
+            image_logical_height_px,
+        }
+    }
+
+    /// 合并 minimap 静态文本层后台结果。
+    ///
+    /// 业务意图：
+    /// - 快速滚动会让多个后台任务交错完成；只有仍匹配当前 pending key 和序号的结果才能进入缓存。
+    /// - 被丢弃或被替换的图片需要通知 GPUI 释放资源，避免长时间拖动时积累过期贴图。
+    fn apply_log_minimap_static_layer_result(
+        &mut self,
+        tab_id: usize,
+        result: LogMinimapStaticLayerTaskResult,
+        context: &mut Context<Self>,
+    ) {
+        let mut images_to_drop = Vec::new();
+        {
+            let mut cache_store = self.log.log_minimap_cache.borrow_mut();
+            let Some(cache) = cache_store.get_mut(&tab_id) else {
+                if let Some(image) = result.static_image {
+                    images_to_drop.push(image);
+                }
+                drop(cache_store);
+                for image in images_to_drop {
+                    context.drop_image(image, None);
+                }
+                return;
+            };
+
+            let pending_matches = cache.pending_key.as_ref() == Some(&result.key)
+                && cache.pending_generation == result.generation;
+            let current_request_matches = cache.key == result.key;
+            if pending_matches {
+                cache.pending_key = None;
+            }
+            if !pending_matches || !current_request_matches {
+                if let Some(image) = result.static_image {
+                    images_to_drop.push(image);
+                }
+            } else {
+                cache.static_image_key = Some(result.key);
+                cache.image_logical_width_px = result.image_logical_width_px;
+                cache.image_logical_height_px = result.image_logical_height_px;
+                if let Some(previous_image) = cache.static_image.take() {
+                    images_to_drop.push(previous_image);
+                }
+                cache.static_image = result.static_image;
+            }
+        }
+
+        for image in images_to_drop {
+            context.drop_image(image, None);
+        }
+    }
+
+    /// 从后台静态层快照构造 minimap bucket。
+    ///
+    /// 业务意图：
+    /// - 后台任务只服务普通内存日志，因此这里去掉分页分支，避免把分页 I/O 降级逻辑带进滚动优化路径。
+    /// - 该函数复用原来的内存日志聚合逻辑，确保迁移到后台后视觉结果不变。
+    fn log_minimap_buckets_from_static_snapshot(
+        snapshot: &LogMinimapStaticLayerSnapshot,
         line_count: usize,
         layout: LogMinimapLayout,
         syntax_theme: SyntaxTheme,
@@ -551,57 +1050,25 @@ impl MainView {
             return Vec::new();
         }
 
-        match snapshot {
-            LogMinimapDocumentSnapshot::InMemory {
-                lines,
-                highlight_mode,
-                precomputed_highlights,
-            } => (0..layout.bucket_count)
-                .map(|bucket_index| {
-                    let (start_line, end_line) = Self::log_minimap_window_bucket_line_range(
-                        layout.window_start_line,
-                        layout.window_line_count,
-                        layout.bucket_count,
-                        bucket_index,
-                        line_count,
-                    );
-                    Self::log_minimap_bucket_from_in_memory_lines(
-                        lines,
-                        *highlight_mode,
-                        precomputed_highlights.as_deref(),
-                        syntax_theme,
-                        start_line,
-                        end_line,
-                    )
-                })
-                .collect(),
-            LogMinimapDocumentSnapshot::Paged { document } => {
-                let visible_lines = document
-                    .read_visible_lines(layout.window_start_line, layout.window_line_count)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|line| (line.line_number, line.text))
-                    .collect::<HashMap<_, _>>();
-                (0..layout.bucket_count)
-                    .map(|bucket_index| {
-                        let (start_line, end_line) = Self::log_minimap_window_bucket_line_range(
-                            layout.window_start_line,
-                            layout.window_line_count,
-                            layout.bucket_count,
-                            bucket_index,
-                            line_count,
-                        );
-                        Self::log_minimap_bucket_from_paged_document(
-                            document,
-                            &visible_lines,
-                            syntax_theme,
-                            start_line,
-                            end_line,
-                        )
-                    })
-                    .collect()
-            }
-        }
+        (0..layout.bucket_count)
+            .map(|bucket_index| {
+                let (start_line, end_line) = Self::log_minimap_window_bucket_line_range(
+                    layout.window_start_line,
+                    layout.window_line_count,
+                    layout.bucket_count,
+                    bucket_index,
+                    line_count,
+                );
+                Self::log_minimap_bucket_from_in_memory_lines(
+                    &snapshot.lines,
+                    snapshot.highlight_mode,
+                    snapshot.precomputed_highlights.as_deref(),
+                    syntax_theme,
+                    start_line,
+                    end_line,
+                )
+            })
+            .collect()
     }
 
     /// 返回某个 minimap bucket 覆盖的真实日志行范围。
@@ -709,56 +1176,6 @@ impl MainView {
             start_column,
             column_len: column_len.saturating_sub(start_column).max(1),
             tone,
-            display_text,
-            highlights,
-        }
-    }
-
-    /// 从分页日志局部窗口聚合一个 minimap bucket。
-    ///
-    /// 业务意图：
-    /// - 分页日志只读取当前 minimap 局部窗口的连续行；这里优先使用已读取到的真实行文本，保证小窗口里也能看到真实字符。
-    /// - 如果分页读取失败或某行缺失，再退回行索引字节长度轮廓，避免右侧预览影响正文可用性。
-    fn log_minimap_bucket_from_paged_document(
-        document: &log_document::PagedLogDocument,
-        visible_lines: &HashMap<usize, String>,
-        syntax_theme: SyntaxTheme,
-        start_line: usize,
-        end_line: usize,
-    ) -> LogMinimapBucket {
-        let mut column_len = 1_usize;
-        let mut display_text = None;
-        let mut highlights = Vec::new();
-        for line_index in Self::log_minimap_bucket_sample_lines(start_line, end_line) {
-            if let Some(line) = visible_lines.get(&line_index)
-                && display_text.is_none()
-            {
-                let (line_display_text, line_highlights) =
-                    Self::log_minimap_display_text_and_highlights(
-                        line,
-                        document.highlight_mode,
-                        None,
-                        syntax_theme,
-                    );
-                display_text = Some(line_display_text);
-                highlights = line_highlights;
-            }
-            if let Some(entry) = document.line_index.get(line_index) {
-                if let Some(segment) = Self::log_minimap_segments_for_byte_len(entry.byte_len)
-                    .into_iter()
-                    .next()
-                {
-                    column_len = column_len.max(segment.column_len);
-                }
-            }
-        }
-
-        LogMinimapBucket {
-            start_line,
-            line_count: end_line.saturating_sub(start_line).max(1),
-            start_column: 0,
-            column_len,
-            tone: LogMinimapLineTone::Text,
             display_text,
             highlights,
         }
@@ -902,6 +1319,7 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 分页日志没有可用文本快照，使用字节长度可以展示长短行分布，同时保持 O(采样行数) 且不访问文件正文。
+    #[cfg(test)]
     pub(in crate::app) fn log_minimap_segments_for_byte_len(
         byte_len: u32,
     ) -> Vec<LogMinimapSegment> {
@@ -971,6 +1389,335 @@ impl MainView {
         &line[..end]
     }
 
+    /// 返回主题调色板签名。
+    ///
+    /// 业务意图：
+    /// - minimap 静态位图已经把颜色烘焙进像素，不能只依赖 `SyntaxTheme` 判断是否复用缓存。
+    /// - 这里只挑选会进入 minimap 静态层或覆盖层边界的颜色，避免无关主题字段导致缓存失效。
+    fn log_minimap_palette_signature(palette: AppThemePalette) -> u64 {
+        let mut signature = 0xcbf2_9ce4_8422_2325_u64;
+        for value in [
+            palette.panel,
+            palette.text,
+            palette.muted_text,
+            palette.error,
+            palette.accent,
+            palette.search_highlight,
+            palette.border,
+        ] {
+            signature ^= value as u64;
+            signature = signature.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        signature
+    }
+
+    /// 计算 minimap 静态文本层的物理像素尺寸。
+    ///
+    /// 业务意图：
+    /// - 离屏图片按设备缩放因子生成，Retina 或 Windows 缩放屏上不会因为逻辑像素拉伸而模糊。
+    /// - 高度来自缓存窗口真实覆盖行数，保证图片平移时上下 overscan 不露白。
+    pub(in crate::app) fn log_minimap_static_image_size(
+        minimap_width: Pixels,
+        layout: LogMinimapLayout,
+        scale_factor: f32,
+    ) -> (u32, u32) {
+        let logical_width = f32::from(minimap_width).max(1.0);
+        let logical_height = Self::log_minimap_static_image_logical_height(layout);
+        (
+            (logical_width * scale_factor).ceil().max(1.0) as u32,
+            (logical_height * scale_factor).ceil().max(1.0) as u32,
+        )
+    }
+
+    /// 计算 minimap 静态文本层的逻辑高度。
+    ///
+    /// 边界条件：
+    /// - 如果 overscan 在超高窗口下超过安全上限，只裁剪远离当前视口的部分，避免生成过大的贴图。
+    fn log_minimap_static_image_logical_height(layout: LogMinimapLayout) -> f32 {
+        (layout.window_line_count as f32 * layout.line_height_px)
+            .ceil()
+            .clamp(1.0, LOG_MINIMAP_MAX_IMAGE_LOGICAL_HEIGHT)
+    }
+
+    /// 构造 minimap 静态文本层图片。
+    ///
+    /// 业务意图：
+    /// - 构建阶段一次性把局部窗口文本、高亮和降级轮廓写入离屏位图；paint 阶段只绘制图片本身。
+    /// - 这对应 VS Code minimap 的“静态文本层”和“动态覆盖层”分离思路，可以显著降低滚动时 CPU 消耗。
+    fn log_minimap_static_render_image(
+        buckets: &[LogMinimapBucket],
+        layout: LogMinimapLayout,
+        minimap_width: Pixels,
+        scale_factor: f32,
+        palette: AppThemePalette,
+    ) -> (Option<Arc<gpui::RenderImage>>, f32, f32) {
+        if buckets.is_empty() {
+            return (None, 0.0, 0.0);
+        }
+
+        let logical_width = f32::from(minimap_width).max(1.0);
+        let logical_height = Self::log_minimap_static_image_logical_height(layout);
+        let (image_width, image_height) =
+            Self::log_minimap_static_image_size(minimap_width, layout, scale_factor);
+        let mut bitmap = LogMinimapBitmap::new(image_width, image_height, rgb(palette.panel));
+        let left = LOG_MINIMAP_HORIZONTAL_PADDING * scale_factor;
+        let max_width = ((logical_width - LOG_MINIMAP_HORIZONTAL_PADDING * 2.0).max(1.0)
+            * scale_factor)
+            .max(1.0);
+        let line_height_px = layout.line_height_px * scale_factor;
+        let column_width_px = LOG_MINIMAP_COLUMN_WIDTH * scale_factor;
+        let line_rect_height = line_height_px
+            .clamp(
+                1.0_f32.min(line_height_px),
+                LOG_MINIMAP_LINE_HEIGHT * scale_factor,
+            )
+            .min(line_height_px.max(1.0));
+
+        for bucket in buckets {
+            let local_line = bucket.start_line.saturating_sub(layout.window_start_line);
+            let y = local_line as f32 * line_height_px;
+            if y > image_height as f32 {
+                continue;
+            }
+            let bucket_height = (bucket.line_count as f32 * line_height_px)
+                .max(line_rect_height)
+                .min(image_height as f32 - y);
+            let default_color = Self::log_minimap_color_for_tone(bucket.tone, palette);
+            if let Some(display_text) = bucket.display_text.as_deref()
+                && !display_text.is_empty()
+            {
+                Self::log_minimap_draw_text_line_to_bitmap(
+                    &mut bitmap,
+                    display_text,
+                    &bucket.highlights,
+                    left,
+                    y,
+                    max_width,
+                    column_width_px,
+                    bucket_height.max(line_height_px),
+                    default_color,
+                );
+                continue;
+            }
+
+            let segment_x = left + bucket.start_column as f32 * column_width_px;
+            if segment_x >= left + max_width {
+                continue;
+            }
+            let segment_width = (bucket.column_len as f32 * column_width_px).clamp(1.0, max_width);
+            let segment_width = segment_width.min(left + max_width - segment_x);
+            bitmap.fill_rect(
+                segment_x,
+                y,
+                segment_width,
+                line_rect_height.min(bucket_height),
+                default_color,
+            );
+        }
+
+        (
+            Some(bitmap.into_render_image()),
+            logical_width,
+            logical_height,
+        )
+    }
+
+    /// 将一行真实日志字符绘制到 minimap 离屏位图。
+    ///
+    /// 业务意图：
+    /// - 字符来自真实日志文本，颜色来自正文同源高亮；缩放后的点阵不可读但能形成接近 VS Code 的代码纹理。
+    /// - 空格只推进列位置，不写像素，这样缩进、表格列和堆栈层级仍能在右侧预览中显现。
+    #[allow(clippy::too_many_arguments)]
+    fn log_minimap_draw_text_line_to_bitmap(
+        bitmap: &mut LogMinimapBitmap,
+        display_text: &str,
+        highlights: &[(Range<usize>, gpui::HighlightStyle)],
+        left: f32,
+        y: f32,
+        max_width: f32,
+        column_width_px: f32,
+        line_height_px: f32,
+        default_color: gpui::Rgba,
+    ) {
+        let glyph_height = line_height_px
+            .min(LOG_MINIMAP_GLYPH_GRID_HEIGHT as f32)
+            .max(1.0);
+        let glyph_width = column_width_px
+            .min(LOG_MINIMAP_GLYPH_GRID_WIDTH as f32)
+            .max(1.0);
+        let glyph_y = y + ((line_height_px - glyph_height) / 2.0).max(0.0);
+        let mut column = 0usize;
+
+        for (byte_index, character) in display_text.char_indices() {
+            if column >= LOG_MINIMAP_MAX_ANALYZED_COLUMNS {
+                break;
+            }
+            let x = left + column as f32 * column_width_px;
+            if x >= left + max_width {
+                break;
+            }
+
+            if !character.is_whitespace() {
+                let color =
+                    Self::log_minimap_color_for_highlight(default_color, highlights, byte_index);
+                Self::log_minimap_draw_micro_glyph(
+                    bitmap,
+                    character,
+                    x,
+                    glyph_y,
+                    glyph_width,
+                    glyph_height,
+                    color,
+                );
+            }
+            column = column.saturating_add(if character == '\t' {
+                LOG_VIEWER_TAB_WIDTH
+            } else {
+                1
+            });
+        }
+    }
+
+    /// 绘制一个 minimap 微缩字符。
+    ///
+    /// 业务意图：
+    /// - 每个字符使用预定义 3x5 点阵，构建静态层时直接写像素，后续滚动不再触发平台字体排版。
+    /// - 当设备缩放或行高很小时，点阵会被裁剪为一两个像素；这和 VS Code minimap 的不可读但可扫视目标一致。
+    fn log_minimap_draw_micro_glyph(
+        bitmap: &mut LogMinimapBitmap,
+        character: char,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        color: gpui::Rgba,
+    ) {
+        let rows = Self::log_minimap_micro_glyph_rows(character);
+        if rows.iter().all(|row| *row == 0) {
+            return;
+        }
+
+        let pixel_width = width.ceil().max(1.0) as usize;
+        let pixel_height = height.ceil().max(1.0) as usize;
+        for pixel_y in 0..pixel_height {
+            let source_y = pixel_y * LOG_MINIMAP_GLYPH_GRID_HEIGHT / pixel_height;
+            let row = rows[source_y.min(LOG_MINIMAP_GLYPH_GRID_HEIGHT - 1)];
+            for pixel_x in 0..pixel_width {
+                let source_x = pixel_x * LOG_MINIMAP_GLYPH_GRID_WIDTH / pixel_width;
+                let bit = 1 << (LOG_MINIMAP_GLYPH_GRID_WIDTH - 1 - source_x);
+                if row & bit != 0 {
+                    bitmap.blend_pixel(
+                        (x + pixel_x as f32).round() as i32,
+                        (y + pixel_y as f32).round() as i32,
+                        color,
+                        1.0,
+                    );
+                }
+            }
+        }
+    }
+
+    /// 返回字符对应的 minimap 微型点阵。
+    ///
+    /// 业务意图：
+    /// - 该表相当于应用内的极小字符 atlas，避免依赖平台字体栅格化，也避免新增字体或图片依赖。
+    /// - 小写字母映射到大写点阵，非 ASCII 使用方块占位；这保留真实字符数量、列位置和高亮颜色，足够服务 minimap 扫视场景。
+    pub(in crate::app) fn log_minimap_micro_glyph_rows(character: char) -> [u8; 5] {
+        let character = character.to_ascii_uppercase();
+        match character {
+            ' ' | '\t' => [0, 0, 0, 0, 0],
+            '0' => [0b111, 0b101, 0b101, 0b101, 0b111],
+            '1' => [0b010, 0b110, 0b010, 0b010, 0b111],
+            '2' => [0b111, 0b001, 0b111, 0b100, 0b111],
+            '3' => [0b111, 0b001, 0b111, 0b001, 0b111],
+            '4' => [0b101, 0b101, 0b111, 0b001, 0b001],
+            '5' => [0b111, 0b100, 0b111, 0b001, 0b111],
+            '6' => [0b111, 0b100, 0b111, 0b101, 0b111],
+            '7' => [0b111, 0b001, 0b010, 0b010, 0b010],
+            '8' => [0b111, 0b101, 0b111, 0b101, 0b111],
+            '9' => [0b111, 0b101, 0b111, 0b001, 0b111],
+            'A' => [0b010, 0b101, 0b111, 0b101, 0b101],
+            'B' => [0b110, 0b101, 0b110, 0b101, 0b110],
+            'C' => [0b111, 0b100, 0b100, 0b100, 0b111],
+            'D' => [0b110, 0b101, 0b101, 0b101, 0b110],
+            'E' => [0b111, 0b100, 0b110, 0b100, 0b111],
+            'F' => [0b111, 0b100, 0b110, 0b100, 0b100],
+            'G' => [0b111, 0b100, 0b101, 0b101, 0b111],
+            'H' => [0b101, 0b101, 0b111, 0b101, 0b101],
+            'I' => [0b111, 0b010, 0b010, 0b010, 0b111],
+            'J' => [0b001, 0b001, 0b001, 0b101, 0b111],
+            'K' => [0b101, 0b101, 0b110, 0b101, 0b101],
+            'L' => [0b100, 0b100, 0b100, 0b100, 0b111],
+            'M' => [0b101, 0b111, 0b111, 0b101, 0b101],
+            'N' => [0b101, 0b111, 0b111, 0b111, 0b101],
+            'O' => [0b111, 0b101, 0b101, 0b101, 0b111],
+            'P' => [0b111, 0b101, 0b111, 0b100, 0b100],
+            'Q' => [0b111, 0b101, 0b101, 0b111, 0b001],
+            'R' => [0b111, 0b101, 0b111, 0b110, 0b101],
+            'S' => [0b111, 0b100, 0b111, 0b001, 0b111],
+            'T' => [0b111, 0b010, 0b010, 0b010, 0b010],
+            'U' => [0b101, 0b101, 0b101, 0b101, 0b111],
+            'V' => [0b101, 0b101, 0b101, 0b101, 0b010],
+            'W' => [0b101, 0b101, 0b111, 0b111, 0b101],
+            'X' => [0b101, 0b101, 0b010, 0b101, 0b101],
+            'Y' => [0b101, 0b101, 0b010, 0b010, 0b010],
+            'Z' => [0b111, 0b001, 0b010, 0b100, 0b111],
+            '-' => [0, 0, 0b111, 0, 0],
+            '_' => [0, 0, 0, 0, 0b111],
+            '.' => [0, 0, 0, 0, 0b010],
+            ',' => [0, 0, 0, 0b010, 0b100],
+            ':' => [0, 0b010, 0, 0b010, 0],
+            ';' => [0, 0b010, 0, 0b010, 0b100],
+            '/' => [0b001, 0b001, 0b010, 0b100, 0b100],
+            '\\' => [0b100, 0b100, 0b010, 0b001, 0b001],
+            '|' => [0b010, 0b010, 0b010, 0b010, 0b010],
+            '(' | '[' | '{' => [0b011, 0b010, 0b010, 0b010, 0b011],
+            ')' | ']' | '}' => [0b110, 0b010, 0b010, 0b010, 0b110],
+            '<' => [0b001, 0b010, 0b100, 0b010, 0b001],
+            '>' => [0b100, 0b010, 0b001, 0b010, 0b100],
+            '=' => [0, 0b111, 0, 0b111, 0],
+            '+' => [0, 0b010, 0b111, 0b010, 0],
+            '*' => [0b101, 0b010, 0b111, 0b010, 0b101],
+            '\'' | '"' | '`' => [0b010, 0b010, 0, 0, 0],
+            '#' => [0b101, 0b111, 0b101, 0b111, 0b101],
+            '@' => [0b111, 0b101, 0b111, 0b100, 0b111],
+            '&' => [0b110, 0b100, 0b111, 0b101, 0b111],
+            '%' => [0b101, 0b001, 0b010, 0b100, 0b101],
+            '$' => [0b111, 0b110, 0b111, 0b011, 0b111],
+            '!' => [0b010, 0b010, 0b010, 0, 0b010],
+            '?' => [0b111, 0b001, 0b010, 0, 0b010],
+            _ if character.is_ascii() => [0b111, 0b001, 0b010, 0b100, 0b111],
+            _ => [0b111, 0b101, 0b111, 0b101, 0b111],
+        }
+    }
+
+    /// 返回某个字节位置在 minimap 中应该使用的字符颜色。
+    ///
+    /// 业务意图：
+    /// - 正文高亮范围以 UTF-8 字节偏移保存，minimap 绘制真实显示文本时沿用同一套范围，保证日期、数字、线程名等颜色和正文一致。
+    fn log_minimap_color_for_highlight(
+        default_color: gpui::Rgba,
+        highlights: &[(Range<usize>, gpui::HighlightStyle)],
+        byte_index: usize,
+    ) -> gpui::Rgba {
+        for (range, style) in highlights {
+            if range.start <= byte_index && byte_index < range.end {
+                let mut color = style
+                    .color
+                    .map(|color| color.to_rgb())
+                    .unwrap_or(default_color);
+                let fade = style.fade_out.unwrap_or(0.0).clamp(0.0, 0.85);
+                color.a = if style.color.is_some() {
+                    (0.88 * (1.0 - fade)).clamp(0.12, 0.95)
+                } else {
+                    (default_color.a * (1.0 - fade)).clamp(0.08, 0.95)
+                };
+                return color;
+            }
+        }
+        default_color
+    }
+
     /// 绘制 minimap。
     ///
     /// 业务意图：
@@ -996,7 +1743,7 @@ impl MainView {
                 scroll_info,
             )
         });
-        Self::paint_log_minimap_buckets(bounds, cache, layout, palette, window, context);
+        Self::paint_log_minimap_static_layer(bounds, cache, layout, window, context);
         Self::paint_log_minimap_markers(
             bounds,
             layout,
@@ -1019,77 +1766,90 @@ impl MainView {
         Self::paint_log_minimap_viewport(bounds, layout, palette, window);
     }
 
-    /// 绘制 minimap 中缓存好的内容 bucket。
-    fn paint_log_minimap_buckets(
+    /// 绘制 minimap 中缓存好的静态文本层。
+    ///
+    /// 业务意图：
+    /// - 字符纹理已经在缓存构建阶段写入离屏图片，滚动时这里只根据浮点窗口起点平移图片。
+    /// - 搜索命中、手动标记和当前视口块不包含在图片内，保证这些快速变化的覆盖层不触发图片重建。
+    fn paint_log_minimap_static_layer(
         bounds: Bounds<Pixels>,
         cache: &LogMinimapRenderCache,
         layout: Option<LogMinimapLayout>,
-        palette: AppThemePalette,
         window: &mut Window,
-        context: &mut App,
+        _context: &mut App,
     ) {
         let Some(layout) = layout else {
             return;
         };
-        if cache.key.line_count == 0 || cache.buckets.is_empty() || bounds.size.height <= px(0.0) {
+        if cache.key.line_count == 0 || bounds.size.height <= px(0.0) {
             return;
+        }
+        let Some(static_image_key) = cache.static_image_key.as_ref() else {
+            return;
+        };
+        let Some(image) = cache.static_image.clone() else {
+            return;
+        };
+        if static_image_key.source_key != cache.key.source_key
+            || static_image_key.line_count != cache.key.line_count
+            || static_image_key.palette_signature != cache.key.palette_signature
+            || static_image_key.syntax_theme != cache.key.syntax_theme
+            || static_image_key.scale_factor_milli != cache.key.scale_factor_milli
+        {
+            return;
+        }
+        let y_offset = Self::log_minimap_static_layer_y_offset(
+            layout.window_start_line_float,
+            static_image_key.window_start_line,
+            layout.line_height_px,
+            cache.image_logical_height_px,
+            f32::from(bounds.size.height),
+            static_image_key == &cache.key,
+        );
+        let image_bounds = Bounds::new(
+            point(bounds.left(), bounds.top() + px(y_offset)),
+            size(
+                px(cache.image_logical_width_px),
+                px(cache.image_logical_height_px),
+            ),
+        );
+        window
+            .paint_image(image_bounds, Default::default(), image, 0, false)
+            .ok();
+    }
+
+    /// 计算 minimap 静态图片在当前可视区内的纵向偏移。
+    ///
+    /// 业务意图：
+    /// - 当前静态图匹配最新缓存 key 时，必须按真实行号精确平移，保证 minimap 文本和视口块对齐。
+    /// - 快速拖动很远时，后台新图还没生成完成，旧图的真实偏移可能会落到可视区外；此时把旧图夹在可视区域内作为临时纹理，
+    ///   避免右侧栏短暂变空，等后台新图返回后再恢复精确内容。
+    ///
+    /// 边界条件：
+    /// - 图片高度小于可视区时无法完整覆盖右侧栏，直接贴顶显示，避免出现正负偏移来回抖动。
+    /// - 行高、图片高度或可视高度异常时返回 0，保证首帧布局不稳定时不会产生 NaN 或无限偏移。
+    pub(in crate::app) fn log_minimap_static_layer_y_offset(
+        requested_window_start_line_float: f64,
+        static_window_start_line: usize,
+        line_height_px: f32,
+        image_height_px: f32,
+        viewport_height_px: f32,
+        exact_key_match: bool,
+    ) -> f32 {
+        if line_height_px <= 0.0 || image_height_px <= 0.0 || viewport_height_px <= 0.0 {
+            return 0.0;
         }
 
-        let left = f32::from(bounds.left()) + LOG_MINIMAP_HORIZONTAL_PADDING;
-        let max_width =
-            (f32::from(bounds.size.width) - LOG_MINIMAP_HORIZONTAL_PADDING * 2.0).max(1.0);
-        let line_height = Self::log_minimap_segment_height_for_line_height(layout.line_height_px);
-        if line_height <= 0.0 {
-            return;
+        let exact_offset = ((static_window_start_line as f64 - requested_window_start_line_float)
+            * line_height_px as f64) as f32;
+        if exact_key_match {
+            return exact_offset;
         }
-        for bucket in cache.buckets.iter() {
-            let y = Self::log_minimap_y_for_line_in_window(
-                bucket.start_line,
-                layout.window_start_line_float,
-                layout.line_height_px,
-                bounds,
-            );
-            let bucket_height = (bucket.line_count as f32 * layout.line_height_px)
-                .max(line_height)
-                .min(f32::from(bounds.size.height));
-            if y + bucket_height < f32::from(bounds.top()) || y > f32::from(bounds.bottom()) {
-                continue;
-            }
-            let y = y.clamp(
-                f32::from(bounds.top()) - bucket_height,
-                f32::from(bounds.bottom()),
-            );
-            let color = Self::log_minimap_color_for_tone(bucket.tone, palette);
-            if let Some(display_text) = bucket.display_text.as_deref()
-                && !display_text.is_empty()
-            {
-                Self::paint_log_minimap_text_line(
-                    display_text,
-                    &bucket.highlights,
-                    point(px(left), px(y)),
-                    px(bucket_height.max(layout.line_height_px)),
-                    layout.line_height_px,
-                    palette,
-                    window,
-                    context,
-                );
-                continue;
-            }
-            let segment_x = left + bucket.start_column as f32 * LOG_MINIMAP_COLUMN_WIDTH;
-            if segment_x >= left + max_width {
-                continue;
-            }
-            let segment_width =
-                (bucket.column_len as f32 * LOG_MINIMAP_COLUMN_WIDTH).clamp(1.0, max_width);
-            let segment_width = segment_width.min(left + max_width - segment_x);
-            window.paint_quad(fill(
-                Bounds::new(
-                    point(px(segment_x), px(y)),
-                    size(px(segment_width), px(line_height.min(bucket_height))),
-                ),
-                color,
-            ));
+        if image_height_px <= viewport_height_px {
+            return 0.0;
         }
+
+        exact_offset.clamp(viewport_height_px - image_height_px, 0.0)
     }
 
     /// 绘制搜索命中或手动标记行。
@@ -1175,95 +1935,6 @@ impl MainView {
             + ((line_index as f64 - window_start_line_float) * line_height_px as f64) as f32
     }
 
-    /// 返回当前迷你行应该绘制的矩形高度。
-    ///
-    /// 业务意图：
-    /// - 行距由正文宽高比推导，矩形本身保持较细，避免局部窗口密集行在视觉上粘成整块。
-    fn log_minimap_segment_height_for_line_height(line_height_px: f32) -> f32 {
-        line_height_px
-            .clamp(0.5_f32.min(line_height_px), LOG_MINIMAP_LINE_HEIGHT)
-            .min(line_height_px)
-    }
-
-    /// 绘制 minimap 中一行真实日志字符。
-    ///
-    /// 业务意图：
-    /// - 用户需要看到接近 VS Code 的真实字符纹理，而不是简单行长横线；这里使用 GPUI 文本系统按极小字号排版代表行。
-    /// - 文本 run 来自正文同源高亮，因此时间戳、数字、日志级别、线程名等颜色与正文保持一致。
-    ///
-    /// 边界条件：
-    /// - 字号只影响字符栅格化，不改变视口块按正文宽高比计算出的几何高度。
-    /// - 如果平台文本系统拒绝极小字号绘制，`paint` 失败会被忽略，正文查看器仍然可用。
-    #[allow(clippy::too_many_arguments)]
-    fn paint_log_minimap_text_line(
-        display_text: &str,
-        highlights: &[(Range<usize>, gpui::HighlightStyle)],
-        origin: Point<Pixels>,
-        line_height: Pixels,
-        layout_line_height_px: f32,
-        palette: AppThemePalette,
-        window: &mut Window,
-        context: &mut App,
-    ) {
-        let mut text_style = window.text_style();
-        text_style.font_family = LOG_VIEWER_FONT_FAMILY.into();
-        text_style.font_size = px(Self::log_minimap_font_size(layout_line_height_px)).into();
-        text_style.color = rgb(palette.text).into();
-        let runs = Self::log_minimap_text_runs(display_text, &text_style, highlights);
-        let font_size = text_style.font_size.to_pixels(window.rem_size());
-        let shaped_line = window.text_system().shape_line(
-            SharedString::from(display_text.to_string()),
-            font_size,
-            &runs,
-            None,
-        );
-        shaped_line.paint(origin, line_height, window, context).ok();
-    }
-
-    /// 返回 minimap 真实字符绘制字号。
-    ///
-    /// 业务意图：
-    /// - 理论缩放字号来自局部行高，但 GPUI 走平台字体栅格化，过小字号会直接消失；设置下限保证用户能看到字符纹理。
-    /// - 上限保证短日志或窄正文窗口中 minimap 仍保持“缩略图”外观，不变成第二个正文编辑器。
-    fn log_minimap_font_size(line_height_px: f32) -> f32 {
-        (line_height_px * 1.15).clamp(LOG_MINIMAP_MIN_FONT_SIZE, LOG_MINIMAP_MAX_FONT_SIZE)
-    }
-
-    /// 将正文高亮转换为 minimap 文本 run。
-    ///
-    /// 边界条件：
-    /// - 高亮范围已经映射到 `display_text`，这里仍再次夹紧，避免截断文本或旧缓存导致排版越界。
-    fn log_minimap_text_runs(
-        display_text: &str,
-        default_style: &gpui::TextStyle,
-        highlights: &[(Range<usize>, gpui::HighlightStyle)],
-    ) -> Vec<TextRun> {
-        let mut runs = Vec::new();
-        let mut cursor = 0usize;
-        for (range, highlight) in highlights {
-            let range = Self::clamp_search_text_range(display_text, range.clone());
-            if range.start > cursor {
-                runs.push(default_style.clone().to_run(range.start - cursor));
-            }
-            if range.start < range.end {
-                runs.push(
-                    default_style
-                        .clone()
-                        .highlight(highlight.clone())
-                        .to_run(range.end - range.start),
-                );
-            }
-            cursor = cursor.max(range.end);
-        }
-        if cursor < display_text.len() {
-            runs.push(default_style.to_run(display_text.len() - cursor));
-        }
-        if runs.is_empty() {
-            runs.push(default_style.to_run(display_text.len()));
-        }
-        runs
-    }
-
     /// 返回局部窗口中搜索命中或手动标记行的 y 坐标。
     ///
     /// 边界条件：
@@ -1286,26 +1957,66 @@ impl MainView {
         Some(y.clamp(f32::from(bounds.top()), f32::from(bounds.bottom()) - 2.0))
     }
 
-    /// 把 minimap 内的 y 坐标换算成目标行号。
+    /// 把 minimap 当前局部窗口内的 y 坐标换算成目标行号。
     ///
     /// 业务意图：
-    /// - 点击预览栏空白处时，需要把用户点击位置映射到整份日志中的相对行号，再让正文滚动到该行附近。
+    /// - minimap 现在只显示当前视口上下文，而不是整份日志压缩图；点击位置必须映射到当前局部窗口里的真实日志行。
+    /// - 该函数保持纯计算，测试可以覆盖顶部、底部和越界点击的夹紧规则。
     #[cfg(test)]
     pub(in crate::app) fn log_minimap_target_line_from_y(
         local_y: Pixels,
-        viewport_height: Pixels,
+        layout: LogMinimapLayout,
         line_count: usize,
     ) -> Option<usize> {
-        if line_count == 0 || viewport_height <= px(0.0) {
+        let target_line = Self::log_minimap_target_line_float_from_y(local_y, layout, line_count)?;
+        Some(
+            target_line
+                .floor()
+                .clamp(0.0, line_count.saturating_sub(1) as f64) as usize,
+        )
+    }
+
+    /// 把 minimap 当前局部窗口内的 y 坐标换算成浮点目标行。
+    ///
+    /// 业务意图：
+    /// - 点击跳转需要保留行内浮点位置，避免高 DPI 或小行高下多次点击同一区域全部落到同一整数行。
+    /// - 返回值仍会夹紧到真实文件范围内，避免在首尾 overscan 或异常坐标下请求不存在的行。
+    fn log_minimap_target_line_float_from_y(
+        local_y: Pixels,
+        layout: LogMinimapLayout,
+        line_count: usize,
+    ) -> Option<f64> {
+        if line_count == 0 || layout.line_height_px <= 0.0 || layout.window_line_count == 0 {
             return None;
         }
         if line_count == 1 {
-            return Some(0);
+            return Some(0.0);
         }
 
-        let ratio = f64::from((local_y / viewport_height).clamp(0.0, 1.0));
-        let line_index = ((line_count as f64) * ratio).floor() as usize;
-        Some(line_index.min(line_count - 1))
+        let local_line = (f64::from(local_y) / layout.line_height_px as f64)
+            .clamp(0.0, layout.window_line_count.saturating_sub(1) as f64);
+        Some((layout.window_start_line_float + local_line).clamp(0.0, line_count as f64 - 1.0))
+    }
+
+    /// 把 minimap 点击位置换算成正文滚动偏移。
+    ///
+    /// 业务意图：
+    /// - 点击视口块外部时，用户点到的是 minimap 里的某一行局部文本，应把这行滚动到正文视口中部。
+    /// - 该逻辑不同于拖动视口块；拖动仍按滚动条轨道百分比换算，点击则按当前局部窗口的真实行号换算。
+    pub(in crate::app) fn log_minimap_scroll_top_for_click(
+        local_y: Pixels,
+        layout: LogMinimapLayout,
+        scroll_info: LogMinimapScrollInfo,
+        line_count: usize,
+    ) -> Option<f64> {
+        let target_line = Self::log_minimap_target_line_float_from_y(local_y, layout, line_count)?;
+        let row_height = f64::from(px(LOG_VIEWER_ROW_HEIGHT));
+        if row_height <= 0.0 {
+            return Some(0.0);
+        }
+        let visible_lines = (scroll_info.viewport_height_px / row_height).max(1.0);
+        let target_top_line = target_line - visible_lines / 2.0;
+        Some((target_top_line * row_height).clamp(0.0, scroll_info.max_scroll_px))
     }
 
     /// 返回 minimap 当前视口块高度。
@@ -1427,10 +2138,11 @@ impl MainView {
         }
     }
 
-    /// 开始拖动 minimap 当前视口块，或点击跳转到对应位置。
+    /// 开始拖动 minimap 当前视口块，或点击局部预览文本跳转到对应位置。
     ///
     /// 业务意图：
-    /// - 点击视口块内部时进入拖动模式且不立即跳转；点击空白区域时先把视口块中心移动到点击位置，再进入拖动模式。
+    /// - 点击视口块内部时进入拖动模式且不立即跳转，保证拖动滚动条手感稳定。
+    /// - 点击视口块外部时，把点击处对应的局部日志行滚到正文中部；随后仍记录拖动状态，用户按住继续移动时可以连续拖动。
     pub(in crate::app) fn start_log_minimap_drag(
         &mut self,
         tab_id: usize,
@@ -1443,7 +2155,9 @@ impl MainView {
         };
         let local_y = (event.position.y - geometry.viewport_top).clamp(px(0.0), geometry.height);
         let block_bottom = geometry.viewport_block_top + geometry.viewport_block_height;
-        let cursor_offset = if local_y >= geometry.viewport_block_top && local_y <= block_bottom {
+        let clicked_viewport_block =
+            local_y >= geometry.viewport_block_top && local_y <= block_bottom;
+        let cursor_offset = if clicked_viewport_block {
             local_y - geometry.viewport_block_top
         } else {
             geometry.viewport_block_height / 2.0
@@ -1458,8 +2172,40 @@ impl MainView {
         self.log.encoding_dropdown_menu = None;
         self.log.log_viewer_context_menu = None;
         self.stop_log_text_selection(context);
-        self.apply_log_minimap_drag_position(tab_id, event.position.y, cursor_offset, context);
+        if clicked_viewport_block {
+            self.apply_log_minimap_drag_position(tab_id, event.position.y, cursor_offset, context);
+        } else if let Some(scroll_top) =
+            self.log_minimap_scroll_top_for_click_on_tab(tab_id, local_y)
+        {
+            self.set_log_tab_vertical_scroll_top(tab_id, scroll_top);
+        }
         context.notify();
+    }
+
+    /// 计算当前 tab 在 minimap 点击位置对应的正文滚动偏移。
+    ///
+    /// 业务意图：
+    /// - 点击位置需要结合当前日志行数、正文视口尺寸和局部窗口布局；集中在这里读取 tab 状态，避免事件处理函数重复分散业务规则。
+    /// - 分页日志当前不显示 minimap，但该函数仍按文档类型通用读取行数，防止未来恢复分页降级预览时点击逻辑缺失。
+    fn log_minimap_scroll_top_for_click_on_tab(
+        &self,
+        tab_id: usize,
+        local_y: Pixels,
+    ) -> Option<f64> {
+        let tab = self.log.open_tabs.iter().find(|tab| tab.id == tab_id)?;
+        let line_count = match &tab.state {
+            LogTabState::Ready { document } => document.line_count(),
+            LogTabState::Loading { .. } | LogTabState::Failed { .. } => return None,
+        };
+        let bounds = Self::log_minimap_viewport_bounds_for_tab(tab)?;
+        let scroll_info = Self::log_minimap_scroll_info_for_tab(tab)?;
+        let layout = Self::log_minimap_layout_for_scroll(
+            line_count,
+            px(LOG_MINIMAP_WIDTH),
+            bounds.size.height,
+            scroll_info,
+        )?;
+        Self::log_minimap_scroll_top_for_click(local_y, layout, scroll_info, line_count)
     }
 
     /// 根据鼠标移动更新 minimap 拖动位置。

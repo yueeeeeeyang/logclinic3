@@ -14,6 +14,8 @@ encoding_rs = "0.8.35"
 flate2 = "1.1.9"
 # GPUI 是当前桌面窗口和交互渲染框架，版本固定到 crates.io 已确认的 0.2.2。
 gpui = "0.2.2"
+# image 仅用于构造 minimap 离屏位图的内存帧；不启用解码器，避免右侧预览滚动时走异步图片解码链路。
+image = { version = "0.25.10", default-features = false }
 # lucide-icons 提供工具栏和目录树图标字体，避免继续使用难看的手写符号。
 lucide-icons = "1.14.0"
 # pulldown-cmark 用于 AI 对话助手回复 Markdown 解析，只影响本地展示，不改变消息存储和请求体。
@@ -27,6 +29,8 @@ rustc-hash = "2.1.2"
 # serde/serde_json 只用于 HPROF sidecar manifest，二进制索引文件继续使用手写紧凑格式。
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+# smallvec 只用于把 minimap 的单帧 RenderImage 交给 GPUI，避免为了单张静态层分配 Vec。
+smallvec = "1.15.1"
 # reqwest 只用于设置页“测试模型”的 OpenAI 兼容接口探测；请求放入后台线程并使用 rustls，避免阻塞 UI 或依赖系统 OpenSSL。
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 # rusqlite 用于 AI 对话历史的本地 SQLite 存储；启用 bundled 以避免 macOS/Windows 依赖系统 SQLite 动态库。

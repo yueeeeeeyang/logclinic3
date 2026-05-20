@@ -551,7 +551,7 @@ impl MainView {
                     .await;
 
                 view.update(app, |view, context| {
-                    view.apply_log_tab_load_result(tab_id, result);
+                    view.apply_log_tab_load_result(tab_id, result, context);
                     context.notify();
                 })
                 .ok();
@@ -567,14 +567,15 @@ impl MainView {
         &mut self,
         tab_id: usize,
         result: LogTabLoadResult,
+        context: &mut Context<Self>,
     ) {
         let mut pending_scroll_to_line = None;
+        self.drop_log_minimap_cache_for_tab(tab_id, context);
         {
             let Some(tab) = self.log.open_tabs.iter_mut().find(|tab| tab.id == tab_id) else {
                 return;
             };
 
-            self.log.log_minimap_cache.borrow_mut().remove(&tab_id);
             tab.scroll_handle = UniformListScrollHandle::new();
             tab.paged_viewport_handle = ScrollHandle::new();
             tab.paged_scroll = PagedLogScrollState::default();
@@ -648,8 +649,8 @@ impl MainView {
             return;
         }
 
+        let source_name = tab.title.clone();
         tab.encoding_choice = encoding_choice;
-        self.log.log_minimap_cache.borrow_mut().remove(&tab_id);
         tab.scroll_handle = UniformListScrollHandle::new();
         tab.pending_scroll_to_line = None;
         tab.highlighted_search_line = None;
@@ -660,10 +661,10 @@ impl MainView {
         tab.state = LogTabState::Loading {
             message: format!("正在按 {} 重新解析...", encoding_choice.label()),
         };
+        self.drop_log_minimap_cache_for_tab(tab_id, context);
         self.log.tab_context_menu = None;
         self.log.encoding_dropdown_menu = None;
         self.log.log_viewer_context_menu = None;
-        let source_name = tab.title.clone();
         if self
             .log
             .log_scrollbar_drag
@@ -716,7 +717,7 @@ impl MainView {
                     .await;
 
                 view.update(app, |view, context| {
-                    view.apply_log_tab_decode_result(tab_id, result);
+                    view.apply_log_tab_decode_result(tab_id, result, context);
                     context.notify();
                 })
                 .ok();
@@ -755,7 +756,7 @@ impl MainView {
                     .await;
 
                 view.update(app, |view, context| {
-                    view.apply_log_tab_decode_result(tab_id, result);
+                    view.apply_log_tab_decode_result(tab_id, result, context);
                     context.notify();
                 })
                 .ok();
@@ -772,25 +773,35 @@ impl MainView {
         &mut self,
         tab_id: usize,
         result: LogTabDecodeResult,
+        context: &mut Context<Self>,
     ) {
+        let result_encoding_choice = match &result {
+            LogTabDecodeResult::Ready {
+                encoding_choice, ..
+            }
+            | LogTabDecodeResult::Failed {
+                encoding_choice, ..
+            } => *encoding_choice,
+        };
+        let Some(current_encoding_choice) = self
+            .log
+            .open_tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.encoding_choice)
+        else {
+            return;
+        };
+        if current_encoding_choice != result_encoding_choice {
+            return;
+        }
+
+        self.drop_log_minimap_cache_for_tab(tab_id, context);
         {
             let Some(tab) = self.log.open_tabs.iter_mut().find(|tab| tab.id == tab_id) else {
                 return;
             };
 
-            let result_encoding_choice = match &result {
-                LogTabDecodeResult::Ready {
-                    encoding_choice, ..
-                }
-                | LogTabDecodeResult::Failed {
-                    encoding_choice, ..
-                } => *encoding_choice,
-            };
-            if tab.encoding_choice != result_encoding_choice {
-                return;
-            }
-
-            self.log.log_minimap_cache.borrow_mut().remove(&tab_id);
             tab.scroll_handle = UniformListScrollHandle::new();
             tab.paged_viewport_handle = ScrollHandle::new();
             tab.paged_scroll = PagedLogScrollState::default();

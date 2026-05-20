@@ -142,9 +142,9 @@ impl MainView {
         self.search.search_results_context_menu = None;
         self.log.log_viewer_context_menu = None;
         match action {
-            TabContextMenuAction::Current => self.close_tab(tab_id),
-            TabContextMenuAction::OtherTabs => self.close_other_tabs(tab_id),
-            TabContextMenuAction::AllTabs => self.close_all_tabs(),
+            TabContextMenuAction::Current => self.close_tab(tab_id, context),
+            TabContextMenuAction::OtherTabs => self.close_other_tabs(tab_id, context),
+            TabContextMenuAction::AllTabs => self.close_all_tabs(context),
         }
         context.notify();
     }
@@ -153,13 +153,13 @@ impl MainView {
     ///
     /// 边界条件：
     /// - 如果关闭的是当前激活 tab，则优先激活当前位置后面的 tab，否则激活前一个 tab。
-    pub(in crate::app) fn close_tab(&mut self, tab_id: usize) {
+    pub(in crate::app) fn close_tab(&mut self, tab_id: usize, context: &mut Context<Self>) {
         let Some(index) = self.log.open_tabs.iter().position(|tab| tab.id == tab_id) else {
             return;
         };
         let closed_tab = self.log.open_tabs.remove(index);
         Self::cleanup_tab_paged_resources(&closed_tab);
-        self.log.log_minimap_cache.borrow_mut().remove(&tab_id);
+        self.drop_log_minimap_cache_for_tab(tab_id, context);
 
         if self.log.active_tab_id == Some(tab_id) {
             self.log.active_tab_id = self
@@ -213,7 +213,7 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 保留右键点击的 tab，并把它设为当前激活 tab。
-    pub(in crate::app) fn close_other_tabs(&mut self, tab_id: usize) {
+    pub(in crate::app) fn close_other_tabs(&mut self, tab_id: usize, context: &mut Context<Self>) {
         let mut retained = Vec::new();
         for tab in self.log.open_tabs.drain(..) {
             if tab.id == tab_id {
@@ -223,10 +223,7 @@ impl MainView {
             }
         }
         self.log.open_tabs = retained;
-        self.log
-            .log_minimap_cache
-            .borrow_mut()
-            .retain(|cached_tab_id, _| *cached_tab_id == tab_id);
+        self.retain_log_minimap_cache_for_tab(tab_id, context);
         self.log.active_tab_id = self.log.open_tabs.first().map(|tab| tab.id);
         self.clear_search_current_file_match_count();
         self.log
@@ -268,12 +265,12 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 清空右侧工作区后回到“点击左侧日志文件查看内容”的友好提示。
-    pub(in crate::app) fn close_all_tabs(&mut self) {
+    pub(in crate::app) fn close_all_tabs(&mut self, context: &mut Context<Self>) {
         for tab in &self.log.open_tabs {
             Self::cleanup_tab_paged_resources(tab);
         }
         self.log.open_tabs.clear();
-        self.log.log_minimap_cache.borrow_mut().clear();
+        self.clear_log_minimap_cache(context);
         self.log.active_tab_id = None;
         self.log.tab_context_menu = None;
         self.log.encoding_dropdown_menu = None;

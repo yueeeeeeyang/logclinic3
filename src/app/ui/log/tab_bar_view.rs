@@ -278,7 +278,7 @@ impl MainView {
             ))
             .on_click(
                 context.listener(move |view, _event: &ClickEvent, _window, context| {
-                    view.close_tab(tab_id);
+                    view.close_tab(tab_id, context);
                     view.log.tab_context_menu = None;
                     view.log.encoding_dropdown_menu = None;
                     context.notify();

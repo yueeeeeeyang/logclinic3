@@ -2951,27 +2951,85 @@ mod state_tests {
         assert_eq!(scroll_top, max_scroll);
     }
 
-    /// 验证 minimap 点击坐标会稳定映射到合法行号。
+    /// 验证 minimap 点击坐标会按局部窗口映射到合法行号。
     ///
     /// 业务意图：
-    /// - 右侧 minimap 用鼠标 y 坐标跳转日志位置，必须处理空文件、单行文件和越界坐标，避免点击底部或顶部时产生非法行号。
+    /// - 右侧 minimap 当前只显示正文视口上下文，点击坐标应落到当前局部窗口中的真实日志行，而不是整份文件百分比。
+    /// - 坐标越界时仍需要夹紧，避免用户点击右侧栏边缘时产生非法行号。
     #[test]
     fn 日志_minimap_点击坐标会夹紧到合法行号() {
+        let scroll_info = LogMinimapScrollInfo {
+            scroll_top_px: 120_000.0,
+            max_scroll_px: 500_000.0,
+            viewport_width_px: 1280.0,
+            viewport_height_px: 720.0,
+        };
+        let layout = MainView::log_minimap_layout_for_scroll(
+            20_000,
+            px(LOG_MINIMAP_WIDTH),
+            px(720.0),
+            scroll_info,
+        )
+        .expect("有效日志和视口尺寸应生成 minimap 布局");
+
         assert_eq!(
-            MainView::log_minimap_target_line_from_y(px(10.0), px(100.0), 0),
+            MainView::log_minimap_target_line_from_y(px(10.0), layout, 0),
             None
         );
         assert_eq!(
-            MainView::log_minimap_target_line_from_y(px(80.0), px(100.0), 1),
+            MainView::log_minimap_target_line_from_y(px(80.0), layout, 1),
             Some(0)
         );
-        assert_eq!(
-            MainView::log_minimap_target_line_from_y(px(-20.0), px(100.0), 100),
-            Some(0)
+
+        let top_line = MainView::log_minimap_target_line_from_y(px(-20.0), layout, 20_000)
+            .expect("越界顶部坐标应夹紧到局部窗口起点");
+        assert!(
+            (top_line as f64 - layout.window_start_line_float).abs() < 1.0,
+            "顶部越界点击应夹紧到当前局部窗口起点，而不是整份文件开头"
         );
-        assert_eq!(
-            MainView::log_minimap_target_line_from_y(px(120.0), px(100.0), 100),
-            Some(99)
+
+        let bottom_line = MainView::log_minimap_target_line_from_y(px(900.0), layout, 20_000)
+            .expect("越界底部坐标应夹紧到局部窗口末端");
+        assert!(
+            bottom_line >= layout.window_start_line,
+            "底部越界点击仍应落在当前局部窗口内"
+        );
+    }
+
+    /// 验证 minimap 点击会把局部窗口中的目标行滚到正文中部。
+    ///
+    /// 业务意图：
+    /// - 点击 minimap 的语义是“跳到鼠标下这段日志”，不是点击滚动条轨道百分比。
+    /// - 该测试锁定局部窗口点击换算，避免后续优化拖动逻辑时重新退化为全文百分比跳转。
+    #[test]
+    fn 日志_minimap_点击按局部行滚到正文中部() {
+        let line_count = 20_000;
+        let scroll_info = LogMinimapScrollInfo {
+            scroll_top_px: 120_000.0,
+            max_scroll_px: 500_000.0,
+            viewport_width_px: 1280.0,
+            viewport_height_px: 720.0,
+        };
+        let layout = MainView::log_minimap_layout_for_scroll(
+            line_count,
+            px(LOG_MINIMAP_WIDTH),
+            px(720.0),
+            scroll_info,
+        )
+        .expect("有效日志和视口尺寸应生成 minimap 布局");
+        let click_y = layout.viewport_block_top + layout.viewport_block_height + px(48.0);
+        let target_line = MainView::log_minimap_target_line_from_y(click_y, layout, line_count)
+            .expect("点击局部窗口内位置应得到目标行");
+        let scroll_top =
+            MainView::log_minimap_scroll_top_for_click(click_y, layout, scroll_info, line_count)
+                .expect("点击局部窗口内位置应得到正文滚动偏移");
+        let row_height = f64::from(px(LOG_VIEWER_ROW_HEIGHT));
+        let visible_lines = scroll_info.viewport_height_px / row_height;
+        let centered_line = scroll_top / row_height + visible_lines / 2.0;
+
+        assert!(
+            (centered_line - target_line as f64).abs() <= 1.0,
+            "点击后的正文视口中部应接近 minimap 鼠标下的目标行"
         );
     }
 
@@ -3109,6 +3167,229 @@ mod state_tests {
         );
     }
 
+    /// 验证 minimap 静态文本层使用量化缓存窗口。
+    ///
+    /// 业务意图：
+    /// - 滚轮或拖动滚动条时，正文顶部行会连续变化；minimap 不能因为每一行变化都重建离屏位图。
+    /// - 小幅滚动应复用同一个量化起点，跨过足够距离后才切换到新的静态文本层。
+    #[test]
+    fn 日志_minimap_缓存窗口小幅滚动复用量化起点() {
+        let first_start = MainView::log_minimap_quantized_window_start_line(10_000);
+        let nearby_start = MainView::log_minimap_quantized_window_start_line(10_010);
+        let far_start = MainView::log_minimap_quantized_window_start_line(10_480);
+
+        assert_eq!(
+            first_start, nearby_start,
+            "十行以内的小幅滚动应只移动图片偏移，不应重建 minimap 静态层"
+        );
+        assert!(
+            far_start > first_start,
+            "跨过量化块后才允许进入新的 minimap 静态层缓存窗口"
+        );
+
+        let base_scroll_info = LogMinimapScrollInfo {
+            scroll_top_px: 120_000.0,
+            max_scroll_px: 500_000.0,
+            viewport_width_px: 1280.0,
+            viewport_height_px: 720.0,
+        };
+        let nearby_scroll_info = LogMinimapScrollInfo {
+            scroll_top_px: 120_000.0 + f64::from(px(LOG_VIEWER_ROW_HEIGHT)) * 10.0,
+            ..base_scroll_info
+        };
+        let base_layout = MainView::log_minimap_layout_for_scroll(
+            20_000,
+            px(LOG_MINIMAP_WIDTH),
+            px(720.0),
+            base_scroll_info,
+        )
+        .expect("有效日志和视口尺寸应生成 minimap 布局");
+        let nearby_layout = MainView::log_minimap_layout_for_scroll(
+            20_000,
+            px(LOG_MINIMAP_WIDTH),
+            px(720.0),
+            nearby_scroll_info,
+        )
+        .expect("有效日志和视口尺寸应生成 minimap 布局");
+
+        assert_eq!(
+            base_layout.window_start_line, nearby_layout.window_start_line,
+            "同一量化块内的小幅滚动应复用同一个缓存起点"
+        );
+        assert_eq!(
+            base_layout.window_line_count, nearby_layout.window_line_count,
+            "同一量化块内的小幅滚动不应改变缓存窗口行数，否则 cache key 会逐行失效"
+        );
+    }
+
+    /// 构造测试用 minimap 缓存键。
+    ///
+    /// 业务意图：
+    /// - 多个 minimap 缓存测试只关心 key 的相等性和窗口起点变化，集中构造可以避免字段新增时测试样板分散失效。
+    fn test_log_minimap_cache_key() -> LogMinimapCacheKey {
+        LogMinimapCacheKey {
+            source_key: "memory.log".to_string(),
+            line_count: 20_000,
+            viewport_width_px: 1280,
+            viewport_height_px: 720,
+            window_start_line: 9_600,
+            window_line_count: 480,
+            bucket_count: 480,
+            image_width_px: 110,
+            image_height_px: 960,
+            scale_factor_milli: 1000,
+            palette_signature: 42,
+            syntax_theme: SyntaxTheme::Light,
+            paged: false,
+        }
+    }
+
+    /// 验证 minimap 静态层后台构建请求会去重。
+    ///
+    /// 业务意图：
+    /// - 滚动跨过量化块时 UI 线程应继续绘制上一张静态图，并且只为最新局部窗口派发一次后台任务。
+    /// - 如果当前图片或 pending 任务已经覆盖请求 key，再次进入 canvas prepare 不应重复生成位图，避免滚动时后台任务堆积。
+    #[test]
+    fn 日志_minimap_静态层后台构建请求会去重() {
+        let current_key = test_log_minimap_cache_key();
+        let mut next_key = current_key.clone();
+        next_key.window_start_line = 9_792;
+
+        assert!(
+            !MainView::log_minimap_should_request_static_layer_build(
+                Some(&current_key),
+                None,
+                &current_key,
+            ),
+            "已有静态图片匹配当前 key 时不应派发后台构建"
+        );
+        assert!(
+            !MainView::log_minimap_should_request_static_layer_build(
+                Some(&current_key),
+                Some(&next_key),
+                &next_key,
+            ),
+            "同一个新 key 已有后台任务时不应重复派发"
+        );
+        assert!(
+            !MainView::log_minimap_should_request_static_layer_build(
+                Some(&current_key),
+                Some(&next_key),
+                &current_key,
+            ),
+            "即使用户滚回已命中的静态图，也不能忘记仍在后台运行的旧任务，否则下一次远距离拖动会重新堆积构建任务"
+        );
+        let mut far_key = current_key.clone();
+        far_key.window_start_line = 10_176;
+        assert!(
+            !MainView::log_minimap_should_request_static_layer_build(
+                Some(&current_key),
+                Some(&next_key),
+                &far_key,
+            ),
+            "已有任意后台任务时不应继续派发新任务，避免快速拖动堆积大量过期静态层构建"
+        );
+        assert!(
+            MainView::log_minimap_should_request_static_layer_build(
+                Some(&current_key),
+                None,
+                &next_key,
+            ),
+            "跨到新量化窗口且没有 pending 任务时，应派发后台构建并继续保留旧图"
+        );
+    }
+
+    /// 验证 minimap 缓存清理会取出静态图片。
+    ///
+    /// 业务意图：
+    /// - 关闭 tab、重新加载和切换编码时，`RenderImage` 需要交给 GPUI `drop_image` 释放 atlas 纹理；清理辅助函数必须先把图片从缓存中取出。
+    /// - 该测试不依赖真实窗口，只锁定缓存所有权转移，避免后续重构再次只删除 HashMap 条目而遗漏纹理释放。
+    #[test]
+    fn 日志_minimap_缓存清理会取出静态图片() {
+        let buffer = image::RgbaImage::new(1, 1);
+        let image = Arc::new(gpui::RenderImage::new(smallvec::SmallVec::from_elem(
+            image::Frame::new(buffer),
+            1,
+        )));
+        let key = test_log_minimap_cache_key();
+        let mut cache = LogMinimapRenderCache {
+            key: key.clone(),
+            static_image_key: Some(key),
+            pending_key: None,
+            pending_generation: 0,
+            static_image: Some(image.clone()),
+            image_logical_width_px: 1.0,
+            image_logical_height_px: 1.0,
+        };
+
+        let taken = MainView::log_minimap_take_static_image(&mut cache)
+            .expect("带静态图片的 minimap 缓存应能取出待释放图片");
+        assert!(
+            Arc::ptr_eq(&taken, &image),
+            "取出的图片必须是缓存里原来的 RenderImage，才能释放已上传的同一张 atlas 纹理"
+        );
+        assert!(
+            cache.static_image.is_none(),
+            "图片取出后缓存内不应继续持有 Arc，避免后续重复释放或误以为仍有可绘制静态层"
+        );
+    }
+
+    /// 验证 minimap 过期静态层在后台刷新期间不会被平移到可视区外。
+    ///
+    /// 业务意图：
+    /// - 用户拖动滚动条跨越很大距离时，新静态图由后台异步生成；旧静态图如果按真实行距继续平移，会完全离开右侧栏并造成空白。
+    /// - 过期图只作为临时纹理使用，因此可以夹紧在可视区内；当 key 精确匹配时仍必须保留真实偏移，避免正常滚动错位。
+    #[test]
+    fn 日志_minimap_过期静态层偏移会夹紧避免拖动空白() {
+        let far_below_offset =
+            MainView::log_minimap_static_layer_y_offset(10_000.0, 1_000, 1.0, 800.0, 600.0, false);
+        assert_eq!(
+            far_below_offset, -200.0,
+            "旧静态图理论上已经在可视区上方很远时，应夹紧到底部仍覆盖右侧栏"
+        );
+
+        let far_above_offset =
+            MainView::log_minimap_static_layer_y_offset(1_000.0, 10_000, 1.0, 800.0, 600.0, false);
+        assert_eq!(
+            far_above_offset, 0.0,
+            "旧静态图理论上已经在可视区下方很远时，应贴顶保留临时纹理"
+        );
+
+        let exact_offset =
+            MainView::log_minimap_static_layer_y_offset(10_000.0, 1_000, 1.0, 800.0, 600.0, true);
+        assert_eq!(
+            exact_offset, -9_000.0,
+            "静态图 key 精确匹配时不能夹紧，否则正常滚动会和真实行号错位"
+        );
+    }
+
+    /// 验证 minimap 离屏位图按设备缩放生成物理像素。
+    ///
+    /// 业务意图：
+    /// - Retina 和 Windows 缩放屏上，如果静态层仍按 1x 生成，GPUI 拉伸后会模糊；物理像素尺寸必须随 scale factor 增长。
+    #[test]
+    fn 日志_minimap_静态位图尺寸跟随设备缩放() {
+        let scroll_info = LogMinimapScrollInfo {
+            scroll_top_px: 120_000.0,
+            max_scroll_px: 500_000.0,
+            viewport_width_px: 1280.0,
+            viewport_height_px: 720.0,
+        };
+        let layout = MainView::log_minimap_layout_for_scroll(
+            20_000,
+            px(LOG_MINIMAP_WIDTH),
+            px(720.0),
+            scroll_info,
+        )
+        .expect("有效日志和视口尺寸应生成 minimap 布局");
+
+        let one_x = MainView::log_minimap_static_image_size(px(LOG_MINIMAP_WIDTH), layout, 1.0);
+        let two_x = MainView::log_minimap_static_image_size(px(LOG_MINIMAP_WIDTH), layout, 2.0);
+
+        assert_eq!(two_x.0, one_x.0 * 2, "2x 屏幕的位图宽度应翻倍");
+        assert_eq!(two_x.1, one_x.1 * 2, "2x 屏幕的位图高度应翻倍");
+    }
+
     /// 验证 minimap bucket 在千万级日志中不会溢出且覆盖首尾。
     ///
     /// 业务意图：
@@ -3227,6 +3508,36 @@ mod state_tests {
         assert!(
             highlights.iter().any(|(_, style)| style.color.is_some()),
             "minimap 高亮应复用正文语法高亮颜色"
+        );
+    }
+
+    /// 验证 minimap 微缩字符图集能区分文本和空白。
+    ///
+    /// 业务意图：
+    /// - 静态文本层不再调用平台字体排版，而是使用内置点阵字符；空格必须保持透明，真实字符必须产生像素纹理。
+    #[test]
+    fn 日志_minimap_微缩字符图集区分文本和空白() {
+        let digit = MainView::log_minimap_micro_glyph_rows('8');
+        let letter = MainView::log_minimap_micro_glyph_rows('a');
+        let upper_letter = MainView::log_minimap_micro_glyph_rows('A');
+        let whitespace = MainView::log_minimap_micro_glyph_rows(' ');
+        let non_ascii = MainView::log_minimap_micro_glyph_rows('中');
+
+        assert!(
+            digit.iter().any(|row| *row != 0),
+            "数字字符应在 minimap 字符图集中产生像素"
+        );
+        assert_eq!(
+            letter, upper_letter,
+            "小写字母复用大写点阵，保证缩略图稳定且无需维护两套字形"
+        );
+        assert!(
+            whitespace.iter().all(|row| *row == 0),
+            "空格必须保持透明，只推进列位置"
+        );
+        assert!(
+            non_ascii.iter().any(|row| *row != 0),
+            "中文等非 ASCII 字符应显示占位纹理，避免整段日志在 minimap 中消失"
         );
     }
 

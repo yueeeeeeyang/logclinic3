@@ -904,7 +904,7 @@ impl MainView {
             return;
         }
 
-        self.clear_workspace_for_new_log_load();
+        self.clear_workspace_for_new_log_load(context);
         self.log.load_state = LogTreeLoadState::Loading {
             message: loading_message,
         };
@@ -959,7 +959,7 @@ impl MainView {
     /// 边界条件：
     /// - 搜索窗口本身不强制关闭，保留用户输入的关键字；但正在运行的搜索会被置为无效，旧后台回调无法继续写回结果面板。
     /// - 只清理会引用旧日志来源的数据，不重置主题、窗口、左侧宽度等会话级偏好。
-    pub(in crate::app) fn clear_workspace_for_new_log_load(&mut self) {
+    pub(in crate::app) fn clear_workspace_for_new_log_load(&mut self, context: &mut Context<Self>) {
         for tab in &self.log.open_tabs {
             Self::cleanup_tab_paged_resources(tab);
         }
@@ -967,7 +967,7 @@ impl MainView {
             tree_state.cleanup_temporary_paths();
         }
         self.log.open_tabs.clear();
-        self.log.log_minimap_cache.borrow_mut().clear();
+        self.clear_log_minimap_cache(context);
         self.log.active_tab_id = None;
         self.log.tab_context_menu = None;
         self.log.encoding_dropdown_menu = None;

@@ -2211,6 +2211,26 @@ pub(in crate::app) struct LogMinimapCacheKey {
     pub(in crate::app) window_line_count: usize,
     /// 当前局部窗口聚合后的 bucket 数量。
     pub(in crate::app) bucket_count: usize,
+    /// 静态文本层位图宽度，单位为物理像素。
+    ///
+    /// 业务意图：
+    /// - minimap 字符层会先绘制到离屏位图，再交给 GPUI 图片管线；窗口缩放或右侧栏宽度变化时必须重建位图。
+    pub(in crate::app) image_width_px: u32,
+    /// 静态文本层位图高度，单位为物理像素。
+    ///
+    /// 边界条件：
+    /// - 位图高度来自局部窗口行数和 minimap 行高，不能只看可见高度；否则滚动时向上平移会露出空白。
+    pub(in crate::app) image_height_px: u32,
+    /// 当前窗口设备缩放因子放大一千倍后的整数。
+    ///
+    /// 业务意图：
+    /// - macOS Retina 和 Windows 缩放显示器会改变离屏位图真实像素密度；缩放变化时复用旧位图会导致模糊或错位。
+    pub(in crate::app) scale_factor_milli: u32,
+    /// 当前主题颜色签名。
+    ///
+    /// 业务意图：
+    /// - 静态文本层已经把默认文字色、面板背景色和日志级别色写进像素，主题切换时必须重建。
+    pub(in crate::app) palette_signature: u64,
     /// 当前缓存对应的语法高亮主题。
     ///
     /// 业务意图：
@@ -2246,7 +2266,7 @@ pub(in crate::app) struct LogMinimapBucket {
     /// 与 `display_text` 对齐的正文同源高亮范围。
     ///
     /// 边界条件：
-    /// - 范围使用 `display_text` 的 UTF-8 字节偏移；文本被截断时必须同步夹紧高亮范围，避免 GPUI 文本排版越界。
+    /// - 范围使用 `display_text` 的 UTF-8 字节偏移；文本被截断时必须同步夹紧高亮范围，避免离屏字符绘制越界。
     pub(in crate::app) highlights: Vec<(Range<usize>, gpui::HighlightStyle)>,
 }
 
@@ -2254,13 +2274,49 @@ pub(in crate::app) struct LogMinimapBucket {
 ///
 /// 业务意图：
 /// - 内容层缓存和滚动覆盖层分离；普通滚动只需要重算视口块位置，不应重新采样日志文本。
-/// - buckets 使用 `Arc` 持有，GPUI canvas 的 prepaint/paint 状态可以廉价克隆并跨闭包传递。
+/// - 静态图片和少量几何值可以被 GPUI canvas 的 prepaint/paint 状态廉价克隆并跨闭包传递。
 #[derive(Clone, Debug)]
 pub(in crate::app) struct LogMinimapRenderCache {
-    /// 当前缓存对应的键。
+    /// 当前渲染帧请求的键。
+    ///
+    /// 业务意图：
+    /// - 该键跟随滚动位置、窗口尺寸和主题变化实时更新，用于覆盖层、视口块和后台任务去重。
+    /// - 静态图片可能还停留在上一块缓存窗口，因此不能再把该字段理解为“图片已经完成的键”。
     pub(in crate::app) key: LogMinimapCacheKey,
-    /// 按垂直顺序排列的像素 bucket。
-    pub(in crate::app) buckets: Arc<Vec<LogMinimapBucket>>,
+    /// 当前静态图片实际对应的键。
+    ///
+    /// 业务意图：
+    /// - 后台生成新图片期间，滚动热路径继续复用上一张图片；绘制图片偏移时必须使用图片自己的窗口起点。
+    /// - `None` 表示首帧、尺寸无效或后台任务尚未返回，预览栏只绘制覆盖层和滚动条，不阻塞正文滚动。
+    pub(in crate::app) static_image_key: Option<LogMinimapCacheKey>,
+    /// 当前正在后台生成的静态图片键。
+    ///
+    /// 业务意图：
+    /// - 同一帧或连续滚动可能多次进入 canvas prepare；该字段避免为同一个局部窗口重复派发后台任务。
+    /// - 当用户快速拖动到新的行块时会被更新为最新键，旧任务回到 UI 线程后按键不匹配丢弃。
+    pub(in crate::app) pending_key: Option<LogMinimapCacheKey>,
+    /// 后台生成任务序号。
+    ///
+    /// 业务意图：
+    /// - 仅比较 key 无法区分“同一 key 的旧任务”和“清理后重新请求的任务”；序号随每次派发递增，避免过期结果覆盖新图片。
+    /// - 该值只在 UI 线程读写，后台任务携带副本回传，不参与持久化。
+    pub(in crate::app) pending_generation: u64,
+    /// 已经离屏绘制好的静态文本层。
+    ///
+    /// 业务意图：
+    /// - 滚动、拖动和搜索标记刷新时只移动或覆盖这张图片，不再对每一行调用 GPUI 文本排版。
+    /// - `None` 表示当前布局尚无有效尺寸或日志没有可绘制内容，覆盖层仍可以按空布局安全返回。
+    pub(in crate::app) static_image: Option<Arc<gpui::RenderImage>>,
+    /// 静态文本层对应的逻辑像素宽度。
+    ///
+    /// 边界条件：
+    /// - GPUI 图片绘制使用逻辑像素矩形，物理像素尺寸和该值共同决定高分屏下是否清晰。
+    pub(in crate::app) image_logical_width_px: f32,
+    /// 静态文本层对应的逻辑像素高度。
+    ///
+    /// 业务意图：
+    /// - 位图可能高于可见 minimap；绘制阶段根据局部窗口浮点起点把图片整体平移，避免每次滚动都重建。
+    pub(in crate::app) image_logical_height_px: f32,
 }
 
 /// 日志 tab 读取完成后回到 UI 线程的数据。
