@@ -12,7 +12,7 @@
 mod model;
 /// 配置目录和配置文件路径。
 mod paths;
-/// 窗口、主题、日志字号、线程过滤和快搜偏好。
+/// 窗口、主题、日志字号、minimap、线程过滤和快搜偏好。
 mod preferences;
 
 pub(crate) use model::*;

@@ -336,7 +336,7 @@ impl MainView {
     /// 渲染日志正文右侧 minimap。
     ///
     /// 业务意图：
-    /// - 预览栏随存在纵向溢出的 Ready 日志默认出现，短日志不占用右侧固定宽度。
+    /// - 预览栏只在通用设置显式开启且 Ready 日志存在纵向溢出时出现，默认关闭以保护滚动性能。
     /// - 使用 `canvas` 绘制，避免为每条采样线创建 GPUI 子元素；点击、拖动和滚轮由外层 div 处理。
     pub(in crate::app) fn render_log_minimap(
         &self,
@@ -345,7 +345,7 @@ impl MainView {
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let tab_id = tab.id;
-        if !Self::log_minimap_should_render_for_tab(tab) {
+        if !self.settings.log_minimap_enabled || !Self::log_minimap_should_render_for_tab(tab) {
             return div()
                 .id(SharedString::from(format!("log-minimap-empty-{tab_id}")))
                 .hidden();

@@ -75,7 +75,7 @@ impl MainView {
     /// - 即使首帧暂时没有滑块测量值，也保留滚动条槽宽度，防止 minimap 和正文宽度在测量回填时抖动。
     ///
     /// 边界条件：
-    /// - 短日志不会渲染 minimap，因此该槽只在存在纵向溢出时出现。
+    /// - minimap 关闭或短日志不会保留额外槽位；只有存在真实纵向滚动指标时才单独显示滚动条。
     /// - 槽内空白区域消费鼠标事件，避免点击穿透到底层日志行或触发 minimap 跳转。
     pub(in crate::app) fn render_log_vertical_scrollbar_for_tab(
         &self,
@@ -85,10 +85,9 @@ impl MainView {
         let palette = self.palette();
         let tab_id = tab.id;
         let metrics = self.log_scrollbar_metrics_for_tab(tab, LogScrollbarAxis::Vertical);
-        if !Self::log_vertical_scrollbar_gutter_should_render(
-            metrics.is_some(),
-            Self::log_minimap_should_render_for_tab(tab),
-        ) {
+        let minimap_visible =
+            self.settings.log_minimap_enabled && Self::log_minimap_should_render_for_tab(tab);
+        if !Self::log_vertical_scrollbar_gutter_should_render(metrics.is_some(), minimap_visible) {
             return div().id("log-vertical-scrollbar-empty").hidden();
         }
         let gutter = div()

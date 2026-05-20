@@ -1,8 +1,8 @@
 // 设置窗口通用页签渲染。
 //
 // 业务意图：
-// - 从设置窗口框架中拆出 主题和日志字号设置渲染，避免页签内容继续堆在独立窗口入口文件中。
-// - 本轮只移动渲染方法，保持按钮、输入元素、配置读写和焦点流转行为不变。
+// - 从设置窗口框架中拆出主题、日志字号、minimap 和右键菜单设置渲染，避免页签内容继续堆在独立窗口入口文件中。
+// - 通用页统一采用“左侧说明、右侧轻量控件”的结构，保持设置项密度和跨平台布局稳定。
 
 use super::*;
 
@@ -10,11 +10,12 @@ impl SettingsWindowView {
     /// 渲染通用页签。
     ///
     /// 业务意图：
-    /// - 通用页签当前承载主题和日志显示字号，未来可继续加入语言等全局体验类配置。
+    /// - 通用页签承载主题、日志阅读体验和系统集成入口，未来可继续加入语言等全局体验类配置。
     pub(in crate::app) fn render_general_tab(
         &self,
         theme: ThemePreference,
         log_viewer_font_size: f32,
+        log_minimap_enabled: bool,
         shell_integration_state: &ShellIntegrationUiState,
         palette: AppThemePalette,
         context: &mut Context<Self>,
@@ -58,6 +59,8 @@ impl SettingsWindowView {
                         palette,
                         context,
                     ))
+                    .child(div().h(px(1.0)).mx_3().bg(rgb(palette.border)))
+                    .child(self.render_log_minimap_setting(log_minimap_enabled, palette, context))
                     .child(div().h(px(1.0)).mx_3().bg(rgb(palette.border)))
                     .child(self.render_shell_integration_setting(
                         shell_integration_state,
@@ -331,6 +334,148 @@ impl SettingsWindowView {
                         view.adjust_log_viewer_font_size(delta, context);
                     }
                 }),
+            )
+    }
+
+    /// 渲染日志 minimap 显示设置。
+    ///
+    /// 业务意图：
+    /// - minimap 是日志正文右侧的 VS Code 风格预览栏，能辅助定位长日志结构，但会占用宽度并增加绘制缓存任务。
+    /// - 用户要求默认关闭，因此通用设置提供显式开关；开启后才允许日志视图进入 minimap 渲染路径。
+    ///
+    /// 边界条件：
+    /// - 开关只控制普通内存日志是否允许显示 minimap；分页大日志和一屏可完整显示的短日志仍由日志视图按性能规则隐藏。
+    pub(in crate::app) fn render_log_minimap_setting(
+        &self,
+        enabled: bool,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("settings-log-minimap")
+            .flex()
+            .items_center()
+            .justify_between()
+            .min_h(px(74.0))
+            .px_4()
+            .py_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .min_w_0()
+                    .child(MainView::render_lucide_icon(
+                        Some(Icon::Map),
+                        18.0,
+                        18.0,
+                        palette.muted_text,
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(palette.text))
+                                    .child("日志 Minimap"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(palette.muted_text))
+                                    .child("在日志正文右侧显示预览栏，默认关闭以保持滚动性能"),
+                            ),
+                    ),
+            )
+            .child(self.render_log_minimap_toggle(enabled, palette, context))
+    }
+
+    /// 渲染日志 minimap 开关控件。
+    ///
+    /// 业务意图：
+    /// - 使用紧凑的开关表达二元状态，避免把性能相关设置做成大按钮导致通用页信息密度失衡。
+    /// - 文字状态固定宽度，开启/关闭切换时不会挤压左侧说明或造成布局跳动。
+    pub(in crate::app) fn render_log_minimap_toggle(
+        &self,
+        enabled: bool,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("settings-log-minimap-toggle-wrapper")
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap_2()
+            .child(
+                div()
+                    .id("settings-log-minimap-toggle")
+                    .flex()
+                    .items_center()
+                    .w(px(44.0))
+                    .h(px(24.0))
+                    .p(px(3.0))
+                    .rounded(px(12.0))
+                    .border_1()
+                    .border_color(rgb(if enabled {
+                        palette.accent
+                    } else {
+                        palette.border
+                    }))
+                    .bg(rgb(if enabled {
+                        palette.accent
+                    } else {
+                        palette.input
+                    }))
+                    .cursor_pointer()
+                    .hover(move |toggle| {
+                        toggle.bg(rgb(if enabled {
+                            palette.accent_hover
+                        } else {
+                            palette.hover
+                        }))
+                    })
+                    .when(enabled, |toggle| toggle.justify_end())
+                    .when(!enabled, |toggle| toggle.justify_start())
+                    .child(
+                        div()
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(rgb(if enabled {
+                                palette.on_accent
+                            } else {
+                                palette.border
+                            }))
+                            .bg(rgb(if enabled {
+                                palette.on_accent
+                            } else {
+                                palette.surface
+                            })),
+                    )
+                    .on_click(
+                        context.listener(|view, _event: &ClickEvent, _window, context| {
+                            view.toggle_log_minimap_enabled(context);
+                        }),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(42.0))
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(if enabled {
+                        palette.accent
+                    } else {
+                        palette.muted_text
+                    }))
+                    .child(if enabled { "已开启" } else { "已关闭" }),
             )
     }
 

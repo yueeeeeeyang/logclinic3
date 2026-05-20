@@ -31,6 +31,13 @@ pub(crate) const THEME_PREFERENCE_FILE_NAME: &str = "theme-preference.txt";
 /// - 文件只保存一个像素值，继续使用简单文本格式，避免为单项设置引入完整配置依赖。
 pub(crate) const LOG_VIEWER_FONT_SIZE_FILE_NAME: &str = "log-viewer-font-size.txt";
 
+/// 日志 minimap 显示开关偏好文件名。
+///
+/// 业务意图：
+/// - minimap 会在日志右侧额外绘制预览位图，属于用户可选择的性能和视觉偏好，需要跨启动恢复。
+/// - 文件只保存 enabled/disabled 单值，保持人工可读，同时避免为一个布尔开关引入结构化配置依赖。
+pub(crate) const LOG_MINIMAP_ENABLED_FILE_NAME: &str = "log-minimap-enabled.txt";
+
 /// 线程日志分析过滤配置文件名。
 ///
 /// 业务意图：
@@ -114,6 +121,14 @@ pub(crate) fn theme_preference_path() -> Option<PathBuf> {
 /// 获取日志显示字号偏好文件路径。
 pub(crate) fn log_viewer_font_size_preference_path() -> Option<PathBuf> {
     app_config_dir().map(|dir| dir.join(LOG_VIEWER_FONT_SIZE_FILE_NAME))
+}
+
+/// 获取日志 minimap 显示开关偏好文件路径。
+///
+/// 跨平台约束：
+/// - 路径仍使用应用配置目录，macOS 和 Windows 的目录选择由 `app_config_dir` 统一处理。
+pub(crate) fn log_minimap_enabled_preference_path() -> Option<PathBuf> {
+    app_config_dir().map(|dir| dir.join(LOG_MINIMAP_ENABLED_FILE_NAME))
 }
 
 /// 获取线程日志分析过滤配置文件路径。

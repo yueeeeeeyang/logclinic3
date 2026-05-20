@@ -217,7 +217,7 @@ impl SearchWorkspaceState {
     }
 }
 
-/// 设置窗口、主题、字号、快搜和线程过滤配置状态。
+/// 设置窗口、主题、字号、minimap、快搜和线程过滤配置状态。
 ///
 /// 业务意图：
 /// - 设置页中的可编辑文本和显示偏好需要跨多个设置窗口渲染函数共享，但不应散落在主视图顶层。
@@ -233,6 +233,12 @@ pub(in crate::app) struct SettingsState {
     pub(in crate::app) theme_preference: ThemePreference,
     /// 日志正文显示字号。
     pub(in crate::app) log_viewer_font_size: f32,
+    /// 日志正文右侧 minimap 是否显示。
+    ///
+    /// 业务意图：
+    /// - minimap 会额外占用右侧宽度并触发预览位图缓存；默认关闭，只有用户在通用设置显式开启后才参与日志渲染。
+    /// - 状态来源于轻量持久化偏好，设置窗口修改后立即影响所有已打开日志 tab。
+    pub(in crate::app) log_minimap_enabled: bool,
     /// 系统右键菜单集成状态。
     ///
     /// 业务意图：
@@ -466,6 +472,7 @@ impl SettingsState {
             settings_active_tab: SettingsTab::General,
             theme_preference: load_theme_preference(),
             log_viewer_font_size: load_log_viewer_font_size_preference(),
+            log_minimap_enabled: load_log_minimap_enabled_preference(),
             shell_integration_state: ShellIntegrationUiState::Unknown,
             thread_analysis_filter_text: load_thread_analysis_filter_preference(),
             thread_analysis_filter_is_editing: false,

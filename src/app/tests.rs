@@ -64,6 +64,18 @@ mod state_tests {
         ))
     }
 
+    /// 构造唯一的日志 minimap 开关配置测试路径。
+    ///
+    /// 业务意图：
+    /// - minimap 开关会跨会话保存性能偏好；测试使用独立临时路径，避免污染开发机真实配置。
+    fn test_log_minimap_enabled_file_path(name: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "logclinic3-log-minimap-enabled-test-{}-{}",
+            std::process::id(),
+            name
+        ))
+    }
+
     /// 构造唯一的线程分析过滤配置测试路径。
     ///
     /// 业务意图：
@@ -1583,6 +1595,58 @@ mod state_tests {
         assert_eq!(read_log_viewer_font_size_preference(&path), Some(14.0));
 
         assert!(write_log_viewer_font_size_preference(&path, 99.0).is_err());
+
+        let _ = fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    /// 验证日志 minimap 配置默认关闭，并兼容常见布尔文本。
+    ///
+    /// 业务意图：
+    /// - minimap 影响日志打开和滚动性能，首次启动或配置损坏时必须保持关闭。
+    /// - 用户手工编辑配置时可能输入 true/false 或 on/off，解析层应稳定接受这些低风险同义值。
+    #[test]
+    fn 日志_minimap_开关配置解析合法值和损坏值() {
+        assert!(!LOG_MINIMAP_DEFAULT_ENABLED);
+        assert_eq!(
+            parse_log_minimap_enabled_preference("enabled\n"),
+            Some(true)
+        );
+        assert_eq!(parse_log_minimap_enabled_preference("true"), Some(true));
+        assert_eq!(parse_log_minimap_enabled_preference("on"), Some(true));
+        assert_eq!(
+            parse_log_minimap_enabled_preference("disabled"),
+            Some(false)
+        );
+        assert_eq!(parse_log_minimap_enabled_preference("false"), Some(false));
+        assert_eq!(parse_log_minimap_enabled_preference("0"), Some(false));
+        assert_eq!(parse_log_minimap_enabled_preference(""), None);
+        assert_eq!(parse_log_minimap_enabled_preference("broken"), None);
+    }
+
+    /// 验证日志 minimap 开关配置可以完成写入和读取往返。
+    ///
+    /// 边界条件：
+    /// - 配置文件缺失或损坏时读取返回 `None`，调用方才会回退默认关闭；读写函数本身不访问真实应用配置目录。
+    #[test]
+    fn 日志_minimap_开关配置可以读写往返() {
+        let path =
+            test_log_minimap_enabled_file_path("roundtrip").join(LOG_MINIMAP_ENABLED_FILE_NAME);
+
+        assert_eq!(read_log_minimap_enabled_preference(&path), None);
+
+        write_log_minimap_enabled_preference(&path, true)
+            .expect("日志 minimap 开关配置应能写入临时目录");
+        assert_eq!(read_log_minimap_enabled_preference(&path), Some(true));
+
+        write_log_minimap_enabled_preference(&path, false)
+            .expect("日志 minimap 开关配置应能覆盖写入临时目录");
+        assert_eq!(read_log_minimap_enabled_preference(&path), Some(false));
+
+        fs::write(&path, "broken-minimap").expect("测试损坏 minimap 配置应能写入");
+        assert_eq!(read_log_minimap_enabled_preference(&path), None);
 
         let _ = fs::remove_file(&path);
         if let Some(parent) = path.parent() {

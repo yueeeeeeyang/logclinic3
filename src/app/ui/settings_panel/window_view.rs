@@ -34,6 +34,11 @@ struct SettingsContentSnapshot {
     theme: ThemePreference,
     /// 日志正文字号。
     log_viewer_font_size: f32,
+    /// 日志 minimap 是否在正文右侧显示。
+    ///
+    /// 业务意图：
+    /// - 设置窗口渲染只读取快照，避免通用页在渲染阶段重新借用主视图状态。
+    log_minimap_enabled: bool,
     /// 系统右键菜单集成状态。
     shell_integration_state: ShellIntegrationUiState,
     /// 快搜关键字是否处于编辑态。
@@ -136,6 +141,24 @@ impl SettingsWindowView {
                 save_log_viewer_font_size_preference(font_size);
                 context.notify();
             }
+        });
+        context.notify();
+    }
+
+    /// 切换日志 minimap 显示开关。
+    ///
+    /// 业务意图：
+    /// - 用户在通用设置中控制右侧预览栏是否参与日志渲染；关闭后应立即把宽度还给正文并释放已生成的预览位图。
+    /// - 开启后不主动构建缓存，等日志正文下一次渲染根据真实视口尺寸按需派发后台任务，避免设置页点击阻塞 UI。
+    ///
+    /// 边界条件：
+    /// - 偏好保存失败不回滚当前会话状态；配置层会输出开发期诊断，避免权限问题导致设置按钮无响应。
+    pub(in crate::app) fn toggle_log_minimap_enabled(&mut self, context: &mut Context<Self>) {
+        self.main_view.update(context, |view, context| {
+            view.settings.log_minimap_enabled = !view.settings.log_minimap_enabled;
+            save_log_minimap_enabled_preference(view.settings.log_minimap_enabled);
+            view.clear_log_minimap_cache(context);
+            context.notify();
         });
         context.notify();
     }
@@ -523,6 +546,7 @@ impl SettingsWindowView {
             active_tab,
             theme,
             log_viewer_font_size,
+            log_minimap_enabled,
             shell_integration_state,
             quick_search_keywords_is_editing,
             quick_search_keywords_focus,
@@ -534,6 +558,7 @@ impl SettingsWindowView {
             SettingsTab::General => self.render_general_tab(
                 theme,
                 log_viewer_font_size,
+                log_minimap_enabled,
                 &shell_integration_state,
                 palette,
                 context,
@@ -564,6 +589,7 @@ impl Render for SettingsWindowView {
             active_tab,
             theme,
             log_viewer_font_size,
+            log_minimap_enabled,
             shell_integration_state,
             quick_search_keywords_is_editing,
             quick_search_keywords_focus,
@@ -576,6 +602,7 @@ impl Render for SettingsWindowView {
                 main_view.settings.settings_active_tab,
                 main_view.settings.theme_preference,
                 main_view.settings.log_viewer_font_size,
+                main_view.settings.log_minimap_enabled,
                 main_view.settings.shell_integration_state.clone(),
                 main_view.settings.quick_search_keywords_is_editing,
                 main_view.settings.quick_search_keywords_focus.clone(),
@@ -602,6 +629,7 @@ impl Render for SettingsWindowView {
                             active_tab,
                             theme,
                             log_viewer_font_size,
+                            log_minimap_enabled,
                             shell_integration_state,
                             quick_search_keywords_is_editing,
                             quick_search_keywords_focus,

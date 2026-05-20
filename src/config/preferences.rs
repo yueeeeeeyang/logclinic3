@@ -1,7 +1,7 @@
 // 用户偏好配置读写功能域。
 //
 // 业务意图：
-// - 该文件只维护窗口尺寸、主题、日志字号、线程过滤和快搜关键字这些轻量文本偏好。
+// - 该文件只维护窗口尺寸、主题、日志字号、日志 minimap、线程过滤和快搜关键字这些轻量文本偏好。
 // - 路径选择下沉到 `paths`，模型档案下沉到 `model`，避免单个配置模块继续增长成混合职责文件。
 //
 // 边界条件：
@@ -13,8 +13,8 @@ use std::{fs, io, path::Path};
 use crate::theme::ThemePreference;
 
 use super::paths::{
-    log_viewer_font_size_preference_path, main_window_size_preference_path,
-    quick_search_keywords_preference_path, theme_preference_path,
+    log_minimap_enabled_preference_path, log_viewer_font_size_preference_path,
+    main_window_size_preference_path, quick_search_keywords_preference_path, theme_preference_path,
     thread_analysis_filter_preference_path,
 };
 
@@ -36,6 +36,13 @@ pub(crate) const LOG_VIEWER_MIN_FONT_SIZE: f32 = 10.0;
 /// 边界条件：
 /// - 当前日志行高仍保持固定密度；过大字体可能与行高冲突并影响虚拟列表测量，因此先限制到 20px。
 pub(crate) const LOG_VIEWER_MAX_FONT_SIZE: f32 = 20.0;
+
+/// 日志 minimap 默认显示状态。
+///
+/// 业务意图：
+/// - minimap 会增加右侧绘制和缓存任务；用户要求默认关闭，确保首次打开日志保持最轻量、最稳定的滚动路径。
+/// - 后续用户在设置页开启后才写入配置并跨启动恢复。
+pub(crate) const LOG_MINIMAP_DEFAULT_ENABLED: bool = false;
 
 /// 快搜默认关键字配置。
 ///
@@ -333,6 +340,77 @@ pub(crate) fn save_log_viewer_font_size_preference(font_size: f32) {
     };
     if let Err(error) = write_log_viewer_font_size_preference(&path, font_size) {
         eprintln!("保存日志显示字号偏好失败：{}：{}", path.display(), error);
+    }
+}
+
+/// 解析日志 minimap 显示开关配置文本。
+///
+/// 业务意图：
+/// - 配置文件使用 enabled/disabled 作为正式格式，便于人工检查当前性能相关设置。
+/// - 同时兼容 true/false 和 1/0，避免用户手工修改配置时因为常见布尔写法导致设置丢失。
+///
+/// 边界条件：
+/// - 空文本、未知值和部分写入的损坏内容都返回 `None`，启动时回退到默认关闭。
+pub(crate) fn parse_log_minimap_enabled_preference(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "enabled" | "true" | "1" | "on" => Some(true),
+        "disabled" | "false" | "0" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// 序列化日志 minimap 显示开关。
+///
+/// 业务意图：
+/// - 固定写入英文状态词，保持配置文件可读且便于后续迁移统一配置格式。
+pub(crate) fn serialize_log_minimap_enabled_preference(enabled: bool) -> String {
+    format!("{}\n", if enabled { "enabled" } else { "disabled" })
+}
+
+/// 从指定文件读取日志 minimap 显示开关。
+///
+/// 错误处理：
+/// - 文件缺失、权限不足或内容损坏都不影响日志查看主流程，调用方会回退默认关闭。
+pub(crate) fn read_log_minimap_enabled_preference(path: &Path) -> Option<bool> {
+    let raw = fs::read_to_string(path).ok()?;
+    parse_log_minimap_enabled_preference(&raw)
+}
+
+/// 将日志 minimap 显示开关写入指定文件。
+///
+/// 边界条件：
+/// - 首次保存时配置目录可能尚不存在；这里按需创建父目录并把真实 I/O 错误交给调用方处理。
+pub(crate) fn write_log_minimap_enabled_preference(path: &Path, enabled: bool) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serialize_log_minimap_enabled_preference(enabled))
+}
+
+/// 读取日志 minimap 显示开关偏好。
+///
+/// 业务意图：
+/// - 用户明确在通用设置里开启后才恢复右侧预览；首次安装或配置损坏时保持默认关闭，避免性能回退。
+pub(crate) fn load_log_minimap_enabled_preference() -> bool {
+    log_minimap_enabled_preference_path()
+        .and_then(|path| read_log_minimap_enabled_preference(&path))
+        .unwrap_or(LOG_MINIMAP_DEFAULT_ENABLED)
+}
+
+/// 保存日志 minimap 显示开关偏好。
+///
+/// 错误处理：
+/// - 写入失败不影响当前会话开关状态，仅输出开发期诊断，避免配置目录权限问题阻断设置操作。
+pub(crate) fn save_log_minimap_enabled_preference(enabled: bool) {
+    let Some(path) = log_minimap_enabled_preference_path() else {
+        return;
+    };
+    if let Err(error) = write_log_minimap_enabled_preference(&path, enabled) {
+        eprintln!(
+            "保存日志 minimap 显示偏好失败：{}：{}",
+            path.display(),
+            error
+        );
     }
 }
 
