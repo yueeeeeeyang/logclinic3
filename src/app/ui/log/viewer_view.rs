@@ -9,6 +9,13 @@
 
 use super::*;
 
+/// 日志正文搜索关键字片段的暖橙色背景。
+///
+/// 业务意图：
+/// - 搜索定位统一同时展示整行黄色背景和关键字片段背景；整行黄色负责定位行，关键字暖橙色负责定位列。
+/// - 使用固定色值而不是主题搜索色，避免关键字和整行同色后在长日志中难以区分命中位置，同时避免高饱和橘红色长时间阅读刺眼。
+const LOG_SEARCH_KEYWORD_HIGHLIGHT: u32 = 0xf2a65a;
+
 impl MainView {
     pub(in crate::app) fn render_log_tab_body(
         &self,
@@ -84,13 +91,13 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 搜索结果跳转和“上一个/下一个”会在行容器上绘制整行定位背景；
-    ///   这里额外只返回关键字片段背景，让用户同时知道命中行和命中列。
+    ///   这里额外返回暖橙色关键字片段背景，让用户同时知道命中行和命中列。
     /// - 命中范围来自搜索时的原始日志行，因此这里在渲染前夹紧到当前行的 UTF-8 边界，避免文件重载或编码切换后旧范围越界。
-    fn log_search_match_highlight_for_line(
+    pub(in crate::app) fn log_search_match_highlight_for_line(
         highlight: Option<&LogSearchMatchHighlight>,
         line_index: usize,
         line: &str,
-        palette: AppThemePalette,
+        _palette: AppThemePalette,
     ) -> Option<(Range<usize>, gpui::HighlightStyle)> {
         let highlight = highlight?;
         if highlight.line_index != line_index {
@@ -103,11 +110,69 @@ impl MainView {
         Some((
             range,
             gpui::HighlightStyle {
-                background_color: Some(rgb(palette.search_highlight).into()),
+                background_color: Some(rgb(LOG_SEARCH_KEYWORD_HIGHLIGHT).into()),
                 font_weight: Some(FontWeight::SEMIBOLD),
                 ..Default::default()
             },
         ))
+    }
+
+    /// 合并日志行高亮并保证鼠标选区背景优先显示。
+    ///
+    /// 业务意图：
+    /// - 日志正文同一段文本可能同时拥有语法高亮、搜索关键字高亮和鼠标选区高亮。
+    /// - 用户正在拖选文本时，选区是最强交互反馈；即使命中关键字落在选区内部，也应显示为被选中，而不是继续显示搜索暖橙色背景。
+    ///
+    /// 实现原因：
+    /// - `gpui::combine_highlights` 会用集合合并重叠样式，重叠背景的最终来源不适合作为稳定的业务优先级。
+    /// - 这里先把选区覆盖范围内已有高亮的背景清空，只保留文字颜色、粗体等非背景样式，再叠加选区背景。
+    ///
+    /// 边界条件：
+    /// - 选区外的搜索关键字背景保持不变。
+    /// - 选区内的搜索关键字仍保留粗体等文本样式，只是不再覆盖选区背景。
+    pub(in crate::app) fn combine_log_highlights_with_selection(
+        highlights: Vec<(Range<usize>, gpui::HighlightStyle)>,
+        selection_range: Range<usize>,
+    ) -> Vec<(Range<usize>, gpui::HighlightStyle)> {
+        if selection_range.start >= selection_range.end {
+            return highlights;
+        }
+
+        let mut adjusted_highlights = Vec::with_capacity(highlights.len().saturating_add(2));
+        for (range, style) in highlights {
+            if range.end <= selection_range.start || range.start >= selection_range.end {
+                adjusted_highlights.push((range, style));
+                continue;
+            }
+
+            if range.start < selection_range.start {
+                let before_end = selection_range.start.min(range.end);
+                if range.start < before_end {
+                    adjusted_highlights.push((range.start..before_end, style));
+                }
+            }
+
+            let overlap_start = range.start.max(selection_range.start);
+            let overlap_end = range.end.min(selection_range.end);
+            if overlap_start < overlap_end {
+                let mut foreground_style = style;
+                foreground_style.background_color = None;
+                adjusted_highlights.push((overlap_start..overlap_end, foreground_style));
+            }
+
+            if selection_range.end < range.end {
+                let after_start = selection_range.end.max(range.start);
+                if after_start < range.end {
+                    adjusted_highlights.push((after_start..range.end, style));
+                }
+            }
+        }
+
+        gpui::combine_highlights(
+            adjusted_highlights,
+            [(selection_range, Self::log_text_selection_highlight_style())],
+        )
+        .collect()
     }
 
     /// 渲染单个加载脉冲点。
@@ -388,17 +453,13 @@ impl MainView {
                                                         selection, index, &line,
                                                     )
                                             {
-                                                // `StyledText::with_highlights` 要求传入的高亮范围有序且不重叠。
-                                                // 日志语法高亮和选区高亮经常覆盖同一段时间戳、等级或线程名，因此必须先拆分合并，
-                                                // 让选区背景和原有文字颜色同时保留，避免选中文本时渲染错位。
-                                                line_highlights = gpui::combine_highlights(
-                                                    line_highlights,
-                                                    [(
+                                                // 搜索关键字背景和鼠标选区背景重叠时，选区必须优先显示；
+                                                // 否则用户拖选到关键字时会误以为关键字没有被选中。
+                                                line_highlights =
+                                                    Self::combine_log_highlights_with_selection(
+                                                        line_highlights,
                                                         range,
-                                                        Self::log_text_selection_highlight_style(),
-                                                    )],
-                                                )
-                                                .collect();
+                                                    );
                                             }
                                             let expanded_line =
                                                 Self::expanded_log_line_for_display(&line);
@@ -557,12 +618,9 @@ impl MainView {
                     && let Some(range) =
                         Self::selected_byte_range_for_line(selection, line_index, &line)
                 {
-                    // 分页模式仍需要和内存模式一样先合并语法高亮和选区高亮，避免重叠范围让 GPUI 文本绘制错位。
-                    line_highlights = gpui::combine_highlights(
-                        line_highlights,
-                        [(range, Self::log_text_selection_highlight_style())],
-                    )
-                    .collect();
+                    // 分页模式和内存模式保持相同的背景优先级：鼠标选区覆盖搜索关键字背景。
+                    line_highlights =
+                        Self::combine_log_highlights_with_selection(line_highlights, range);
                 }
                 let expanded_line = Self::expanded_log_line_for_display(&line);
                 let display_highlights =

@@ -2466,6 +2466,62 @@ mod state_tests {
         );
     }
 
+    /// 验证多文件线程分析不要求线程在相邻日志中连续出现。
+    ///
+    /// 业务意图：
+    /// - 用户要求去除“连续”限制；只要线程出现在多个选中的线程日志文件中，就应显示在分析结果里。
+    /// - 中间某个选中文件缺少该线程时，时间线对应单元格保持为空，但不应把整条线程过滤掉。
+    #[test]
+    fn 多文件线程分析重复线程不要求相邻文件连续出现() {
+        let sample = |name: &str, state: ThreadStateKind| ThreadStateSample {
+            name: name.to_string(),
+            thread_id: None,
+            state,
+            line_index: 0,
+            preview_lines: vec![format!("\"{name}\"")],
+            stack_lines: vec![format!("\"{name}\"")],
+        };
+        let source = |name: &str| LogFileSource::LocalFile {
+            path: PathBuf::from(name),
+        };
+        let snapshots = vec![
+            ThreadSnapshot {
+                label: "第一个文件".to_string(),
+                source_index: 0,
+                source: source("a.log"),
+                threads: vec![sample("repeat-thread", ThreadStateKind::Runnable)],
+            },
+            ThreadSnapshot {
+                label: "第二个文件".to_string(),
+                source_index: 1,
+                source: source("b.log"),
+                threads: vec![sample("only-middle", ThreadStateKind::Waiting)],
+            },
+            ThreadSnapshot {
+                label: "第三个文件".to_string(),
+                source_index: 2,
+                source: source("c.log"),
+                threads: vec![sample("repeat-thread", ThreadStateKind::Blocked)],
+            },
+        ];
+
+        let analysis = build_thread_analysis_data(3, 0, snapshots, &[]);
+
+        assert_eq!(analysis.thread_names, vec!["repeat-thread"]);
+        assert_eq!(
+            analysis.matrix[0][0].as_ref().map(|cell| cell.state),
+            Some(ThreadStateKind::Runnable)
+        );
+        assert!(
+            analysis.matrix[0][1].is_none(),
+            "中间文件缺少该线程时应保留空单元格，而不是过滤整条线程"
+        );
+        assert_eq!(
+            analysis.matrix[0][2].as_ref().map(|cell| cell.state),
+            Some(ThreadStateKind::Blocked)
+        );
+    }
+
     /// 验证线程分析色块单击即可触发日志跳转。
     ///
     /// 业务意图：
@@ -2979,8 +3035,8 @@ mod state_tests {
     /// 验证搜索结果定位同时保留整行高亮和关键字片段高亮。
     ///
     /// 业务意图：
-    /// - 点击底部搜索结果后，正文需要通过整行背景提示“当前定位行”，并通过片段背景提示“命中关键字列”。
-    /// - 左侧文件树搜索改为只高亮文件名关键字后，不能误把日志正文搜索结果的整行定位反馈清掉。
+    /// - 任意日志正文搜索入口都应通过整行黄色背景提示“当前定位行”，并通过暖橙色片段背景提示“命中关键字列”。
+    /// - 左侧文件树搜索只影响文件名关键字，不能误把日志正文搜索结果的整行定位反馈清掉。
     #[test]
     fn 搜索结果定位会同时设置行高亮和片段高亮() {
         let source = test_local_file("/tmp/search.log");
@@ -3016,6 +3072,72 @@ mod state_tests {
                 line_index: 12,
                 match_range: 4..9,
             })
+        );
+    }
+
+    /// 验证搜索关键字片段使用暖橙色背景，和整行黄色定位背景区分开。
+    ///
+    /// 业务意图：
+    /// - 日志正文搜索现在统一保留整行背景和关键字片段背景；两层颜色必须不同，用户才能同时识别命中行和命中列。
+    /// - 关键字颜色固定为暖橙色，不随主题搜索行背景变化，避免主题色调整后两层高亮重新混在一起。
+    #[test]
+    fn 日志搜索关键字片段使用暖橙色背景() {
+        let palette = AppThemePalette::for_theme(EffectiveTheme::Light);
+        let highlight = LogSearchMatchHighlight {
+            line_index: 3,
+            match_range: 7..14,
+        };
+        let (range, style) = MainView::log_search_match_highlight_for_line(
+            Some(&highlight),
+            3,
+            "prefix keyword suffix",
+            palette,
+        )
+        .expect("当前行存在搜索命中时应返回关键字片段高亮");
+
+        assert_eq!(range, 7..14);
+        assert_eq!(style.background_color, Some(rgb(0xf2a65a).into()));
+        assert_ne!(
+            style.background_color,
+            Some(rgb(palette.search_highlight).into())
+        );
+        assert_eq!(style.font_weight, Some(gpui::FontWeight::SEMIBOLD));
+    }
+
+    /// 验证鼠标选区覆盖搜索关键字背景但保留关键字文字样式。
+    ///
+    /// 业务意图：
+    /// - 搜索命中关键字本身有暖橙色背景，鼠标选区有蓝色背景；当两者重叠时，用户更需要看到“这段文本已被选中”。
+    /// - 选区覆盖背景时仍应保留搜索关键字的粗体等文字样式，避免失去命中提示。
+    #[test]
+    fn 日志选区覆盖搜索关键字背景但保留文字样式() {
+        let search_background: gpui::Hsla = rgb(0xf2a65a).into();
+        let selection_background = MainView::log_text_selection_highlight_style().background_color;
+        let highlights = MainView::combine_log_highlights_with_selection(
+            vec![(
+                4..10,
+                gpui::HighlightStyle {
+                    background_color: Some(search_background),
+                    font_weight: Some(gpui::FontWeight::SEMIBOLD),
+                    ..Default::default()
+                },
+            )],
+            6..8,
+        );
+
+        let selected_keyword = highlights
+            .iter()
+            .find(|(range, _)| *range == (6..8))
+            .expect("搜索关键字和鼠标选区重叠部分应被单独拆分");
+        assert_eq!(selected_keyword.1.background_color, selection_background);
+        assert_eq!(
+            selected_keyword.1.font_weight,
+            Some(gpui::FontWeight::SEMIBOLD)
+        );
+        assert!(
+            highlights.iter().any(|(range, style)| *range == (4..6)
+                && style.background_color == Some(search_background)),
+            "选区外的搜索关键字背景应保持不变"
         );
     }
 
