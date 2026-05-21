@@ -128,6 +128,7 @@ impl MainView {
         dialog.query_input.marked_range = None;
         dialog.query_input.selection_range = 0..dialog.query_input.text.len();
         dialog.query_input.horizontal_scroll_px = 0.0;
+        dialog.query_input.selection_drag = None;
     }
 
     /// 把用户选择的历史关键字填入搜索对话框。
@@ -153,6 +154,7 @@ impl MainView {
         let cursor = dialog.query_input.text.len();
         dialog.query_input.selection_range = cursor..cursor;
         dialog.query_input.marked_range = None;
+        dialog.query_input.selection_drag = None;
         dialog.query_history_menu_open = false;
         dialog.current_file_match_count = None;
         dialog.current_file_navigation_match = None;
@@ -418,6 +420,7 @@ impl MainView {
             };
             let mut query_input = SingleLineTextInputState::from_text(query);
             query_input.selection_range = 0..query_input.text.len();
+            query_input.selection_drag = None;
             self.search.search_dialog = Some(SearchDialogState {
                 query_input,
                 query_history_menu_open: false,
@@ -446,6 +449,7 @@ impl MainView {
             dialog.query_input.text = selected_query;
             dialog.query_input.selection_range = cursor..cursor;
             dialog.query_input.marked_range = None;
+            dialog.query_input.selection_drag = None;
             dialog.query_history_menu_open = false;
             dialog.current_file_match_count = None;
             dialog.current_file_navigation_match = None;
@@ -460,6 +464,7 @@ impl MainView {
             dialog.query_input.text = last_query.query;
             dialog.match_mode = last_query.match_mode;
             dialog.query_input.marked_range = None;
+            dialog.query_input.selection_drag = None;
             dialog.query_history_menu_open = false;
             dialog.current_file_match_count = None;
             dialog.current_file_navigation_match = None;

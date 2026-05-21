@@ -403,6 +403,7 @@ impl MainView {
                     .child(self.render_encoding_selector(
                         tab.id,
                         encoding_button_label,
+                        tab.encoding_choice,
                         matches!(tab.state, LogTabState::Ready { .. }) || tab.raw_bytes.is_some(),
                         palette,
                         context,
@@ -513,68 +514,41 @@ impl MainView {
         &self,
         tab_id: usize,
         display_label: &'static str,
+        selected_choice: EncodingChoice,
         enabled: bool,
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        let select = Select::new(
+            format!("encoding-select-{}", tab_id),
+            display_label,
+            selected_choice,
+            Self::encoding_select_options(),
+            Self::encoding_select_metrics(),
+            palette,
+        )
+        .enabled(enabled);
+
         div()
             .id("encoding-selector")
             .flex()
             .items_center()
             .flex_none()
-            .child(
-                div()
-                    .id(SharedString::from(format!(
-                        "encoding-dropdown-button-{}",
-                        tab_id
-                    )))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .w(px(ENCODING_DROPDOWN_BUTTON_WIDTH))
-                    .h(px(ENCODING_DROPDOWN_BUTTON_HEIGHT))
-                    .px_2()
-                    .rounded(px(4.0))
-                    .border_1()
-                    .border_color(rgb(palette.border))
-                    .bg(rgb(palette.input))
-                    .text_xs()
-                    .text_color(rgb(if enabled {
-                        palette.text
-                    } else {
-                        palette.muted_text
-                    }))
-                    .when(enabled, |button| {
-                        button.cursor_pointer().hover(move |button| {
-                            button
-                                .border_color(rgb(palette.accent))
-                                .bg(rgb(palette.hover))
-                        })
-                    })
-                    .when(!enabled, |button| button.opacity(0.62))
-                    .child(display_label)
-                    .child(Self::render_lucide_icon(
-                        Some(Icon::ChevronDown),
-                        12.0,
-                        12.0,
-                        palette.muted_text,
-                    ))
-                    .on_click(context.listener(
-                        move |view, event: &ClickEvent, _window, context| {
-                            if enabled {
-                                let position = event.position();
-                                view.toggle_encoding_dropdown(
-                                    tab_id,
-                                    f32::from(position.x),
-                                    f32::from(position.y),
-                                    context,
-                                );
-                            }
-                            // 编码选择按钮属于状态栏内的独立控件，点击不应继续传给日志正文或外层浮层。
-                            context.stop_propagation();
-                        },
-                    )),
-            )
+            .child(select.render_trigger(context.listener(
+                move |view, event: &ClickEvent, _window, context| {
+                    if enabled {
+                        let position = event.position();
+                        view.toggle_encoding_dropdown(
+                            tab_id,
+                            f32::from(position.x),
+                            f32::from(position.y),
+                            context,
+                        );
+                    }
+                    // 编码选择按钮属于状态栏内的独立控件，点击不应继续传给日志正文或外层浮层。
+                    context.stop_propagation();
+                },
+            )))
     }
 
     /// 渲染右侧状态栏中的点状分隔符。
@@ -589,7 +563,7 @@ impl MainView {
             .child("·")
     }
 
-    /// 切换编码下拉框展开状态。
+    /// 切换编码 Select 菜单展开状态。
     ///
     /// 业务意图：
     /// - 同一个 tab 再次点击编码框会收起菜单；点击其它 tab 的编码框会切换到新的菜单。
@@ -645,8 +619,9 @@ impl MainView {
     /// 边界条件：
     /// - 点击按钮文字或箭头会带来几个像素的偏差，但菜单仍紧邻编码按钮，不会回到旧版左侧固定位置。
     pub(in crate::app) fn encoding_dropdown_menu_x(&self, window_x: f32) -> f32 {
+        let metrics = Self::encoding_select_metrics();
         let panel_x = (window_x - self.right_panel_left_offset()).max(0.0);
-        (panel_x - ENCODING_DROPDOWN_BUTTON_WIDTH / 2.0).max(0.0)
+        (panel_x - metrics.button_width / 2.0).max(0.0)
     }
 
     /// 根据点击位置计算编码菜单在右侧工作区内的纵坐标。
@@ -654,13 +629,27 @@ impl MainView {
     /// 业务意图：
     /// - 菜单应出现在编码按钮下方；点击位置通常位于按钮中部，因此加上半个按钮高度和固定间隔。
     pub(in crate::app) fn encoding_dropdown_menu_y(window_y: f32) -> f32 {
-        (window_y - TOOLBAR_HEIGHT
-            + ENCODING_DROPDOWN_BUTTON_HEIGHT / 2.0
-            + ENCODING_DROPDOWN_MENU_GAP)
-            .max(0.0)
+        let metrics = Self::encoding_select_metrics();
+        (window_y - TOOLBAR_HEIGHT + metrics.button_height / 2.0 + metrics.menu_gap).max(0.0)
     }
 
-    /// 返回编码下拉框的手动编码选项。
+    /// 返回编码 Select 的尺寸配置。
+    ///
+    /// 业务意图：
+    /// - 日志编码选择器是第一个迁移到通用 Select 的控件，但用户可见尺寸必须沿用旧常量。
+    /// - 最大菜单高度预留 8 个选项的空间；当前手动编码只有 5 项，因此不会出现滚动条，后续增加编码时仍有上限保护。
+    pub(in crate::app) fn encoding_select_metrics() -> SelectMetrics {
+        SelectMetrics::new(
+            ENCODING_DROPDOWN_BUTTON_WIDTH,
+            ENCODING_DROPDOWN_BUTTON_HEIGHT,
+            ENCODING_DROPDOWN_WIDTH,
+            ENCODING_DROPDOWN_ITEM_HEIGHT,
+            ENCODING_DROPDOWN_ITEM_HEIGHT * 8.0 + 8.0,
+            ENCODING_DROPDOWN_MENU_GAP,
+        )
+    }
+
+    /// 返回编码 Select 菜单的手动编码选项。
     ///
     /// 业务意图：
     /// - 打开日志时仍默认自动识别；下拉菜单只承载用户主动纠正编码的手动选项。
@@ -670,6 +659,21 @@ impl MainView {
         LogTextEncoding::manual_options()
             .into_iter()
             .map(EncodingChoice::Manual)
+            .collect()
+    }
+
+    /// 返回编码 Select 使用的通用选项结构。
+    ///
+    /// 业务意图：
+    /// - 通用 Select 通过 `SelectOption` 统一管理稳定 id、展示文案和业务值。
+    /// - id 使用手动编码数组下标，避免把中文或带空格的 label 作为元素标识，同时保持选项顺序变化可被测试捕获。
+    pub(in crate::app) fn encoding_select_options() -> Vec<SelectOption<EncodingChoice>> {
+        Self::encoding_choices()
+            .into_iter()
+            .enumerate()
+            .map(|(index, choice)| {
+                SelectOption::new(format!("encoding-{}", index), choice.label(), choice)
+            })
             .collect()
     }
 
@@ -691,105 +695,55 @@ impl MainView {
         let tab_id = tab.id;
         let selected_choice = tab.encoding_choice;
         let palette = self.palette();
-        let menu_items = Self::encoding_choices()
+        let select = Select::new(
+            "encoding-select",
+            Self::log_tab_encoding_selector_label(tab),
+            selected_choice,
+            Self::encoding_select_options(),
+            Self::encoding_select_metrics(),
+            palette,
+        )
+        .open_anchor(Some(SelectAnchor::new(menu.x, menu.y)));
+
+        select.render_menu(|choice| {
+            Box::new(
+                context.listener(move |view, _event: &MouseDownEvent, _window, context| {
+                    view.select_tab_encoding(tab_id, choice, context);
+                    context.stop_propagation();
+                }),
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 验证编码 Select 仍只展示底层支持的手动编码选项，不把“自动”加入菜单。
+    #[test]
+    fn 编码_select_options_覆盖所有手动编码() {
+        let actual_labels = MainView::encoding_select_options()
             .into_iter()
-            .map(|choice| {
-                self.render_encoding_dropdown_item(
-                    tab_id,
-                    choice,
-                    choice == selected_choice,
-                    palette,
-                    context,
-                )
-            })
+            .map(|option| option.label)
+            .collect::<Vec<_>>();
+        let expected_labels = LogTextEncoding::manual_options()
+            .into_iter()
+            .map(|encoding| encoding.label().to_string())
             .collect::<Vec<_>>();
 
-        div()
-            .id("encoding-dropdown-menu")
-            .absolute()
-            .left(px(menu.x))
-            .top(px(menu.y))
-            .w(px(ENCODING_DROPDOWN_WIDTH))
-            .py_1()
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(rgb(palette.border))
-            .bg(rgb(palette.menu))
-            .shadow_lg()
-            .on_mouse_down(
-                MouseButton::Left,
-                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
-                    // 下拉菜单包含内边距和选中态空白，菜单壳层需要兜住这些区域的点击。
-                    context.stop_propagation();
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
-                    // 右键点在菜单上不能穿透到底层日志正文并打开日志右键菜单。
-                    context.stop_propagation();
-                }),
-            )
-            .children(menu_items)
+        assert_eq!(actual_labels, expected_labels);
     }
 
-    /// 渲染编码下拉菜单单项。
-    ///
-    /// 业务意图：
-    /// - 当前选中编码通过浅蓝背景标识；点击其它项会触发重新解码。
-    /// - 菜单项使用左键按下立即处理，而不是等待 click 合成事件；编码菜单上方有关闭遮罩，
-    ///   这样可以避免鼠标按下和释放之间弹层状态变化导致选择事件丢失。
-    pub(in crate::app) fn render_encoding_dropdown_item(
-        &self,
-        tab_id: usize,
-        choice: EncodingChoice,
-        selected: bool,
-        palette: AppThemePalette,
-        context: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let item = div()
-            .id(SharedString::from(format!(
-                "encoding-dropdown-item-{}-{}",
-                tab_id,
-                choice.label()
-            )))
-            .flex()
-            .items_center()
-            .justify_between()
-            .h(px(ENCODING_DROPDOWN_ITEM_HEIGHT))
-            .px_2()
-            .text_xs()
-            .text_color(rgb(if selected {
-                palette.accent
-            } else {
-                palette.text
-            }))
-            .bg(rgb(if selected {
-                palette.selected
-            } else {
-                palette.menu
-            }))
-            .cursor_pointer()
-            .hover(move |item| item.bg(rgb(palette.hover)).text_color(rgb(palette.accent)))
-            .child(choice.label());
+    /// 验证编码 Select 迁移后仍沿用原有按钮、菜单和菜单项尺寸。
+    #[test]
+    fn 编码_select_metrics_保持现有尺寸常量() {
+        let metrics = MainView::encoding_select_metrics();
 
-        let item = if selected {
-            item.child(Self::render_lucide_icon(
-                Some(Icon::Check),
-                12.0,
-                12.0,
-                palette.accent,
-            ))
-        } else {
-            item
-        };
-
-        item.on_mouse_down(
-            MouseButton::Left,
-            context.listener(move |view, _event: &MouseDownEvent, _window, context| {
-                view.select_tab_encoding(tab_id, choice, context);
-                context.stop_propagation();
-            }),
-        )
+        assert_eq!(metrics.button_width, ENCODING_DROPDOWN_BUTTON_WIDTH);
+        assert_eq!(metrics.button_height, ENCODING_DROPDOWN_BUTTON_HEIGHT);
+        assert_eq!(metrics.menu_width, ENCODING_DROPDOWN_WIDTH);
+        assert_eq!(metrics.item_height, ENCODING_DROPDOWN_ITEM_HEIGHT);
+        assert_eq!(metrics.menu_gap, ENCODING_DROPDOWN_MENU_GAP);
     }
 }

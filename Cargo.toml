@@ -18,6 +18,24 @@ gpui = "0.2.2"
 image = { version = "0.25.10", default-features = false }
 # lucide-icons 提供工具栏和目录树图标字体，避免继续使用难看的手写符号。
 lucide-icons = "1.14.0"
+# portable-pty 提供跨平台本地伪终端能力；连接页第一版不暴露本地终端，但用它验证统一 TerminalBackend 抽象。
+portable-pty = "0.9.0"
+# russh 提供纯 Rust SSH client；显式使用 ring+rsa，避免默认 aws-lc 原生构建扩大 macOS/Windows 打包面。
+russh = { version = "0.61.0", default-features = false, features = ["ring", "rsa"] }
+# alacritty_terminal 提供成熟 VT/ANSI 解析和终端 grid 状态，GPUI 只负责把 grid 映射为自绘界面。
+alacritty_terminal = "0.26.0"
+# tokio 只服务 russh 后台运行时；不把异步运行时暴露到 GPUI 主线程，避免 UI 生命周期和网络任务耦合。
+tokio = { version = "1.52.2", features = ["rt-multi-thread", "net", "io-util", "sync", "time"] }
+# keyring 负责选择 macOS Keychain / Windows 凭据存储，连接密码主密钥不落入 SQLite 或普通配置文件。
+keyring = "4.0.1"
+# keyring-core 暴露 Entry API；keyring 4.x 只负责安装具体 store，因此需要直接依赖 core 创建凭据项。
+keyring-core = "1.0.0"
+# aes-gcm 用于把 SSH 密码加密后写入 SQLite；AEAD 可同时校验连接 ID 绑定和密文完整性。
+aes-gcm = "0.10.3"
+# base64 用于把随机主密钥、nonce 和密文转换成可写入系统凭据和 SQLite 文本字段的稳定格式。
+base64 = "0.22.1"
+# zeroize 用于尽量缩短 SSH 密码明文在内存中的残留时间；仍不能替代系统级内存隔离。
+zeroize = "1.8.2"
 # pulldown-cmark 用于 AI 对话助手回复 Markdown 解析，只影响本地展示，不改变消息存储和请求体。
 pulldown-cmark = "0.13.3"
 # crc32fast 用于 HPROF sidecar 缓存的首尾块快速校验，避免为了秒开重新计算全文件哈希。

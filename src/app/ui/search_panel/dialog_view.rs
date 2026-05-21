@@ -261,37 +261,6 @@ impl SearchDialogWindowView {
         context.notify();
     }
 
-    /// 处理搜索关键字输入框鼠标按下。
-    ///
-    /// 业务意图：
-    /// - GPUI 当前版本的文本输入能力通过自定义元素注册到平台输入协议；鼠标事件仍需要回写到业务状态。
-    /// - 首次激活搜索框时全选关键字，方便直接替换；已聚焦状态下继续保留单击定位、双击选词、三击全选的常见习惯。
-    pub(in crate::app) fn handle_query_input_mouse_down(
-        &mut self,
-        event: &MouseDownEvent,
-        window: &mut Window,
-        context: &mut Context<Self>,
-    ) {
-        let search_was_focused = self
-            .main_view
-            .read(context)
-            .search
-            .search_input_focus
-            .is_focused(window);
-        let focus_handle = self.main_view.update(context, |view, context| {
-            if search_was_focused {
-                view.start_search_text_mouse_selection(SearchTextInputKind::Query, event, context);
-            } else if let Some(dialog) = view.search.search_dialog.as_mut() {
-                MainView::select_all_search_query(dialog);
-                view.touch_search_text_cursor_activity();
-                context.notify();
-            }
-            view.search.search_input_focus.clone()
-        });
-        window.focus(&focus_handle);
-        context.notify();
-    }
-
     /// 处理目录目标输入框鼠标按下。
     pub(in crate::app) fn handle_directory_input_mouse_down(
         &mut self,
@@ -489,29 +458,6 @@ impl SearchDialogWindowView {
             .track_focus(&focus_handle)
             .key_context("search-input")
             .on_key_down(context.listener(Self::handle_search_input_key_down))
-            .on_mouse_down(
-                MouseButton::Left,
-                context.listener(|view, event: &MouseDownEvent, window, context| {
-                    view.handle_query_input_mouse_down(event, window, context);
-                }),
-            )
-            .on_mouse_move(
-                context.listener(|view, event: &MouseMoveEvent, _window, context| {
-                    view.handle_search_text_mouse_move(event, context);
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Left,
-                context.listener(|view, _event: &MouseUpEvent, _window, context| {
-                    view.handle_search_text_mouse_up(context);
-                }),
-            )
-            .on_mouse_up_out(
-                MouseButton::Left,
-                context.listener(|view, _event: &MouseUpEvent, _window, context| {
-                    view.handle_search_text_mouse_up(context);
-                }),
-            )
             .child(
                 div()
                     .flex()
@@ -528,9 +474,9 @@ impl SearchDialogWindowView {
                             .line_height(px(20.0))
                             .text_size(px(14.0))
                             .text_color(rgb(palette.text))
-                            .child(SearchTextInputElement {
+                            .child(TextInputElement {
                                 view: self.main_view.clone(),
-                                input_kind: SearchTextInputKind::Query,
+                                binding: TextInputBinding::SearchQuery,
                                 focus_handle,
                                 placeholder: "输入搜索关键字",
                                 palette,

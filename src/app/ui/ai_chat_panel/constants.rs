@@ -4,6 +4,8 @@
 // - 常量集中放置，保证渲染、状态和测试使用同一组 UI 数值，重构不改变任何页面布局行为。
 // - 所有尺寸值继续使用 GPUI 逻辑像素，由框架处理 macOS 和 Windows 的缩放差异。
 
+use super::TOOLBAR_HEIGHT;
+
 /// AI 对话页左侧会话列表默认宽度。
 ///
 /// UI 约束：
@@ -33,7 +35,8 @@ pub(in crate::app) const AI_CHAT_WORKSPACE_MIN_WIDTH: f32 = 420.0;
 ///
 /// UI 约束：
 /// - 历史会话栏和右侧对话窗口共享同一条顶部分隔线，必须使用同一高度避免横线错位。
-pub(in crate::app) const AI_CHAT_TOP_BAR_HEIGHT: f32 = 46.0;
+/// - 顶部栏高度和日志分析页操作栏保持一致，保证主功能页切换时 header 高度稳定。
+pub(in crate::app) const AI_CHAT_TOP_BAR_HEIGHT: f32 = TOOLBAR_HEIGHT;
 
 /// AI 对话输入区默认高度。
 ///

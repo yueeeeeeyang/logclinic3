@@ -1528,27 +1528,13 @@ impl MainView {
         let Some(dialog) = self.search.search_dialog.as_mut() else {
             return;
         };
-        let (text, selection_range, marked_range) = Self::search_text_state_mut(dialog, input_kind);
-        *marked_range = None;
-        match event.click_count {
-            0 | 1 => {
-                if event.modifiers.shift {
-                    selection_range.end = index;
-                    *selection_range = Self::clamp_search_text_range(text, selection_range.clone());
-                } else {
-                    *selection_range = index..index;
-                }
-                self.search.search_text_selection_drag = Some((input_kind, selection_range.start));
-            }
-            2 => {
-                *selection_range = Self::search_text_word_range_for_index(text, index);
-                self.search.search_text_selection_drag = None;
-            }
-            _ => {
-                *selection_range = 0..text.len();
-                self.search.search_text_selection_drag = None;
-            }
-        }
+        let drag_anchor = begin_text_input_mouse_selection(
+            Self::search_text_input_mut(dialog, input_kind),
+            index,
+            event.click_count,
+            event.modifiers.shift,
+        );
+        self.search.search_text_selection_drag = drag_anchor.map(|anchor| (input_kind, anchor));
         self.touch_search_text_cursor_activity();
         context.notify();
     }
@@ -1564,10 +1550,11 @@ impl MainView {
         };
         let index = self.search_text_index_for_point(input_kind, position);
         if let Some(dialog) = self.search.search_dialog.as_mut() {
-            let (text, selection_range, marked_range) =
-                Self::search_text_state_mut(dialog, input_kind);
-            *marked_range = None;
-            *selection_range = Self::clamp_search_text_range(text, anchor..index);
+            update_text_input_mouse_selection(
+                Self::search_text_input_mut(dialog, input_kind),
+                anchor,
+                index,
+            );
             self.touch_search_text_cursor_activity();
             context.notify();
         }
@@ -1634,30 +1621,7 @@ impl MainView {
         if text.is_empty() {
             return 0..0;
         }
-        let index = Self::clamp_search_text_range(text, index..index).start;
-        let current = text[index..]
-            .chars()
-            .next()
-            .or_else(|| text[..index].chars().next_back());
-        let Some(current) = current else {
-            return 0..0;
-        };
-        let select_whitespace = current.is_whitespace();
-        let mut start = 0usize;
-        for (byte_index, character) in text[..index].char_indices().rev() {
-            if character.is_whitespace() != select_whitespace {
-                start = byte_index + character.len_utf8();
-                break;
-            }
-        }
-        let mut end = text.len();
-        for (relative_index, character) in text[index..].char_indices() {
-            if character.is_whitespace() != select_whitespace {
-                end = index + relative_index;
-                break;
-            }
-        }
-        start..end
+        text_input_word_range_for_index(text, index)
     }
 
     /// 标记搜索输入框光标刚发生用户活动。
@@ -1704,42 +1668,27 @@ impl MainView {
         event: &KeyDownEvent,
         context: &mut Context<Self>,
     ) {
+        let mut changed = false;
+
         if Self::is_paste_keystroke(&event.keystroke) {
             let clipboard_text = context
                 .read_from_clipboard()
                 .and_then(|item| item.text())
-                .map(|text| Self::sanitize_search_input_text(&text));
-            if let Some(text) = clipboard_text {
-                let text_is_not_empty = !text.is_empty();
-                if text_is_not_empty {
-                    let mut should_jump_from_top = false;
-                    if let Some(dialog) = self.search.search_dialog.as_mut() {
-                        if input_kind == SearchTextInputKind::Query {
-                            dialog.query_history_menu_open = false;
-                        }
-                        let (input_text, selection_range, marked_range) =
-                            Self::search_text_state_mut(dialog, input_kind);
-                        Self::replace_search_text_selection(
-                            input_text,
-                            selection_range,
-                            marked_range,
-                            &text,
-                        );
-                        if input_kind == SearchTextInputKind::Query {
-                            dialog.current_file_match_count = None;
-                            dialog.current_file_navigation_match = None;
-                            should_jump_from_top = true;
-                        }
-                    }
-                    self.touch_search_text_cursor_activity();
-                    if should_jump_from_top {
-                        self.jump_search_query_in_current_file(true, context);
-                    }
-                    context.stop_propagation();
-                    context.notify();
-                    return;
+                .map(|text| sanitize_text_input_single_line_text(&text));
+            if let Some(text) = clipboard_text
+                && !text.is_empty()
+                && let Some(dialog) = self.search.search_dialog.as_mut()
+            {
+                if input_kind == SearchTextInputKind::Query {
+                    dialog.query_history_menu_open = false;
                 }
+                replace_text_input_selection(
+                    Self::search_text_input_mut(dialog, input_kind),
+                    &text,
+                );
+                changed = true;
             }
+            self.finish_search_text_key_edit(input_kind, changed, context);
             context.stop_propagation();
             return;
         }
@@ -1750,123 +1699,66 @@ impl MainView {
         if input_kind == SearchTextInputKind::Query {
             dialog.query_history_menu_open = false;
         }
-        let (text, selection_range, marked_range) = Self::search_text_state_mut(dialog, input_kind);
+        let input = Self::search_text_input_mut(dialog, input_kind);
 
         if Self::is_copy_keystroke(&event.keystroke) {
-            if selection_range.start != selection_range.end {
-                let range = Self::clamp_search_text_range(text, selection_range.clone());
-                if range.start < range.end {
-                    context.write_to_clipboard(ClipboardItem::new_string(text[range].to_string()));
-                }
+            if let Some(text) = text_input_selected_text(input) {
+                context.write_to_clipboard(ClipboardItem::new_string(text));
             }
+            context.stop_propagation();
+            return;
+        }
+
+        if Self::is_cut_keystroke(&event.keystroke) {
+            if let Some(text) = text_input_selected_text(input) {
+                context.write_to_clipboard(ClipboardItem::new_string(text));
+                replace_text_input_selection(input, "");
+                changed = true;
+            }
+            self.finish_search_text_key_edit(input_kind, changed, context);
             context.stop_propagation();
             return;
         }
 
         if Self::is_select_all_keystroke(&event.keystroke) {
-            *marked_range = None;
-            *selection_range = 0..text.len();
-            self.touch_search_text_cursor_activity();
+            select_all_text_input(input);
+            self.finish_search_text_key_edit(input_kind, false, context);
             context.stop_propagation();
-            context.notify();
             return;
         }
 
-        match event.keystroke.key.as_str() {
-            "left" => {
-                *marked_range = None;
-                if event.keystroke.modifiers.shift {
-                    selection_range.end =
-                        Self::previous_search_text_boundary(text, selection_range.end);
-                    *selection_range = Self::clamp_search_text_range(text, selection_range.clone());
-                } else if selection_range.start != selection_range.end {
-                    *selection_range = selection_range.start..selection_range.start;
-                } else {
-                    let cursor = Self::previous_search_text_boundary(text, selection_range.end);
-                    *selection_range = cursor..cursor;
-                }
-                self.touch_search_text_cursor_activity();
-                context.stop_propagation();
-                context.notify();
-            }
-            "right" => {
-                *marked_range = None;
-                if event.keystroke.modifiers.shift {
-                    selection_range.end =
-                        Self::next_search_text_boundary(text, selection_range.end);
-                    *selection_range = Self::clamp_search_text_range(text, selection_range.clone());
-                } else if selection_range.start != selection_range.end {
-                    *selection_range = selection_range.end..selection_range.end;
-                } else {
-                    let cursor = Self::next_search_text_boundary(text, selection_range.end);
-                    *selection_range = cursor..cursor;
-                }
-                self.touch_search_text_cursor_activity();
-                context.stop_propagation();
-                context.notify();
-            }
-            "up" => {
-                *marked_range = None;
-                *selection_range = 0..0;
-                self.touch_search_text_cursor_activity();
-                context.stop_propagation();
-                context.notify();
-            }
-            "down" => {
-                *marked_range = None;
-                let cursor = text.len();
-                *selection_range = cursor..cursor;
-                self.touch_search_text_cursor_activity();
-                context.stop_propagation();
-                context.notify();
-            }
-            "backspace" => {
-                if let Some(range) = marked_range.take().or_else(|| {
-                    (selection_range.start != selection_range.end).then(|| selection_range.clone())
-                }) {
-                    text.replace_range(range.clone(), "");
-                    *selection_range = range.start..range.start;
-                } else if let Some((previous_index, _)) =
-                    text[..selection_range.end].char_indices().next_back()
-                {
-                    text.replace_range(previous_index..selection_range.end, "");
-                    *selection_range = previous_index..previous_index;
-                }
-                if input_kind == SearchTextInputKind::Query {
-                    self.clear_search_current_file_match_count();
-                    self.jump_search_query_in_current_file(true, context);
-                }
-                self.touch_search_text_cursor_activity();
-                context.stop_propagation();
-                context.notify();
-            }
-            "delete" => {
-                if let Some(range) = marked_range.take().or_else(|| {
-                    (selection_range.start != selection_range.end).then(|| selection_range.clone())
-                }) {
-                    text.replace_range(range.clone(), "");
-                    *selection_range = range.start..range.start;
-                } else if let Some((next_index, next_character)) =
-                    text[selection_range.end..].char_indices().next()
-                {
-                    let start = selection_range.end + next_index;
-                    let end = start + next_character.len_utf8();
-                    text.replace_range(start..end, "");
-                    *selection_range = start..start;
-                }
-                if input_kind == SearchTextInputKind::Query {
-                    self.clear_search_current_file_match_count();
-                    self.jump_search_query_in_current_file(true, context);
-                }
-                self.touch_search_text_cursor_activity();
-                context.stop_propagation();
-                context.notify();
-            }
+        let outcome = match event.keystroke.key.as_str() {
+            "left" => move_text_input_left(input, event.keystroke.modifiers.shift),
+            "right" => move_text_input_right(input, event.keystroke.modifiers.shift),
+            "home" | "up" => move_text_input_home(input, event.keystroke.modifiers.shift),
+            "end" | "down" => move_text_input_end(input, event.keystroke.modifiers.shift),
+            "backspace" => backspace_text_input(input),
+            "delete" => delete_text_input(input),
             "enter" | "escape" => {
-                // Enter 和 Escape 由全局快捷键处理，保持搜索框只负责文本编辑。
+                // Enter 和 Escape 由搜索窗口控制逻辑处理，输入框不消费。
+                TextInputEditOutcome::default()
             }
-            _ => {}
+            _ => TextInputEditOutcome::default(),
+        };
+        if outcome.consumed {
+            self.finish_search_text_key_edit(input_kind, outcome.changed, context);
+            context.stop_propagation();
         }
+    }
+
+    /// 完成搜索输入框键盘编辑后的业务副作用。
+    fn finish_search_text_key_edit(
+        &mut self,
+        input_kind: SearchTextInputKind,
+        changed: bool,
+        context: &mut Context<Self>,
+    ) {
+        if changed && input_kind == SearchTextInputKind::Query {
+            self.clear_search_current_file_match_count();
+            self.jump_search_query_in_current_file(true, context);
+        }
+        self.touch_search_text_cursor_activity();
+        context.notify();
     }
 
     /// 处理快搜关键字输入区的基础编辑按键。
@@ -2457,6 +2349,17 @@ impl MainView {
         }
     }
 
+    /// 返回指定输入槽位的通用单行输入状态。
+    pub(in crate::app) fn search_text_input_mut(
+        dialog: &mut SearchDialogState,
+        input_kind: SearchTextInputKind,
+    ) -> &mut SingleLineTextInputState {
+        match input_kind {
+            SearchTextInputKind::Query => &mut dialog.query_input,
+            SearchTextInputKind::DirectoryTarget => &mut dialog.directory_input,
+        }
+    }
+
     /// 返回指定输入槽位的只读文本、选择范围和组合范围。
     pub(in crate::app) fn search_text_state(
         dialog: &SearchDialogState,
@@ -2483,18 +2386,25 @@ impl MainView {
     /// 业务意图：
     /// - 平台 IME 提交、快捷键粘贴和日志查看器粘贴到搜索框都需要同一套替换规则。
     /// - 统一处理组合文本、选区和光标位置，可以避免关键字输入框与目录输入框行为不一致。
+    /// - 该函数保留给旧单元测试和未迁移的输入路径使用，实际替换规则已经下沉到通用输入框编辑核心。
+    #[allow(dead_code)]
     pub(in crate::app) fn replace_search_text_selection(
         text: &mut String,
         selection_range: &mut Range<usize>,
         marked_range: &mut Option<Range<usize>>,
         replacement: &str,
     ) {
-        let range = marked_range
-            .take()
-            .unwrap_or_else(|| Self::clamp_search_text_range(text, selection_range.clone()));
-        text.replace_range(range.clone(), replacement);
-        let cursor = range.start + replacement.len();
-        *selection_range = cursor..cursor;
+        let mut input = SingleLineTextInputState {
+            text: std::mem::take(text),
+            selection_range: selection_range.clone(),
+            marked_range: marked_range.take(),
+            horizontal_scroll_px: 0.0,
+            selection_drag: None,
+        };
+        replace_text_input_selection(&mut input, replacement);
+        *text = input.text;
+        *selection_range = input.selection_range;
+        *marked_range = input.marked_range;
     }
 
     /// 用剪贴板文本覆盖搜索关键字。
@@ -2512,6 +2422,7 @@ impl MainView {
         dialog.query_input.selection_range = cursor..cursor;
         dialog.query_input.marked_range = None;
         dialog.query_input.horizontal_scroll_px = 0.0;
+        dialog.query_input.selection_drag = None;
         dialog.query_history_menu_open = false;
         dialog.current_file_match_count = None;
         dialog.current_file_navigation_match = None;
@@ -2535,31 +2446,13 @@ impl MainView {
         viewport_width: Pixels,
         keep_cursor_visible: bool,
     ) -> f32 {
-        let viewport_width = f32::from(viewport_width).max(0.0);
-        let content_width = f32::from(content_width).max(0.0);
-        let caret_width = SINGLE_LINE_INPUT_CARET_WIDTH.min(viewport_width);
-        if viewport_width <= 0.0 || content_width + caret_width <= viewport_width {
-            return 0.0;
-        }
-
-        let margin = SINGLE_LINE_INPUT_SCROLL_MARGIN.min(viewport_width / 2.0);
-        let right_guard = (margin + caret_width).min(viewport_width);
-        let max_scroll = (content_width + right_guard - viewport_width).max(0.0);
-        let mut scroll = current_scroll_px.clamp(0.0, max_scroll);
-        if !keep_cursor_visible {
-            return scroll;
-        }
-
-        let cursor_x = f32::from(cursor_x).clamp(0.0, content_width);
-        let visible_left = scroll + margin;
-        let visible_right = scroll + viewport_width - right_guard;
-        if cursor_x < visible_left {
-            scroll = (cursor_x - margin).max(0.0);
-        } else if cursor_x > visible_right {
-            scroll = (cursor_x - viewport_width + right_guard).min(max_scroll);
-        }
-
-        scroll
+        text_input_horizontal_scroll_offset(
+            current_scroll_px,
+            cursor_x,
+            content_width,
+            viewport_width,
+            keep_cursor_visible,
+        )
     }
 
     /// 判断是否为搜索输入框全选快捷键。
@@ -2580,24 +2473,16 @@ impl MainView {
     /// - 鼠标命中、平台输入和快捷键都可能给出超过文本长度或反向的范围。
     /// - Rust `String::replace_range` 只能接受 UTF-8 字符边界，因此这里统一转换为最近的安全边界。
     pub(in crate::app) fn clamp_search_text_range(text: &str, range: Range<usize>) -> Range<usize> {
-        let start = Self::search_input_clamp_byte_index(text, range.start);
-        let end = Self::search_input_clamp_byte_index(text, range.end);
-        start.min(end)..start.max(end)
+        text_input_clamp_range(text, range)
     }
 
     /// 将任意字节下标夹到搜索输入文本的 UTF-8 字符边界。
+    ///
+    /// 业务意图：
+    /// - 未迁移输入框仍可能通过旧 `MainView` 辅助函数访问字符边界工具，因此保留该包装入口。
+    #[allow(dead_code)]
     pub(in crate::app) fn search_input_clamp_byte_index(text: &str, index: usize) -> usize {
-        if index >= text.len() {
-            return text.len();
-        }
-        if text.is_char_boundary(index) {
-            return index;
-        }
-        text.char_indices()
-            .map(|(byte_index, _)| byte_index)
-            .take_while(|byte_index| *byte_index < index)
-            .last()
-            .unwrap_or(0)
+        text_input_clamp_byte_index(text, index)
     }
 
     /// 返回当前光标左侧的前一个 UTF-8 字符边界。
@@ -2605,22 +2490,12 @@ impl MainView {
     /// 业务意图：
     /// - 方向键移动必须按用户可见字符边界前进，不能把中文、emoji 或其它多字节字符切成非法 `String` 范围。
     pub(in crate::app) fn previous_search_text_boundary(text: &str, offset: usize) -> usize {
-        let offset = Self::search_input_clamp_byte_index(text, offset);
-        text[..offset]
-            .char_indices()
-            .next_back()
-            .map(|(index, _)| index)
-            .unwrap_or(0)
+        text_input_previous_boundary(text, offset)
     }
 
     /// 返回当前光标右侧的下一个 UTF-8 字符边界。
     pub(in crate::app) fn next_search_text_boundary(text: &str, offset: usize) -> usize {
-        let offset = Self::search_input_clamp_byte_index(text, offset);
-        text[offset..]
-            .char_indices()
-            .nth(1)
-            .map(|(index, _)| offset + index)
-            .unwrap_or(text.len())
+        text_input_next_boundary(text, offset)
     }
 
     /// 根据当前窗口焦点判断平台输入应写入哪个搜索文本框。
@@ -2668,7 +2543,7 @@ impl MainView {
 
     /// 清理平台输入文本，确保搜索框保持单行普通文本。
     pub(in crate::app) fn sanitize_search_input_text(text: &str) -> String {
-        text.replace(['\n', '\r'], "")
+        sanitize_text_input_single_line_text(text)
     }
 
     /// 渲染搜索选项复选框。

@@ -69,6 +69,15 @@ impl EntityInputHandler for MainView {
             ));
             return Some(self.log.log_tree_search.input.text[range].to_string());
         }
+        if let Some(field) = self.active_connection_form_field(window) {
+            let state = self.connections.dialog.as_ref()?.field(field);
+            let range = Self::search_input_range_from_utf16(&state.input.text, range_utf16);
+            adjusted_range.replace(Self::search_input_range_to_utf16(
+                &state.input.text,
+                range.clone(),
+            ));
+            return Some(state.input.text[range].to_string());
+        }
         if self.settings.quick_search_keywords_focus.is_focused(window) {
             let range = Self::search_input_range_from_utf16(
                 &self.settings.quick_search_keywords_input.text,
@@ -153,6 +162,16 @@ impl EntityInputHandler for MainView {
                 range: Self::search_input_range_to_utf16(
                     &self.log.log_tree_search.input.text,
                     self.log.log_tree_search.input.selection_range.clone(),
+                ),
+                reversed: false,
+            });
+        }
+        if let Some(field) = self.active_connection_form_field(window) {
+            let state = self.connections.dialog.as_ref()?.field(field);
+            return Some(UTF16Selection {
+                range: Self::search_input_range_to_utf16(
+                    &state.input.text,
+                    state.input.selection_range.clone(),
                 ),
                 reversed: false,
             });
@@ -243,6 +262,14 @@ impl EntityInputHandler for MainView {
                     Self::search_input_range_to_utf16(&self.log.log_tree_search.input.text, range)
                 });
         }
+        if let Some(field) = self.active_connection_form_field(window) {
+            let state = self.connections.dialog.as_ref()?.field(field);
+            return state
+                .input
+                .marked_range
+                .clone()
+                .map(|range| Self::search_input_range_to_utf16(&state.input.text, range));
+        }
         if self.settings.quick_search_keywords_focus.is_focused(window) {
             return self
                 .settings
@@ -297,6 +324,15 @@ impl EntityInputHandler for MainView {
         }
         if self.log.log_tree_search.focus.is_focused(window) {
             self.log.log_tree_search.input.marked_range = None;
+            context.notify();
+            return;
+        }
+        if let Some(field) = self.active_connection_form_field(window) {
+            if let Some(dialog) = self.connections.dialog.as_mut() {
+                let input = &mut dialog.field_mut(field).input;
+                input.marked_range = None;
+                input.selection_drag = None;
+            }
             context.notify();
             return;
         }
@@ -435,6 +471,32 @@ impl EntityInputHandler for MainView {
             self.log.log_tree_search.clear_layout();
             self.touch_search_text_cursor_activity();
             self.refresh_log_tree_search_results(true, context);
+            return;
+        }
+        if let Some(field) = self.active_connection_form_field(window) {
+            let replacement = Self::sanitize_search_input_text(text);
+            if let Some(dialog) = self.connections.dialog.as_mut() {
+                let field_state = dialog.field_mut(field);
+                let range = range_utf16
+                    .map(|range| {
+                        Self::search_input_range_from_utf16(&field_state.input.text, range)
+                    })
+                    .or_else(|| field_state.input.marked_range.clone())
+                    .unwrap_or_else(|| field_state.input.selection_range.clone());
+                let range = Self::clamp_search_text_range(&field_state.input.text, range);
+                field_state
+                    .input
+                    .text
+                    .replace_range(range.clone(), &replacement);
+                let cursor = range.start + replacement.len();
+                field_state.input.selection_range = cursor..cursor;
+                field_state.input.marked_range = None;
+                field_state.input.selection_drag = None;
+                field_state.clear_layout();
+                dialog.error = None;
+            }
+            self.touch_search_text_cursor_activity();
+            context.notify();
             return;
         }
         if self.settings.quick_search_keywords_focus.is_focused(window) {
@@ -727,6 +789,49 @@ impl EntityInputHandler for MainView {
             self.refresh_log_tree_search_results(true, context);
             return;
         }
+        if let Some(field) = self.active_connection_form_field(window) {
+            let replacement = Self::sanitize_search_input_text(new_text);
+            if let Some(dialog) = self.connections.dialog.as_mut() {
+                let field_state = dialog.field_mut(field);
+                let range = range_utf16
+                    .map(|range| {
+                        Self::search_input_range_from_utf16(&field_state.input.text, range)
+                    })
+                    .or_else(|| field_state.input.marked_range.clone())
+                    .unwrap_or_else(|| field_state.input.selection_range.clone());
+                let range = Self::clamp_search_text_range(&field_state.input.text, range);
+                field_state
+                    .input
+                    .text
+                    .replace_range(range.clone(), &replacement);
+
+                if replacement.is_empty() {
+                    field_state.input.marked_range = None;
+                } else {
+                    field_state.input.marked_range =
+                        Some(range.start..range.start + replacement.len());
+                }
+
+                let selected_range = new_selected_range_utf16
+                    .map(|utf16_range| {
+                        Self::search_input_range_from_utf16(&replacement, utf16_range)
+                    })
+                    .map(|relative_range| {
+                        range.start + relative_range.start..range.start + relative_range.end
+                    })
+                    .unwrap_or_else(|| {
+                        let cursor = range.start + replacement.len();
+                        cursor..cursor
+                    });
+                field_state.input.selection_range = selected_range;
+                field_state.input.selection_drag = None;
+                field_state.clear_layout();
+                dialog.error = None;
+            }
+            self.touch_search_text_cursor_activity();
+            context.notify();
+            return;
+        }
         if self.settings.quick_search_keywords_focus.is_focused(window) {
             if !self.settings.quick_search_keywords_is_editing {
                 return;
@@ -966,6 +1071,25 @@ impl EntityInputHandler for MainView {
                 ),
             ));
         }
+        if let Some(field) = self.active_connection_form_field(window) {
+            let state = self.connections.dialog.as_ref()?.field(field);
+            let range = Self::search_input_range_from_utf16(&state.input.text, range_utf16);
+            let Some(layout) = state.last_layout.as_ref() else {
+                return Some(element_bounds);
+            };
+            return Some(Bounds::from_corners(
+                point(
+                    element_bounds.left() + layout.x_for_index(range.start)
+                        - px(state.input.horizontal_scroll_px),
+                    element_bounds.top(),
+                ),
+                point(
+                    element_bounds.left() + layout.x_for_index(range.end)
+                        - px(state.input.horizontal_scroll_px),
+                    element_bounds.bottom(),
+                ),
+            ));
+        }
         if self.settings.quick_search_keywords_focus.is_focused(window) {
             let range = Self::search_input_range_from_utf16(
                 &self.settings.quick_search_keywords_input.text,
@@ -1083,6 +1207,14 @@ impl EntityInputHandler for MainView {
             let utf8_index = self.log_tree_search_index_for_point(point);
             return Some(Self::search_input_utf16_offset_from_byte(
                 &self.log.log_tree_search.input.text,
+                utf8_index,
+            ));
+        }
+        if let Some(field) = self.active_connection_form_field(window) {
+            let utf8_index = self.connection_form_text_index_for_point(field, point);
+            let state = self.connections.dialog.as_ref()?.field(field);
+            return Some(Self::search_input_utf16_offset_from_byte(
+                &state.input.text,
                 utf8_index,
             ));
         }

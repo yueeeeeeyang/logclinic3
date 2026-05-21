@@ -51,6 +51,21 @@ impl MainView {
             return true;
         }
 
+        if self.navigation.active_main_feature == MainFeature::Connections
+            && self.connection_terminal_focused_without_modal(window)
+        {
+            // 连接终端聚焦时，复制/粘贴快捷键必须优先归终端处理：
+            // - 有终端选区时 `Ctrl/Cmd+C` 复制终端文本并消费事件。
+            // - 没有终端选区时返回 false，让终端按键处理继续把 `Ctrl+C` 作为 ETX 发给 PTY/SSH。
+            // - 粘贴只写入当前终端，避免继续落到日志选区或搜索框的全局粘贴兜底逻辑。
+            if Self::is_copy_keystroke(&keystroke) {
+                return self.copy_selected_connection_terminal_text(context);
+            }
+            if Self::is_paste_keystroke(&keystroke) {
+                return self.paste_clipboard_text_into_connection_terminal(context);
+            }
+        }
+
         if Self::is_copy_keystroke(&keystroke) && self.copy_selected_log_text(context) {
             return true;
         }
@@ -168,6 +183,7 @@ impl MainView {
         self.search_text_input_focused(window)
             || self.log.log_tree_search.focus.is_focused(window)
             || self.settings_text_input_focused(window)
+            || self.connection_text_input_focused(window)
             || self.ai_chat.input_focus.is_focused(window)
             || self.notes.title_focus.is_focused(window)
             || note_editor_input_focused

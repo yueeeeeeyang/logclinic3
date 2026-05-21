@@ -366,7 +366,7 @@ mod state_tests {
     /// - 左侧大导航只显示图标，hover 气泡依赖 `label()` 返回中文名称；图标和名称错配会直接影响用户识别功能入口。
     #[test]
     fn 主功能导航名称和图标稳定() {
-        assert_eq!(MainFeature::all().len(), 4);
+        assert_eq!(MainFeature::all().len(), 5);
         assert_eq!(MainFeature::LogAnalysis.label(), "日志分析");
         assert_eq!(
             char::from(MainFeature::LogAnalysis.icon()),
@@ -376,6 +376,11 @@ mod state_tests {
         assert_eq!(
             char::from(MainFeature::Notes.icon()),
             char::from(Icon::NotebookText)
+        );
+        assert_eq!(MainFeature::Connections.label(), "连接");
+        assert_eq!(
+            char::from(MainFeature::Connections.icon()),
+            char::from(Icon::Cable)
         );
         assert_eq!(MainFeature::HprofAnalysis.label(), "HPROF解析");
         assert_eq!(
@@ -457,7 +462,7 @@ mod state_tests {
             )
         );
         assert_eq!(
-            MainNavigationItem::Feature(MainFeature::HprofAnalysis).tooltip_anchor(),
+            MainNavigationItem::Feature(MainFeature::Connections).tooltip_anchor(),
             MainNavigationTooltipAnchor::Top(
                 MAIN_NAV_PADDING
                     + (MAIN_NAV_BUTTON_SIZE + MAIN_NAV_BUTTON_GAP) * 2.0
@@ -465,10 +470,18 @@ mod state_tests {
             )
         );
         assert_eq!(
-            MainNavigationItem::Feature(MainFeature::AiChat).tooltip_anchor(),
+            MainNavigationItem::Feature(MainFeature::HprofAnalysis).tooltip_anchor(),
             MainNavigationTooltipAnchor::Top(
                 MAIN_NAV_PADDING
                     + (MAIN_NAV_BUTTON_SIZE + MAIN_NAV_BUTTON_GAP) * 3.0
+                    + MAIN_NAV_TOOLTIP_BUTTON_INSET
+            )
+        );
+        assert_eq!(
+            MainNavigationItem::Feature(MainFeature::AiChat).tooltip_anchor(),
+            MainNavigationTooltipAnchor::Top(
+                MAIN_NAV_PADDING
+                    + (MAIN_NAV_BUTTON_SIZE + MAIN_NAV_BUTTON_GAP) * 4.0
                     + MAIN_NAV_TOOLTIP_BUTTON_INSET
             )
         );
@@ -1108,6 +1121,7 @@ mod state_tests {
                 selection_range: 0.."旧关键字".len(),
                 marked_range: Some(0.."旧".len()),
                 horizontal_scroll_px: 0.0,
+                selection_drag: None,
             },
             query_history_menu_open: true,
             scope: SearchScope::CurrentFile,
@@ -1151,6 +1165,7 @@ mod state_tests {
                 selection_range: 5..5,
                 marked_range: Some(0..5),
                 horizontal_scroll_px: 18.0,
+                selection_drag: Some(5),
             },
             query_history_menu_open: false,
             scope: SearchScope::CurrentFile,
@@ -1171,6 +1186,7 @@ mod state_tests {
         assert_eq!(dialog.query_input.selection_range, 0.."error日志".len());
         assert!(dialog.query_input.marked_range.is_none());
         assert_eq!(dialog.query_input.horizontal_scroll_px, 0.0);
+        assert!(dialog.query_input.selection_drag.is_none());
     }
 
     /// 验证切换正则模式会清空依赖旧匹配条件的当前文件计数缓存。
@@ -1185,6 +1201,7 @@ mod state_tests {
                 selection_range: 0.."error|warn".len(),
                 marked_range: None,
                 horizontal_scroll_px: 0.0,
+                selection_drag: None,
             },
             query_history_menu_open: true,
             scope: SearchScope::CurrentFile,
@@ -1224,6 +1241,7 @@ mod state_tests {
                 selection_range: 0.."monitorThread".len(),
                 marked_range: None,
                 horizontal_scroll_px: 0.0,
+                selection_drag: None,
             },
             case_sensitive: true,
             match_mode: SearchMatchMode::Literal,

@@ -421,6 +421,12 @@ impl MainView {
         self.log.log_viewer_context_menu = None;
         self.log.log_tree_context_menu = None;
         self.search.search_results_context_menu = None;
+        if feature != MainFeature::Connections {
+            self.connections.dialog = None;
+            self.connections.delete_confirm_dialog = None;
+            self.connections.host_key_dialog = None;
+            self.connections.tree_resize_drag = None;
+        }
         if feature == MainFeature::AiChat {
             self.ensure_ai_chat_initial_data_loaded(context);
         }

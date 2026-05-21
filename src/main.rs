@@ -18,6 +18,7 @@ mod ai_chat;
 mod app;
 mod archive;
 mod config;
+mod connections;
 mod highlighting;
 mod hprof;
 mod launch;

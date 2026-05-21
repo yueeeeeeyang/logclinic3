@@ -13,6 +13,10 @@ mod analysis_panel;
 /// AI 对话 GPUI 面板。
 #[path = "ai_chat_panel/mod.rs"]
 mod chat_panel;
+/// 跨功能复用的 GPUI 通用组件。
+mod components;
+/// 连接管理和内嵌终端 GPUI 面板。
+mod connections_panel;
 /// 日志工作区 GPUI 视图和动作。
 mod log;
 /// 应用内 Markdown 解析与渲染。
@@ -35,6 +39,8 @@ pub(in crate::app) use analysis_panel::{
     LogAiAnalysisWindowView, SearchResultsResizeDrag, SearchTarget, ThreadAnalysisWindowView,
 };
 pub(in crate::app) use chat_panel::*;
+pub(in crate::app) use components::*;
+pub(in crate::app) use connections_panel::*;
 #[cfg(test)]
 pub(in crate::app) use log::LogMinimapScrollInfo;
 pub(in crate::app) use markdown::*;

@@ -1312,8 +1312,8 @@ pub(in crate::app) enum ModelConfigInputKind {
 /// - 抽出该状态后，后续按键处理、UTF-16/UTF-8 转换和组合文本替换可以逐步收敛到同一套工具函数。
 ///
 /// 边界条件：
-/// - 该结构不包含焦点句柄、字形布局或鼠标拖拽锚点；这些数据受窗口、渲染元素和具体交互区域约束，
-///   第一轮仍保留在原 UI 工作区内，避免搜索窗口和设置窗口的焦点生命周期发生变化。
+/// - 该结构不包含焦点句柄和字形布局；这些数据受窗口、渲染元素和具体交互区域约束，仍由调用方保存。
+/// - 鼠标拖拽锚点属于输入框编辑语义，必须跟随文本状态一起收敛到通用组件，避免每个功能页重复维护后出现释放事件遗漏。
 #[derive(Clone)]
 pub(in crate::app) struct SingleLineTextInputState {
     /// 当前字段文本，使用 UTF-8 保存，平台输入协议回调时再和 UTF-16 范围互转。
@@ -1328,6 +1328,16 @@ pub(in crate::app) struct SingleLineTextInputState {
     /// - 当文本宽度超过输入框可视宽度时，自绘输入框需要像系统输入框一样左右滚动，保证光标和选区终点始终可见。
     /// - 该值只属于当前 UI 会话，不写入配置；文本被整体替换时重置为 0，避免新内容继承旧内容的滚动位置。
     pub(in crate::app) horizontal_scroll_px: f32,
+    /// 鼠标拖拽选区时的固定 UTF-8 字节锚点。
+    ///
+    /// 业务意图：
+    /// - 该状态描述的是“当前输入框是否正在用鼠标扩展选区”，属于单行输入框的通用编辑行为。
+    /// - 放在输入框状态内后，搜索、连接、设置等页面只负责提供焦点和布局，不再各自实现一套容易遗漏 `mouse_up` 的拖拽生命周期。
+    ///
+    /// 边界条件：
+    /// - 单击按下时设置，释放任意位置时由 `TextInputElement` 清空；双击选词、三击全选不进入拖拽状态。
+    /// - 文本整体替换或输入法提交时会清空，避免旧锚点指向已不存在的 UTF-8 字节下标。
+    pub(in crate::app) selection_drag: Option<usize>,
 }
 
 /// 单行输入框绘制阶段需要读取的只读快照。
@@ -1379,6 +1389,7 @@ impl SingleLineTextInputState {
             selection_range: cursor..cursor,
             marked_range: None,
             horizontal_scroll_px: 0.0,
+            selection_drag: None,
         }
     }
 
@@ -1392,6 +1403,7 @@ impl SingleLineTextInputState {
         self.selection_range = cursor..cursor;
         self.marked_range = None;
         self.horizontal_scroll_px = 0.0;
+        self.selection_drag = None;
     }
 }
 
@@ -1404,16 +1416,15 @@ pub(in crate::app) fn single_line_range_from_utf16(
     text: &str,
     range_utf16: Range<usize>,
 ) -> Range<usize> {
-    let start = single_line_byte_index_from_utf16(text, range_utf16.start);
-    let end = single_line_byte_index_from_utf16(text, range_utf16.end);
-    start.min(end)..end.max(start)
+    // 旧输入框、模型设置和新通用输入框都必须使用同一套 UTF-16/UTF-8 映射规则，
+    // 否则中文输入法、emoji 和平台组合文本回调会在不同功能里表现不一致。
+    text_input_range_from_utf16(text, range_utf16)
 }
 
 /// 将单行输入内部 UTF-8 字节范围转换为平台输入协议需要的 UTF-16 范围。
 pub(in crate::app) fn single_line_range_to_utf16(text: &str, range: Range<usize>) -> Range<usize> {
-    let start = single_line_utf16_offset_from_byte(text, range.start);
-    let end = single_line_utf16_offset_from_byte(text, range.end);
-    start..end
+    // 保留旧函数名作为未迁移输入框的兼容入口，实际边界算法集中在通用输入组件。
+    text_input_range_to_utf16(text, range)
 }
 
 /// 把 UTF-16 偏移映射到 UTF-8 字节边界。
@@ -1421,23 +1432,17 @@ pub(in crate::app) fn single_line_range_to_utf16(text: &str, range: Range<usize>
 /// 边界条件：
 /// - 如果平台给出超过文本长度的偏移，统一夹到字符串末尾。
 /// - 如果偏移落在代理对或多字节字符内部，返回该字符起点，保证后续 `replace_range` 安全。
+/// - 当前运行路径多通过范围转换入口间接访问该能力，保留独立入口用于测试和后续未迁移输入框接入。
+#[allow(dead_code)]
 pub(in crate::app) fn single_line_byte_index_from_utf16(text: &str, target_utf16: usize) -> usize {
-    let mut utf16_cursor = 0usize;
-    for (byte_index, character) in text.char_indices() {
-        if utf16_cursor >= target_utf16 {
-            return byte_index;
-        }
-        utf16_cursor += character.len_utf16();
-    }
-    text.len()
+    // 平台输入协议统一按 UTF-16 计数，这里委托给通用输入组件，避免未来修复边界问题时遗漏旧输入框。
+    text_input_byte_index_from_utf16(text, target_utf16)
 }
 
 /// 把 UTF-8 字节边界映射到 UTF-16 偏移。
 pub(in crate::app) fn single_line_utf16_offset_from_byte(text: &str, byte_index: usize) -> usize {
-    text.char_indices()
-        .take_while(|(index, _)| *index < byte_index)
-        .map(|(_, character)| character.len_utf16())
-        .sum()
+    // 该入口仍被 GPUI 平台输入处理调用，内部复用通用组件算法保证候选框和组合范围位置一致。
+    text_input_utf16_offset_from_byte(text, byte_index)
 }
 
 /// 模型配置单行输入框的窗口相关状态。
@@ -1624,7 +1629,7 @@ impl ShellIntegrationUiState {
 /// 主窗口当前展示的大功能页。
 ///
 /// 业务意图：
-/// - 主窗口左侧固定大导航只负责在日志分析、笔记、HPROF 解析和 AI 对话主要工作区之间切换。
+/// - 主窗口左侧固定大导航只负责在日志分析、笔记、连接、HPROF 解析和 AI 对话主要工作区之间切换。
 /// - 状态只保存在当前会话，不写入配置文件，避免后续调整默认入口或恢复策略时被旧配置约束。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::app) enum MainFeature {
@@ -1632,6 +1637,8 @@ pub(in crate::app) enum MainFeature {
     LogAnalysis,
     /// 笔记页，承载本地目录树、只读阅读器和编辑器。
     Notes,
+    /// 连接页，承载 SSH 连接配置和内嵌终端 tab。
+    Connections,
     /// HPROF 解析页，承载 heap dump 文件选择、解析进度和 dominator tree 结果。
     HprofAnalysis,
     /// AI 对话页，承载本地会话历史、模型选择和 OpenAI 兼容流式对话。
@@ -1651,6 +1658,7 @@ impl MainFeature {
         &[
             Self::LogAnalysis,
             Self::Notes,
+            Self::Connections,
             Self::HprofAnalysis,
             Self::AiChat,
         ]
@@ -1661,6 +1669,7 @@ impl MainFeature {
         match self {
             Self::LogAnalysis => "日志分析",
             Self::Notes => "笔记",
+            Self::Connections => "连接",
             Self::HprofAnalysis => "HPROF解析",
             Self::AiChat => "AI对话",
         }
@@ -1671,6 +1680,7 @@ impl MainFeature {
         match self {
             Self::LogAnalysis => Icon::Search,
             Self::Notes => Icon::NotebookText,
+            Self::Connections => Icon::Cable,
             Self::HprofAnalysis => Icon::ChartNoAxesCombined,
             Self::AiChat => Icon::BotMessageSquare,
         }
@@ -1722,14 +1732,19 @@ impl MainNavigationItem {
                     + MAIN_NAV_BUTTON_GAP
                     + MAIN_NAV_TOOLTIP_BUTTON_INSET,
             ),
-            Self::Feature(MainFeature::HprofAnalysis) => MainNavigationTooltipAnchor::Top(
+            Self::Feature(MainFeature::Connections) => MainNavigationTooltipAnchor::Top(
                 MAIN_NAV_PADDING
                     + (MAIN_NAV_BUTTON_SIZE + MAIN_NAV_BUTTON_GAP) * 2.0
                     + MAIN_NAV_TOOLTIP_BUTTON_INSET,
             ),
-            Self::Feature(MainFeature::AiChat) => MainNavigationTooltipAnchor::Top(
+            Self::Feature(MainFeature::HprofAnalysis) => MainNavigationTooltipAnchor::Top(
                 MAIN_NAV_PADDING
                     + (MAIN_NAV_BUTTON_SIZE + MAIN_NAV_BUTTON_GAP) * 3.0
+                    + MAIN_NAV_TOOLTIP_BUTTON_INSET,
+            ),
+            Self::Feature(MainFeature::AiChat) => MainNavigationTooltipAnchor::Top(
+                MAIN_NAV_PADDING
+                    + (MAIN_NAV_BUTTON_SIZE + MAIN_NAV_BUTTON_GAP) * 4.0
                     + MAIN_NAV_TOOLTIP_BUTTON_INSET,
             ),
             Self::Settings => MainNavigationTooltipAnchor::Bottom(

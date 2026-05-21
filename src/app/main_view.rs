@@ -139,6 +139,13 @@ pub(in crate::app) struct MainView {
     /// - 主视图只负责在大功能页之间协调，避免根实体直接理解笔记文件扫描和迁移细节。
     pub(in crate::app) notes: NotesWorkspaceState,
 
+    /// SSH 连接管理和内嵌终端工作区状态。
+    ///
+    /// 业务意图：
+    /// - 连接列表、加密配置加载错误、主机指纹确认弹窗和终端 tab 都集中在该字段，主窗口只负责页面切换。
+    /// - 后台 SSH 或本地 PTY 线程不能直接触碰 GPUI 状态，只能通过该状态持有的事件队列轮询更新。
+    pub(in crate::app) connections: ConnectionsWorkspaceState,
+
     /// 当前窗口系统外观。
     ///
     /// 业务意图：
@@ -178,6 +185,7 @@ impl MainView {
         let model_config = ModelConfigState::new(context, model_configs);
         let ai_chat = AiChatWorkspaceState::new_unloaded(context);
         let notes = NotesWorkspaceState::load_or_initialize(context);
+        let connections = ConnectionsWorkspaceState::load_or_initialize(context);
 
         // AI 对话页第一次渲染代码块时需要初始化 syntect 语法和主题集合；该初始化与 UI 状态无关，
         // 提前放到 GPUI 后台执行器中完成，避免用户首次点击 AI 导航时把这部分成本压到主线程。
@@ -203,6 +211,7 @@ impl MainView {
             hprof_analysis_view: None,
             ai_chat,
             notes,
+            connections,
             system_window_appearance: WindowAppearance::Light,
             window_appearance_subscription: None,
             global_keystroke_subscription: None,

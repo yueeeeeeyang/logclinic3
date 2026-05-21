@@ -26,6 +26,7 @@ use crate::archive::{
     cleanup_materialized_file, cleanup_stale_large_log_cache, materialize_source_for_paging,
 };
 use crate::config::*;
+use crate::connections::*;
 use crate::highlighting::{SyntaxTheme, highlight_line};
 use crate::launch::{
     classify_launch_paths, log_source_paths_from_launch_arguments, log_source_paths_from_open_urls,
@@ -76,15 +77,15 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     Animation, AnimationExt as _, AnyWindowHandle, App, AppContext, Application, AsyncApp, Bounds,
     ClickEvent, ClipboardItem, Context, DisplayId, Element, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, ExternalPaths, FontStyle, FontWeight, GlobalElementId, HighlightStyle,
-    InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, Keystroke, LayoutId, ListAlignment,
-    ListHorizontalSizingBehavior, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, ParentElement, PathPromptOptions, Pixels, Point, Render, ScrollHandle,
-    ScrollStrategy, ScrollWheelEvent, ShapedLine, SharedString, StatefulInteractiveElement,
-    StrikethroughStyle, Style, Styled as _, StyledText, TextRun, TitlebarOptions, UTF16Selection,
-    UnderlineStyle, UniformListScrollHandle, Window, WindowAppearance, WindowBounds, WindowHandle,
-    WindowKind, WindowOptions, actions, div, fill, list, point, px, relative, rgb, rgba, size,
-    uniform_list,
+    EntityInputHandler, ExternalPaths, FocusHandle, FontStyle, FontWeight, GlobalElementId,
+    HighlightStyle, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, Keystroke, LayoutId,
+    ListAlignment, ListHorizontalSizingBehavior, ListState, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, PathPromptOptions, Pixels, Point,
+    Render, ScrollHandle, ScrollStrategy, ScrollWheelEvent, ShapedLine, SharedString,
+    StatefulInteractiveElement, StrikethroughStyle, Style, Styled as _, StyledText, TextRun,
+    TitlebarOptions, UTF16Selection, UnderlineStyle, UniformListScrollHandle, Window,
+    WindowAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, actions, div, fill,
+    list, point, px, relative, rgb, rgba, size, uniform_list,
 };
 use lucide_icons::{Icon, LUCIDE_FONT_BYTES};
 use main_view::MainView;
