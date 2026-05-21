@@ -399,6 +399,49 @@ mod state_tests {
         );
     }
 
+    /// 验证连接行右键菜单坐标会限制在左侧栏内部。
+    ///
+    /// 业务意图：
+    /// - 连接行右键菜单渲染在连接侧栏内，而鼠标事件是主窗口坐标；这里锁定主导航扣减和右边界夹紧，
+    ///   避免菜单覆盖右侧终端或在靠近左边缘时出现负坐标。
+    /// - 纵向坐标也必须按菜单高度夹紧，避免窗口底部右键时“删除”等底部菜单项被裁掉。
+    #[test]
+    fn 连接行右键菜单坐标会限制在侧栏内() {
+        assert_eq!(
+            MainView::connection_profile_context_menu_x(
+                MAIN_NAV_WIDTH + 24.0,
+                CONNECTIONS_TREE_DEFAULT_WIDTH
+            ),
+            24.0
+        );
+        assert_eq!(
+            MainView::connection_profile_context_menu_x(8.0, CONNECTIONS_TREE_DEFAULT_WIDTH),
+            0.0
+        );
+        assert_eq!(
+            MainView::connection_profile_context_menu_x(
+                MAIN_NAV_WIDTH + CONNECTIONS_TREE_DEFAULT_WIDTH + 40.0,
+                CONNECTIONS_TREE_DEFAULT_WIDTH
+            ),
+            CONNECTIONS_TREE_DEFAULT_WIDTH - CONNECTIONS_CONTEXT_MENU_WIDTH
+        );
+
+        assert_eq!(
+            MainView::connection_profile_context_menu_y(24.0, 480.0),
+            24.0
+        );
+        assert_eq!(
+            MainView::connection_profile_context_menu_y(-12.0, 480.0),
+            0.0
+        );
+        assert_eq!(
+            MainView::connection_profile_context_menu_y(460.0, 480.0),
+            480.0
+                - CONNECTIONS_CONTEXT_MENU_ITEM_HEIGHT * 3.0
+                - CONNECTIONS_CONTEXT_MENU_VERTICAL_PADDING
+        );
+    }
+
     /// 验证设置窗口页签包含插件、存储和关于入口。
     ///
     /// 业务意图：
@@ -4529,44 +4572,105 @@ mod state_tests {
         );
     }
 
-    /// 验证搜索关键字片段使用暖橙色背景，和整行黄色定位背景区分开。
+    /// 验证搜索关键字片段在明暗主题下都保持可读，且和整行定位背景区分开。
     ///
     /// 业务意图：
     /// - 日志正文搜索现在统一保留整行背景和关键字片段背景；两层颜色必须不同，用户才能同时识别命中行和命中列。
-    /// - 关键字颜色固定为暖橙色，不随主题搜索行背景变化，避免主题色调整后两层高亮重新混在一起。
+    /// - 亮色主题保留原有暖橙色背景；暗色主题需要额外覆盖前景色，避免绿色语法高亮文本落在搜索底色上看不清。
     #[test]
-    fn 日志搜索关键字片段使用暖橙色背景() {
-        let palette = AppThemePalette::for_theme(EffectiveTheme::Light);
+    fn 日志搜索关键字片段在明暗主题下都保持可读() {
+        let light_palette = AppThemePalette::for_theme(EffectiveTheme::Light);
         let highlight = LogSearchMatchHighlight {
             line_index: 3,
             match_range: 7..14,
         };
-        let (range, style) = MainView::log_search_match_highlight_for_line(
+        let (range, light_style) = MainView::log_search_match_highlight_for_line(
             Some(&highlight),
             3,
             "prefix keyword suffix",
-            palette,
+            light_palette,
         )
         .expect("当前行存在搜索命中时应返回关键字片段高亮");
 
         assert_eq!(range, 7..14);
-        assert_eq!(style.background_color, Some(rgb(0xf2a65a).into()));
+        assert_eq!(light_style.background_color, Some(rgb(0xf2a65a).into()));
+        assert_eq!(light_style.color, None);
         assert_ne!(
-            style.background_color,
-            Some(rgb(palette.search_highlight).into())
+            light_style.background_color,
+            Some(rgb(light_palette.search_highlight).into())
         );
-        assert_eq!(style.font_weight, Some(gpui::FontWeight::SEMIBOLD));
+        assert_eq!(light_style.font_weight, Some(gpui::FontWeight::SEMIBOLD));
+
+        let dark_palette = AppThemePalette::for_theme(EffectiveTheme::Dark);
+        let (_, dark_style) = MainView::log_search_match_highlight_for_line(
+            Some(&highlight),
+            3,
+            "prefix keyword suffix",
+            dark_palette,
+        )
+        .expect("暗色主题当前行存在搜索命中时也应返回关键字片段高亮");
+        assert_eq!(dark_style.background_color, Some(rgb(0x1d4ed8).into()));
+        assert_eq!(dark_style.color, Some(rgb(0xf8fafc).into()));
+        assert_ne!(
+            dark_style.background_color,
+            Some(rgb(dark_palette.search_highlight).into())
+        );
+        assert_eq!(dark_style.font_weight, Some(gpui::FontWeight::SEMIBOLD));
     }
 
-    /// 验证鼠标选区覆盖搜索关键字背景但保留关键字文字样式。
+    /// 验证暗色搜索关键字前景色不会和日志语法色混合。
+    ///
+    /// 业务意图：
+    /// - GPUI 合并重叠高亮时会混合前景色；如果搜索关键字范围内仍保留绿色日志语法色，最终文字会变成低对比混合色。
+    /// - 暗色搜索关键字带显式前景色时，需要先清掉命中范围内的语法前景色，让关键字文字保持稳定可读。
+    #[test]
+    fn 暗色日志搜索关键字前景色会覆盖语法色() {
+        let palette = AppThemePalette::for_theme(EffectiveTheme::Dark);
+        let (_, search_style) = MainView::log_search_match_highlight_for_line(
+            Some(&LogSearchMatchHighlight {
+                line_index: 0,
+                match_range: 2..6,
+            }),
+            0,
+            "xxkeyword",
+            palette,
+        )
+        .expect("测试行存在搜索命中时应返回关键字片段高亮");
+
+        let highlights = MainView::combine_log_highlights_with_search_match(
+            vec![(
+                0..10,
+                gpui::HighlightStyle {
+                    color: Some(rgb(0x5ee787).into()),
+                    ..Default::default()
+                },
+            )],
+            2..6,
+            search_style,
+        );
+
+        let selected_keyword = highlights
+            .iter()
+            .find(|(range, _)| *range == (2..6))
+            .expect("搜索关键字和语法色重叠部分应被单独拆分");
+        assert_eq!(selected_keyword.1.color, search_style.color);
+        assert_eq!(
+            selected_keyword.1.background_color,
+            search_style.background_color
+        );
+    }
+
+    /// 验证鼠标选区覆盖搜索关键字背景，并在暗色主题下覆盖为可读文字颜色。
     ///
     /// 业务意图：
     /// - 搜索命中关键字本身有暖橙色背景，鼠标选区有蓝色背景；当两者重叠时，用户更需要看到“这段文本已被选中”。
-    /// - 选区覆盖背景时仍应保留搜索关键字的粗体等文字样式，避免失去命中提示。
+    /// - 选区覆盖背景时仍应保留搜索关键字的粗体等文字样式；暗色主题额外覆盖前景色，避免语法高亮色和选区背景对比不足。
     #[test]
-    fn 日志选区覆盖搜索关键字背景但保留文字样式() {
+    fn 日志选区覆盖搜索关键字背景并保持暗色可读() {
+        let palette = AppThemePalette::for_theme(EffectiveTheme::Dark);
         let search_background: gpui::Hsla = rgb(0xf2a65a).into();
-        let selection_background = MainView::log_text_selection_highlight_style().background_color;
+        let selection_style = MainView::log_text_selection_highlight_style(palette);
+        let selection_background = selection_style.background_color;
         let highlights = MainView::combine_log_highlights_with_selection(
             vec![(
                 4..10,
@@ -4577,6 +4681,7 @@ mod state_tests {
                 },
             )],
             6..8,
+            palette,
         );
 
         let selected_keyword = highlights
@@ -4584,6 +4689,7 @@ mod state_tests {
             .find(|(range, _)| *range == (6..8))
             .expect("搜索关键字和鼠标选区重叠部分应被单独拆分");
         assert_eq!(selected_keyword.1.background_color, selection_background);
+        assert_eq!(selected_keyword.1.color, selection_style.color);
         assert_eq!(
             selected_keyword.1.font_weight,
             Some(gpui::FontWeight::SEMIBOLD)

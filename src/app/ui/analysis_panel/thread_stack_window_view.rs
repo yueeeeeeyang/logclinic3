@@ -984,7 +984,7 @@ impl ThreadStackWindowView {
                                         // 线程详情正文和主日志正文使用同一种选区覆盖规则，避免选区与语法高亮重叠时出现背景冲突。
                                         highlights =
                                             MainView::combine_log_highlights_with_selection(
-                                                highlights, range,
+                                                highlights, range, palette,
                                             );
                                     }
                                     div()

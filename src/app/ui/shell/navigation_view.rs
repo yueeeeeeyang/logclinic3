@@ -426,6 +426,8 @@ impl MainView {
             self.connections.delete_confirm_dialog = None;
             self.connections.host_key_dialog = None;
             self.connections.tree_resize_drag = None;
+            self.connections.create_menu_open = false;
+            self.connections.profile_context_menu = None;
         }
         if feature == MainFeature::AiChat {
             self.ensure_ai_chat_initial_data_loaded(context);

@@ -24,14 +24,19 @@ impl MainView {
         context: &mut Context<Self>,
     ) {
         self.connections.create_menu_open = !self.connections.create_menu_open;
+        self.connections.profile_context_menu = None;
         context.stop_propagation();
         context.notify();
     }
 
-    /// 关闭新建连接类型菜单。
-    pub(in crate::app) fn close_connection_create_menu(&mut self, context: &mut Context<Self>) {
-        if self.connections.create_menu_open {
+    /// 关闭左侧连接栏所有浮层菜单。
+    ///
+    /// 业务意图：
+    /// - 新建类型菜单和连接行右键菜单共享左侧栏浮层层级；任一菜单外部点击都应统一关闭，避免两个菜单同时残留。
+    pub(in crate::app) fn close_connection_tree_menus(&mut self, context: &mut Context<Self>) {
+        if self.connections.create_menu_open || self.connections.profile_context_menu.is_some() {
             self.connections.create_menu_open = false;
+            self.connections.profile_context_menu = None;
             context.notify();
         }
     }
@@ -44,6 +49,7 @@ impl MainView {
         context: &mut Context<Self>,
     ) {
         self.connections.create_menu_open = false;
+        self.connections.profile_context_menu = None;
         self.open_connection_create_entry(kind, window, context);
         context.stop_propagation();
         context.notify();
@@ -87,6 +93,7 @@ impl MainView {
         let dialog = ConnectionDialogState::edit(&profile, context);
         window.focus(&dialog.name.focus);
         self.connections.create_menu_open = false;
+        self.connections.profile_context_menu = None;
         self.connections.dialog = Some(dialog);
         context.notify();
     }
@@ -262,6 +269,7 @@ impl MainView {
             profile_name: profile.name.clone(),
         });
         self.connections.create_menu_open = false;
+        self.connections.profile_context_menu = None;
         context.notify();
     }
 
@@ -371,13 +379,94 @@ impl MainView {
         self.reset_connection_host_key_from_dialog(&ClickEvent::default(), window, context);
     }
 
-    /// 选择左侧连接。
-    pub(in crate::app) fn select_connection_profile(
+    /// 计算连接行右键菜单在左侧栏内的横坐标。
+    ///
+    /// 业务意图：
+    /// - GPUI 鼠标事件给的是窗口坐标，而连接行菜单绘制在左侧连接栏内部，必须扣除固定主导航宽度。
+    /// - 横坐标限制在侧栏范围内，避免靠近分割线右键时菜单溢出到终端区域。
+    pub(in crate::app) fn connection_profile_context_menu_x(window_x: f32, tree_width: f32) -> f32 {
+        (window_x - MAIN_NAV_WIDTH)
+            .max(0.0)
+            .clamp(0.0, (tree_width - CONNECTIONS_CONTEXT_MENU_WIDTH).max(0.0))
+    }
+
+    /// 计算连接行右键菜单在左侧栏内的纵坐标。
+    ///
+    /// 业务意图：
+    /// - 菜单绘制在连接侧栏内部，纵向位置来自窗口鼠标坐标；靠近窗口底部右键时必须向上夹紧，保证“删除”等底部菜单项仍可见可点。
+    /// - 菜单高度按当前三项菜单和垂直内边距计算，后续增减菜单项时需要同步该高度规则。
+    pub(in crate::app) fn connection_profile_context_menu_y(
+        window_y: f32,
+        available_height: f32,
+    ) -> f32 {
+        let menu_height =
+            CONNECTIONS_CONTEXT_MENU_ITEM_HEIGHT * 3.0 + CONNECTIONS_CONTEXT_MENU_VERTICAL_PADDING;
+        window_y
+            .max(0.0)
+            .clamp(0.0, (available_height - menu_height).max(0.0))
+    }
+
+    /// 打开左侧连接行右键菜单。
+    pub(in crate::app) fn open_connection_profile_context_menu(
         &mut self,
         profile_id: &str,
+        event: &MouseDownEvent,
+        window: &Window,
         context: &mut Context<Self>,
     ) {
-        self.connections.selected_profile_id = Some(profile_id.to_string());
+        let Some(profile) = self.connections.profile_by_id(profile_id) else {
+            self.connections.status_message = Some("连接不存在，无法打开菜单".to_string());
+            context.stop_propagation();
+            context.notify();
+            return;
+        };
+        let target_profile_id = profile.id.clone();
+
+        self.connections.selected_profile_id = Some(target_profile_id.clone());
+        self.connections.profile_context_menu = Some(ConnectionProfileContextMenu {
+            profile_id: target_profile_id,
+            x: Self::connection_profile_context_menu_x(
+                f32::from(event.position.x),
+                self.connections.tree_width,
+            ),
+            y: Self::connection_profile_context_menu_y(
+                f32::from(event.position.y),
+                f32::from(window.viewport_size().height),
+            ),
+        });
+        self.connections.create_menu_open = false;
+        context.stop_propagation();
+        context.notify();
+    }
+
+    /// 执行左侧连接行右键菜单动作。
+    pub(in crate::app) fn handle_connection_profile_context_menu_action(
+        &mut self,
+        action: ConnectionProfileContextMenuAction,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let Some(menu) = self.connections.profile_context_menu.take() else {
+            context.stop_propagation();
+            context.notify();
+            return;
+        };
+        let profile_id = menu.profile_id;
+        self.connections.selected_profile_id = Some(profile_id.clone());
+        self.connections.create_menu_open = false;
+
+        match action {
+            ConnectionProfileContextMenuAction::Connect => {
+                self.open_connection_terminal(&profile_id, window, context);
+            }
+            ConnectionProfileContextMenuAction::Edit => {
+                self.open_edit_connection_dialog(&profile_id, window, context);
+            }
+            ConnectionProfileContextMenuAction::Delete => {
+                self.open_delete_connection_dialog(&profile_id, context);
+            }
+        }
+        context.stop_propagation();
         context.notify();
     }
 
@@ -393,6 +482,9 @@ impl MainView {
             context.notify();
             return;
         };
+        self.connections.selected_profile_id = Some(profile.id.clone());
+        self.connections.create_menu_open = false;
+        self.connections.profile_context_menu = None;
         let password = match decrypt_connection_password(&profile.id, &profile.encrypted_password) {
             Ok(password) => password,
             Err(error) => {
@@ -466,6 +558,7 @@ impl MainView {
         };
 
         self.connections.create_menu_open = false;
+        self.connections.profile_context_menu = None;
         self.connections.tabs.push(tab);
         self.connections.active_tab_id = Some(tab_id);
         if let Some(active) = self.connections.active_tab() {
@@ -1104,7 +1197,7 @@ impl MainView {
     /// 将窗口坐标换算为当前终端的 alacritty 格点。
     ///
     /// 边界条件：
-    /// - GPUI 鼠标事件是窗口坐标，连接页右侧终端还要扣除主导航、连接列表、tab 栏和状态栏。
+    /// - GPUI 鼠标事件是窗口坐标，连接页右侧终端还要扣除主导航、连接列表、tab 栏和终端内边距。
     /// - 鼠标拖到终端外时交给 `point_from_panel_offset` 夹紧，避免选区或鼠标上报生成越界坐标。
     fn active_connection_terminal_point_from_window_position(
         &self,
@@ -1112,8 +1205,9 @@ impl MainView {
         y: f32,
     ) -> Option<Point> {
         let tab = self.connections.active_tab()?;
-        let local_x = x - MAIN_NAV_WIDTH - self.connections.tree_width;
-        let local_y = y - CONNECTIONS_TAB_BAR_HEIGHT - CONNECTIONS_TERMINAL_STATUS_BAR_HEIGHT;
+        let local_x =
+            x - MAIN_NAV_WIDTH - self.connections.tree_width - CONNECTION_TERMINAL_PADDING;
+        let local_y = y - CONNECTIONS_TAB_BAR_HEIGHT - CONNECTION_TERMINAL_PADDING;
         Some(tab.emulator.point_from_panel_offset(local_x, local_y))
     }
 

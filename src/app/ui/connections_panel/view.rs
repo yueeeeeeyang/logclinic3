@@ -77,8 +77,9 @@ impl MainView {
             .child(self.render_connections_tree_toolbar(palette, context))
             .child(self.render_connections_tree_body(palette, context))
             .child(self.render_connections_tree_resize_handle(context))
-            .child(self.render_connections_create_menu_dismiss_overlay(context))
+            .child(self.render_connections_tree_menu_dismiss_overlay(context))
             .child(self.render_connections_create_menu(palette, context))
+            .child(self.render_connection_profile_context_menu(palette, context))
     }
 
     /// 渲染连接左侧栏工具栏。
@@ -135,21 +136,21 @@ impl MainView {
             )
     }
 
-    /// 渲染新建连接类型菜单的透明关闭遮罩。
+    /// 渲染连接左侧栏浮层菜单的透明关闭遮罩。
     ///
     /// 业务意图：
-    /// - 新建菜单只属于左侧连接栏，点击菜单外的左侧区域应关闭菜单并消费事件，避免误选连接行。
+    /// - 新建菜单和连接行右键菜单都只属于左侧连接栏，点击菜单外的左侧区域应关闭菜单并消费事件，避免误选连接行。
     /// - 遮罩限制在左侧栏内部，不影响主导航和右侧终端区域交互。
-    fn render_connections_create_menu_dismiss_overlay(
+    fn render_connections_tree_menu_dismiss_overlay(
         &self,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        if !self.connections.create_menu_open {
-            return div().id("connections-create-menu-overlay-empty").hidden();
+        if !self.connections.create_menu_open && self.connections.profile_context_menu.is_none() {
+            return div().id("connections-tree-menu-overlay-empty").hidden();
         }
 
         div()
-            .id("connections-create-menu-overlay")
+            .id("connections-tree-menu-overlay")
             .absolute()
             .left(px(0.0))
             .top(px(0.0))
@@ -157,14 +158,14 @@ impl MainView {
             .on_mouse_down(
                 MouseButton::Left,
                 context.listener(|view, _event: &MouseDownEvent, _window, context| {
-                    view.close_connection_create_menu(context);
+                    view.close_connection_tree_menus(context);
                     context.stop_propagation();
                 }),
             )
             .on_mouse_down(
                 MouseButton::Right,
                 context.listener(|view, _event: &MouseDownEvent, _window, context| {
-                    view.close_connection_create_menu(context);
+                    view.close_connection_tree_menus(context);
                     context.stop_propagation();
                 }),
             )
@@ -327,10 +328,8 @@ impl MainView {
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let profile_id = profile.id.clone();
-        let connect_profile_id = profile.id.clone();
-        let edit_profile_id = profile.id.clone();
-        let delete_profile_id = profile.id.clone();
+        let click_profile_id = profile.id.clone();
+        let context_profile_id = profile.id.clone();
         let active = self.connections.selected_profile_id.as_deref() == Some(profile.id.as_str());
         let background = if active { palette.hover } else { palette.panel };
         div()
@@ -345,8 +344,21 @@ impl MainView {
             .cursor_pointer()
             .hover(move |row| row.bg(rgb(palette.hover)))
             .on_click(
-                context.listener(move |view, _event: &ClickEvent, _window, context| {
-                    view.select_connection_profile(&profile_id, context);
+                context.listener(move |view, _event: &ClickEvent, window, context| {
+                    // 连接行主动作是直接打开一个新的 SSH tab；编辑和删除统一放在右键菜单，避免卡片内按钮分散点击目标。
+                    view.open_connection_terminal(&click_profile_id, window, context);
+                    context.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(move |view, event: &MouseDownEvent, window, context| {
+                    view.open_connection_profile_context_menu(
+                        &context_profile_id,
+                        event,
+                        window,
+                        context,
+                    );
                 }),
             )
             .child(
@@ -383,98 +395,101 @@ impl MainView {
                         profile.username, profile.host, profile.port
                     )),
             )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(self.render_connection_row_button(
-                        "连接",
-                        Icon::Play,
-                        palette,
-                        context.listener(move |view, _event: &ClickEvent, window, context| {
-                            view.open_connection_terminal(&connect_profile_id, window, context);
-                            context.stop_propagation();
-                        }),
-                    ))
-                    .child(self.render_connection_row_icon_button(
-                        Icon::Pencil,
-                        palette,
-                        context.listener(move |view, _event: &ClickEvent, window, context| {
-                            view.open_edit_connection_dialog(&edit_profile_id, window, context);
-                            context.stop_propagation();
-                        }),
-                    ))
-                    .child(self.render_connection_row_icon_button(
-                        Icon::Trash2,
-                        palette,
-                        context.listener(move |view, _event: &ClickEvent, _window, context| {
-                            view.open_delete_connection_dialog(&delete_profile_id, context);
-                            context.stop_propagation();
-                        }),
-                    )),
-            )
             .into_any_element()
     }
 
-    /// 渲染连接行文字按钮。
-    fn render_connection_row_button(
+    /// 渲染连接行右键菜单。
+    fn render_connection_profile_context_menu(
         &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let Some(menu) = self.connections.profile_context_menu.as_ref() else {
+            return div().id("connection-profile-context-menu-empty").hidden();
+        };
+
+        div()
+            .id("connection-profile-context-menu")
+            .absolute()
+            .left(px(menu.x))
+            .top(px(menu.y))
+            .w(px(CONNECTIONS_CONTEXT_MENU_WIDTH))
+            .py_1()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.menu))
+            .shadow_lg()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    context.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    context.stop_propagation();
+                }),
+            )
+            .child(self.render_connection_profile_context_menu_item(
+                ConnectionProfileContextMenuAction::Connect,
+                "连接",
+                Icon::Play,
+                palette,
+                context,
+            ))
+            .child(self.render_connection_profile_context_menu_item(
+                ConnectionProfileContextMenuAction::Edit,
+                "编辑",
+                Icon::Pencil,
+                palette,
+                context,
+            ))
+            .child(self.render_connection_profile_context_menu_item(
+                ConnectionProfileContextMenuAction::Delete,
+                "删除",
+                Icon::Trash2,
+                palette,
+                context,
+            ))
+    }
+
+    /// 渲染连接行右键菜单单项。
+    fn render_connection_profile_context_menu_item(
+        &self,
+        action: ConnectionProfileContextMenuAction,
         label: &'static str,
         icon: Icon,
         palette: AppThemePalette,
-        listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> impl IntoElement {
-        div()
-            .id(SharedString::from(format!("connection-row-action-{label}")))
-            .flex()
-            .items_center()
-            .gap_1()
-            .h(px(24.0))
-            .px_2()
-            .rounded(px(5.0))
-            .text_xs()
-            .text_color(rgb(palette.text))
-            .bg(rgb(palette.background))
-            .cursor_pointer()
-            .hover(move |button| button.text_color(rgb(palette.accent)))
-            .child(Self::render_lucide_icon(
-                Some(icon),
-                14.0,
-                13.0,
-                palette.muted_text,
-            ))
-            .child(label)
-            .on_click(listener)
-    }
-
-    /// 渲染连接行图标按钮。
-    fn render_connection_row_icon_button(
-        &self,
-        icon: Icon,
-        palette: AppThemePalette,
-        listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> impl IntoElement {
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         div()
             .id(SharedString::from(format!(
-                "connection-row-icon-{}",
-                char::from(icon) as u32
+                "connection-profile-menu-{label}"
             )))
             .flex()
             .items_center()
-            .justify_center()
-            .size(px(24.0))
-            .rounded(px(5.0))
-            .bg(rgb(palette.background))
+            .gap_2()
+            .h(px(CONNECTIONS_CONTEXT_MENU_ITEM_HEIGHT))
+            .px_3()
+            .text_sm()
+            .text_color(rgb(palette.text))
             .cursor_pointer()
-            .hover(move |button| button.text_color(rgb(palette.accent)))
+            .hover(move |item| item.bg(rgb(palette.hover)))
             .child(Self::render_lucide_icon(
                 Some(icon),
-                14.0,
-                13.0,
+                16.0,
+                15.0,
                 palette.muted_text,
             ))
-            .on_click(listener)
+            .child(label)
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(move |view, _event: &MouseDownEvent, window, context| {
+                    view.handle_connection_profile_context_menu_action(action, window, context);
+                }),
+            )
     }
 
     /// 渲染左侧栏拖拽命中区。
@@ -644,7 +659,7 @@ impl MainView {
     /// 渲染终端区域。
     fn render_connection_terminal_area(
         &self,
-        palette: AppThemePalette,
+        _palette: AppThemePalette,
         terminal_colors: ConnectionTerminalUiColors,
         context: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -665,12 +680,11 @@ impl MainView {
                     32.0,
                     terminal_colors.muted,
                 ))
-                .child(div().text_sm().child("选择左侧连接并点击连接"))
+                .child(div().text_sm().child("点击左侧连接打开终端"))
                 .into_any_element();
         };
 
         let lines = tab.emulator.render_lines(self.effective_theme());
-        let status = terminal_status_label(&tab.status);
         div()
             .id("connections-terminal-area")
             .relative()
@@ -685,27 +699,6 @@ impl MainView {
             .bg(rgb(terminal_colors.background))
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .h(px(CONNECTIONS_TERMINAL_STATUS_BAR_HEIGHT))
-                    .flex_none()
-                    .px_3()
-                    .border_b_1()
-                    .border_color(rgb(terminal_colors.border))
-                    .text_xs()
-                    .text_color(rgb(terminal_colors.muted))
-                    .child(status)
-                    .when_some(self.connections.status_message.as_ref(), |bar, message| {
-                        bar.child(
-                            div()
-                                .text_color(rgb(palette.muted_text))
-                                .child(message.clone()),
-                        )
-                    }),
-            )
-            .child(
-                div()
                     .id("connections-terminal-lines")
                     .relative()
                     .flex()
@@ -713,6 +706,7 @@ impl MainView {
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
+                    .p(px(CONNECTION_TERMINAL_PADDING))
                     .font_family(LOG_VIEWER_FONT_FAMILY)
                     .text_size(px(CONNECTION_TERMINAL_FONT_SIZE))
                     .line_height(px(CONNECTION_TERMINAL_ROW_HEIGHT))
@@ -720,7 +714,7 @@ impl MainView {
                     .on_mouse_down(
                         MouseButton::Left,
                         context.listener(|view, event: &MouseDownEvent, window, context| {
-                            // 只在终端正文区域启动选区或 xterm 鼠标上报，避免点击状态栏时被换算成第 0 行终端输入。
+                            // 只在终端正文区域启动选区或 xterm 鼠标上报；终端外壳没有状态栏后，点击 tab 栏或侧栏不会被换算成终端第 0 行。
                             if let Some(tab) = view.connections.active_tab() {
                                 window.focus(&tab.focus);
                             }
@@ -750,10 +744,10 @@ impl MainView {
                         div()
                             .id("connections-terminal-resize-observer")
                             .absolute()
-                            .left(px(0.0))
-                            .right(px(0.0))
-                            .top(px(0.0))
-                            .bottom(px(0.0))
+                            .left(px(CONNECTION_TERMINAL_PADDING))
+                            .right(px(CONNECTION_TERMINAL_PADDING))
+                            .top(px(CONNECTION_TERMINAL_PADDING))
+                            .bottom(px(CONNECTION_TERMINAL_PADDING))
                             .child(ConnectionTerminalResizeObserverElement {
                                 view: context.entity(),
                                 tab_id: tab.id,
@@ -1328,16 +1322,5 @@ impl Element for ConnectionTerminalResizeObserverElement {
         self.view.update(context, |view, context| {
             view.sync_connection_terminal_size_from_bounds(self.tab_id, bounds, context);
         });
-    }
-}
-
-/// 终端状态标签。
-fn terminal_status_label(status: &ConnectionTerminalStatus) -> String {
-    match status {
-        ConnectionTerminalStatus::Connecting => "正在连接 SSH".to_string(),
-        ConnectionTerminalStatus::WaitingHostKey => "等待确认 SSH 主机指纹".to_string(),
-        ConnectionTerminalStatus::Connected => "已连接".to_string(),
-        ConnectionTerminalStatus::Exited(message) => message.clone(),
-        ConnectionTerminalStatus::Error(message) => message.clone(),
     }
 }

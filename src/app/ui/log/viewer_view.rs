@@ -9,12 +9,25 @@
 
 use super::*;
 
-/// 日志正文搜索关键字片段的暖橙色背景。
+/// 日志正文搜索关键字片段在亮色主题下的暖橙色背景。
 ///
 /// 业务意图：
 /// - 搜索定位统一同时展示整行黄色背景和关键字片段背景；整行黄色负责定位行，关键字暖橙色负责定位列。
 /// - 使用固定色值而不是主题搜索色，避免关键字和整行同色后在长日志中难以区分命中位置，同时避免高饱和橘红色长时间阅读刺眼。
 pub(in crate::app) const LOG_SEARCH_KEYWORD_HIGHLIGHT: u32 = 0xf2a65a;
+
+/// 日志正文搜索关键字片段在暗色主题下的深蓝背景。
+///
+/// 业务意图：
+/// - 暗色日志正文常使用绿色、蓝色等语法前景色；如果继续使用亮色黄橙底，语法色和背景会互相干扰。
+/// - 这里使用深蓝底色并配合浅色前景，让搜索关键字在暗色日志和整行搜索定位背景上都能清晰区分。
+pub(in crate::app) const LOG_SEARCH_KEYWORD_HIGHLIGHT_DARK: u32 = 0x1d4ed8;
+
+/// 暗色主题搜索关键字片段上的文本颜色。
+///
+/// 业务意图：
+/// - 搜索命中片段优先表达“当前命中的文字内容”，因此暗色主题下显式覆盖语法高亮前景，避免绿色日志文本落在搜索背景上发糊。
+pub(in crate::app) const LOG_SEARCH_KEYWORD_TEXT_DARK: u32 = 0xf8fafc;
 
 impl MainView {
     pub(in crate::app) fn render_log_tab_body(
@@ -97,7 +110,7 @@ impl MainView {
         highlight: Option<&LogSearchMatchHighlight>,
         line_index: usize,
         line: &str,
-        _palette: AppThemePalette,
+        palette: AppThemePalette,
     ) -> Option<(Range<usize>, gpui::HighlightStyle)> {
         let highlight = highlight?;
         if highlight.line_index != line_index {
@@ -107,14 +120,77 @@ impl MainView {
         if range.start >= range.end {
             return None;
         }
+        let is_dark = Self::log_palette_is_dark(palette);
         Some((
             range,
             gpui::HighlightStyle {
-                background_color: Some(rgb(LOG_SEARCH_KEYWORD_HIGHLIGHT).into()),
+                color: is_dark.then(|| rgb(LOG_SEARCH_KEYWORD_TEXT_DARK).into()),
+                background_color: Some(
+                    rgb(if is_dark {
+                        LOG_SEARCH_KEYWORD_HIGHLIGHT_DARK
+                    } else {
+                        LOG_SEARCH_KEYWORD_HIGHLIGHT
+                    })
+                    .into(),
+                ),
                 font_weight: Some(FontWeight::SEMIBOLD),
                 ..Default::default()
             },
         ))
+    }
+
+    /// 合并日志行高亮和搜索关键字高亮。
+    ///
+    /// 业务意图：
+    /// - 搜索关键字是当前定位的最重要反馈，暗色主题下需要让关键字文字颜色稳定可读。
+    /// - GPUI 的高亮合并会把两个前景色做混合，而不是按后者覆盖；如果直接合并，绿色日志语法色会把搜索关键字的浅色前景混成低对比颜色。
+    ///
+    /// 边界条件：
+    /// - 亮色主题搜索样式没有显式前景色，仍保留原有语法高亮文字颜色。
+    /// - 暗色主题搜索样式带前景色时，只清理命中范围内已有高亮的前景色，命中范围外的日志语法高亮不受影响。
+    pub(in crate::app) fn combine_log_highlights_with_search_match(
+        highlights: Vec<(Range<usize>, gpui::HighlightStyle)>,
+        search_range: Range<usize>,
+        search_style: gpui::HighlightStyle,
+    ) -> Vec<(Range<usize>, gpui::HighlightStyle)> {
+        if search_range.start >= search_range.end {
+            return highlights;
+        }
+
+        let mut adjusted_highlights = Vec::with_capacity(highlights.len().saturating_add(2));
+        for (range, style) in highlights {
+            if search_style.color.is_none()
+                || range.end <= search_range.start
+                || range.start >= search_range.end
+            {
+                adjusted_highlights.push((range, style));
+                continue;
+            }
+
+            if range.start < search_range.start {
+                let before_end = search_range.start.min(range.end);
+                if range.start < before_end {
+                    adjusted_highlights.push((range.start..before_end, style));
+                }
+            }
+
+            let overlap_start = range.start.max(search_range.start);
+            let overlap_end = range.end.min(search_range.end);
+            if overlap_start < overlap_end {
+                let mut readable_style = style;
+                readable_style.color = None;
+                adjusted_highlights.push((overlap_start..overlap_end, readable_style));
+            }
+
+            if search_range.end < range.end {
+                let after_start = search_range.end.max(range.start);
+                if after_start < range.end {
+                    adjusted_highlights.push((after_start..range.end, style));
+                }
+            }
+        }
+
+        gpui::combine_highlights(adjusted_highlights, [(search_range, search_style)]).collect()
     }
 
     /// 合并日志行高亮并保证鼠标选区背景优先显示。
@@ -133,11 +209,13 @@ impl MainView {
     pub(in crate::app) fn combine_log_highlights_with_selection(
         highlights: Vec<(Range<usize>, gpui::HighlightStyle)>,
         selection_range: Range<usize>,
+        palette: AppThemePalette,
     ) -> Vec<(Range<usize>, gpui::HighlightStyle)> {
         if selection_range.start >= selection_range.end {
             return highlights;
         }
 
+        let selection_style = Self::log_text_selection_highlight_style(palette);
         let mut adjusted_highlights = Vec::with_capacity(highlights.len().saturating_add(2));
         for (range, style) in highlights {
             if range.end <= selection_range.start || range.start >= selection_range.end {
@@ -157,6 +235,10 @@ impl MainView {
             if overlap_start < overlap_end {
                 let mut foreground_style = style;
                 foreground_style.background_color = None;
+                if let Some(color) = selection_style.color {
+                    // 暗色主题的选区会显式覆盖前景色，避免搜索关键字或语法高亮的绿色文字落在蓝色选区上仍然看不清。
+                    foreground_style.color = Some(color);
+                }
                 adjusted_highlights.push((overlap_start..overlap_end, foreground_style));
             }
 
@@ -168,11 +250,17 @@ impl MainView {
             }
         }
 
-        gpui::combine_highlights(
-            adjusted_highlights,
-            [(selection_range, Self::log_text_selection_highlight_style())],
-        )
-        .collect()
+        gpui::combine_highlights(adjusted_highlights, [(selection_range, selection_style)])
+            .collect()
+    }
+
+    /// 判断当前日志调色板是否属于暗色主题。
+    ///
+    /// 业务意图：
+    /// - 日志高亮 helper 只接收调色板，不直接依赖窗口主题状态；通过集中比较主题背景色，保持渲染路径和测试路径都能得到一致结果。
+    /// - 如果未来暗色主题调色板调整，只需要继续保证 `AppThemePalette::for_theme` 是唯一来源，日志高亮就会跟随主题分支。
+    fn log_palette_is_dark(palette: AppThemePalette) -> bool {
+        palette.background == AppThemePalette::for_theme(EffectiveTheme::Dark).background
     }
 
     /// 渲染单个加载脉冲点。
@@ -443,11 +531,12 @@ impl MainView {
                                                         )
                                                     {
                                                         // 搜索命中片段是定位反馈，只给关键字本身增加背景；后续选区高亮仍可覆盖它。
-                                                        line_highlights = gpui::combine_highlights(
+                                                        line_highlights =
+                                                            Self::combine_log_highlights_with_search_match(
                                                             line_highlights,
-                                                            [(range, style)],
-                                                        )
-                                                        .collect();
+                                                            range,
+                                                            style,
+                                                        );
                                                     }
                                                     if let Some(selection) = &text_selection
                                                         && let Some(range) =
@@ -461,6 +550,7 @@ impl MainView {
                                                             Self::combine_log_highlights_with_selection(
                                                                 line_highlights,
                                                                 range,
+                                                                palette,
                                                             );
                                                     }
                                                     let expanded_line =
@@ -607,16 +697,22 @@ impl MainView {
                     palette,
                 ) {
                     // 分页模式和内存模式保持一致：行容器负责整行定位背景，文本高亮只覆盖命中关键字片段。
-                    line_highlights =
-                        gpui::combine_highlights(line_highlights, [(range, style)]).collect();
+                    line_highlights = Self::combine_log_highlights_with_search_match(
+                        line_highlights,
+                        range,
+                        style,
+                    );
                 }
                 if let Some(selection) = &text_selection
                     && let Some(range) =
                         Self::selected_byte_range_for_line(selection, line_index, &line)
                 {
                     // 分页模式和内存模式保持相同的背景优先级：鼠标选区覆盖搜索关键字背景。
-                    line_highlights =
-                        Self::combine_log_highlights_with_selection(line_highlights, range);
+                    line_highlights = Self::combine_log_highlights_with_selection(
+                        line_highlights,
+                        range,
+                        palette,
+                    );
                 }
                 let expanded_line = Self::expanded_log_line_for_display(&line);
                 let display_highlights =

@@ -45,11 +45,12 @@ pub(in crate::app) const CONNECTIONS_TOOLBAR_HEIGHT: f32 = TOOLBAR_HEIGHT;
 /// - 右侧 tab 栏必须和左侧连接工具栏同高，否则空 tab 状态下左右顶部边线会错位。
 pub(in crate::app) const CONNECTIONS_TAB_BAR_HEIGHT: f32 = CONNECTIONS_TOOLBAR_HEIGHT;
 
-/// 终端状态栏高度。
+/// 终端内容内边距。
 ///
 /// 实现原因：
-/// - 鼠标事件拿到的是窗口坐标，换算终端格点时必须扣除 tab 栏和状态栏，常量化后渲染和事件处理共用同一约束。
-pub(in crate::app) const CONNECTIONS_TERMINAL_STATUS_BAR_HEIGHT: f32 = 28.0;
+/// - 终端文本不能紧贴 tab 栏和右侧边界，否则光标、中文宽字符和选区边缘在亮色主题下会显得拥挤。
+/// - 该值同时参与鼠标格点换算，保证点击位置与实际绘制文本保持一致。
+pub(in crate::app) const CONNECTION_TERMINAL_PADDING: f32 = 2.0;
 
 /// 终端默认字体大小。
 pub(in crate::app) const CONNECTION_TERMINAL_FONT_SIZE: f32 = 13.0;
@@ -70,10 +71,25 @@ pub(in crate::app) const CONNECTION_TERMINAL_CELL_WIDTH: f32 = 8.0;
 /// 连接页事件轮询间隔。
 pub(in crate::app) const CONNECTIONS_TERMINAL_POLL_MILLIS: u64 = 30;
 
+/// 左侧连接行右键菜单宽度。
+///
+/// UI 约束：
+/// - 菜单需要容纳“连接 / 编辑 / 删除”三项，同时不能覆盖过多连接名称区域。
+pub(in crate::app) const CONNECTIONS_CONTEXT_MENU_WIDTH: f32 = 148.0;
+
+/// 左侧连接行右键菜单单项高度。
+pub(in crate::app) const CONNECTIONS_CONTEXT_MENU_ITEM_HEIGHT: f32 = 32.0;
+
+/// 左侧连接行右键菜单纵向内边距总和。
+///
+/// UI 约束：
+/// - 右键菜单使用 `.py_1()`，上下各 4px；坐标夹紧必须把这部分高度算进去，否则底部菜单项仍可能被窗口裁掉。
+pub(in crate::app) const CONNECTIONS_CONTEXT_MENU_VERTICAL_PADDING: f32 = 8.0;
+
 /// 连接终端区域主题色。
 ///
 /// 业务意图：
-/// - 终端 tab、状态栏、正文背景和默认 ANSI 前景/背景必须跟随应用明暗主题，避免亮色主题下仍出现大面积深色块。
+/// - 终端 tab、正文背景和默认 ANSI 前景/背景必须跟随应用明暗主题，避免亮色主题下仍出现大面积深色块。
 /// - 这里只集中定义连接页终端外壳颜色；远端程序主动输出的 256 色或 truecolor 仍按终端协议优先展示。
 #[derive(Clone, Copy)]
 pub(in crate::app) struct ConnectionTerminalUiColors {
@@ -81,10 +97,8 @@ pub(in crate::app) struct ConnectionTerminalUiColors {
     pub(in crate::app) background: u32,
     /// 终端默认文字色。
     pub(in crate::app) foreground: u32,
-    /// 终端次级文字色，例如状态栏和图标。
+    /// 终端次级文字色，例如空状态和 tab 图标。
     pub(in crate::app) muted: u32,
-    /// 终端内部分割线颜色。
-    pub(in crate::app) border: u32,
     /// 激活 tab 背景色。
     pub(in crate::app) active_tab_background: u32,
     /// 未激活 tab 背景色。
@@ -115,7 +129,6 @@ pub(in crate::app) fn connection_terminal_ui_colors(
             background: palette.surface,
             foreground: palette.text,
             muted: palette.muted_text,
-            border: palette.border,
             active_tab_background: palette.surface,
             inactive_tab_background: palette.panel,
             active_tab_text: palette.text,
@@ -130,7 +143,6 @@ pub(in crate::app) fn connection_terminal_ui_colors(
             background: 0x0f172a,
             foreground: 0xe5e7eb,
             muted: 0x94a3b8,
-            border: 0x1e293b,
             active_tab_background: 0x0f172a,
             inactive_tab_background: palette.panel,
             active_tab_text: 0xe5e7eb,
@@ -201,6 +213,12 @@ pub(in crate::app) struct ConnectionsWorkspaceState {
     /// - 顶部新增按钮不直接假定只有 SSH，而是先打开类型菜单；当前菜单包含 SSH 和本地终端，后续可追加其它协议。
     /// - 菜单状态只属于左侧连接栏，关闭或选择后必须立即复位，避免遮挡连接列表点击。
     pub(in crate::app) create_menu_open: bool,
+    /// 左侧连接行右键菜单。
+    ///
+    /// UI 约束：
+    /// - 连接卡片本身只负责单击直连，编辑和删除等低频动作统一收进右键菜单，避免卡片内按钮互相抢占点击区域。
+    /// - 菜单坐标保存为左侧连接栏内部坐标；鼠标事件进入时需要扣除主导航宽度并限制在侧栏范围内。
+    pub(in crate::app) profile_context_menu: Option<ConnectionProfileContextMenu>,
     /// 新增/编辑连接弹窗状态。
     pub(in crate::app) dialog: Option<ConnectionDialogState>,
     /// 删除连接确认弹窗状态。
@@ -244,6 +262,7 @@ impl ConnectionsWorkspaceState {
             tabs: Vec::new(),
             tab_bar_scroll_handle: ScrollHandle::new(),
             create_menu_open: false,
+            profile_context_menu: None,
             dialog: None,
             delete_confirm_dialog: None,
             host_key_dialog: None,
@@ -368,6 +387,31 @@ impl ConnectionCreateKind {
             Self::LocalTerminal => Icon::SquareTerminal,
         }
     }
+}
+
+/// 左侧连接行右键菜单状态。
+pub(in crate::app) struct ConnectionProfileContextMenu {
+    /// 菜单目标连接 ID。
+    pub(in crate::app) profile_id: String,
+    /// 菜单在连接侧栏内部的横坐标。
+    pub(in crate::app) x: f32,
+    /// 菜单在连接侧栏内部的纵坐标。
+    pub(in crate::app) y: f32,
+}
+
+/// 左侧连接行右键菜单动作。
+///
+/// 业务意图：
+/// - 单击连接行已变为直接连接；右键菜单保留“连接”以兼容用户从菜单确认动作的习惯。
+/// - 编辑和删除都需要明确指向当前右键目标，避免依赖左侧当前高亮项造成误操作。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::app) enum ConnectionProfileContextMenuAction {
+    /// 打开一个新的 SSH 终端 tab。
+    Connect,
+    /// 打开编辑连接弹窗。
+    Edit,
+    /// 打开删除确认弹窗。
+    Delete,
 }
 
 /// 新增/编辑连接弹窗状态。

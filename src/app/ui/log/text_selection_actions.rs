@@ -325,12 +325,22 @@ impl MainView {
     /// 构造日志正文选区高亮样式。
     ///
     /// 业务意图：
-    /// - 语法高亮按文字颜色表达，选区属于交互反馈，需要使用浅色背景以接近系统文本选择体验。
-    /// - 字体颜色保持默认，避免复制选区时影响日志级别、时间戳等已有高亮的可读性。
-    pub(in crate::app) fn log_text_selection_highlight_style() -> gpui::HighlightStyle {
-        gpui::HighlightStyle {
-            background_color: Some(rgb(0xcfe8ff).into()),
-            ..Default::default()
+    /// - 语法高亮按文字颜色表达，选区属于交互反馈，需要在不同主题下使用足够清晰的背景。
+    /// - 亮色主题保留浅蓝背景和原有前景色，避免改变现有阅读习惯；暗色主题改用深蓝背景和浅色前景，解决绿色日志文本落在选区上对比度不足的问题。
+    pub(in crate::app) fn log_text_selection_highlight_style(
+        palette: AppThemePalette,
+    ) -> gpui::HighlightStyle {
+        if palette.background == AppThemePalette::for_theme(EffectiveTheme::Dark).background {
+            gpui::HighlightStyle {
+                color: Some(rgb(0xf8fafc).into()),
+                background_color: Some(rgb(0x2563eb).into()),
+                ..Default::default()
+            }
+        } else {
+            gpui::HighlightStyle {
+                background_color: Some(rgb(0xcfe8ff).into()),
+                ..Default::default()
+            }
         }
     }
 }
