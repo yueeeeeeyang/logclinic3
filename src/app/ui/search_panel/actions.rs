@@ -994,6 +994,8 @@ impl MainView {
                 matched_lines: 0,
             },
             results: Vec::new(),
+            result_groups: Vec::new(),
+            result_group_indices: HashMap::new(),
             errors: Vec::new(),
             canceled: false,
             expanded: true,
@@ -1252,19 +1254,44 @@ impl MainView {
 
         let mut matched_lines = 0usize;
         if let Some(panel) = self.search.search_results_panel.as_mut() {
+            let record_index_to_refresh;
             {
-                let Some(record) = panel
+                let Some((record_index, record)) = panel
                     .records
                     .iter_mut()
-                    .find(|record| record.job_id == job_id)
+                    .enumerate()
+                    .find(|(_, record)| record.job_id == job_id)
                 else {
                     return false;
                 };
+                record_index_to_refresh = record_index;
                 match result {
                     Ok(mut results) => {
                         matched_lines = results.len();
-                        for result in &results {
-                            record.expanded_file_keys.insert(result.source_key.clone());
+                        let first_result_index = record.results.len();
+                        for (offset, result) in results.iter().enumerate() {
+                            let result_index = first_result_index + offset;
+                            let source_key = result.source_key.clone();
+                            let group_index = if let Some(group_index) =
+                                record.result_group_indices.get(&source_key).copied()
+                            {
+                                group_index
+                            } else {
+                                let group_index = record.result_groups.len();
+                                record.result_groups.push(SearchResultFileGroup {
+                                    source_key: source_key.clone(),
+                                    full_path: Self::search_result_source_full_path(&result.source),
+                                    result_indices: Vec::new(),
+                                });
+                                record
+                                    .result_group_indices
+                                    .insert(source_key.clone(), group_index);
+                                group_index
+                            };
+                            if let Some(group) = record.result_groups.get_mut(group_index) {
+                                group.result_indices.push(result_index);
+                            }
+                            record.expanded_file_keys.insert(source_key);
                         }
                         record.results.append(&mut results);
                     }
@@ -1276,7 +1303,7 @@ impl MainView {
                 record.progress.total_files = total_files;
                 record.progress.matched_lines = record.results.len();
             }
-            panel.rows = Self::search_results_panel_rows_from_records(&panel.records);
+            Self::replace_search_results_panel_rows_for_record(panel, record_index_to_refresh);
         }
 
         if let Some(dialog) = self.search.search_dialog.as_mut() {

@@ -950,6 +950,16 @@ pub(in crate::app) struct OpenLogTab {
     /// - 超大日志的真实滚动距离可能达到数亿像素，必须用 `f64` 保存在应用状态中，渲染时再映射到视口内的小坐标。
     /// - 普通内存日志不读取该字段；切换编码或重新加载时必须重置。
     pub(in crate::app) paged_scroll: PagedLogScrollState,
+    /// 分页日志当前视口的后台解码缓存。
+    ///
+    /// 业务意图：
+    /// - 分页日志渲染路径只能消费已经准备好的行文本，不能在 GPUI render 过程中同步 `seek/read` 大文件。
+    /// - 使用 `RefCell` 是因为 GPUI render 方法只拿到 `&self` 和不可变 tab 引用，但发起后台预取时需要记录“已请求范围”，避免一帧内重复投递任务。
+    ///
+    /// 边界条件：
+    /// - 该状态只属于 UI 线程；后台任务只带走请求参数和 `PagedLogDocument` 克隆，完成后再按 tab ID 合并结果。
+    /// - 文件重新加载、编码切换或 tab 内容替换时必须重置，避免旧编码的行文本显示到新文档上。
+    pub(in crate::app) paged_visible_lines: RefCell<PagedLogVisibleLinesState>,
     /// 打开后需要滚动定位的目标行。
     ///
     /// 业务意图：
@@ -1030,6 +1040,40 @@ pub(in crate::app) struct PagedLogScrollState {
     pub(in crate::app) top_px: f64,
     /// 当前视口左侧对应的横向内容偏移，单位为逻辑像素。
     pub(in crate::app) left_px: f64,
+}
+
+/// 分页日志可见行后台读取请求。
+///
+/// 业务意图：
+/// - 视口滚动后只需要解码连续的一小段行；把起始行和容量作为请求键，可以判断缓存是否仍能服务当前帧。
+/// - 请求不包含 tab ID，tab ID 属于 UI 合并阶段的路由信息，避免把同一个文档读取能力和 UI 容器耦合。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::app) struct PagedLogVisibleLinesRequest {
+    /// 0 基可见起始行。
+    pub(in crate::app) start_line: usize,
+    /// 当前视口最多需要展示的行数，已经包含上方半行和底部缓冲。
+    pub(in crate::app) max_lines: usize,
+}
+
+/// 分页日志可见行后台读取缓存。
+///
+/// 业务意图：
+/// - render 只读取 `ready_lines`；如果当前请求尚未完成，则显示空白可见区并等待后台任务回填，避免 UI 线程阻塞。
+/// - `pending_request` 用于去重同一滚动位置上的重复重绘；滚动到新区域后允许新请求覆盖旧请求，旧结果返回时会被丢弃。
+///
+/// 边界条件：
+/// - `ready_request` 和 `ready_lines` 必须一起更新，保证行文本与请求范围一致。
+/// - `error_message` 仅用于调试和后续 UI 提示扩展；当前 viewer 保持原有容错策略，不因为一次可见区读取失败切换整个 tab 状态。
+#[derive(Debug, Default)]
+pub(in crate::app) struct PagedLogVisibleLinesState {
+    /// 最近一次已经完成并可安全渲染的请求范围。
+    pub(in crate::app) ready_request: Option<PagedLogVisibleLinesRequest>,
+    /// 与 `ready_request` 对应的解码行文本。
+    pub(in crate::app) ready_lines: Vec<log_document::PagedLine>,
+    /// 当前已经投递到后台线程但尚未返回的请求范围。
+    pub(in crate::app) pending_request: Option<PagedLogVisibleLinesRequest>,
+    /// 最近一次后台读取失败的中文错误。
+    pub(in crate::app) error_message: Option<String>,
 }
 
 /// 日志正文中的文本位置。
@@ -2025,6 +2069,20 @@ pub(in crate::app) struct SearchHistoryRecord {
     pub(in crate::app) progress: SearchProgress,
     /// 搜索命中结果。
     pub(in crate::app) results: Vec<SearchResultItem>,
+    /// 按文件来源维护的搜索命中分组缓存。
+    ///
+    /// 业务意图：
+    /// - 目录搜索会按文件分批返回结果，面板不能每个文件完成后重新扫描整条历史记录来构建分组。
+    /// - 分组只保存 `results` 下标，追加新文件结果时按增量写入，虚拟列表行重建可以直接消费该缓存。
+    pub(in crate::app) result_groups: Vec<SearchResultFileGroup>,
+    /// 文件来源稳定键到分组下标的索引。
+    ///
+    /// 业务意图：
+    /// - 同一个文件可能被分多批返回或后续补充结果，用 O(1) 索引定位已有分组，避免在分组数量较多时线性查找。
+    ///
+    /// 边界条件：
+    /// - 该索引只服务当前进程内 UI 缓存，不持久化；如果测试或维护代码直接改写 `results`，需要同步重建分组缓存。
+    pub(in crate::app) result_group_indices: HashMap<String, usize>,
     /// 单文件读取或解码失败列表。
     pub(in crate::app) errors: Vec<SearchFileError>,
     /// 当前记录是否来自被用户取消的搜索任务。

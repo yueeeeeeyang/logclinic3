@@ -216,42 +216,101 @@ impl MainView {
     ) -> Vec<SearchResultsPanelRow> {
         let mut rows = Vec::new();
         for (record_index, record) in records.iter().enumerate().rev() {
-            rows.push(SearchResultsPanelRow::RecordHeader { record_index });
-
-            if !record.expanded {
-                continue;
-            }
-
-            if record.results.is_empty() && record.errors.is_empty() {
-                rows.push(SearchResultsPanelRow::Empty { record_index });
-                continue;
-            }
-
-            for group in Self::search_result_file_groups(record) {
-                let expanded = record.expanded_file_keys.contains(&group.source_key);
-                rows.push(SearchResultsPanelRow::FileHeader {
-                    record_index,
-                    source_key: group.source_key,
-                    full_path: group.full_path,
-                    result_count: group.result_indices.len(),
-                });
-                if expanded {
-                    rows.extend(group.result_indices.into_iter().map(|result_index| {
-                        SearchResultsPanelRow::Result {
-                            record_index,
-                            result_index,
-                        }
-                    }));
-                }
-            }
-            rows.extend(
-                (0..record.errors.len()).map(|error_index| SearchResultsPanelRow::Error {
-                    record_index,
-                    error_index,
-                }),
-            );
+            rows.extend(Self::search_results_panel_rows_for_record(
+                record_index,
+                record,
+            ));
         }
         rows
+    }
+
+    /// 将单条搜索历史记录展平成虚拟列表行。
+    ///
+    /// 业务意图：
+    /// - 单文件搜索结果返回时只需要替换对应历史记录的行段，不应重建整个结果面板缓存。
+    /// - 该函数让完整重建和局部替换共享同一套行生成规则，避免展开状态或错误行顺序出现分歧。
+    pub(in crate::app) fn search_results_panel_rows_for_record(
+        record_index: usize,
+        record: &SearchHistoryRecord,
+    ) -> Vec<SearchResultsPanelRow> {
+        let mut rows = vec![SearchResultsPanelRow::RecordHeader { record_index }];
+
+        if !record.expanded {
+            return rows;
+        }
+
+        if record.results.is_empty() && record.errors.is_empty() {
+            rows.push(SearchResultsPanelRow::Empty { record_index });
+            return rows;
+        }
+
+        for group in Self::search_result_file_groups(record) {
+            let expanded = record.expanded_file_keys.contains(&group.source_key);
+            rows.push(SearchResultsPanelRow::FileHeader {
+                record_index,
+                source_key: group.source_key,
+                full_path: group.full_path,
+                result_count: group.result_indices.len(),
+            });
+            if expanded {
+                rows.extend(group.result_indices.into_iter().map(|result_index| {
+                    SearchResultsPanelRow::Result {
+                        record_index,
+                        result_index,
+                    }
+                }));
+            }
+        }
+        rows.extend(
+            (0..record.errors.len()).map(|error_index| SearchResultsPanelRow::Error {
+                record_index,
+                error_index,
+            }),
+        );
+        rows
+    }
+
+    /// 替换搜索结果面板中单条历史记录对应的行段。
+    ///
+    /// 业务意图：
+    /// - 目录搜索每完成一个文件都会回到 UI 线程，如果每次都从全部历史记录重建 `rows`，大量结果会把追加更新放大成 O(n²)。
+    /// - 行模型按记录连续排列，因此可以定位该记录的起止行后做局部 `splice`。
+    ///
+    /// 边界条件：
+    /// - 如果当前缓存中找不到该记录行段，说明记录刚创建或缓存被重置，退回完整重建保证 UI 正确。
+    pub(in crate::app) fn replace_search_results_panel_rows_for_record(
+        panel: &mut SearchResultsPanelState,
+        record_index: usize,
+    ) {
+        let Some(record) = panel.records.get(record_index) else {
+            return;
+        };
+        let replacement = Self::search_results_panel_rows_for_record(record_index, record);
+        let Some(start) = panel
+            .rows
+            .iter()
+            .position(|row| Self::search_results_panel_row_record_index(row) == record_index)
+        else {
+            panel.rows = Self::search_results_panel_rows_from_records(&panel.records);
+            return;
+        };
+        let end = start
+            + panel.rows[start..]
+                .iter()
+                .take_while(|row| Self::search_results_panel_row_record_index(row) == record_index)
+                .count();
+        panel.rows.splice(start..end, replacement);
+    }
+
+    /// 返回虚拟列表行所属的搜索历史记录下标。
+    fn search_results_panel_row_record_index(row: &SearchResultsPanelRow) -> usize {
+        match row {
+            SearchResultsPanelRow::RecordHeader { record_index }
+            | SearchResultsPanelRow::FileHeader { record_index, .. }
+            | SearchResultsPanelRow::Result { record_index, .. }
+            | SearchResultsPanelRow::Error { record_index, .. }
+            | SearchResultsPanelRow::Empty { record_index } => *record_index,
+        }
     }
 
     /// 按文件来源对搜索命中进行稳定分组。
@@ -262,6 +321,10 @@ impl MainView {
     pub(in crate::app) fn search_result_file_groups(
         record: &SearchHistoryRecord,
     ) -> Vec<SearchResultFileGroup> {
+        if !record.result_groups.is_empty() || record.results.is_empty() {
+            return record.result_groups.clone();
+        }
+
         let mut groups: Vec<SearchResultFileGroup> = Vec::new();
 
         for (result_index, result) in record.results.iter().enumerate() {
@@ -520,10 +583,9 @@ impl MainView {
 
         for record in &mut panel.records {
             record.expanded = true;
-            record.expanded_file_keys = record
-                .results
-                .iter()
-                .map(|result| result.source_key.clone())
+            record.expanded_file_keys = Self::search_result_file_groups(record)
+                .into_iter()
+                .map(|group| group.source_key)
                 .collect();
         }
         panel.rows = Self::search_results_panel_rows_from_records(&panel.records);
@@ -805,11 +867,16 @@ impl MainView {
             )
             .on_click(
                 context.listener(move |view, _event: &ClickEvent, _window, context| {
-                    if let Some(panel) = view.search.search_results_panel.as_mut()
-                        && let Some(record) = panel.records.get_mut(record_index)
-                    {
-                        record.expanded = !record.expanded;
-                        panel.rows = Self::search_results_panel_rows_from_records(&panel.records);
+                    if let Some(panel) = view.search.search_results_panel.as_mut() {
+                        let updated = if let Some(record) = panel.records.get_mut(record_index) {
+                            record.expanded = !record.expanded;
+                            true
+                        } else {
+                            false
+                        };
+                        if updated {
+                            Self::replace_search_results_panel_rows_for_record(panel, record_index);
+                        }
                     }
                     context.notify();
                 }),
@@ -889,15 +956,20 @@ impl MainView {
             )
             .on_click(
                 context.listener(move |view, _event: &ClickEvent, _window, context| {
-                    if let Some(panel) = view.search.search_results_panel.as_mut()
-                        && let Some(record) = panel.records.get_mut(record_index)
-                    {
-                        if !record.expanded_file_keys.remove(&source_key_for_click) {
-                            record
-                                .expanded_file_keys
-                                .insert(source_key_for_click.clone());
+                    if let Some(panel) = view.search.search_results_panel.as_mut() {
+                        let updated = if let Some(record) = panel.records.get_mut(record_index) {
+                            if !record.expanded_file_keys.remove(&source_key_for_click) {
+                                record
+                                    .expanded_file_keys
+                                    .insert(source_key_for_click.clone());
+                            }
+                            true
+                        } else {
+                            false
+                        };
+                        if updated {
+                            Self::replace_search_results_panel_rows_for_record(panel, record_index);
                         }
-                        panel.rows = Self::search_results_panel_rows_from_records(&panel.records);
                     }
                     context.notify();
                 }),

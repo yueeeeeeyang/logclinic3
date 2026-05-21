@@ -1364,6 +1364,8 @@ mod state_tests {
                 matched_lines: 2,
             },
             results: Vec::new(),
+            result_groups: Vec::new(),
+            result_group_indices: HashMap::new(),
             errors: Vec::new(),
             canceled: true,
             expanded: true,
@@ -1393,6 +1395,8 @@ mod state_tests {
                 matched_lines: 2,
             },
             results: Vec::new(),
+            result_groups: Vec::new(),
+            result_group_indices: HashMap::new(),
             errors: Vec::new(),
             canceled: false,
             expanded: true,
@@ -3192,6 +3196,38 @@ mod state_tests {
         }
     }
 
+    /// 验证线程分析线程名列只扩展到线程名内容所需宽度。
+    ///
+    /// 业务意图：
+    /// - 线程日志分析结果中快照数量较少时，右侧时间线只占用少量宽度；此时长线程名不应仍被固定 260px 截断。
+    /// - 线程名列只需要显示完整线程名，不应把时间线右侧所有空白都吞掉，否则用户会误以为还有额外内容列。
+    #[test]
+    fn 线程分析线程名列只扩展到内容宽度() {
+        let short_required_width =
+            ThreadAnalysisWindowView::thread_analysis_name_column_required_width("SubThread");
+        let short_width =
+            ThreadAnalysisWindowView::thread_analysis_name_column_width_for_required_width(
+                short_required_width,
+            );
+        assert_eq!(short_width, THREAD_ANALYSIS_NAME_COLUMN_WIDTH);
+
+        let long_name = "CACHE_REINIT_weaver.hrm.resource.ResourceComInfo_1779295169625";
+        let long_required_width =
+            ThreadAnalysisWindowView::thread_analysis_name_column_required_width(long_name);
+        let expanded_width =
+            ThreadAnalysisWindowView::thread_analysis_name_column_width_for_required_width(
+                long_required_width,
+            );
+        assert_eq!(expanded_width, long_required_width);
+        assert!(expanded_width > THREAD_ANALYSIS_NAME_COLUMN_WIDTH);
+
+        let viewport_remaining_width = 1200.0 - 13.0 * THREAD_ANALYSIS_SNAPSHOT_COLUMN_WIDTH;
+        assert!(
+            expanded_width < viewport_remaining_width,
+            "线程名列不应为了填满容器而扩展到右侧剩余空白"
+        );
+    }
+
     /// 验证线程分析气泡在窗口右下角会自动改为向左上方弹出。
     ///
     /// 业务意图：
@@ -3524,6 +3560,7 @@ mod state_tests {
             scroll_handle: UniformListScrollHandle::new(),
             paged_viewport_handle: ScrollHandle::new(),
             paged_scroll: PagedLogScrollState::default(),
+            paged_visible_lines: RefCell::new(PagedLogVisibleLinesState::default()),
             pending_scroll_to_line: None,
             highlighted_search_line: None,
             highlighted_search_match: None,
@@ -4234,6 +4271,8 @@ mod state_tests {
                     match_range: 0..5,
                 },
             ],
+            result_groups: Vec::new(),
+            result_group_indices: HashMap::new(),
             errors: Vec::new(),
             canceled: false,
             expanded: true,
@@ -4286,6 +4325,7 @@ mod state_tests {
                 scroll_handle: UniformListScrollHandle::new(),
                 paged_viewport_handle: ScrollHandle::new(),
                 paged_scroll: PagedLogScrollState::default(),
+                paged_visible_lines: RefCell::new(PagedLogVisibleLinesState::default()),
                 pending_scroll_to_line: None,
                 highlighted_search_line: None,
                 highlighted_search_match: None,
@@ -4307,6 +4347,7 @@ mod state_tests {
                 scroll_handle: UniformListScrollHandle::new(),
                 paged_viewport_handle: ScrollHandle::new(),
                 paged_scroll: PagedLogScrollState::default(),
+                paged_visible_lines: RefCell::new(PagedLogVisibleLinesState::default()),
                 pending_scroll_to_line: None,
                 highlighted_search_line: None,
                 highlighted_search_match: None,
@@ -4348,6 +4389,7 @@ mod state_tests {
             scroll_handle: UniformListScrollHandle::new(),
             paged_viewport_handle: ScrollHandle::new(),
             paged_scroll: PagedLogScrollState::default(),
+            paged_visible_lines: RefCell::new(PagedLogVisibleLinesState::default()),
             pending_scroll_to_line: None,
             highlighted_search_line: None,
             highlighted_search_match: None,
@@ -4463,6 +4505,7 @@ mod state_tests {
                 scroll_handle: UniformListScrollHandle::new(),
                 paged_viewport_handle: ScrollHandle::new(),
                 paged_scroll: PagedLogScrollState::default(),
+                paged_visible_lines: RefCell::new(PagedLogVisibleLinesState::default()),
                 pending_scroll_to_line: None,
                 highlighted_search_line: None,
                 highlighted_search_match: Some(LogSearchMatchHighlight {
@@ -4487,6 +4530,7 @@ mod state_tests {
                 scroll_handle: UniformListScrollHandle::new(),
                 paged_viewport_handle: ScrollHandle::new(),
                 paged_scroll: PagedLogScrollState::default(),
+                paged_visible_lines: RefCell::new(PagedLogVisibleLinesState::default()),
                 pending_scroll_to_line: None,
                 highlighted_search_line: None,
                 highlighted_search_match: Some(LogSearchMatchHighlight {

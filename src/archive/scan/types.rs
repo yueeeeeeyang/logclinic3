@@ -9,6 +9,7 @@
 //! - 树节点辅助方法限制在 `archive::scan` 内部使用，避免其它模块绕过扫描入口构造不完整来源。
 
 use std::{
+    collections::HashMap,
     error::Error,
     fmt::{self, Display},
     path::PathBuf,
@@ -104,10 +105,26 @@ pub(crate) struct ArchiveScanNode {
     pub(crate) source: Option<ArchiveMemberSource>,
     /// 子节点列表。
     pub(crate) children: Vec<ArchiveScanNode>,
+    /// 子节点查找索引。
+    ///
+    /// 业务意图：
+    /// - 压缩包可能包含大量同级成员，按路径插入时必须避免每个片段都线性扫描兄弟节点。
+    /// - 键包含名称和类型，保证同名目录、文件和错误节点不会被错误合并。
+    ///
+    /// 边界条件：
+    /// - 该索引只用于扫描构建阶段，不会暴露给日志加载器；直接扩展子节点后需要重建或增量维护。
+    child_index: HashMap<(String, ArchiveScanEntryKind), usize>,
+    /// 当前子树下可打开文件数量缓存。
+    ///
+    /// 业务意图：
+    /// - 嵌套压缩包判断和进度汇报会多次读取文件数量，缓存后避免重复递归统计。
+    descendant_file_count: usize,
+    /// 包含当前节点在内的子树节点数量缓存。
+    subtree_node_count: usize,
 }
 
 /// 压缩包扫描节点类型。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ArchiveScanEntryKind {
     /// 压缩包内部目录或被展开的内层压缩包。
     Directory,
@@ -194,6 +211,9 @@ impl ArchiveScanNode {
             error_message: None,
             source: None,
             children: Vec::new(),
+            child_index: HashMap::new(),
+            descendant_file_count: usize::from(kind == ArchiveScanEntryKind::File),
+            subtree_node_count: 1,
         }
     }
 
@@ -210,6 +230,9 @@ impl ArchiveScanNode {
             error_message: Some(error_message.into()),
             source: None,
             children: Vec::new(),
+            child_index: HashMap::new(),
+            descendant_file_count: 0,
+            subtree_node_count: 1,
         }
     }
 
@@ -220,8 +243,12 @@ impl ArchiveScanNode {
         meta: impl Into<String>,
         error_message: impl Into<String>,
     ) {
-        self.children
-            .push(Self::error(label.into(), meta.into(), error_message.into()));
+        let child = Self::error(label.into(), meta.into(), error_message.into());
+        let index = self.children.len();
+        self.child_index
+            .insert(archive_child_index_key(&child.label, child.kind), index);
+        self.children.push(child);
+        self.subtree_node_count = self.subtree_node_count.saturating_add(1);
     }
 
     /// 添加与压缩包内部路径相关的错误节点。
@@ -251,17 +278,7 @@ impl ArchiveScanNode {
         if segments.is_empty() {
             return;
         }
-
-        let mut current = self;
-        for segment in &segments[..segments.len() - 1] {
-            current = current.get_or_insert_child(segment, ArchiveScanEntryKind::Directory);
-        }
-
-        let leaf_label = &segments[segments.len() - 1];
-        let leaf = current.get_or_insert_child(leaf_label, kind);
-        leaf.meta = meta;
-        leaf.source = source;
-        leaf.error_message = error_message;
+        let _ = self.add_leaf_path_inner(segments, kind, meta, source, error_message);
     }
 
     /// 在指定路径挂载已经构建好的内层压缩包子树。
@@ -269,18 +286,9 @@ impl ArchiveScanNode {
         if segments.is_empty() {
             return;
         }
-
-        let mut current = self;
-        for segment in &segments[..segments.len() - 1] {
-            current = current.get_or_insert_child(segment, ArchiveScanEntryKind::Directory);
-        }
-
-        let leaf_label = &segments[segments.len() - 1];
-        let leaf = current.get_or_insert_child(leaf_label, ArchiveScanEntryKind::Directory);
-        leaf.meta = subtree.meta;
-        leaf.source = None;
-        leaf.error_message = subtree.error_message;
-        leaf.children.extend(subtree.children);
+        let mut subtree = subtree;
+        subtree.refresh_cached_metrics();
+        let _ = self.add_subtree_path_inner(segments, subtree);
     }
 
     /// 查找或插入一个同名同类型子节点。
@@ -288,29 +296,148 @@ impl ArchiveScanNode {
         &mut self,
         label: &str,
         kind: ArchiveScanEntryKind,
-    ) -> &mut ArchiveScanNode {
-        if let Some(index) = self
-            .children
-            .iter()
-            .position(|child| child.label == label && child.kind == kind)
-        {
-            return &mut self.children[index];
+    ) -> (&mut ArchiveScanNode, bool) {
+        let key = archive_child_index_key(label, kind);
+        if let Some(index) = self.child_index.get(&key).copied() {
+            return (&mut self.children[index], false);
         }
 
         self.children.push(Self::new(label.to_string(), kind));
         let index = self.children.len() - 1;
-        &mut self.children[index]
+        self.child_index.insert(key, index);
+        (&mut self.children[index], true)
+    }
+
+    /// 递归插入叶子路径并返回新增节点数和新增文件数。
+    ///
+    /// 业务意图：
+    /// - 在插入过程中顺便维护缓存计数，让压缩包扫描进度读取 `descendant_node_count` 时保持 O(1)。
+    /// - 返回增量而不是每次重新递归统计整棵树，避免大压缩包按条目汇报进度时退化为 O(n²)。
+    fn add_leaf_path_inner(
+        &mut self,
+        segments: &[String],
+        kind: ArchiveScanEntryKind,
+        meta: Option<String>,
+        source: Option<ArchiveMemberSource>,
+        error_message: Option<String>,
+    ) -> (usize, usize) {
+        if segments.len() == 1 {
+            let (inserted_node_count, inserted_file_count) = {
+                let (leaf, inserted) = self.get_or_insert_child(&segments[0], kind);
+                leaf.meta = meta;
+                leaf.source = source;
+                leaf.error_message = error_message;
+                (
+                    usize::from(inserted),
+                    usize::from(inserted && kind == ArchiveScanEntryKind::File),
+                )
+            };
+            self.apply_child_metric_delta(inserted_node_count, inserted_file_count);
+            return (inserted_node_count, inserted_file_count);
+        }
+
+        let (inserted_directory_count, child_node_delta, child_file_delta) = {
+            let (child, inserted) =
+                self.get_or_insert_child(&segments[0], ArchiveScanEntryKind::Directory);
+            let (child_node_delta, child_file_delta) =
+                child.add_leaf_path_inner(&segments[1..], kind, meta, source, error_message);
+            (usize::from(inserted), child_node_delta, child_file_delta)
+        };
+        let node_delta = inserted_directory_count.saturating_add(child_node_delta);
+        self.apply_child_metric_delta(node_delta, child_file_delta);
+        (node_delta, child_file_delta)
+    }
+
+    /// 递归挂载内层压缩包子树并返回新增节点数和新增文件数。
+    fn add_subtree_path_inner(
+        &mut self,
+        segments: &[String],
+        subtree: ArchiveScanNode,
+    ) -> (usize, usize) {
+        if segments.len() == 1 {
+            let subtree_children_node_count = subtree
+                .children
+                .iter()
+                .map(|child| child.subtree_node_count)
+                .sum::<usize>();
+            let subtree_children_file_count = subtree
+                .children
+                .iter()
+                .map(|child| child.descendant_file_count)
+                .sum::<usize>();
+            let (inserted_node_count, child_node_delta, child_file_delta) = {
+                let (leaf, inserted) =
+                    self.get_or_insert_child(&segments[0], ArchiveScanEntryKind::Directory);
+                leaf.meta = subtree.meta;
+                leaf.source = None;
+                leaf.error_message = subtree.error_message;
+                leaf.children.extend(subtree.children);
+                leaf.refresh_cached_metrics();
+                (
+                    usize::from(inserted),
+                    subtree_children_node_count,
+                    subtree_children_file_count,
+                )
+            };
+            let node_delta = inserted_node_count.saturating_add(child_node_delta);
+            self.apply_child_metric_delta(node_delta, child_file_delta);
+            return (node_delta, child_file_delta);
+        }
+
+        let (inserted_directory_count, child_node_delta, child_file_delta) = {
+            let (child, inserted) =
+                self.get_or_insert_child(&segments[0], ArchiveScanEntryKind::Directory);
+            let (child_node_delta, child_file_delta) =
+                child.add_subtree_path_inner(&segments[1..], subtree);
+            (usize::from(inserted), child_node_delta, child_file_delta)
+        };
+        let node_delta = inserted_directory_count.saturating_add(child_node_delta);
+        self.apply_child_metric_delta(node_delta, child_file_delta);
+        (node_delta, child_file_delta)
+    }
+
+    /// 将子节点增量合并到当前节点缓存。
+    fn apply_child_metric_delta(&mut self, node_delta: usize, file_delta: usize) {
+        self.subtree_node_count = self.subtree_node_count.saturating_add(node_delta);
+        if self.kind != ArchiveScanEntryKind::File {
+            self.descendant_file_count = self.descendant_file_count.saturating_add(file_delta);
+        }
+    }
+
+    /// 递归刷新当前子树缓存和子节点索引。
+    ///
+    /// 业务意图：
+    /// - 某些路径会直接扩展已构建子树，刷新方法用于在挂载前后重新建立精确计数和索引。
+    fn refresh_cached_metrics(&mut self) {
+        for child in &mut self.children {
+            child.refresh_cached_metrics();
+        }
+        self.child_index.clear();
+        self.child_index.extend(
+            self.children
+                .iter()
+                .enumerate()
+                .map(|(index, child)| (archive_child_index_key(&child.label, child.kind), index)),
+        );
+        self.subtree_node_count = 1usize.saturating_add(
+            self.children
+                .iter()
+                .map(|child| child.subtree_node_count)
+                .sum::<usize>(),
+        );
+        self.descendant_file_count = if self.kind == ArchiveScanEntryKind::File {
+            1
+        } else {
+            self.children
+                .iter()
+                .map(|child| child.descendant_file_count)
+                .sum()
+        };
     }
 
     /// 递归统计可打开文件节点数量。
     pub(super) fn descendant_file_count(&self) -> usize {
-        match self.kind {
-            ArchiveScanEntryKind::File => 1,
-            ArchiveScanEntryKind::Directory => {
-                self.children.iter().map(Self::descendant_file_count).sum()
-            }
-            ArchiveScanEntryKind::Error => 0,
-        }
+        self.descendant_file_count
     }
 
     /// 递归统计当前节点下所有可展示节点数量，不包含当前隐藏根节点。
@@ -319,21 +446,14 @@ impl ArchiveScanNode {
     /// - 加载压缩包时需要在目录树真正挂载前向用户展示“已发现多少节点”。
     /// - 扫描入口使用一个空标签根节点承载所有成员，该根节点不会出现在 UI 中，因此这里只统计子树。
     pub(super) fn descendant_node_count(&self) -> usize {
-        self.children
-            .iter()
-            .map(Self::node_count_including_self)
-            .sum()
+        self.subtree_node_count.saturating_sub(1)
     }
+}
 
-    /// 递归统计包含当前节点在内的节点数量。
-    ///
-    /// 边界条件：
-    /// - 错误节点也会显示在目录树中，因此同样计入节点数，帮助用户理解坏条目并非扫描停滞。
-    fn node_count_including_self(&self) -> usize {
-        1 + self
-            .children
-            .iter()
-            .map(Self::node_count_including_self)
-            .sum::<usize>()
-    }
+/// 构造压缩包扫描节点查找索引键。
+fn archive_child_index_key(
+    label: &str,
+    kind: ArchiveScanEntryKind,
+) -> (String, ArchiveScanEntryKind) {
+    (label.to_string(), kind)
 }

@@ -290,7 +290,7 @@ pub struct LogTreeRow {
 /// 业务意图：
 /// - 类型枚举让 UI 渲染保持稳定，不依赖扩展名、颜色或错误文案等易变展示细节。
 /// - 压缩包作为独立类型展示，方便用户区分真实目录和归档文件内部结构。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LogTreeEntryKind {
     /// 普通目录节点。
     Directory,

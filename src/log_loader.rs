@@ -12,6 +12,7 @@
 //! - 压缩包内部路径必须做安全归一化，绝对路径、盘符路径和 `..` 路径即使不落盘也不能作为正常树节点展示。
 
 use std::{
+    collections::HashMap,
     fs,
     path::{Component, Path, PathBuf},
 };
@@ -89,7 +90,7 @@ where
         );
         report_progress(progress.clone());
         let error_count_before_source = error_count;
-        let root = load_single_source(
+        let mut root = load_single_source(
             &paths[0],
             &mut error_count,
             &mut temporary_paths,
@@ -103,6 +104,7 @@ where
                 report_progress(progress.clone());
             },
         );
+        root.refresh_cached_metrics();
         progress.processed_sources = 1;
         progress.current_source = None;
         clear_current_source_progress(&mut progress);
@@ -126,7 +128,7 @@ where
             );
             report_progress(progress.clone());
             let error_count_before_source = error_count;
-            let source_root = load_single_source(
+            let mut source_root = load_single_source(
                 path,
                 &mut error_count,
                 &mut temporary_paths,
@@ -140,7 +142,16 @@ where
                     report_progress(progress.clone());
                 },
             );
+            source_root.refresh_cached_metrics();
+            let source_node_count = source_root.subtree_node_count;
+            let source_file_count = source_root.descendant_file_count;
             virtual_root.children.push(source_root);
+            virtual_root.subtree_node_count = virtual_root
+                .subtree_node_count
+                .saturating_add(source_node_count);
+            virtual_root.descendant_file_count = virtual_root
+                .descendant_file_count
+                .saturating_add(source_file_count);
             progress.processed_sources = progress.processed_sources.saturating_add(1);
             progress.current_source = None;
             clear_current_source_progress(&mut progress);
@@ -253,6 +264,9 @@ fn load_single_source(
             error_message: None,
             source: None,
             children: Vec::new(),
+            child_index: HashMap::new(),
+            descendant_file_count: 0,
+            subtree_node_count: 1,
         };
     }
 
@@ -271,6 +285,9 @@ fn load_single_source(
                 error_message: None,
                 source: None,
                 children: Vec::new(),
+                child_index: HashMap::new(),
+                descendant_file_count: 0,
+                subtree_node_count: 1,
             };
 
             match scan_archive_with_progress(path, format, |archive_progress| {
@@ -301,6 +318,9 @@ fn load_single_source(
                 path: path.to_path_buf(),
             }),
             children: Vec::new(),
+            child_index: HashMap::new(),
+            descendant_file_count: 1,
+            subtree_node_count: 1,
         };
     }
 
@@ -437,6 +457,9 @@ fn archive_node_to_tree_node(node: ArchiveScanNode) -> TreeNode {
             .into_iter()
             .map(archive_node_to_tree_node)
             .collect(),
+        child_index: HashMap::new(),
+        descendant_file_count: 0,
+        subtree_node_count: 1,
     }
 }
 
@@ -552,6 +575,25 @@ struct TreeNode {
     source: Option<LogFileSource>,
     /// 子节点列表。
     children: Vec<TreeNode>,
+    /// 子节点查找索引。
+    ///
+    /// 业务意图：
+    /// - 目录和压缩包可能包含大量同级文件，插入路径时不能每个片段都线性扫描已有兄弟节点。
+    /// - 键使用“名称 + 类型”，保持同名文件和目录可以共存的既有业务语义。
+    ///
+    /// 边界条件：
+    /// - 排序会改变子节点下标，因此排序后必须重建索引；该字段只服务构建阶段，不输出给 UI。
+    child_index: HashMap<(String, LogTreeEntryKind), usize>,
+    /// 当前节点下可打开文件节点数量的缓存。
+    ///
+    /// 业务意图：
+    /// - 扁平化目录树时每个目录都要展示文件数量，不能在每个目录行上重新递归统计整棵子树。
+    descendant_file_count: usize,
+    /// 当前子树节点总数缓存。
+    ///
+    /// 业务意图：
+    /// - 加载进度需要展示已发现节点数，缓存后可以避免整理阶段反复递归计数。
+    subtree_node_count: usize,
 }
 
 impl TreeNode {
@@ -567,6 +609,9 @@ impl TreeNode {
             error_message: None,
             source: None,
             children: Vec::new(),
+            child_index: HashMap::new(),
+            descendant_file_count: usize::from(kind == LogTreeEntryKind::File),
+            subtree_node_count: 1,
         }
     }
 
@@ -586,6 +631,9 @@ impl TreeNode {
             error_message: Some(error_message.into()),
             source: None,
             children: Vec::new(),
+            child_index: HashMap::new(),
+            descendant_file_count: 0,
+            subtree_node_count: 1,
         }
     }
 
@@ -642,16 +690,14 @@ impl TreeNode {
     /// - 复用目录节点可以自然合并多条路径的公共前缀。
     /// - 文件和目录同名时不合并，避免错误隐藏真实结构冲突。
     fn get_or_insert_child(&mut self, label: &str, kind: LogTreeEntryKind) -> &mut TreeNode {
-        if let Some(index) = self
-            .children
-            .iter()
-            .position(|child| child.label == label && child.kind == kind)
-        {
+        let key = child_index_key(label, kind);
+        if let Some(index) = self.child_index.get(&key).copied() {
             return &mut self.children[index];
         }
 
         self.children.push(Self::new(label.to_string(), kind));
         let index = self.children.len() - 1;
+        self.child_index.insert(key, index);
         &mut self.children[index]
     }
 
@@ -665,11 +711,10 @@ impl TreeNode {
             child.sort_recursively();
         }
 
-        self.children.sort_by(|left, right| {
-            let left_key = (sort_rank(left.kind), left.label.to_ascii_lowercase());
-            let right_key = (sort_rank(right.kind), right.label.to_ascii_lowercase());
-            left_key.cmp(&right_key)
-        });
+        self.children
+            .sort_by_cached_key(|child| (sort_rank(child.kind), child.label.to_ascii_lowercase()));
+        self.rebuild_child_index();
+        self.refresh_cached_metrics_from_children();
     }
 
     /// 返回当前内部树包含的节点总数。
@@ -678,7 +723,56 @@ impl TreeNode {
     /// - 加载进度条需要在目录树扁平化前展示“已经发现多少节点”，直接复用内部树结构可以避免额外构造临时 `LogTreeRow`。
     /// - 该统计只用于进度提示，不影响最终 `summary`，最终摘要仍以扁平化后的真实行数为准。
     fn node_count(&self) -> usize {
-        1 + self.children.iter().map(Self::node_count).sum::<usize>()
+        self.subtree_node_count
+    }
+
+    /// 刷新当前子树的缓存统计。
+    ///
+    /// 业务意图：
+    /// - 路径插入阶段只维护结构和查找索引，最终整理时用一次后序遍历计算文件数和节点数。
+    /// - 这样扁平化每个目录行时可以 O(1) 读取文件数量，避免目录越深重复递归越多。
+    ///
+    /// 边界条件：
+    /// - 普通文件节点统计为 1 个可打开文件；错误、符号链接和空目录统计为 0。
+    /// - 压缩包根和普通目录都按子节点累计文件数量，保持现有 UI 展示语义。
+    fn refresh_cached_metrics(&mut self) {
+        for child in &mut self.children {
+            child.refresh_cached_metrics();
+        }
+        self.refresh_cached_metrics_from_children();
+        self.rebuild_child_index();
+    }
+
+    /// 使用已经刷新的子节点统计更新当前节点缓存。
+    ///
+    /// 业务意图：
+    /// - 排序阶段子节点已经先完成整理，父节点只需要汇总直接子节点，避免每一层排序后重新遍历整棵子树。
+    fn refresh_cached_metrics_from_children(&mut self) {
+        let mut subtree_node_count = 1usize;
+        let mut descendant_file_count = usize::from(self.kind == LogTreeEntryKind::File);
+        for child in &self.children {
+            subtree_node_count = subtree_node_count.saturating_add(child.subtree_node_count);
+            if self.kind != LogTreeEntryKind::File {
+                descendant_file_count =
+                    descendant_file_count.saturating_add(child.descendant_file_count);
+            }
+        }
+        self.subtree_node_count = subtree_node_count;
+        self.descendant_file_count = descendant_file_count;
+    }
+
+    /// 重建子节点查找索引。
+    ///
+    /// 业务意图：
+    /// - 排序会改变 `children` 下标，构建期的索引必须同步更新，避免后续追加路径时复用到错误节点。
+    fn rebuild_child_index(&mut self) {
+        self.child_index.clear();
+        self.child_index.extend(
+            self.children
+                .iter()
+                .enumerate()
+                .map(|(index, child)| (child_index_key(&child.label, child.kind), index)),
+        );
     }
 
     /// 将递归树节点扁平化为 UI 可直接渲染的行。
@@ -717,31 +811,21 @@ impl TreeNode {
     /// - 错误、符号链接和普通文件沿用构建阶段写入的元信息，不额外派生数量。
     fn display_meta(&self) -> Option<String> {
         match self.kind {
-            LogTreeEntryKind::Directory => Some(format!("{} 个文件", self.descendant_file_count())),
+            LogTreeEntryKind::Directory => Some(format!("{} 个文件", self.descendant_file_count)),
             LogTreeEntryKind::Archive
             | LogTreeEntryKind::File
             | LogTreeEntryKind::Symlink
             | LogTreeEntryKind::Error => self.meta.clone(),
         }
     }
+}
 
-    /// 递归统计当前节点下可打开文件节点数量。
-    ///
-    /// 业务意图：
-    /// - 目录树中的文件数量用于帮助用户快速判断目录规模，而不是统计目录项总数。
-    /// - 只把 `LogTreeEntryKind::File` 计入数量，避免错误节点、符号链接或纯目录影响日志文件规模判断。
-    ///
-    /// 边界条件：
-    /// - 当前目录本身不可能是文件节点时才调用；即使未来复用到其它节点，普通文件也会按 1 个文件处理。
-    fn descendant_file_count(&self) -> usize {
-        match self.kind {
-            LogTreeEntryKind::File => 1,
-            LogTreeEntryKind::Directory | LogTreeEntryKind::Archive => {
-                self.children.iter().map(Self::descendant_file_count).sum()
-            }
-            LogTreeEntryKind::Symlink | LogTreeEntryKind::Error => 0,
-        }
-    }
+/// 构造子节点查找索引键。
+///
+/// 业务意图：
+/// - 同一父目录下同名文件和目录必须保留为两个节点，因此类型也是键的一部分。
+fn child_index_key(label: &str, kind: LogTreeEntryKind) -> (String, LogTreeEntryKind) {
+    (label.to_string(), kind)
 }
 
 /// 返回目录树排序时使用的类型优先级。

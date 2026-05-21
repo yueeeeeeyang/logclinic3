@@ -127,7 +127,7 @@ pub struct SearchOptions {
     /// 是否区分大小写。
     ///
     /// 边界条件：
-    /// - 普通文本不区分大小写时使用 Rust `to_lowercase` 做 Unicode 级别折叠，适合中文和 ASCII 混合日志的第一版需求。
+    /// - 普通文本不区分大小写时 ASCII 日志走零分配字节比较，非 ASCII 文本使用 Rust `to_lowercase` 做 Unicode 级别折叠。
     /// - 正则模式不读取该字段，大小写应通过 `(?i)` 等 Rust regex 语法表达。
     pub case_sensitive: bool,
     /// 匹配模式。
@@ -217,7 +217,16 @@ pub(crate) struct SearchMatcher {
 /// 单个查询词的可执行匹配器。
 enum SearchMatcherTerm {
     /// 普通文本查询词。
-    Literal(String),
+    ///
+    /// 业务意图：
+    /// - `query` 保留用户原始输入，用于区分大小写匹配和结果范围长度。
+    /// - `folded_query` 在构造匹配器时预先计算，不区分大小写搜索扫描百万行日志时不能每行重复分配查询词小写副本。
+    Literal {
+        /// 原始查询词。
+        query: String,
+        /// 预计算的小写折叠查询词。
+        folded_query: String,
+    },
     /// 已编译正则表达式。
     Regex(Regex),
 }
@@ -237,7 +246,11 @@ impl SearchMatcher {
         {
             match options.match_mode {
                 SearchMatchMode::Literal => {
-                    terms.push(SearchMatcherTerm::Literal(query.to_string()));
+                    let query = query.to_string();
+                    terms.push(SearchMatcherTerm::Literal {
+                        folded_query: query.to_lowercase(),
+                        query,
+                    });
                 }
                 SearchMatchMode::Regex => {
                     let regex = Regex::new(query)
@@ -322,7 +335,10 @@ impl SearchMatcherTerm {
     /// 返回当前查询词在单行中的第一个命中范围。
     fn find_range(&self, line_text: &str, case_sensitive: bool) -> Option<Range<usize>> {
         match self {
-            Self::Literal(query) => find_literal_query_range(line_text, query, case_sensitive),
+            Self::Literal {
+                query,
+                folded_query,
+            } => find_literal_query_range(line_text, query, folded_query, case_sensitive),
             Self::Regex(regex) => regex
                 .find(line_text)
                 .map(|matched| matched.start()..matched.end()),
@@ -335,7 +351,10 @@ impl SearchMatcherTerm {
     /// - 当前文件轻量导航需要在同一行内继续定位下一处或上一处命中，而不是只能跳到其它行。
     fn ranges_in_line(&self, line_text: &str, case_sensitive: bool) -> Vec<Range<usize>> {
         match self {
-            Self::Literal(query) => find_literal_query_ranges(line_text, query, case_sensitive),
+            Self::Literal {
+                query,
+                folded_query,
+            } => find_literal_query_ranges(line_text, query, folded_query, case_sensitive),
             Self::Regex(regex) => regex
                 .find_iter(line_text)
                 .map(|matched| matched.start()..matched.end())
@@ -346,9 +365,15 @@ impl SearchMatcherTerm {
     /// 统计当前查询词在单行中的非重叠命中次数。
     fn count_in_line(&self, line_text: &str, case_sensitive: bool) -> usize {
         match self {
-            Self::Literal(query) => {
-                count_literal_query_occurrences_in_line(line_text, query, case_sensitive)
-            }
+            Self::Literal {
+                query,
+                folded_query,
+            } => count_literal_query_occurrences_in_line(
+                line_text,
+                query,
+                folded_query,
+                case_sensitive,
+            ),
             Self::Regex(regex) => regex.find_iter(line_text).count(),
         }
     }
@@ -850,7 +875,7 @@ fn find_search_result_in_memory_range_rev(
 /// 边界条件：
 /// - 空查询返回 0，调用方可决定是否展示占位。
 /// - 同一行内多次出现会累计；匹配采用非重叠语义，和普通文本查找工具保持一致。
-/// - 不区分大小写时使用 `to_lowercase`，与 `search_lines` 的匹配规则保持一致。
+/// - 不区分大小写时 ASCII 行走零分配字节比较，非 ASCII 行使用 `to_lowercase`，与 `search_lines` 的匹配规则保持一致。
 pub fn count_query_occurrences(lines: &[String], options: &SearchOptions) -> usize {
     if options.is_empty_query() {
         return 0;
@@ -866,6 +891,7 @@ pub fn count_query_occurrences(lines: &[String], options: &SearchOptions) -> usi
 fn count_literal_query_occurrences_in_line(
     line_text: &str,
     query: &str,
+    folded_query: &str,
     case_sensitive: bool,
 ) -> usize {
     if query.is_empty() {
@@ -876,9 +902,12 @@ fn count_literal_query_occurrences_in_line(
         return line_text.matches(query).count();
     }
 
+    if query.is_ascii() && line_text.is_ascii() {
+        return count_ascii_case_insensitive_occurrences(line_text.as_bytes(), query.as_bytes());
+    }
+
     let folded_line = line_text.to_lowercase();
-    let folded_query = query.to_lowercase();
-    folded_line.matches(&folded_query).count()
+    folded_line.matches(folded_query).count()
 }
 
 /// 在单行文本中查找普通文本查询词并返回原始行内的字节范围。
@@ -889,6 +918,7 @@ fn count_literal_query_occurrences_in_line(
 fn find_literal_query_range(
     line_text: &str,
     query: &str,
+    folded_query: &str,
     case_sensitive: bool,
 ) -> Option<Range<usize>> {
     if query.is_empty() {
@@ -901,9 +931,13 @@ fn find_literal_query_range(
             .map(|start| start..start + query.len());
     }
 
+    if query.is_ascii() && line_text.is_ascii() {
+        return find_ascii_case_insensitive(line_text.as_bytes(), query.as_bytes())
+            .map(|start| start..start + query.len());
+    }
+
     let folded_line = line_text.to_lowercase();
-    let folded_query = query.to_lowercase();
-    let folded_start = folded_line.find(&folded_query)?;
+    let folded_start = folded_line.find(folded_query)?;
     let folded_end = folded_start + folded_query.len();
     let start = byte_index_from_folded_offset(line_text, folded_start);
     let end = byte_index_from_folded_offset(line_text, folded_end);
@@ -922,6 +956,7 @@ fn find_literal_query_range(
 fn find_literal_query_ranges(
     line_text: &str,
     query: &str,
+    folded_query: &str,
     case_sensitive: bool,
 ) -> Vec<Range<usize>> {
     if query.is_empty() {
@@ -935,12 +970,15 @@ fn find_literal_query_ranges(
             .collect();
     }
 
+    if query.is_ascii() && line_text.is_ascii() {
+        return find_ascii_case_insensitive_ranges(line_text.as_bytes(), query.as_bytes());
+    }
+
     let folded_line = line_text.to_lowercase();
-    let folded_query = query.to_lowercase();
     let mut ranges = Vec::new();
     let mut search_start = 0usize;
     while search_start <= folded_line.len() {
-        let Some(relative_start) = folded_line[search_start..].find(&folded_query) else {
+        let Some(relative_start) = folded_line[search_start..].find(folded_query) else {
             break;
         };
         let folded_start = search_start + relative_start;
@@ -955,6 +993,67 @@ fn find_literal_query_ranges(
     ranges
 }
 
+/// 统计 ASCII 文本中的大小写不敏感普通文本命中次数。
+///
+/// 业务意图：
+/// - 大多数日志关键字和行内容都是 ASCII；这条路径直接比较字节，避免每行 `to_lowercase` 分配整行副本。
+/// - 计数沿用 `str::matches` 的非重叠语义，命中后从查询词末尾继续搜索。
+///
+/// 边界条件：
+/// - 调用方已保证查询词非空且行文本为 ASCII，因此返回的字节范围天然是 UTF-8 边界。
+fn count_ascii_case_insensitive_occurrences(line: &[u8], query: &[u8]) -> usize {
+    let mut count = 0usize;
+    let mut search_start = 0usize;
+    while search_start <= line.len().saturating_sub(query.len()) {
+        let Some(relative_start) = find_ascii_case_insensitive(&line[search_start..], query) else {
+            break;
+        };
+        count += 1;
+        search_start += relative_start + query.len();
+    }
+    count
+}
+
+/// 返回 ASCII 文本中第一处大小写不敏感命中的字节偏移。
+///
+/// 业务意图：
+/// - 通过字节窗口比较实现零分配查找；ASCII 大小写规则不会改变字节长度，因此可直接作为原始行内高亮范围。
+fn find_ascii_case_insensitive(line: &[u8], query: &[u8]) -> Option<usize> {
+    if query.is_empty() || query.len() > line.len() {
+        return None;
+    }
+    line.windows(query.len())
+        .position(|window| ascii_slice_eq_ignore_case(window, query))
+}
+
+/// 返回 ASCII 文本中的全部大小写不敏感命中范围。
+///
+/// 边界条件：
+/// - 采用非重叠范围，和计数、`match_indices` 语义保持一致。
+fn find_ascii_case_insensitive_ranges(line: &[u8], query: &[u8]) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut search_start = 0usize;
+    while search_start <= line.len().saturating_sub(query.len()) {
+        let Some(relative_start) = find_ascii_case_insensitive(&line[search_start..], query) else {
+            break;
+        };
+        let start = search_start + relative_start;
+        let end = start + query.len();
+        ranges.push(start..end);
+        search_start = end;
+    }
+    ranges
+}
+
+/// 判断两个 ASCII 字节切片是否大小写不敏感相等。
+fn ascii_slice_eq_ignore_case(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
 /// 将 `to_lowercase` 后的字节偏移映射回原始字符串的字节偏移。
 ///
 /// 业务意图：
@@ -967,7 +1066,7 @@ fn byte_index_from_folded_offset(original: &str, folded_offset: usize) -> usize 
         if folded_cursor >= folded_offset {
             return byte_index;
         }
-        folded_cursor += character.to_lowercase().to_string().len();
+        folded_cursor += character.to_lowercase().map(char::len_utf8).sum::<usize>();
     }
 
     original.len()

@@ -9,6 +9,22 @@
 
 use super::*;
 
+/// 线程分析线程名列估算时单个显示列的像素宽度。
+///
+/// 业务意图：
+/// - GPUI 的真实字形测量发生在绘制阶段，但线程名列宽必须在布局阶段稳定给出，否则首帧会先用默认宽度，后续点击窗口才刷新。
+/// - 这里按当前 `text_xs` 的实际展示密度取略宽的估算值，让长连接线程名能在结果打开时直接完整显示。
+///
+/// 边界条件：
+/// - 估算只影响列宽，不参与搜索、过滤或线程身份判断；不同系统字体存在少量差异时宁可略宽，也避免继续截断。
+const THREAD_ANALYSIS_NAME_COLUMN_ESTIMATED_CHAR_WIDTH: f32 = 7.5;
+
+/// 线程分析线程名列在文本右侧预留的安全像素。
+///
+/// 业务意图：
+/// - 行内线程名元素带有右侧内边距，并且截断渲染需要少量余量；统一加入估算宽度，避免最长线程名末尾贴住时间线色块。
+const THREAD_ANALYSIS_NAME_COLUMN_TEXT_PADDING: f32 = 12.0;
+
 /// 搜索结果面板高度拖动状态。
 ///
 /// 业务意图：
@@ -67,6 +83,15 @@ pub(in crate::app) struct ThreadAnalysisWindowView {
     /// - Java thread dump 可能包含数千个线程，不能一次性把所有线程行都创建成 GPUI 元素。
     /// - 使用 `uniform_list` 只渲染可见行，并通过该句柄保存纵向和横向滚动位置。
     pub(in crate::app) scroll_handle: UniformListScrollHandle,
+    /// 当前线程名列的布局宽度。
+    ///
+    /// 业务意图：
+    /// - 线程名列宽度由可见线程名估算得到，并同时影响行布局与横向滚动条轨道起点。
+    /// - 渲染时刷新该值，拖动横向滚动条时直接复用，避免鼠标移动每一帧都重新扫描所有线程状态。
+    ///
+    /// 边界条件：
+    /// - 新窗口、替换分析结果或切换状态过滤后先回到默认最小宽度；下一次 render 会用最新可见线程名覆盖。
+    pub(in crate::app) name_column_width: f32,
     /// 当前线程分析滚动条拖动状态。
     ///
     /// 业务意图：
@@ -142,6 +167,7 @@ impl ThreadAnalysisWindowView {
             main_view,
             analysis,
             scroll_handle: UniformListScrollHandle::new(),
+            name_column_width: THREAD_ANALYSIS_NAME_COLUMN_WIDTH,
             scrollbar_drag: None,
             cell_popup: None,
             jumped_cell: None,
@@ -165,6 +191,7 @@ impl ThreadAnalysisWindowView {
         self.analysis = analysis;
         if !replacing_progress_with_progress {
             self.scroll_handle = UniformListScrollHandle::new();
+            self.name_column_width = THREAD_ANALYSIS_NAME_COLUMN_WIDTH;
             self.scrollbar_drag = None;
             self.cell_popup = None;
             self.jumped_cell = None;
@@ -337,6 +364,7 @@ impl ThreadAnalysisWindowView {
             self.visible_state_kinds.insert(state);
         }
         self.scroll_handle = UniformListScrollHandle::new();
+        self.name_column_width = THREAD_ANALYSIS_NAME_COLUMN_WIDTH;
         self.scrollbar_drag = None;
         self.cell_popup = None;
         context.notify();
@@ -348,6 +376,7 @@ impl ThreadAnalysisWindowView {
         thread_name: String,
         cells: &[Option<Arc<ThreadTimelineCell>>],
         visible_state_kinds: &HashSet<ThreadStateKind>,
+        name_column_width: f32,
         palette: AppThemePalette,
         theme: EffectiveTheme,
         context: &mut Context<Self>,
@@ -361,7 +390,7 @@ impl ThreadAnalysisWindowView {
             .border_color(rgb(palette.border))
             .child(
                 div()
-                    .w(px(THREAD_ANALYSIS_NAME_COLUMN_WIDTH))
+                    .w(px(name_column_width))
                     .flex_none()
                     .pr_2()
                     .truncate()
@@ -832,13 +861,13 @@ impl ThreadAnalysisWindowView {
     /// - 快照数量很多时需要横向拖动入口；轨道从线程名列右侧开始，对齐实际时间线区域。
     fn render_horizontal_scrollbar(
         &self,
+        name_column_width: f32,
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let Some(metrics) = MainView::log_horizontal_scrollbar_metrics(
-            &self.scroll_handle,
-            THREAD_ANALYSIS_NAME_COLUMN_WIDTH,
-        ) else {
+        let Some(metrics) =
+            MainView::log_horizontal_scrollbar_metrics(&self.scroll_handle, name_column_width)
+        else {
             return div()
                 .id("thread-analysis-horizontal-scrollbar-empty")
                 .hidden();
@@ -961,9 +990,76 @@ impl ThreadAnalysisWindowView {
             }
             LogScrollbarAxis::Horizontal => MainView::log_horizontal_scrollbar_metrics(
                 &self.scroll_handle,
-                THREAD_ANALYSIS_NAME_COLUMN_WIDTH,
+                self.name_column_width,
             ),
         }
+    }
+
+    /// 返回当前窗口中可见线程名列应使用的宽度。
+    ///
+    /// 业务意图：
+    /// - 线程 dump 的线程名经常包含线程池编号、HTTP 连接地址和业务资源名，固定 260px 会在结果首帧截断关键信息。
+    /// - 列宽只根据当前过滤后仍可见的最长线程名估算，不再把右侧空白全部吞掉；这样既能显示完整线程名，也不会人为制造大段空白。
+    ///
+    /// 边界条件：
+    /// - 首帧不依赖滚动容器测量，因此窗口刚打开时就能得到和后续交互一致的宽度。
+    /// - 如果最长线程名超过当前视口，仍优先给出完整线程名所需宽度，时间线区域通过已有横向滚动查看。
+    fn thread_analysis_name_column_width_for_visible_threads(
+        &self,
+        visible_thread_indexes: &[usize],
+    ) -> f32 {
+        let required_width = visible_thread_indexes
+            .iter()
+            .filter_map(|thread_index| self.analysis.thread_names.get(*thread_index))
+            .map(|thread_name| Self::thread_analysis_name_column_required_width(thread_name))
+            .fold(THREAD_ANALYSIS_NAME_COLUMN_WIDTH, f32::max);
+
+        Self::thread_analysis_name_column_width_for_required_width(required_width)
+    }
+
+    /// 根据已估算出的线程名内容宽度计算最终列宽。
+    ///
+    /// 业务意图：
+    /// - 单元测试只需要验证“至少保留默认宽度”和“长线程名只扩到内容所需宽度”两条规则，不依赖 GPUI 运行时测量。
+    pub(in crate::app) fn thread_analysis_name_column_width_for_required_width(
+        required_width: f32,
+    ) -> f32 {
+        required_width.max(THREAD_ANALYSIS_NAME_COLUMN_WIDTH)
+    }
+
+    /// 估算单个线程名完整展示所需的列宽。
+    ///
+    /// 业务意图：
+    /// - 线程名列的宽度必须在虚拟列表生成行之前确定，不能等到每一行真实绘制后再反馈布局，否则会出现首帧截断、点击后才扩展的问题。
+    /// - 使用显示列数估算可以覆盖 ASCII、制表符和常见中文线程名，且计算成本只与可见线程数和线程名长度相关。
+    ///
+    /// 边界条件：
+    /// - 空线程名仍返回右侧安全余量，最终列宽会由默认最小宽度兜底。
+    /// - 制表符按 4 列处理，避免日志中异常线程名包含制表符时估算过窄。
+    pub(in crate::app) fn thread_analysis_name_column_required_width(thread_name: &str) -> f32 {
+        THREAD_ANALYSIS_NAME_COLUMN_TEXT_PADDING
+            + Self::thread_analysis_thread_name_display_columns(thread_name) as f32
+                * THREAD_ANALYSIS_NAME_COLUMN_ESTIMATED_CHAR_WIDTH
+    }
+
+    /// 返回线程名用于布局估算的显示列数。
+    ///
+    /// 业务意图：
+    /// - 线程名通常是 ASCII，但日志来源不可控；中文或全角字符如果仍按 1 列估算，在 Windows 和 macOS 字体下都容易继续被截断。
+    /// - 该函数只用于 UI 宽度估算，不改变线程名原文和过滤语义。
+    fn thread_analysis_thread_name_display_columns(thread_name: &str) -> usize {
+        thread_name
+            .chars()
+            .map(|character| {
+                if character == '\t' {
+                    4
+                } else if character.is_ascii() {
+                    1
+                } else {
+                    2
+                }
+            })
+            .sum()
     }
 }
 
@@ -979,6 +1075,9 @@ impl Render for ThreadAnalysisWindowView {
         let row_count = visible_thread_indexes.len();
         let visible_state_kinds = self.visible_state_kinds.clone();
         let scroll_handle = self.scroll_handle.clone();
+        let name_column_width =
+            self.thread_analysis_name_column_width_for_visible_threads(&visible_thread_indexes);
+        self.name_column_width = name_column_width;
 
         div()
             .on_mouse_down(
@@ -1091,6 +1190,7 @@ impl Render for ThreadAnalysisWindowView {
                                                 thread_name,
                                                 cells,
                                                 &visible_state_kinds,
+                                                name_column_width,
                                                 palette,
                                                 theme,
                                                 _context,
@@ -1107,7 +1207,7 @@ impl Render for ThreadAnalysisWindowView {
                         .track_scroll(scroll_handle),
                     )
                     .child(self.render_vertical_scrollbar(palette, context))
-                    .child(self.render_horizontal_scrollbar(palette, context))
+                    .child(self.render_horizontal_scrollbar(name_column_width, palette, context))
                     .when_some(self.analysis.progress.as_ref(), |content, progress| {
                         content.child(self.render_progress_bar(progress, palette))
                     }),

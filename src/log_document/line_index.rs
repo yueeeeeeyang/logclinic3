@@ -73,19 +73,6 @@ impl LineIndexEntries {
     pub fn read_all(&self) -> Vec<LineIndexEntry> {
         self.entries.as_ref().clone()
     }
-
-    /// 顺序遍历索引条目，调用方可以在回调中提前停止。
-    pub fn for_each<F>(&self, mut callback: F) -> io::Result<()>
-    where
-        F: FnMut(usize, LineIndexEntry) -> io::Result<bool>,
-    {
-        for (index, entry) in self.entries.iter().copied().enumerate() {
-            if !callback(index, entry)? {
-                break;
-            }
-        }
-        Ok(())
-    }
 }
 
 /// 行索引整体状态。
