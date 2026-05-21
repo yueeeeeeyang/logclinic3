@@ -489,7 +489,6 @@ impl MainView {
             scroll_handle: UniformListScrollHandle::new(),
             paged_viewport_handle: ScrollHandle::new(),
             paged_scroll: PagedLogScrollState::default(),
-            paged_visible_lines: RefCell::new(PagedLogVisibleLinesState::default()),
             pending_scroll_to_line: None,
             highlighted_search_line: None,
             highlighted_search_match: None,
@@ -692,7 +691,6 @@ impl MainView {
             tab.scroll_handle = UniformListScrollHandle::new();
             tab.paged_viewport_handle = ScrollHandle::new();
             tab.paged_scroll = PagedLogScrollState::default();
-            tab.paged_visible_lines = RefCell::new(PagedLogVisibleLinesState::default());
             tab.text_selection = None;
             tab.selection_drag_anchor = None;
             tab.marked_lines.clear();
@@ -919,7 +917,6 @@ impl MainView {
             tab.scroll_handle = UniformListScrollHandle::new();
             tab.paged_viewport_handle = ScrollHandle::new();
             tab.paged_scroll = PagedLogScrollState::default();
-            tab.paged_visible_lines = RefCell::new(PagedLogVisibleLinesState::default());
             tab.text_selection = None;
             tab.selection_drag_anchor = None;
             tab.last_marker_jump_line = None;

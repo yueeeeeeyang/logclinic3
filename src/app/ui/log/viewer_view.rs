@@ -559,7 +559,7 @@ impl MainView {
     /// - 分页日志可能有数千万行，完整 `uniform_list` 会把行号乘以固定行高后交给 `f32` 像素坐标，滚到深处会出现行间距和重叠。
     /// - 这里只渲染当前视口附近的一小段真实行号，纵向滚动位置由 `PagedLogScrollState` 的 `f64` 逻辑坐标保存。
     /// - 行号、选区、高亮和右键菜单仍复用普通日志行渲染逻辑，保证两种模式的视觉行为一致。
-    /// - 文件读取和解码必须在后台任务中完成，render 只读取 tab 上已经准备好的可见行缓存，避免滚动过程中阻塞 UI 线程。
+    /// - 按用户要求，分页可见行回到 render 路径同步读取；为降低回退后的成本，读取仍走连续区间批量读取和分页解码缓存。
     fn render_paged_log_document_viewer(
         &self,
         tab: &OpenLogTab,
@@ -584,27 +584,9 @@ impl MainView {
         let highlighted_search_line = tab.highlighted_search_line;
         let highlighted_search_match = tab.highlighted_search_match.clone();
         let marked_lines = tab.marked_lines.clone();
-        let visible_request = PagedLogVisibleLinesRequest {
-            start_line: first_line_index,
-            max_lines: visible_rows,
-        };
-        let (visible_lines, should_request_visible_lines) = {
-            let mut visible_state = tab.paged_visible_lines.borrow_mut();
-            if visible_state.ready_request == Some(visible_request) {
-                (visible_state.ready_lines.clone(), false)
-            } else {
-                let should_request = visible_request.max_lines > 0
-                    && visible_state.pending_request != Some(visible_request);
-                if should_request {
-                    visible_state.pending_request = Some(visible_request);
-                    visible_state.error_message = None;
-                }
-                (Vec::new(), should_request)
-            }
-        };
-        if should_request_visible_lines {
-            self.spawn_paged_visible_lines_read(tab_id, document.clone(), visible_request, context);
-        }
+        let visible_lines =
+            Self::read_paged_visible_lines_for_render(document, first_line_index, visible_rows)
+                .unwrap_or_default();
 
         let rows = visible_lines
             .into_iter()
@@ -778,60 +760,27 @@ impl MainView {
         )
     }
 
-    /// 在后台读取分页日志当前视口所需的可见行。
+    /// 读取分页日志当前视口所需的可见行。
     ///
     /// 业务意图：
-    /// - GPUI render 可能在滚轮、拖动滚动条和窗口 resize 时高频触发，不能在其中同步执行本地文件 I/O。
-    /// - 后台任务先调用 `read_visible_lines` 做连续区间读取；若区间读取失败，再在后台逐行兜底，保留旧实现“局部可读仍展示”的容错特性。
-    ///
-    /// 边界条件：
-    /// - 请求返回时 tab 可能已经关闭、重新加载或滚动到其它位置，因此合并前必须再次校验 tab ID 和 `pending_request`。
-    /// - 后台任务只克隆分页文档句柄，不持有 `RefCell` 或 GPUI 元素，避免跨线程访问 UI 状态。
-    fn spawn_paged_visible_lines_read(
-        &self,
-        tab_id: usize,
-        document: log_document::PagedLogDocument,
-        request: PagedLogVisibleLinesRequest,
-        context: &mut Context<Self>,
-    ) {
-        context
-            .spawn(async move |view, app| {
-                let result = app
-                    .background_executor()
-                    .spawn(
-                        async move { Self::read_paged_visible_lines_for_render(document, request) },
-                    )
-                    .await;
-
-                view.update(app, |view, context| {
-                    view.apply_paged_visible_lines_result(tab_id, request, result);
-                    context.notify();
-                })
-                .ok();
-            })
-            .detach();
-    }
-
-    /// 执行分页日志可见行读取任务。
-    ///
-    /// 业务意图：
-    /// - 将文件读取封装成纯后台函数，方便 render 侧只负责调度和消费结果。
-    /// - 主路径批量读取连续可见区间，兜底路径逐行读取只在异常情况下触发，并且同样运行在后台线程。
+    /// - 用户要求取消分页可见行异步加载，以避免滚动或拖动滚动条时出现新数据未返回导致的白屏闪烁。
+    /// - 主路径仍调用 `read_visible_lines` 批量读取连续可见区间；该方法内部复用解码缓存，避免恢复到逐行 `seek + read` 的最差路径。
     ///
     /// 边界条件：
     /// - 视口容量为 0 或起始行越界时返回空集合，覆盖窗口高度极小、文件为空和滚动状态被裁剪的情况。
     /// - 如果批量读取失败且逐行兜底也没有读到任何行，返回原始错误，便于后续 UI 提示定位真实文件问题。
     fn read_paged_visible_lines_for_render(
-        document: log_document::PagedLogDocument,
-        request: PagedLogVisibleLinesRequest,
+        document: &log_document::PagedLogDocument,
+        start_line: usize,
+        max_lines: usize,
     ) -> Result<Vec<log_document::PagedLine>, LogContentError> {
-        match document.read_visible_lines(request.start_line, request.max_lines) {
+        match document.read_visible_lines(start_line, max_lines) {
             Ok(lines) => Ok(lines),
             Err(error) => {
                 let line_count = document.line_count();
                 let mut fallback_lines = Vec::new();
-                for row_offset in 0..request.max_lines {
-                    let Some(line_index) = request.start_line.checked_add(row_offset) else {
+                for row_offset in 0..max_lines {
+                    let Some(line_index) = start_line.checked_add(row_offset) else {
                         break;
                     };
                     if line_index >= line_count {
@@ -846,51 +795,6 @@ impl MainView {
                 } else {
                     Ok(fallback_lines)
                 }
-            }
-        }
-    }
-
-    /// 合并分页日志可见行后台读取结果。
-    ///
-    /// 业务意图：
-    /// - 后台读取完成后只更新发起该请求的 tab，render 下一帧再消费 `ready_lines`。
-    /// - 用 `pending_request` 抵消乱序返回：用户快速拖动滚动条时，旧区域结果不能覆盖新区域的可见行。
-    ///
-    /// 边界条件：
-    /// - tab 已关闭、tab 已切换为内存文档或请求已过期时直接忽略。
-    /// - 读取失败只清空当前可见行缓存并记录错误，不把整个 tab 切到失败状态，避免瞬时 I/O 错误破坏已打开文档。
-    fn apply_paged_visible_lines_result(
-        &mut self,
-        tab_id: usize,
-        request: PagedLogVisibleLinesRequest,
-        result: Result<Vec<log_document::PagedLine>, LogContentError>,
-    ) {
-        let Some(tab) = self.log.open_tabs.iter().find(|tab| tab.id == tab_id) else {
-            return;
-        };
-        if !matches!(
-            &tab.state,
-            LogTabState::Ready { document }
-                if matches!(document.as_ref(), LogTabDocument::Paged(_))
-        ) {
-            return;
-        }
-
-        let mut visible_state = tab.paged_visible_lines.borrow_mut();
-        if visible_state.pending_request != Some(request) {
-            return;
-        }
-        visible_state.pending_request = None;
-        match result {
-            Ok(lines) => {
-                visible_state.ready_request = Some(request);
-                visible_state.ready_lines = lines;
-                visible_state.error_message = None;
-            }
-            Err(error) => {
-                visible_state.ready_request = None;
-                visible_state.ready_lines.clear();
-                visible_state.error_message = Some(error.to_string());
             }
         }
     }
