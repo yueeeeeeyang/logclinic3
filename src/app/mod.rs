@@ -32,7 +32,9 @@ use crate::launch::{
 };
 use crate::log_ai_analysis::*;
 use crate::log_document;
-use crate::log_document::{EncodingChoice, LogContentError, LogTextEncoding, decode_log_bytes};
+use crate::log_document::{
+    EncodingChoice, LogContentError, LogTextEncoding, decode_log_bytes, longest_log_line_index,
+};
 use crate::log_document::{LargeLogOpenResult, LogTabDocument, open_log_source_for_tab};
 use crate::plugin::*;
 use crate::search::{
@@ -51,10 +53,11 @@ use crate::shell_integration::{
 };
 use crate::theme::{AppThemePalette, EffectiveTheme, ThemePreference};
 use crate::thread_analysis::{
-    ThreadAnalysisData, ThreadAnalysisFilterRule, ThreadAnalysisProgress, ThreadStateKind,
-    ThreadTimelineCell, analyze_thread_dump_sources_with_progress,
-    parse_thread_analysis_filter_rules, parse_thread_analysis_name_filter_rules,
-    visible_thread_indexes_for_state_kinds,
+    ThreadAnalysisData, ThreadAnalysisFilterRule, ThreadAnalysisProgress,
+    ThreadDumpLineFilterSummary, ThreadStateKind, ThreadTimelineCell,
+    analyze_thread_dump_sources_with_progress, filter_thread_dump_lines_with_analysis_rules,
+    has_java_thread_dump_snapshots, parse_thread_analysis_filter_rules,
+    parse_thread_analysis_name_filter_rules, visible_thread_indexes_for_state_kinds,
 };
 #[cfg(test)]
 use crate::thread_analysis::{

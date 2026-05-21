@@ -343,7 +343,7 @@ impl MainView {
             LogFileSource::NestedArchiveMember { .. } => "嵌套压缩包内文件",
         };
         let encoding_button_label = Self::log_tab_encoding_selector_label(tab);
-        let status = match &tab.state {
+        let mut status = match &tab.state {
             LogTabState::Ready { document } => {
                 // 状态栏展示编码来源和行数；实际编码本身由右侧内联编码选择器负责显示和切换。
                 let encoding_source = if document.detected_automatically() {
@@ -366,13 +366,19 @@ impl MainView {
             LogTabState::Loading { .. } => "正在处理".to_string(),
             LogTabState::Failed { .. } => "需要选择正确编码或重新加载".to_string(),
         };
+        if let Some(summary) = tab.thread_filter_summary {
+            status = format!(
+                "{} · 已过滤 {} 个线程片段",
+                status, summary.hidden_thread_count
+            );
+        }
         let palette = self.palette();
 
         div()
             .id("log-document-toolbar")
             .flex()
             .items_center()
-            .justify_end()
+            .justify_between()
             .h(px(LOG_DOCUMENT_TOOLBAR_HEIGHT))
             .flex_none()
             .px_3()
@@ -380,6 +386,7 @@ impl MainView {
             .bg(rgb(palette.panel))
             .border_b_1()
             .border_color(rgb(palette.border))
+            .child(self.render_thread_filter_toolbar_button(tab, palette, context))
             .child(
                 div()
                     .id("log-document-status-group")
@@ -402,6 +409,76 @@ impl MainView {
                     ))
                     .child(Self::render_status_separator(palette))
                     .child(div().min_w_0().truncate().child(status)),
+            )
+    }
+
+    /// 渲染日志工具条左侧的线程过滤按钮。
+    ///
+    /// 业务意图：
+    /// - Java thread dump 打开后，用户经常需要先按线程分析配置隐藏 JVM 常驻线程和单次噪声线程，再阅读剩余业务线程。
+    /// - 按钮放在工具条左侧空位，和右侧编码/行数状态分离，避免改变日志正文起点或挤压状态信息。
+    ///
+    /// 边界条件：
+    /// - 普通日志、读取失败、加载中和分页大日志都返回占位容器，不显示按钮。
+    /// - 点击会消费事件，避免工具条未来叠加弹层时误传到底层日志正文。
+    pub(in crate::app) fn render_thread_filter_toolbar_button(
+        &self,
+        tab: &OpenLogTab,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        if !tab.thread_filter_available {
+            return div().id("thread-filter-toolbar-placeholder").flex_none();
+        }
+
+        let tab_id = tab.id;
+        let active = tab.thread_filter_original_document.is_some();
+        let label = if active {
+            "取消过滤"
+        } else {
+            "过滤线程"
+        };
+        let foreground = if active { palette.accent } else { palette.text };
+        div()
+            .id(SharedString::from(format!("thread-filter-button-{tab_id}")))
+            .flex()
+            .items_center()
+            .gap_1()
+            .h(px(ENCODING_DROPDOWN_BUTTON_HEIGHT))
+            .px_2()
+            .flex_none()
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(rgb(if active {
+                palette.accent
+            } else {
+                palette.border
+            }))
+            .bg(rgb(if active {
+                palette.selected
+            } else {
+                palette.input
+            }))
+            .text_xs()
+            .text_color(rgb(foreground))
+            .cursor_pointer()
+            .hover(move |button| {
+                button
+                    .border_color(rgb(palette.accent))
+                    .bg(rgb(palette.hover))
+            })
+            .child(Self::render_lucide_icon(
+                Some(Icon::ListFilter),
+                13.0,
+                13.0,
+                foreground,
+            ))
+            .child(label)
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, _window, context| {
+                    view.toggle_thread_filter_for_tab(tab_id, context);
+                    context.stop_propagation();
+                }),
             )
     }
 

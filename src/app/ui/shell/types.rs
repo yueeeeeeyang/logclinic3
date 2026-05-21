@@ -924,6 +924,29 @@ pub(in crate::app) struct OpenLogTab {
     pub(in crate::app) title: String,
     /// 用户当前选择的编码策略。
     pub(in crate::app) encoding_choice: EncodingChoice,
+    /// 当前 tab 是否识别为 Java thread dump 日志。
+    ///
+    /// 业务意图：
+    /// - 工具条“过滤线程”按钮只在当前内容可以被线程分析解析器识别时展示，避免普通日志出现无效操作。
+    /// - 该值在后台读取或重新解码完成后计算并缓存，渲染工具条时不重复扫描大文本。
+    ///
+    /// 边界条件：
+    /// - 当前只对完整内存文档启用；分页大日志暂不在 UI 渲染路径同步读取整份文件。
+    pub(in crate::app) thread_filter_available: bool,
+    /// 线程过滤激活前的原始日志文档。
+    ///
+    /// 业务意图：
+    /// - “过滤线程”只改变当前 tab 的展示内容，不应改写源文件；取消过滤时直接恢复这里保存的原始文档。
+    /// - `LogTabDocument` 内部正文使用 `Arc`，保存克隆不会复制所有日志行，适合线程日志这类临时视图切换。
+    ///
+    /// 边界条件：
+    /// - 重新加载、切换编码、关闭 tab 或读取失败时必须清空，避免旧文档被错误恢复到新内容上。
+    pub(in crate::app) thread_filter_original_document: Option<Box<LogTabDocument>>,
+    /// 当前线程过滤的统计摘要。
+    ///
+    /// 业务意图：
+    /// - 工具条状态需要提示已隐藏多少线程片段，但不应为了展示文案持有过滤后的完整结果。
+    pub(in crate::app) thread_filter_summary: Option<ThreadDumpLineFilterSummary>,
     /// 已读取的原始字节。
     ///
     /// 业务意图：
@@ -2358,6 +2381,11 @@ pub(in crate::app) enum LogTabLoadResult {
         raw_bytes: Option<Arc<Vec<u8>>>,
         /// 自动解码后的文档。
         document: Box<LogTabDocument>,
+        /// 当前文档是否可启用线程正文过滤。
+        ///
+        /// 业务意图：
+        /// - Java thread dump 识别在后台读取任务中完成，UI 合并阶段只写入缓存结果，避免主线程扫描较大的日志正文。
+        thread_filter_available: bool,
     },
     /// 原始字节读取成功，但自动检测或解码失败。
     DecodeFailed {
@@ -2388,6 +2416,11 @@ pub(in crate::app) enum LogTabDecodeResult {
         encoding_choice: EncodingChoice,
         /// 新编码下的日志文档。
         document: Box<LogTabDocument>,
+        /// 当前文档是否可启用线程正文过滤。
+        ///
+        /// 业务意图：
+        /// - 编码切换后的文本可能从乱码变成可解析的 thread dump，因此需要随解码结果重新计算。
+        thread_filter_available: bool,
     },
     /// 解码失败。
     Failed {

@@ -254,6 +254,52 @@ pub(crate) struct ThreadAnalysisFilterRule {
     pub(crate) lines: Vec<String>,
 }
 
+/// 当前日志正文按线程分析规则过滤后的结果。
+///
+/// 业务意图：
+/// - 主日志查看器里的“过滤线程”按钮需要复用线程日志分析窗口的过滤语义，但输出目标不是矩阵，而是当前正文行集合。
+/// - 该结构把过滤后的正文和统计信息一起返回，UI 可以只替换当前 tab 的展示内容，不改写原始文件或压缩包成员。
+///
+/// 边界条件：
+/// - 行过滤只隐藏被判定为无效的线程片段，保留 thread dump 的时间戳、`Full thread dump` 边界和其它非线程行。
+/// - 统计按线程片段计数，因为同一线程名可能在多个快照中出现，其中某些片段命中堆栈过滤而其它片段仍需保留。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ThreadDumpLineFilterResult {
+    /// 过滤后的日志正文行。
+    pub(crate) filtered_lines: Vec<String>,
+    /// 当前日志中识别到的 thread dump 快照数量。
+    pub(crate) snapshot_count: usize,
+    /// 被隐藏的线程片段数量。
+    pub(crate) hidden_thread_count: usize,
+    /// 过滤后仍保留的线程片段数量。
+    pub(crate) retained_thread_count: usize,
+}
+
+/// 线程正文过滤的轻量摘要。
+///
+/// 业务意图：
+/// - 过滤后的 tab 需要在工具条中提示当前内容已经被裁剪，但不应持有整份过滤结果副本。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ThreadDumpLineFilterSummary {
+    /// 当前日志中识别到的 thread dump 快照数量。
+    pub(crate) snapshot_count: usize,
+    /// 被隐藏的线程片段数量。
+    pub(crate) hidden_thread_count: usize,
+    /// 过滤后仍保留的线程片段数量。
+    pub(crate) retained_thread_count: usize,
+}
+
+impl ThreadDumpLineFilterResult {
+    /// 返回可保存在 tab 状态中的轻量摘要。
+    pub(crate) fn summary(&self) -> ThreadDumpLineFilterSummary {
+        ThreadDumpLineFilterSummary {
+            snapshot_count: self.snapshot_count,
+            hidden_thread_count: self.hidden_thread_count,
+            retained_thread_count: self.retained_thread_count,
+        }
+    }
+}
+
 /// Java thread dump 中常见线程状态。
 ///
 /// 业务意图：
@@ -461,6 +507,127 @@ pub(crate) fn parse_thread_dump_snapshots(
     }
 
     snapshots
+}
+
+/// 判断当前解码行是否包含可识别的 Java thread dump 快照。
+///
+/// 业务意图：
+/// - 日志查看器工具条只应在当前文件确实是 Java 线程日志时展示“过滤线程”按钮，避免普通应用日志出现无效入口。
+/// - 判定逻辑复用线程日志分析解析器，而不是另写只看文件名或关键字的启发式规则，保证按钮可见性和实际过滤能力一致。
+///
+/// 边界条件：
+/// - 空文件、只有 `Full thread dump` 但没有线程状态行、普通异常堆栈都会返回 `false`。
+/// - 该函数只消费已经解码的内存行，不读取文件系统；分页大文件暂不在渲染路径同步扫描整份内容。
+pub(crate) fn has_java_thread_dump_snapshots(
+    lines: &[String],
+    source_name: &str,
+    source: &LogFileSource,
+) -> bool {
+    !parse_thread_dump_snapshots(lines, source_name, 0, source).is_empty()
+}
+
+/// 使用线程日志分析的同一过滤语义过滤当前日志正文行。
+///
+/// 业务意图：
+/// - “过滤线程”按钮要隐藏的线程集合必须和线程日志分析窗口一致：先应用用户配置的线程名/堆栈规则，
+///   再应用默认的“只出现一次线程不展示”规则。
+/// - 输出仍是普通日志行列表，主查看器可以继续复用原有虚拟列表、搜索高亮、复制和行号渲染能力。
+///
+/// 边界条件：
+/// - 未识别到 thread dump 时返回 `None`，调用方不应改变当前正文。
+/// - 过滤只影响当前 tab 的展示状态，不修改源文件、压缩包成员或持久化配置。
+/// - 时间戳和 `Full thread dump` 边界不属于线程片段，即使相邻线程被隐藏也会保留，方便用户判断剩余内容来自哪个快照。
+pub(crate) fn filter_thread_dump_lines_with_analysis_rules(
+    lines: &[String],
+    source_name: &str,
+    source: &LogFileSource,
+    filter_rules: &[ThreadAnalysisFilterRule],
+) -> Option<ThreadDumpLineFilterResult> {
+    let snapshots = parse_thread_dump_snapshots(lines, source_name, 0, source);
+    if snapshots.is_empty() {
+        return None;
+    }
+
+    let mut snapshots_after_config_filter = snapshots.clone();
+    for snapshot in &mut snapshots_after_config_filter {
+        snapshot
+            .threads
+            .retain(|sample| !thread_sample_matches_filter_rules(sample, filter_rules));
+    }
+    let visible_thread_name_set = default_visible_thread_names(&snapshots_after_config_filter, 1);
+
+    let mut hidden_lines = vec![false; lines.len()];
+    let mut hidden_thread_count = 0usize;
+    let mut retained_thread_count = 0usize;
+    for snapshot in &snapshots {
+        for sample in &snapshot.threads {
+            let hidden_by_config = thread_sample_matches_filter_rules(sample, filter_rules);
+            let hidden_by_default = !visible_thread_name_set.contains(&sample.name);
+            if hidden_by_config || hidden_by_default {
+                hidden_thread_count = hidden_thread_count.saturating_add(1);
+                mark_thread_sample_lines_hidden(lines.len(), sample, &mut hidden_lines);
+            } else {
+                retained_thread_count = retained_thread_count.saturating_add(1);
+            }
+        }
+    }
+
+    let filtered_lines = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(line_index, line)| (!hidden_lines[line_index]).then(|| line.clone()))
+        .collect::<Vec<_>>();
+
+    Some(ThreadDumpLineFilterResult {
+        filtered_lines,
+        snapshot_count: snapshots.len(),
+        hidden_thread_count,
+        retained_thread_count,
+    })
+}
+
+/// 标记单个线程片段在原日志行集合中的隐藏范围。
+///
+/// 业务意图：
+/// - 线程过滤需要隐藏从线程头到该线程片段末尾的连续行，但不能把下一个快照的时间戳一起隐藏。
+/// - 解析器为了悬浮详情保留了较完整的 `stack_lines`，这里按展示过滤场景再裁剪一次边界。
+fn mark_thread_sample_lines_hidden(
+    total_line_count: usize,
+    sample: &ThreadStateSample,
+    hidden_lines: &mut [bool],
+) {
+    let visible_stack_line_count = thread_sample_filter_line_count(&sample.stack_lines);
+    let start = sample.line_index.min(total_line_count);
+    let end = sample
+        .line_index
+        .saturating_add(visible_stack_line_count)
+        .min(total_line_count);
+    for hidden in hidden_lines.iter_mut().take(end).skip(start) {
+        *hidden = true;
+    }
+}
+
+/// 返回线程片段在正文过滤场景中应隐藏的行数。
+///
+/// 业务意图：
+/// - thread dump 常在下一个 `Full thread dump` 前先输出时间戳；解析阶段可能会把该时间戳暂时收进上一条线程片段。
+/// - 正文过滤必须保留这些快照边界行，否则用户会失去时间线线索，因此这里从线程片段尾部剔除时间戳及其前置空行。
+fn thread_sample_filter_line_count(stack_lines: &[String]) -> usize {
+    let mut end = stack_lines.len();
+    loop {
+        let mut candidate_end = end;
+        while candidate_end > 1 && stack_lines[candidate_end - 1].trim().is_empty() {
+            candidate_end = candidate_end.saturating_sub(1);
+        }
+        if candidate_end > 1
+            && extract_thread_dump_timestamp(&stack_lines[candidate_end - 1]).is_some()
+        {
+            end = candidate_end.saturating_sub(1);
+        } else {
+            break;
+        }
+    }
+    end.max(1)
 }
 
 /// 将已收集完的线程片段写入当前快照。

@@ -2633,6 +2633,97 @@ mod state_tests {
         assert!(analysis.summary.contains("过滤 1 个线程"));
     }
 
+    /// 验证当前日志正文可以按线程分析同一套规则过滤线程片段。
+    ///
+    /// 业务意图：
+    /// - 工具条“过滤线程”按钮不打开分析窗口，而是直接裁剪当前正文；被裁剪的线程必须同时包含用户配置过滤和默认单次线程过滤。
+    /// - 下一个快照的时间戳必须保留，否则用户过滤后无法判断剩余线程属于哪个 thread dump 时间点。
+    #[test]
+    fn 当前线程日志正文按分析规则过滤线程片段并保留快照边界() {
+        let lines = vec![
+            "2026-05-07 11:01:10".to_string(),
+            "Full thread dump Java HotSpot(TM) 64-Bit Server VM:".to_string(),
+            "\"repeat-thread\" #1 prio=5".to_string(),
+            "   java.lang.Thread.State: RUNNABLE".to_string(),
+            "        at demo.Business.run(Business.java:20)".to_string(),
+            "\"noise-thread\" #2 prio=5".to_string(),
+            "   java.lang.Thread.State: RUNNABLE".to_string(),
+            "        at demo.Noise.loop(Noise.java:10)".to_string(),
+            "2026-05-07 11:02:10".to_string(),
+            "Full thread dump Java HotSpot(TM) 64-Bit Server VM:".to_string(),
+            "\"repeat-thread\" #1 prio=5".to_string(),
+            "   java.lang.Thread.State: WAITING (parking)".to_string(),
+            "        at demo.Business.wait(Business.java:30)".to_string(),
+            "\"once-thread\" #3 prio=5".to_string(),
+            "   java.lang.Thread.State: RUNNABLE".to_string(),
+            "        at demo.Once.run(Once.java:40)".to_string(),
+        ];
+        let source = LogFileSource::LocalFile {
+            path: PathBuf::from("thread.log"),
+        };
+        let rules = MainView::parse_thread_analysis_name_filter_rules("noise-*");
+
+        let result =
+            filter_thread_dump_lines_with_analysis_rules(&lines, "thread.log", &source, &rules)
+                .expect("Java thread dump 应生成正文过滤结果");
+
+        assert_eq!(result.snapshot_count, 2);
+        assert_eq!(result.hidden_thread_count, 2);
+        assert_eq!(result.retained_thread_count, 2);
+        assert!(
+            result
+                .filtered_lines
+                .iter()
+                .any(|line| line == "2026-05-07 11:02:10"),
+            "过滤上一条线程时不能误删下一个快照时间戳"
+        );
+        assert!(
+            result
+                .filtered_lines
+                .iter()
+                .all(|line| !line.contains("noise-thread") && !line.contains("once-thread"))
+        );
+        assert_eq!(
+            result
+                .filtered_lines
+                .iter()
+                .filter(|line| line.contains("\"repeat-thread\""))
+                .count(),
+            2
+        );
+    }
+
+    /// 验证线程过滤按钮可用性使用真实 Java thread dump 解析结果判断。
+    ///
+    /// 业务意图：
+    /// - 普通日志中可能包含单词 `thread` 或 Java 异常堆栈，但没有完整 thread dump 时不应展示过滤按钮。
+    #[test]
+    fn 线程日志识别要求存在可解析快照和线程状态() {
+        let source = LogFileSource::LocalFile {
+            path: PathBuf::from("thread.log"),
+        };
+        let thread_lines = vec![
+            "Full thread dump Java HotSpot(TM) 64-Bit Server VM:".to_string(),
+            "\"worker\" #1 prio=5".to_string(),
+            "   java.lang.Thread.State: RUNNABLE".to_string(),
+        ];
+        let normal_lines = vec![
+            "2026-05-07 INFO thread pool started".to_string(),
+            "at demo.Worker.run(Worker.java:10)".to_string(),
+        ];
+
+        assert!(has_java_thread_dump_snapshots(
+            &thread_lines,
+            "thread.log",
+            &source
+        ));
+        assert!(!has_java_thread_dump_snapshots(
+            &normal_lines,
+            "app.log",
+            &source
+        ));
+    }
+
     /// 验证线程分析默认隐藏在选中日志中只出现一次的线程。
     ///
     /// 业务意图：
@@ -3553,6 +3644,9 @@ mod state_tests {
             source_key: "local:access.log".to_string(),
             title: "access.log".to_string(),
             encoding_choice: EncodingChoice::Manual(LogTextEncoding::Gbk),
+            thread_filter_available: false,
+            thread_filter_original_document: None,
+            thread_filter_summary: None,
             raw_bytes: Some(Arc::new(b"hello".to_vec())),
             state: LogTabState::Ready {
                 document: Box::new(LogTabDocument::InMemory(document)),
@@ -4317,6 +4411,9 @@ mod state_tests {
                 source_key: "local:first.log".to_string(),
                 title: "first.log".to_string(),
                 encoding_choice: EncodingChoice::Auto,
+                thread_filter_available: false,
+                thread_filter_original_document: None,
+                thread_filter_summary: None,
                 raw_bytes: None,
                 state: LogTabState::Loading {
                     message: "测试加载中".to_string(),
@@ -4338,6 +4435,9 @@ mod state_tests {
                 source_key: "local:second.log".to_string(),
                 title: "second.log".to_string(),
                 encoding_choice: EncodingChoice::Auto,
+                thread_filter_available: false,
+                thread_filter_original_document: None,
+                thread_filter_summary: None,
                 raw_bytes: None,
                 state: LogTabState::Loading {
                     message: "测试加载中".to_string(),
@@ -4379,6 +4479,9 @@ mod state_tests {
             source_key: "local:search.log".to_string(),
             title: "search.log".to_string(),
             encoding_choice: EncodingChoice::Auto,
+            thread_filter_available: false,
+            thread_filter_original_document: None,
+            thread_filter_summary: None,
             raw_bytes: None,
             state: LogTabState::Loading {
                 message: "测试加载中".to_string(),
@@ -4494,6 +4597,9 @@ mod state_tests {
                 source_key: "local:first.log".to_string(),
                 title: "first.log".to_string(),
                 encoding_choice: EncodingChoice::Auto,
+                thread_filter_available: false,
+                thread_filter_original_document: None,
+                thread_filter_summary: None,
                 raw_bytes: None,
                 state: LogTabState::Loading {
                     message: "测试加载中".to_string(),
@@ -4518,6 +4624,9 @@ mod state_tests {
                 source_key: "local:second.log".to_string(),
                 title: "second.log".to_string(),
                 encoding_choice: EncodingChoice::Auto,
+                thread_filter_available: false,
+                thread_filter_original_document: None,
+                thread_filter_summary: None,
                 raw_bytes: None,
                 state: LogTabState::Loading {
                     message: "测试加载中".to_string(),

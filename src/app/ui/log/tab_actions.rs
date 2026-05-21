@@ -283,6 +283,209 @@ impl MainView {
         parse_thread_analysis_name_filter_rules(raw)
     }
 
+    /// 判断当前日志文档是否可以启用线程正文过滤。
+    ///
+    /// 业务意图：
+    /// - 工具条渲染不能每帧扫描完整日志，因此在日志读取或重新解码完成时一次性缓存可用状态。
+    /// - 判定复用线程分析解析器，保证按钮出现后点击过滤不会因为规则不一致而无效。
+    ///
+    /// 边界条件：
+    /// - 分页大日志不在这里同步读取全部行，避免为了显示按钮阻塞 UI；后续如果需要支持超大线程日志，应走后台流式解析。
+    pub(in crate::app) fn log_document_supports_thread_filter(
+        document: &LogTabDocument,
+        source_name: &str,
+        source: &LogFileSource,
+    ) -> bool {
+        match document {
+            LogTabDocument::InMemory(document) => {
+                has_java_thread_dump_snapshots(&document.lines, source_name, source)
+            }
+            LogTabDocument::Paged(_) => false,
+        }
+    }
+
+    /// 切换当前 tab 的线程正文过滤状态。
+    ///
+    /// 业务意图：
+    /// - “过滤线程”复用线程日志分析配置，把当前正文中分析窗口会隐藏的线程片段直接从查看器里裁剪掉。
+    /// - 再次点击恢复过滤前的原始文档，保证该功能只影响当前会话展示，不改变源文件或编码选择。
+    ///
+    /// 边界条件：
+    /// - 只有已识别的内存态 Java thread dump 可以过滤；读取中、失败、分页日志或普通日志点击会被忽略。
+    /// - 过滤会改变行号映射，因此清空搜索定位、选区和手动标记，避免旧行号指向过滤后的错误内容。
+    pub(in crate::app) fn toggle_thread_filter_for_tab(
+        &mut self,
+        tab_id: usize,
+        context: &mut Context<Self>,
+    ) {
+        let Some(tab_index) = self.log.open_tabs.iter().position(|tab| tab.id == tab_id) else {
+            return;
+        };
+
+        if self.log.open_tabs[tab_index]
+            .thread_filter_original_document
+            .is_some()
+        {
+            self.restore_thread_filter_for_tab(tab_index, context);
+            return;
+        }
+
+        self.apply_thread_filter_for_tab(tab_index, context);
+    }
+
+    /// 对指定 tab 应用线程正文过滤。
+    ///
+    /// 业务意图：
+    /// - 将线程分析过滤结果转换成新的内存文档，并保留过滤前文档用于取消过滤。
+    /// - 过滤后的行号已经不再对应原文件，因此必须同步清理搜索高亮、标记行、选区和 minimap 缓存。
+    ///
+    /// 边界条件：
+    /// - 如果当前配置没有隐藏任何线程片段，则保持原文档不变，避免用户点击后进入“过滤中但内容完全相同”的模糊状态。
+    fn apply_thread_filter_for_tab(&mut self, tab_index: usize, context: &mut Context<Self>) {
+        let filter_rules = self.current_thread_analysis_filter_rules();
+        let Some((tab_id, original_document, filter_result)) =
+            self.thread_filter_result_for_tab(tab_index, &filter_rules)
+        else {
+            return;
+        };
+
+        if filter_result.hidden_thread_count == 0 {
+            return;
+        }
+
+        let filter_summary = filter_result.summary();
+        let mut filtered_document = original_document.as_ref().clone();
+        if let LogTabDocument::InMemory(document) = &mut filtered_document {
+            document.lines = Arc::new(filter_result.filtered_lines);
+            document.longest_line_index = longest_log_line_index(&document.lines);
+            // 过滤后行集合不再对应整文件语法树，必须丢弃预计算高亮，改回逐行轻量高亮。
+            document.precomputed_highlights = None;
+        }
+
+        let Some(tab) = self.log.open_tabs.get_mut(tab_index) else {
+            return;
+        };
+        tab.thread_filter_available = true;
+        tab.thread_filter_summary = Some(filter_summary);
+        tab.thread_filter_original_document = Some(original_document);
+        tab.state = LogTabState::Ready {
+            document: Box::new(filtered_document),
+        };
+        Self::reset_log_tab_view_state_after_thread_filter(tab);
+        self.drop_log_minimap_cache_for_tab(tab_id, context);
+        self.clear_search_current_file_match_count();
+        self.log.encoding_dropdown_menu = None;
+        self.log.log_viewer_context_menu = None;
+        self.log.tab_context_menu = None;
+        context.notify();
+    }
+
+    /// 恢复指定 tab 过滤前的线程日志正文。
+    ///
+    /// 业务意图：
+    /// - 取消过滤必须回到同一编码下的原始展示文档，而不是重新读取文件，避免压缩包成员或外部文件变化影响当前排障上下文。
+    ///
+    /// 边界条件：
+    /// - 恢复后同样清理行号相关 UI 状态，因为过滤视图和原始视图的行号集合不同。
+    fn restore_thread_filter_for_tab(&mut self, tab_index: usize, context: &mut Context<Self>) {
+        let Some(tab) = self.log.open_tabs.get_mut(tab_index) else {
+            return;
+        };
+        let Some(original_document) = tab.thread_filter_original_document.take() else {
+            return;
+        };
+        let tab_id = tab.id;
+        tab.state = LogTabState::Ready {
+            document: original_document,
+        };
+        tab.thread_filter_summary = None;
+        tab.thread_filter_available = true;
+        Self::reset_log_tab_view_state_after_thread_filter(tab);
+        self.drop_log_minimap_cache_for_tab(tab_id, context);
+        self.clear_search_current_file_match_count();
+        self.log.encoding_dropdown_menu = None;
+        self.log.log_viewer_context_menu = None;
+        self.log.tab_context_menu = None;
+        context.notify();
+    }
+
+    /// 返回当前设置页已保存的线程分析过滤规则集合。
+    ///
+    /// 业务意图：
+    /// - 当前正文过滤和独立线程分析窗口必须使用完全相同的线程名规则与堆栈规则组合。
+    ///
+    /// 边界条件：
+    /// - 如果设置页正在编辑但尚未保存，继续使用进入编辑前的有效文本，和线程分析窗口现有行为保持一致。
+    fn current_thread_analysis_filter_rules(&self) -> Vec<ThreadAnalysisFilterRule> {
+        let mut filter_rules = Self::parse_thread_analysis_name_filter_rules(
+            self.thread_analysis_name_filter_effective_text(),
+        );
+        filter_rules.extend(Self::parse_thread_analysis_filter_rules(
+            self.thread_analysis_filter_effective_text(),
+        ));
+        filter_rules
+    }
+
+    /// 计算指定 tab 的线程过滤结果和原始文档快照。
+    ///
+    /// 业务意图：
+    /// - 先在不可变借用下完成规则计算和原始文档克隆，避免在持有可变 tab 引用时再扫描正文导致借用关系复杂化。
+    ///
+    /// 边界条件：
+    /// - 只处理已缓存为可过滤的内存文档；分页文档和普通日志即使误触发也会返回 `None`。
+    fn thread_filter_result_for_tab(
+        &self,
+        tab_index: usize,
+        filter_rules: &[ThreadAnalysisFilterRule],
+    ) -> Option<(
+        usize,
+        Box<LogTabDocument>,
+        crate::thread_analysis::ThreadDumpLineFilterResult,
+    )> {
+        let tab = self.log.open_tabs.get(tab_index)?;
+        if !tab.thread_filter_available {
+            return None;
+        }
+        let LogTabState::Ready {
+            document: ready_document,
+        } = &tab.state
+        else {
+            return None;
+        };
+        let LogTabDocument::InMemory(document) = ready_document.as_ref() else {
+            return None;
+        };
+        let source_name = tab.title.clone();
+        let source = tab.source.clone();
+        let filter_result = filter_thread_dump_lines_with_analysis_rules(
+            &document.lines,
+            &source_name,
+            &source,
+            filter_rules,
+        )?;
+        Some((tab.id, ready_document.clone(), filter_result))
+    }
+
+    /// 重置线程过滤切换后不再可靠的 tab 视图状态。
+    ///
+    /// 业务意图：
+    /// - 线程过滤会改变可见行集合，任何按旧行号保存的滚动、搜索、标记和选区状态都必须丢弃。
+    ///
+    /// 边界条件：
+    /// - 编码选择和原始字节不在这里清理，因为过滤不改变解码策略，也不影响后续手动切换编码。
+    fn reset_log_tab_view_state_after_thread_filter(tab: &mut OpenLogTab) {
+        tab.scroll_handle = UniformListScrollHandle::new();
+        tab.paged_viewport_handle = ScrollHandle::new();
+        tab.paged_scroll = PagedLogScrollState::default();
+        tab.pending_scroll_to_line = None;
+        tab.highlighted_search_line = None;
+        tab.highlighted_search_match = None;
+        tab.marked_lines.clear();
+        tab.last_marker_jump_line = None;
+        tab.text_selection = None;
+        tab.selection_drag_anchor = None;
+    }
+
     /// 在主视图更新租借结束后打开或更新线程分析独立窗口。
     ///
     /// 业务意图：
@@ -482,6 +685,9 @@ impl MainView {
             source_key,
             title,
             encoding_choice: EncodingChoice::Auto,
+            thread_filter_available: false,
+            thread_filter_original_document: None,
+            thread_filter_summary: None,
             raw_bytes: None,
             state: LogTabState::Loading {
                 message: "正在读取日志文件...".to_string(),
@@ -625,6 +831,7 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 读取压缩包成员和解码大文本都可能耗时，必须离开 UI 线程执行。
+    /// - Java thread dump 识别也在同一后台任务里完成，避免 UI 合并阶段为了显示按钮再次扫描正文。
     /// - 后台任务返回时只按 tab ID 合并状态，避免持有过期引用。
     pub(in crate::app) fn spawn_log_tab_load(
         &self,
@@ -633,6 +840,7 @@ impl MainView {
         context: &mut Context<Self>,
     ) {
         let source_name = source.display_name();
+        let source_for_filter = source.clone();
         context
             .spawn(async move |view, app| {
                 let result = app
@@ -642,10 +850,20 @@ impl MainView {
                             Ok(LargeLogOpenResult::InMemoryReady {
                                 raw_bytes,
                                 document,
-                            }) => LogTabLoadResult::Ready {
-                                raw_bytes: Some(raw_bytes),
-                                document: Box::new(LogTabDocument::InMemory(document)),
-                            },
+                            }) => {
+                                let document = Box::new(LogTabDocument::InMemory(document));
+                                let thread_filter_available =
+                                    Self::log_document_supports_thread_filter(
+                                        &document,
+                                        &source_name,
+                                        &source_for_filter,
+                                    );
+                                LogTabLoadResult::Ready {
+                                    raw_bytes: Some(raw_bytes),
+                                    document,
+                                    thread_filter_available,
+                                }
+                            }
                             Ok(LargeLogOpenResult::InMemoryDecodeFailed { raw_bytes, message }) => {
                                 LogTabLoadResult::DecodeFailed { raw_bytes, message }
                             }
@@ -653,6 +871,7 @@ impl MainView {
                                 LogTabLoadResult::Ready {
                                     raw_bytes: None,
                                     document: Box::new(LogTabDocument::Paged(document)),
+                                    thread_filter_available: false,
                                 }
                             }
                             Err(error) => LogTabLoadResult::ReadFailed {
@@ -695,11 +914,16 @@ impl MainView {
             tab.selection_drag_anchor = None;
             tab.marked_lines.clear();
             tab.last_marker_jump_line = None;
+            tab.thread_filter_available = false;
+            tab.thread_filter_original_document = None;
+            tab.thread_filter_summary = None;
             match result {
                 LogTabLoadResult::Ready {
                     raw_bytes,
                     document,
+                    thread_filter_available,
                 } => {
+                    tab.thread_filter_available = thread_filter_available;
                     tab.raw_bytes = raw_bytes;
                     tab.state = LogTabState::Ready { document };
                     pending_scroll_to_line = tab.pending_scroll_to_line.take();
@@ -762,6 +986,7 @@ impl MainView {
         }
 
         let source_name = tab.title.clone();
+        let source = tab.source.clone();
         tab.encoding_choice = encoding_choice;
         tab.scroll_handle = UniformListScrollHandle::new();
         tab.pending_scroll_to_line = None;
@@ -770,6 +995,9 @@ impl MainView {
         tab.last_marker_jump_line = None;
         tab.text_selection = None;
         tab.selection_drag_anchor = None;
+        tab.thread_filter_available = false;
+        tab.thread_filter_original_document = None;
+        tab.thread_filter_summary = None;
         tab.state = LogTabState::Loading {
             message: format!("正在按 {} 重新解析...", encoding_choice.label()),
         };
@@ -793,7 +1021,14 @@ impl MainView {
         }
         context.notify();
         if let Some(raw_bytes) = raw_bytes {
-            self.spawn_log_tab_decode(tab_id, raw_bytes, encoding_choice, source_name, context);
+            self.spawn_log_tab_decode(
+                tab_id,
+                raw_bytes,
+                encoding_choice,
+                source_name,
+                source,
+                context,
+            );
         } else if let Some(document) = paged_document {
             self.spawn_paged_log_tab_decode(tab_id, document, encoding_choice, context);
         }
@@ -803,12 +1038,14 @@ impl MainView {
     ///
     /// 业务意图：
     /// - 内存模式日志重新解码仍可能耗时，放到后台执行可以避免界面短暂停顿。
+    /// - 重新解码后需要重新识别 thread dump，因为错误编码可能让同一份字节从不可解析变成可解析。
     pub(in crate::app) fn spawn_log_tab_decode(
         &self,
         tab_id: usize,
         raw_bytes: Arc<Vec<u8>>,
         encoding_choice: EncodingChoice,
         source_name: String,
+        source: LogFileSource,
         context: &mut Context<Self>,
     ) {
         context
@@ -817,9 +1054,19 @@ impl MainView {
                     .background_executor()
                     .spawn(async move {
                         decode_log_bytes(&raw_bytes, encoding_choice, &source_name)
-                            .map(|document| LogTabDecodeResult::Ready {
-                                encoding_choice,
-                                document: Box::new(LogTabDocument::InMemory(document)),
+                            .map(|document| {
+                                let document = Box::new(LogTabDocument::InMemory(document));
+                                let thread_filter_available =
+                                    Self::log_document_supports_thread_filter(
+                                        &document,
+                                        &source_name,
+                                        &source,
+                                    );
+                                LogTabDecodeResult::Ready {
+                                    encoding_choice,
+                                    document,
+                                    thread_filter_available,
+                                }
                             })
                             .unwrap_or_else(|error: LogContentError| LogTabDecodeResult::Failed {
                                 encoding_choice,
@@ -859,6 +1106,7 @@ impl MainView {
                             .map(|document| LogTabDecodeResult::Ready {
                                 encoding_choice,
                                 document: Box::new(LogTabDocument::Paged(document)),
+                                thread_filter_available: false,
                             })
                             .unwrap_or_else(|error| LogTabDecodeResult::Failed {
                                 encoding_choice,
@@ -920,8 +1168,16 @@ impl MainView {
             tab.text_selection = None;
             tab.selection_drag_anchor = None;
             tab.last_marker_jump_line = None;
+            tab.thread_filter_available = false;
+            tab.thread_filter_original_document = None;
+            tab.thread_filter_summary = None;
             match result {
-                LogTabDecodeResult::Ready { document, .. } => {
+                LogTabDecodeResult::Ready {
+                    document,
+                    thread_filter_available,
+                    ..
+                } => {
+                    tab.thread_filter_available = thread_filter_available;
                     tab.state = LogTabState::Ready { document };
                 }
                 LogTabDecodeResult::Failed { message, .. } => {
