@@ -36,6 +36,15 @@ MACOS_CONTENT_SCALE = 0.82
 # 业务意图：macOS 图标通常是圆角方形；0.22 接近 1024px 图标约 220px 圆角的视觉比例，既保留主体也去掉生硬直角。
 MACOS_CORNER_RADIUS_RATIO = 0.22
 
+# 业务意图：AI 生成图标常把主体画在白色画布上；这里仅抠除从图片边缘连通进来的近白背景，保留图标内部文档纸张等白色主体。
+EDGE_BACKGROUND_MIN_CHANNEL = 240
+
+# 业务意图：背景可能不是纯白，允许少量 RGB 波动；阈值过大可能误伤蓝色主体的高光，因此保持保守。
+EDGE_BACKGROUND_MAX_CHANNEL_DELTA = 24
+
+# 业务意图：已有透明像素应被视为背景，避免后续边缘搜索被半透明空像素阻断。
+EDGE_BACKGROUND_ALPHA_THRESHOLD = 8
+
 # PNG 文件签名。
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
@@ -71,13 +80,21 @@ def run_command(command: list[str]) -> None:
         raise RuntimeError(f"命令执行失败：{' '.join(command)}") from error
 
 
-def resize_png(source: Path, target: Path, size: int, *, rounded: bool) -> None:
+def resize_png(
+    source: Path,
+    target: Path,
+    size: int,
+    *,
+    rounded: bool,
+    remove_edge_background: bool = False,
+) -> None:
     """使用 `sips` 生成指定尺寸的 PNG，并按需写入圆角透明蒙版。
 
     业务意图：
     - `sips` 是 macOS 系统自带工具，不需要为一次性图标缩放新增项目依赖。
     - 目标路径先删除再生成，避免旧尺寸文件残留导致 `.icns` 或 `.ico` 混入过期图标。
     - 圆角蒙版在缩放后按目标尺寸重新计算，避免小尺寸图标出现锯齿或圆角比例失真。
+    - 部分源图自带白色画布，按需先把边缘连通的近白背景改成透明，避免最终 Dock 图标出现白边。
     """
 
     if target.exists():
@@ -88,9 +105,12 @@ def resize_png(source: Path, target: Path, size: int, *, rounded: bool) -> None:
         raw_target.unlink()
 
     run_command(["sips", "-z", str(size), str(size), str(source), "--out", str(raw_target)])
-    if rounded:
+    if rounded or remove_edge_background:
         image = read_png_rgba(raw_target)
-        apply_rounded_corners(image, MACOS_CORNER_RADIUS_RATIO)
+        if remove_edge_background:
+            remove_edge_connected_light_background(image)
+        if rounded:
+            apply_rounded_corners(image, MACOS_CORNER_RADIUS_RATIO)
         write_png_rgba(image, target)
         raw_target.unlink()
     else:
@@ -111,7 +131,7 @@ def build_macos_standard_source_icon(source: Path, target: Path) -> None:
 
     inset_size = round(MACOS_ICON_CANVAS_SIZE * MACOS_CONTENT_SCALE)
     inset_path = target.with_name(f"{target.stem}.inset{target.suffix}")
-    resize_png(source, inset_path, inset_size, rounded=True)
+    resize_png(source, inset_path, inset_size, rounded=True, remove_edge_background=True)
 
     inset_image = read_png_rgba(inset_path)
     canvas = PngImage(
@@ -140,6 +160,71 @@ def paste_image_center(canvas: PngImage, image: PngImage) -> None:
         target_start = ((y + y_offset) * canvas.width + x_offset) * 4
         target_end = target_start + image.width * 4
         canvas.rgba[target_start:target_end] = image.rgba[source_start:source_end]
+
+
+def remove_edge_connected_light_background(image: PngImage) -> None:
+    """抠除从边缘连通进来的近白背景。
+
+    业务意图：
+    - 新图标的主体外部带有白色画布，如果直接缩放进 macOS 透明安全区，会在 Dock/Finder 中形成一圈明显白边。
+    - 只从四条边做连通搜索，能删除外部画布，同时保留图标内部白色纸张、折角和高光。
+
+    边界条件：
+    - 近白阈值必须保守，避免误删蓝色底板的浅色高光。
+    - 已经透明或几乎透明的像素也作为背景传播，兼容后续重新处理透明 PNG 的场景。
+    """
+
+    visited = bytearray(image.width * image.height)
+    pending: list[tuple[int, int]] = []
+
+    def enqueue_if_background(x: int, y: int) -> None:
+        index = y * image.width + x
+        if visited[index] != 0:
+            return
+        visited[index] = 1
+        if is_edge_light_background_pixel(image, x, y):
+            pending.append((x, y))
+
+    for x in range(image.width):
+        enqueue_if_background(x, 0)
+        enqueue_if_background(x, image.height - 1)
+    for y in range(image.height):
+        enqueue_if_background(0, y)
+        enqueue_if_background(image.width - 1, y)
+
+    while pending:
+        x, y = pending.pop()
+        pixel_index = (y * image.width + x) * 4
+        image.rgba[pixel_index : pixel_index + 4] = b"\x00\x00\x00\x00"
+
+        if x > 0:
+            enqueue_if_background(x - 1, y)
+        if x + 1 < image.width:
+            enqueue_if_background(x + 1, y)
+        if y > 0:
+            enqueue_if_background(x, y - 1)
+        if y + 1 < image.height:
+            enqueue_if_background(x, y + 1)
+
+
+def is_edge_light_background_pixel(image: PngImage, x: int, y: int) -> bool:
+    """判断像素是否属于可抠除的边缘浅色背景。"""
+
+    pixel_index = (y * image.width + x) * 4
+    red = image.rgba[pixel_index]
+    green = image.rgba[pixel_index + 1]
+    blue = image.rgba[pixel_index + 2]
+    alpha = image.rgba[pixel_index + 3]
+
+    if alpha <= EDGE_BACKGROUND_ALPHA_THRESHOLD:
+        return True
+
+    min_channel = min(red, green, blue)
+    max_channel = max(red, green, blue)
+    return (
+        min_channel >= EDGE_BACKGROUND_MIN_CHANNEL
+        and max_channel - min_channel <= EDGE_BACKGROUND_MAX_CHANNEL_DELTA
+    )
 
 
 def read_png_rgba(path: Path) -> PngImage:
