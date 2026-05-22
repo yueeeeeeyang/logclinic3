@@ -14,8 +14,12 @@ use super::*;
 pub(in crate::app) enum TextInputBinding {
     /// 搜索弹窗的关键字输入框。
     SearchQuery,
+    /// 连接页左侧连接名称过滤输入框。
+    ConnectionTreeSearch,
     /// SSH 连接表单中的单行输入框。
     ConnectionForm(ConnectionFormField),
+    /// 连接分类弹窗中的名称输入框。
+    ConnectionCategoryName,
 }
 
 /// 输入框展示模式。
@@ -139,6 +143,11 @@ impl MainView {
                 .map(|snapshot| {
                     TextInputSnapshot::from_single_line(snapshot, TextInputDisplayMode::Plain)
                 }),
+            TextInputBinding::ConnectionTreeSearch => {
+                self.connection_tree_search_text_snapshot().map(|snapshot| {
+                    TextInputSnapshot::from_single_line(snapshot, TextInputDisplayMode::Plain)
+                })
+            }
             TextInputBinding::ConnectionForm(field) => {
                 let display_mode = if field == ConnectionFormField::Password {
                     TextInputDisplayMode::Masked { mask_char: '*' }
@@ -147,6 +156,11 @@ impl MainView {
                 };
                 self.connection_form_text_snapshot(field)
                     .map(|snapshot| TextInputSnapshot::from_single_line(snapshot, display_mode))
+            }
+            TextInputBinding::ConnectionCategoryName => {
+                self.connection_category_text_snapshot().map(|snapshot| {
+                    TextInputSnapshot::from_single_line(snapshot, TextInputDisplayMode::Plain)
+                })
             }
         }
     }
@@ -166,8 +180,14 @@ impl MainView {
                 bounds,
                 horizontal_scroll_px,
             ),
+            TextInputBinding::ConnectionTreeSearch => {
+                self.store_connection_tree_search_text_layout(line, bounds, horizontal_scroll_px)
+            }
             TextInputBinding::ConnectionForm(field) => {
                 self.store_connection_form_text_layout(field, line, bounds, horizontal_scroll_px)
+            }
+            TextInputBinding::ConnectionCategoryName => {
+                self.store_connection_category_text_layout(line, bounds, horizontal_scroll_px)
             }
         }
     }
@@ -190,11 +210,17 @@ impl MainView {
                 .search_dialog
                 .as_mut()
                 .map(|dialog| &mut dialog.query_input),
+            TextInputBinding::ConnectionTreeSearch => Some(&mut self.connections.tree_search.input),
             TextInputBinding::ConnectionForm(field) => self
                 .connections
                 .dialog
                 .as_mut()
                 .map(|dialog| &mut dialog.field_mut(field).input),
+            TextInputBinding::ConnectionCategoryName => self
+                .connections
+                .category_dialog
+                .as_mut()
+                .map(|dialog| &mut dialog.name.input),
         }
     }
 
@@ -209,11 +235,17 @@ impl MainView {
                 .search_dialog
                 .as_ref()
                 .map(|dialog| &dialog.query_input),
+            TextInputBinding::ConnectionTreeSearch => Some(&self.connections.tree_search.input),
             TextInputBinding::ConnectionForm(field) => self
                 .connections
                 .dialog
                 .as_ref()
                 .map(|dialog| &dialog.field(field).input),
+            TextInputBinding::ConnectionCategoryName => self
+                .connections
+                .category_dialog
+                .as_ref()
+                .map(|dialog| &dialog.name.input),
         }
     }
 
@@ -231,8 +263,14 @@ impl MainView {
             TextInputBinding::SearchQuery => {
                 self.search_text_index_for_point(SearchTextInputKind::Query, position)
             }
+            TextInputBinding::ConnectionTreeSearch => {
+                self.connection_tree_search_text_index_for_point(position)
+            }
             TextInputBinding::ConnectionForm(field) => {
                 self.connection_form_text_index_for_point(field, position)
+            }
+            TextInputBinding::ConnectionCategoryName => {
+                self.connection_category_text_index_for_point(position)
             }
         }
     }
@@ -253,15 +291,31 @@ impl MainView {
         was_focused: bool,
         context: &mut Context<Self>,
     ) -> bool {
-        if binding == TextInputBinding::SearchQuery && !was_focused {
-            if let Some(dialog) = self.search.search_dialog.as_mut() {
-                Self::select_all_search_query(dialog);
-                self.search.search_text_selection_drag = None;
-                self.touch_search_text_cursor_activity();
-                context.notify();
-                return true;
+        if matches!(binding, TextInputBinding::ConnectionForm(_)) {
+            // 连接表单中的分类 Select 与文本输入框处于同一个弹窗层级；点击任意文本字段时应先收起
+            // Select，避免浮层继续覆盖后续输入区域或底部按钮。
+            self.close_connection_dialog_category_select();
+        }
+        if !was_focused {
+            match binding {
+                TextInputBinding::SearchQuery => {
+                    if let Some(dialog) = self.search.search_dialog.as_mut() {
+                        Self::select_all_search_query(dialog);
+                        self.search.search_text_selection_drag = None;
+                        self.touch_search_text_cursor_activity();
+                        context.notify();
+                        return true;
+                    }
+                    return false;
+                }
+                TextInputBinding::ConnectionTreeSearch => {
+                    select_all_text_input(&mut self.connections.tree_search.input);
+                    self.touch_search_text_cursor_activity();
+                    context.notify();
+                    return true;
+                }
+                _ => {}
             }
-            return false;
         }
 
         let index = self.text_input_index_for_point(binding, event.position);

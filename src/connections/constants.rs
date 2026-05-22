@@ -15,8 +15,8 @@ pub(crate) const CONNECTIONS_DATABASE_FILE_NAME: &str = "connections.db";
 /// 连接数据库 schema 版本。
 ///
 /// 业务意图：
-/// - SQLite `PRAGMA user_version` 用于检测未来版本和后续迁移；第一版只包含 SSH 连接表。
-pub(crate) const CONNECTIONS_DATABASE_SCHEMA_VERSION: i64 = 1;
+/// - SQLite `PRAGMA user_version` 用于检测未来版本和后续迁移；v2 在 SSH 连接表之外新增分类树。
+pub(crate) const CONNECTIONS_DATABASE_SCHEMA_VERSION: i64 = 2;
 
 /// SSH 密码密文格式版本前缀。
 ///

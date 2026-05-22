@@ -38,6 +38,7 @@ pub(crate) fn open_connections_database(path: &Path) -> Result<Connection, Strin
 ///
 /// 边界条件：
 /// - `user_version` 大于当前版本时说明数据库来自未来版本，不能安全降级读取，直接返回中文错误。
+/// - v1 数据库只有 SSH 连接表；升级到 v2 时新增分类表和连接的 `category_id` 列，旧连接默认继续显示在根层。
 pub(crate) fn initialize_connections_database(connection: &Connection) -> Result<(), String> {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -51,12 +52,23 @@ pub(crate) fn initialize_connections_database(connection: &Connection) -> Result
     connection
         .execute_batch(
             r#"
+            CREATE TABLE IF NOT EXISTS connection_categories (
+                id TEXT PRIMARY KEY NOT NULL,
+                parent_id TEXT,
+                name TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_connection_categories_parent_created
+                ON connection_categories(parent_id, created_at_ms ASC);
+
             CREATE TABLE IF NOT EXISTS ssh_connections (
                 id TEXT PRIMARY KEY NOT NULL,
                 name TEXT NOT NULL,
                 host TEXT NOT NULL,
                 port INTEGER NOT NULL,
                 username TEXT NOT NULL,
+                category_id TEXT,
                 encrypted_password TEXT NOT NULL,
                 host_key_fingerprint TEXT,
                 created_at_ms INTEGER NOT NULL,
@@ -69,6 +81,25 @@ pub(crate) fn initialize_connections_database(connection: &Connection) -> Result
         )
         .map_err(|error| format!("初始化连接数据库失败：{error}"))?;
 
+    if !sqlite_table_has_column(connection, "ssh_connections", "category_id")? {
+        connection
+            .execute(
+                "ALTER TABLE ssh_connections ADD COLUMN category_id TEXT",
+                [],
+            )
+            .map_err(|error| format!("升级连接数据库分类字段失败：{error}"))?;
+    }
+
+    connection
+        .execute(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_ssh_connections_category_updated
+                ON ssh_connections(category_id, updated_at_ms DESC)
+            "#,
+            [],
+        )
+        .map_err(|error| format!("初始化连接分类索引失败：{error}"))?;
+
     if version < CONNECTIONS_DATABASE_SCHEMA_VERSION {
         connection
             .pragma_update(None, "user_version", CONNECTIONS_DATABASE_SCHEMA_VERSION)
@@ -77,13 +108,65 @@ pub(crate) fn initialize_connections_database(connection: &Connection) -> Result
     Ok(())
 }
 
+/// 判断 SQLite 表是否存在指定列。
+///
+/// 业务意图：
+/// - `ALTER TABLE ADD COLUMN` 在重复添加时会失败；升级 v1 数据库和创建新库都会走初始化入口，因此必须先读取 `PRAGMA table_info`。
+fn sqlite_table_has_column(
+    connection: &Connection,
+    table_name: &str,
+    column_name: &str,
+) -> Result<bool, String> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table_name})"))
+        .map_err(|error| format!("读取连接数据库表结构失败：{error}"))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("读取连接数据库表结构失败：{error}"))?;
+    for row in rows {
+        let name = row.map_err(|error| format!("解析连接数据库表结构失败：{error}"))?;
+        if name == column_name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// 加载连接分类列表。
+pub(crate) fn load_connection_categories(path: &Path) -> Result<Vec<ConnectionCategory>, String> {
+    let connection = open_connections_database(path)?;
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT id, parent_id, name, created_at_ms, updated_at_ms
+            FROM connection_categories
+            ORDER BY created_at_ms ASC, updated_at_ms ASC
+            "#,
+        )
+        .map_err(|error| format!("读取连接分类失败：{error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ConnectionCategory {
+                id: row.get(0)?,
+                parent_id: row.get(1)?,
+                name: row.get(2)?,
+                created_at_ms: row.get(3)?,
+                updated_at_ms: row.get(4)?,
+            })
+        })
+        .map_err(|error| format!("读取连接分类失败：{error}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析连接分类失败：{error}"))
+}
+
 /// 加载 SSH 连接列表。
 pub(crate) fn load_connection_profiles(path: &Path) -> Result<Vec<ConnectionProfile>, String> {
     let connection = open_connections_database(path)?;
     let mut statement = connection
         .prepare(
             r#"
-            SELECT id, name, host, port, username, encrypted_password,
+            SELECT id, name, host, port, username, category_id, encrypted_password,
                    host_key_fingerprint, created_at_ms, updated_at_ms, last_connected_at_ms
             FROM ssh_connections
             ORDER BY updated_at_ms DESC, created_at_ms DESC
@@ -101,11 +184,12 @@ pub(crate) fn load_connection_profiles(path: &Path) -> Result<Vec<ConnectionProf
                 host: row.get(2)?,
                 port,
                 username: row.get(4)?,
-                encrypted_password: row.get(5)?,
-                host_key_fingerprint: row.get(6)?,
-                created_at_ms: row.get(7)?,
-                updated_at_ms: row.get(8)?,
-                last_connected_at_ms: row.get(9)?,
+                category_id: row.get(5)?,
+                encrypted_password: row.get(6)?,
+                host_key_fingerprint: row.get(7)?,
+                created_at_ms: row.get(8)?,
+                updated_at_ms: row.get(9)?,
+                last_connected_at_ms: row.get(10)?,
             })
         })
         .map_err(|error| format!("读取连接列表失败：{error}"))?;
@@ -124,9 +208,9 @@ pub(crate) fn insert_connection_profile(
         .execute(
             r#"
             INSERT INTO ssh_connections
-                (id, name, host, port, username, encrypted_password, host_key_fingerprint,
+                (id, name, host, port, username, category_id, encrypted_password, host_key_fingerprint,
                  created_at_ms, updated_at_ms, last_connected_at_ms)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             "#,
             params![
                 profile.id,
@@ -134,6 +218,7 @@ pub(crate) fn insert_connection_profile(
                 profile.host,
                 i64::from(profile.port),
                 profile.username,
+                profile.category_id,
                 profile.encrypted_password,
                 profile.host_key_fingerprint,
                 profile.created_at_ms,
@@ -159,10 +244,11 @@ pub(crate) fn update_connection_profile(
                 host = ?3,
                 port = ?4,
                 username = ?5,
-                encrypted_password = ?6,
-                host_key_fingerprint = ?7,
-                updated_at_ms = ?8,
-                last_connected_at_ms = ?9
+                category_id = ?6,
+                encrypted_password = ?7,
+                host_key_fingerprint = ?8,
+                updated_at_ms = ?9,
+                last_connected_at_ms = ?10
             WHERE id = ?1
             "#,
             params![
@@ -171,6 +257,7 @@ pub(crate) fn update_connection_profile(
                 profile.host,
                 i64::from(profile.port),
                 profile.username,
+                profile.category_id,
                 profile.encrypted_password,
                 profile.host_key_fingerprint,
                 profile.updated_at_ms,
@@ -178,6 +265,93 @@ pub(crate) fn update_connection_profile(
             ],
         )
         .map_err(|error| format!("更新连接失败：{error}"))?;
+    Ok(())
+}
+
+/// 新增连接分类。
+pub(crate) fn insert_connection_category(
+    path: &Path,
+    category: &ConnectionCategory,
+) -> Result<(), String> {
+    let connection = open_connections_database(path)?;
+    connection
+        .execute(
+            r#"
+            INSERT INTO connection_categories
+                (id, parent_id, name, created_at_ms, updated_at_ms)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![
+                category.id,
+                category.parent_id,
+                category.name,
+                category.created_at_ms,
+                category.updated_at_ms,
+            ],
+        )
+        .map_err(|error| format!("保存连接分类失败：{error}"))?;
+    Ok(())
+}
+
+/// 更新连接分类。
+pub(crate) fn update_connection_category(
+    path: &Path,
+    category: &ConnectionCategory,
+) -> Result<(), String> {
+    let connection = open_connections_database(path)?;
+    connection
+        .execute(
+            r#"
+            UPDATE connection_categories
+            SET parent_id = ?2,
+                name = ?3,
+                updated_at_ms = ?4
+            WHERE id = ?1
+            "#,
+            params![
+                category.id,
+                category.parent_id,
+                category.name,
+                category.updated_at_ms,
+            ],
+        )
+        .map_err(|error| format!("更新连接分类失败：{error}"))?;
+    Ok(())
+}
+
+/// 删除空连接分类。
+///
+/// 边界条件：
+/// - 有子分类或连接挂载时直接返回中文错误，避免误删后连接“掉回根层”造成用户以为数据丢失。
+pub(crate) fn delete_connection_category(path: &Path, category_id: &str) -> Result<(), String> {
+    let connection = open_connections_database(path)?;
+    let child_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM connection_categories WHERE parent_id = ?1",
+            params![category_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("检查连接分类子分类失败：{error}"))?;
+    if child_count > 0 {
+        return Err("分类下还有子分类，不能删除".to_string());
+    }
+    let profile_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM ssh_connections WHERE category_id = ?1",
+            params![category_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("检查连接分类下连接失败：{error}"))?;
+    if profile_count > 0 {
+        return Err("分类下还有连接，不能删除".to_string());
+    }
+
+    connection
+        .execute(
+            "DELETE FROM connection_categories WHERE id = ?1",
+            params![category_id],
+        )
+        .map_err(|error| format!("删除连接分类失败：{error}"))?;
     Ok(())
 }
 
@@ -259,11 +433,23 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 22,
             username: "root".to_string(),
+            category_id: None,
             encrypted_password: "v1:nonce:cipher".to_string(),
             host_key_fingerprint: None,
             created_at_ms: now,
             updated_at_ms: now,
             last_connected_at_ms: None,
+        }
+    }
+
+    /// 构造测试连接分类。
+    fn test_category(id: &str, parent_id: Option<&str>, created_at_ms: i64) -> ConnectionCategory {
+        ConnectionCategory {
+            id: id.to_string(),
+            parent_id: parent_id.map(ToString::to_string),
+            name: format!("分类 {id}"),
+            created_at_ms,
+            updated_at_ms: created_at_ms,
         }
     }
 
@@ -278,10 +464,12 @@ mod tests {
         assert_eq!(loaded[0].name, "测试连接");
 
         profile.name = "修改后连接".to_string();
+        profile.category_id = Some("cat-1".to_string());
         profile.host_key_fingerprint = Some("SHA256:test".to_string());
         update_connection_profile(&path, &profile).unwrap();
         let loaded = load_connection_profiles(&path).unwrap();
         assert_eq!(loaded[0].name, "修改后连接");
+        assert_eq!(loaded[0].category_id.as_deref(), Some("cat-1"));
         assert_eq!(
             loaded[0].host_key_fingerprint.as_deref(),
             Some("SHA256:test")
@@ -289,6 +477,94 @@ mod tests {
 
         delete_connection_profile(&path, "conn-1").unwrap();
         assert!(load_connection_profiles(&path).unwrap().is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    /// 验证连接分类可以完成基础 CRUD。
+    #[test]
+    fn 连接分类数据库可以读写更新和删除空分类() {
+        let path = test_connections_database_path("category-crud");
+        let mut category = test_category("cat-1", None, 1);
+        insert_connection_category(&path, &category).unwrap();
+        let loaded = load_connection_categories(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "分类 cat-1");
+
+        category.name = "重命名分类".to_string();
+        category.updated_at_ms = 2;
+        update_connection_category(&path, &category).unwrap();
+        let loaded = load_connection_categories(&path).unwrap();
+        assert_eq!(loaded[0].name, "重命名分类");
+
+        delete_connection_category(&path, "cat-1").unwrap();
+        assert!(load_connection_categories(&path).unwrap().is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    /// 验证非空分类不会被删除，避免连接或子分类静默丢失层级。
+    #[test]
+    fn 连接分类非空时拒绝删除() {
+        let path = test_connections_database_path("category-non-empty");
+        let parent = test_category("cat-parent", None, 1);
+        let child = test_category("cat-child", Some("cat-parent"), 2);
+        insert_connection_category(&path, &parent).unwrap();
+        insert_connection_category(&path, &child).unwrap();
+        let error =
+            delete_connection_category(&path, "cat-parent").expect_err("有子分类时必须拒绝删除");
+        assert!(error.contains("子分类"));
+
+        delete_connection_category(&path, "cat-child").unwrap();
+        let mut profile = test_profile("conn-1");
+        profile.category_id = Some("cat-parent".to_string());
+        insert_connection_profile(&path, &profile).unwrap();
+        let error =
+            delete_connection_category(&path, "cat-parent").expect_err("有连接时必须拒绝删除");
+        assert!(error.contains("连接"));
+        let _ = fs::remove_file(&path);
+    }
+
+    /// 验证 v1 数据库升级到 v2 后旧连接会保留并显示在根层。
+    #[test]
+    fn 连接数据库_v1_升级后旧连接保留在根层() {
+        let path = test_connections_database_path("migrate-v1");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE ssh_connections (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    name TEXT NOT NULL,
+                    host TEXT NOT NULL,
+                    port INTEGER NOT NULL,
+                    username TEXT NOT NULL,
+                    encrypted_password TEXT NOT NULL,
+                    host_key_fingerprint TEXT,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    last_connected_at_ms INTEGER
+                );
+                INSERT INTO ssh_connections
+                    (id, name, host, port, username, encrypted_password, host_key_fingerprint,
+                     created_at_ms, updated_at_ms, last_connected_at_ms)
+                VALUES
+                    ('conn-old', '旧连接', '127.0.0.1', 22, 'root', 'v1:nonce:cipher',
+                     NULL, 1, 1, NULL);
+                PRAGMA user_version = 1;
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        let loaded = load_connection_profiles(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "conn-old");
+        assert!(loaded[0].category_id.is_none());
+        assert!(load_connection_categories(&path).unwrap().is_empty());
+        let connection = Connection::open(&path).unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CONNECTIONS_DATABASE_SCHEMA_VERSION);
         let _ = fs::remove_file(&path);
     }
 

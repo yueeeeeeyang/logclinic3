@@ -4,7 +4,7 @@
 // - 本文件只定义 GPUI 会话状态、表单状态、tab 状态和 alacritty_terminal 渲染快照。
 // - SQLite、加密和 SSH 网络任务都留在 `crate::connections` 业务域，避免 UI 状态直接承担安全和 IO 细节。
 
-use std::{ops::Range, path::PathBuf};
+use std::{collections::HashSet, ops::Range, path::PathBuf};
 
 use alacritty_terminal::{
     event::VoidListener,
@@ -85,6 +85,18 @@ pub(in crate::app) const CONNECTIONS_CONTEXT_MENU_ITEM_HEIGHT: f32 = 32.0;
 /// UI 约束：
 /// - 右键菜单使用 `.py_1()`，上下各 4px；坐标夹紧必须把这部分高度算进去，否则底部菜单项仍可能被窗口裁掉。
 pub(in crate::app) const CONNECTIONS_CONTEXT_MENU_VERTICAL_PADDING: f32 = 8.0;
+
+/// 左侧连接树搜索框高度。
+///
+/// UI 约束：
+/// - 搜索框放在连接页标题栏下方，需要保持紧凑，避免挤压分类树首屏。
+pub(in crate::app) const CONNECTIONS_TREE_SEARCH_HEIGHT: f32 = 32.0;
+
+/// 左侧连接树单层缩进。
+///
+/// UI 约束：
+/// - 分类和连接共用树形列表，缩进必须稳定，避免搜索和展开/收起时行内容横向跳动。
+pub(in crate::app) const CONNECTIONS_TREE_DEPTH_INDENT: f32 = 16.0;
 
 /// 连接终端区域主题色。
 ///
@@ -191,10 +203,16 @@ pub(in crate::app) struct ConnectionsWorkspaceState {
     pub(in crate::app) database_path: Option<PathBuf>,
     /// SSH 连接配置列表，来自独立 SQLite。
     pub(in crate::app) profiles: Vec<ConnectionProfile>,
+    /// 连接分类列表，来自独立 SQLite；根层是虚拟节点，不包含在该列表中。
+    pub(in crate::app) categories: Vec<ConnectionCategory>,
     /// 数据库初始化或读取错误，中文展示给用户。
     pub(in crate::app) database_error: Option<String>,
     /// 左侧当前选中的连接 ID；只影响高亮和编辑/删除默认目标。
     pub(in crate::app) selected_profile_id: Option<String>,
+    /// 左侧连接树已展开分类 ID 集合；搜索模式会临时展开匹配祖先但不写入该集合。
+    pub(in crate::app) expanded_category_ids: HashSet<String>,
+    /// 左侧连接名称搜索框状态；只过滤连接名称，不匹配分类名称。
+    pub(in crate::app) tree_search: ConnectionTreeSearchState,
     /// 左侧栏宽度，当前只保存进程内状态。
     pub(in crate::app) tree_width: f32,
     /// 当前是否正在拖拽调整左侧栏宽度。
@@ -219,10 +237,25 @@ pub(in crate::app) struct ConnectionsWorkspaceState {
     /// - 连接卡片本身只负责单击直连，编辑和删除等低频动作统一收进右键菜单，避免卡片内按钮互相抢占点击区域。
     /// - 菜单坐标保存为左侧连接栏内部坐标；鼠标事件进入时需要扣除主导航宽度并限制在侧栏范围内。
     pub(in crate::app) profile_context_menu: Option<ConnectionProfileContextMenu>,
+    /// 左侧分类行右键菜单。
+    ///
+    /// UI 约束：
+    /// - 分类菜单和连接菜单共享左侧浮层层级，任一菜单打开时必须关闭另一种菜单，避免点击目标不明确。
+    pub(in crate::app) category_context_menu: Option<ConnectionCategoryContextMenu>,
+    /// 终端 tab 右键菜单。
+    ///
+    /// UI 约束：
+    /// - 菜单绘制在右侧终端工作区内部，坐标使用工作区局部坐标，避免受左侧栏宽度变化影响。
+    pub(in crate::app) tab_context_menu: Option<ConnectionTabContextMenu>,
     /// 新增/编辑连接弹窗状态。
     pub(in crate::app) dialog: Option<ConnectionDialogState>,
+    /// 新增/编辑分类弹窗状态。
+    pub(in crate::app) category_dialog: Option<ConnectionCategoryDialogState>,
     /// 删除连接确认弹窗状态。
     pub(in crate::app) delete_confirm_dialog: Option<ConnectionDeleteConfirmDialog>,
+    /// 删除分类确认弹窗状态。
+    pub(in crate::app) category_delete_confirm_dialog:
+        Option<ConnectionCategoryDeleteConfirmDialog>,
     /// 首次信任或指纹不匹配弹窗状态。
     pub(in crate::app) host_key_dialog: Option<ConnectionHostKeyDialog>,
     /// 当前页面状态提示，保存、删除、连接失败等短消息写在这里。
@@ -236,14 +269,18 @@ impl ConnectionsWorkspaceState {
     ///
     /// 边界条件：
     /// - 数据库不可用时保留空列表和错误消息，主窗口仍然可以打开日志、笔记、HPROF 和 AI 页。
-    pub(in crate::app) fn load_or_initialize(_context: &mut Context<MainView>) -> Self {
+    pub(in crate::app) fn load_or_initialize(context: &mut Context<MainView>) -> Self {
         let database_path = connections_database_path();
-        let (profiles, database_error) = match database_path.as_ref() {
-            Some(path) => match load_connection_profiles(path) {
-                Ok(profiles) => (profiles, None),
-                Err(error) => (Vec::new(), Some(error)),
+        let (profiles, categories, database_error) = match database_path.as_ref() {
+            Some(path) => match (
+                load_connection_profiles(path),
+                load_connection_categories(path),
+            ) {
+                (Ok(profiles), Ok(categories)) => (profiles, categories, None),
+                (Err(error), _) | (_, Err(error)) => (Vec::new(), Vec::new(), Some(error)),
             },
             None => (
+                Vec::new(),
                 Vec::new(),
                 Some("无法定位应用配置目录，连接配置不会被加载".to_string()),
             ),
@@ -253,8 +290,11 @@ impl ConnectionsWorkspaceState {
         Self {
             database_path,
             profiles,
+            categories,
             database_error,
             selected_profile_id,
+            expanded_category_ids: HashSet::new(),
+            tree_search: ConnectionTreeSearchState::new(context),
             tree_width: CONNECTIONS_TREE_DEFAULT_WIDTH,
             tree_resize_drag: None,
             next_tab_id: 1,
@@ -263,8 +303,12 @@ impl ConnectionsWorkspaceState {
             tab_bar_scroll_handle: ScrollHandle::new(),
             create_menu_open: false,
             profile_context_menu: None,
+            category_context_menu: None,
+            tab_context_menu: None,
             dialog: None,
+            category_dialog: None,
             delete_confirm_dialog: None,
+            category_delete_confirm_dialog: None,
             host_key_dialog: None,
             status_message: None,
             terminal_poll_scheduled: false,
@@ -278,19 +322,36 @@ impl ConnectionsWorkspaceState {
             .find(|profile| profile.id == profile_id)
     }
 
-    /// 重新加载 SQLite 中的连接列表。
-    pub(in crate::app) fn reload_profiles(&mut self) {
+    /// 根据分类 ID 查找分类。
+    pub(in crate::app) fn category_by_id(&self, category_id: &str) -> Option<&ConnectionCategory> {
+        self.categories
+            .iter()
+            .find(|category| category.id == category_id)
+    }
+
+    /// 重新加载 SQLite 中的连接和分类列表。
+    pub(in crate::app) fn reload_tree_data(&mut self) {
         let Some(path) = self.database_path.as_ref() else {
             self.database_error = Some("无法定位应用配置目录，连接配置不会被加载".to_string());
             self.profiles.clear();
+            self.categories.clear();
             self.selected_profile_id = None;
             return;
         };
 
-        match load_connection_profiles(path) {
-            Ok(profiles) => {
+        match (
+            load_connection_profiles(path),
+            load_connection_categories(path),
+        ) {
+            (Ok(profiles), Ok(categories)) => {
                 self.database_error = None;
                 self.profiles = profiles;
+                self.categories = categories;
+                self.expanded_category_ids.retain(|category_id| {
+                    self.categories
+                        .iter()
+                        .any(|category| &category.id == category_id)
+                });
                 if let Some(selected) = self.selected_profile_id.as_ref()
                     && self.profiles.iter().any(|profile| &profile.id == selected)
                 {
@@ -298,10 +359,15 @@ impl ConnectionsWorkspaceState {
                 }
                 self.selected_profile_id = self.profiles.first().map(|profile| profile.id.clone());
             }
-            Err(error) => {
+            (Err(error), _) | (_, Err(error)) => {
                 self.database_error = Some(error);
             }
         }
+    }
+
+    /// 兼容旧调用点的连接列表刷新入口。
+    pub(in crate::app) fn reload_profiles(&mut self) {
+        self.reload_tree_data();
     }
 
     /// 关闭指定连接打开的所有终端 tab。
@@ -322,10 +388,43 @@ impl ConnectionsWorkspaceState {
         if let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) {
             self.tabs[index].backend.shutdown();
             self.tabs.remove(index);
+            if self.active_tab_id == Some(tab_id) {
+                self.active_tab_id = self
+                    .tabs
+                    .get(index)
+                    .or_else(|| {
+                        index
+                            .checked_sub(1)
+                            .and_then(|previous| self.tabs.get(previous))
+                    })
+                    .map(|tab| tab.id);
+            }
         }
-        if self.active_tab_id == Some(tab_id) {
-            self.active_tab_id = self.tabs.last().map(|tab| tab.id);
+        self.tab_context_menu = None;
+    }
+
+    /// 关闭指定 tab 之外的所有终端 tab。
+    pub(in crate::app) fn close_other_tabs(&mut self, tab_id: usize) {
+        for tab in self.tabs.iter().filter(|tab| tab.id != tab_id) {
+            tab.backend.shutdown();
         }
+        self.tabs.retain(|tab| tab.id == tab_id);
+        self.active_tab_id = self.tabs.first().map(|tab| tab.id);
+        self.tab_context_menu = None;
+        self.tab_bar_scroll_handle
+            .set_offset(point(px(0.0), px(0.0)));
+    }
+
+    /// 关闭全部终端 tab。
+    pub(in crate::app) fn close_all_tabs(&mut self) {
+        for tab in &self.tabs {
+            tab.backend.shutdown();
+        }
+        self.tabs.clear();
+        self.active_tab_id = None;
+        self.tab_context_menu = None;
+        self.tab_bar_scroll_handle
+            .set_offset(point(px(0.0), px(0.0)));
     }
 
     /// 返回当前激活 tab 的可变引用。
@@ -349,6 +448,58 @@ pub(in crate::app) struct ConnectionsTreeResizeDrag {
     pub(in crate::app) start_width: f32,
 }
 
+/// 左侧连接树搜索输入状态。
+///
+/// 业务意图：
+/// - 搜索框只影响连接树当前展示，不写入 SQLite，不影响分类展开持久状态。
+/// - 使用通用单行输入框状态，让中文 IME、复制粘贴、拖拽选区和水平滚动与其它输入框保持一致。
+pub(in crate::app) struct ConnectionTreeSearchState {
+    /// 单行输入框通用编辑状态。
+    pub(in crate::app) input: SingleLineTextInputState,
+    /// 搜索框焦点句柄。
+    pub(in crate::app) focus: FocusHandle,
+    /// 最近一次绘制的字形布局，用于鼠标命中和 IME 候选窗口定位。
+    pub(in crate::app) last_layout: Option<ShapedLine>,
+    /// 最近一次绘制的输入框窗口坐标。
+    pub(in crate::app) last_bounds: Option<Bounds<Pixels>>,
+}
+
+impl ConnectionTreeSearchState {
+    /// 创建连接树搜索输入状态。
+    pub(in crate::app) fn new(context: &mut Context<MainView>) -> Self {
+        Self {
+            input: SingleLineTextInputState::empty(),
+            focus: context.focus_handle(),
+            last_layout: None,
+            last_bounds: None,
+        }
+    }
+
+    /// 判断当前是否存在有效搜索关键字。
+    pub(in crate::app) fn query(&self) -> String {
+        self.input.text.trim().to_lowercase()
+    }
+
+    /// 记录最近一次绘制布局。
+    pub(in crate::app) fn store_layout(
+        &mut self,
+        line: ShapedLine,
+        bounds: Bounds<Pixels>,
+        horizontal_scroll_px: f32,
+    ) {
+        self.last_layout = Some(line);
+        self.last_bounds = Some(bounds);
+        self.input.horizontal_scroll_px = horizontal_scroll_px;
+    }
+
+    /// 清理布局缓存。
+    pub(in crate::app) fn clear_layout(&mut self) {
+        self.last_layout = None;
+        self.last_bounds = None;
+        self.input.horizontal_scroll_px = 0.0;
+    }
+}
+
 /// 新建连接菜单中的连接类型。
 ///
 /// 业务意图：
@@ -360,6 +511,8 @@ pub(in crate::app) enum ConnectionCreateKind {
     Ssh,
     /// 本机 shell 终端，不保存连接配置。
     LocalTerminal,
+    /// 新建连接分类。
+    Category,
 }
 
 /// 新建连接菜单当前展示的连接类型顺序。
@@ -369,6 +522,7 @@ pub(in crate::app) enum ConnectionCreateKind {
 pub(in crate::app) const CONNECTION_CREATE_KINDS: &[ConnectionCreateKind] = &[
     ConnectionCreateKind::Ssh,
     ConnectionCreateKind::LocalTerminal,
+    ConnectionCreateKind::Category,
 ];
 
 impl ConnectionCreateKind {
@@ -377,6 +531,7 @@ impl ConnectionCreateKind {
         match self {
             Self::Ssh => "SSH 连接",
             Self::LocalTerminal => "本地终端",
+            Self::Category => "新建分类",
         }
     }
 
@@ -385,6 +540,7 @@ impl ConnectionCreateKind {
         match self {
             Self::Ssh => Icon::Terminal,
             Self::LocalTerminal => Icon::SquareTerminal,
+            Self::Category => Icon::FolderPlus,
         }
     }
 }
@@ -414,6 +570,51 @@ pub(in crate::app) enum ConnectionProfileContextMenuAction {
     Delete,
 }
 
+/// 左侧分类行右键菜单状态。
+pub(in crate::app) struct ConnectionCategoryContextMenu {
+    /// 菜单目标分类 ID。
+    pub(in crate::app) category_id: String,
+    /// 菜单在连接侧栏内部的横坐标。
+    pub(in crate::app) x: f32,
+    /// 菜单在连接侧栏内部的纵坐标。
+    pub(in crate::app) y: f32,
+}
+
+/// 左侧分类行右键菜单动作。
+///
+/// 业务意图：
+/// - 分类行主点击用于展开/收起，管理动作统一放到右键菜单，避免和连接行的单击直连语义冲突。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::app) enum ConnectionCategoryContextMenuAction {
+    /// 在当前分类下新建子分类。
+    CreateChild,
+    /// 重命名分类。
+    Edit,
+    /// 删除空分类。
+    Delete,
+}
+
+/// 连接终端 tab 右键菜单状态。
+pub(in crate::app) struct ConnectionTabContextMenu {
+    /// 菜单目标 tab ID。
+    pub(in crate::app) tab_id: usize,
+    /// 菜单在右侧终端工作区内部的横坐标。
+    pub(in crate::app) x: f32,
+    /// 菜单在右侧终端工作区内部的纵坐标。
+    pub(in crate::app) y: f32,
+}
+
+/// 连接终端 tab 右键菜单动作。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::app) enum ConnectionTabContextMenuAction {
+    /// 关闭右键点击的 tab。
+    Current,
+    /// 关闭右键点击 tab 之外的其它 tab。
+    OtherTabs,
+    /// 关闭全部连接终端 tab。
+    AllTabs,
+}
+
 /// 新增/编辑连接弹窗状态。
 pub(in crate::app) struct ConnectionDialogState {
     /// 弹窗模式。
@@ -428,6 +629,10 @@ pub(in crate::app) struct ConnectionDialogState {
     pub(in crate::app) port: ConnectionFormTextFieldState,
     /// 用户名输入状态。
     pub(in crate::app) username: ConnectionFormTextFieldState,
+    /// 当前选择的分类 ID；`None` 表示根层无分类。
+    pub(in crate::app) category_id: Option<String>,
+    /// 分类 Select 是否展开。
+    pub(in crate::app) category_select_open: bool,
     /// 密码输入状态；编辑时为空表示不修改旧密码。
     pub(in crate::app) password: ConnectionFormTextFieldState,
 }
@@ -442,6 +647,8 @@ impl ConnectionDialogState {
             host: ConnectionFormTextFieldState::new(String::new(), context),
             port: ConnectionFormTextFieldState::new(DEFAULT_SSH_PORT.to_string(), context),
             username: ConnectionFormTextFieldState::new(String::new(), context),
+            category_id: None,
+            category_select_open: false,
             password: ConnectionFormTextFieldState::new(String::new(), context),
         }
     }
@@ -460,6 +667,8 @@ impl ConnectionDialogState {
             host: ConnectionFormTextFieldState::new(profile.host.clone(), context),
             port: ConnectionFormTextFieldState::new(profile.port.to_string(), context),
             username: ConnectionFormTextFieldState::new(profile.username.clone(), context),
+            category_id: profile.category_id.clone(),
+            category_select_open: false,
             password: ConnectionFormTextFieldState::new(String::new(), context),
         }
     }
@@ -475,6 +684,7 @@ impl ConnectionDialogState {
             host: self.host.input.text.clone(),
             port_text: self.port.input.text.clone(),
             username: self.username.input.text.clone(),
+            category_id: self.category_id.clone(),
             password: self.password.input.text.clone(),
         }
     }
@@ -592,12 +802,80 @@ pub(in crate::app) enum ConnectionFormField {
     Password,
 }
 
+/// 新增/编辑分类弹窗状态。
+pub(in crate::app) struct ConnectionCategoryDialogState {
+    /// 弹窗模式。
+    pub(in crate::app) mode: ConnectionCategoryDialogMode,
+    /// 表单错误消息。
+    pub(in crate::app) error: Option<String>,
+    /// 分类名称输入状态。
+    pub(in crate::app) name: ConnectionFormTextFieldState,
+}
+
+impl ConnectionCategoryDialogState {
+    /// 创建新增分类弹窗。
+    pub(in crate::app) fn create(
+        parent_id: Option<String>,
+        context: &mut Context<MainView>,
+    ) -> Self {
+        Self {
+            mode: ConnectionCategoryDialogMode::Create { parent_id },
+            error: None,
+            name: ConnectionFormTextFieldState::new(String::new(), context),
+        }
+    }
+
+    /// 创建编辑分类弹窗。
+    pub(in crate::app) fn edit(
+        category: &ConnectionCategory,
+        context: &mut Context<MainView>,
+    ) -> Self {
+        Self {
+            mode: ConnectionCategoryDialogMode::Edit {
+                category_id: category.id.clone(),
+            },
+            error: None,
+            name: ConnectionFormTextFieldState::new(category.name.clone(), context),
+        }
+    }
+
+    /// 生成保存校验使用的纯分类草稿。
+    pub(in crate::app) fn to_category_draft(&self) -> ConnectionCategoryDraft {
+        ConnectionCategoryDraft {
+            name: self.name.input.text.clone(),
+        }
+    }
+}
+
+/// 分类弹窗模式。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::app) enum ConnectionCategoryDialogMode {
+    /// 新增分类，`parent_id=None` 表示根层分类。
+    Create {
+        /// 父分类 ID。
+        parent_id: Option<String>,
+    },
+    /// 编辑已有分类名称。
+    Edit {
+        /// 正在编辑的分类 ID。
+        category_id: String,
+    },
+}
+
 /// 删除连接确认弹窗。
 pub(in crate::app) struct ConnectionDeleteConfirmDialog {
     /// 待删除连接 ID。
     pub(in crate::app) profile_id: String,
     /// 待删除连接名称，用于确认文案。
     pub(in crate::app) profile_name: String,
+}
+
+/// 删除分类确认弹窗。
+pub(in crate::app) struct ConnectionCategoryDeleteConfirmDialog {
+    /// 待删除分类 ID。
+    pub(in crate::app) category_id: String,
+    /// 待删除分类名称，用于确认文案。
+    pub(in crate::app) category_name: String,
 }
 
 /// SSH 主机指纹弹窗。
@@ -610,6 +888,174 @@ pub(in crate::app) struct ConnectionHostKeyDialog {
     pub(in crate::app) fingerprint: String,
     /// 如果是指纹不匹配，这里保存旧指纹；首次信任时为 `None`。
     pub(in crate::app) expected: Option<String>,
+}
+
+/// 左侧连接树派生行。
+///
+/// 业务意图：
+/// - 分类展开、搜索过滤和连接排序都属于状态推导，先生成结构化行再交给 GPUI 渲染，便于纯单元测试覆盖。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::app) enum ConnectionTreeRow {
+    /// 分类行。
+    Category {
+        /// 分类快照。
+        category: ConnectionCategory,
+        /// 树形缩进层级。
+        depth: usize,
+        /// 当前是否展开；搜索模式下匹配祖先会被临时视为展开。
+        expanded: bool,
+    },
+    /// 连接行。
+    Profile {
+        /// 连接快照。
+        profile: ConnectionProfile,
+        /// 树形缩进层级。
+        depth: usize,
+    },
+}
+
+/// 根据分类、连接、展开状态和搜索词生成左侧连接树行。
+///
+/// 业务意图：
+/// - 搜索只匹配连接名称；匹配连接的祖先分类需要保留，帮助用户理解结果所在路径。
+/// - 普通模式按分类创建时间稳定排序，同一分类下连接沿用存储层的更新时间倒序。
+///
+/// 边界条件：
+/// - 数据库中如果存在父分类缺失的孤儿分类，按根层分类展示，避免用户看不到可恢复的数据。
+/// - 分类父级如果意外形成循环，递归会通过 visited 集合停止，避免 UI 渲染卡死。
+pub(in crate::app) fn build_connection_tree_rows(
+    categories: &[ConnectionCategory],
+    profiles: &[ConnectionProfile],
+    expanded_category_ids: &HashSet<String>,
+    search_query: &str,
+) -> Vec<ConnectionTreeRow> {
+    let normalized_query = search_query.trim().to_lowercase();
+    let searching = !normalized_query.is_empty();
+    let mut rows = Vec::new();
+    let mut visited = HashSet::new();
+
+    build_connection_tree_rows_for_parent(
+        None,
+        0,
+        categories,
+        profiles,
+        expanded_category_ids,
+        searching,
+        &normalized_query,
+        &mut visited,
+        &mut rows,
+    );
+    rows
+}
+
+fn build_connection_tree_rows_for_parent(
+    parent_id: Option<&str>,
+    depth: usize,
+    categories: &[ConnectionCategory],
+    profiles: &[ConnectionProfile],
+    expanded_category_ids: &HashSet<String>,
+    searching: bool,
+    normalized_query: &str,
+    visited: &mut HashSet<String>,
+    rows: &mut Vec<ConnectionTreeRow>,
+) {
+    for category in categories.iter().filter(|category| {
+        connection_category_visible_under_parent(category, parent_id, categories)
+    }) {
+        if !visited.insert(category.id.clone()) {
+            continue;
+        }
+        let has_match = !searching
+            || connection_category_has_matching_profile(
+                categories,
+                profiles,
+                &category.id,
+                normalized_query,
+                &mut HashSet::new(),
+            );
+        if has_match {
+            let expanded = searching || expanded_category_ids.contains(&category.id);
+            rows.push(ConnectionTreeRow::Category {
+                category: category.clone(),
+                depth,
+                expanded,
+            });
+            if expanded {
+                build_connection_tree_rows_for_parent(
+                    Some(&category.id),
+                    depth + 1,
+                    categories,
+                    profiles,
+                    expanded_category_ids,
+                    searching,
+                    normalized_query,
+                    visited,
+                    rows,
+                );
+            }
+        }
+    }
+
+    for profile in profiles.iter().filter(|profile| {
+        connection_profile_visible_under_parent(profile, parent_id, categories)
+            && (!searching || profile.name.to_lowercase().contains(normalized_query))
+    }) {
+        rows.push(ConnectionTreeRow::Profile {
+            profile: profile.clone(),
+            depth,
+        });
+    }
+}
+
+fn connection_category_visible_under_parent(
+    category: &ConnectionCategory,
+    parent_id: Option<&str>,
+    categories: &[ConnectionCategory],
+) -> bool {
+    match (category.parent_id.as_deref(), parent_id) {
+        (None, None) => true,
+        (Some(parent), Some(expected)) => parent == expected,
+        (Some(parent), None) => !categories.iter().any(|category| category.id == parent),
+        _ => false,
+    }
+}
+
+fn connection_profile_visible_under_parent(
+    profile: &ConnectionProfile,
+    parent_id: Option<&str>,
+    categories: &[ConnectionCategory],
+) -> bool {
+    match (profile.category_id.as_deref(), parent_id) {
+        (None, None) => true,
+        (Some(category_id), Some(expected)) => category_id == expected,
+        (Some(category_id), None) => !categories.iter().any(|category| category.id == category_id),
+        _ => false,
+    }
+}
+
+fn connection_category_has_matching_profile(
+    categories: &[ConnectionCategory],
+    profiles: &[ConnectionProfile],
+    category_id: &str,
+    normalized_query: &str,
+    visited: &mut HashSet<String>,
+) -> bool {
+    if !visited.insert(category_id.to_string()) {
+        return false;
+    }
+    profiles.iter().any(|profile| {
+        profile.category_id.as_deref() == Some(category_id)
+            && profile.name.to_lowercase().contains(normalized_query)
+    }) || categories.iter().any(|category| {
+        category.parent_id.as_deref() == Some(category_id)
+            && connection_category_has_matching_profile(
+                categories,
+                profiles,
+                &category.id,
+                normalized_query,
+                visited,
+            )
+    })
 }
 
 /// 终端 tab 状态。
@@ -1043,6 +1489,34 @@ fn terminal_indexed_color_to_rgb(index: u8, theme: EffectiveTheme) -> u32 {
 mod tests {
     use super::*;
 
+    /// 构造连接树测试分类。
+    fn test_category(id: &str, parent_id: Option<&str>, created_at_ms: i64) -> ConnectionCategory {
+        ConnectionCategory {
+            id: id.to_string(),
+            parent_id: parent_id.map(ToString::to_string),
+            name: id.to_string(),
+            created_at_ms,
+            updated_at_ms: created_at_ms,
+        }
+    }
+
+    /// 构造连接树测试连接。
+    fn test_profile(id: &str, name: &str, category_id: Option<&str>) -> ConnectionProfile {
+        ConnectionProfile {
+            id: id.to_string(),
+            name: name.to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 22,
+            username: "root".to_string(),
+            category_id: category_id.map(ToString::to_string),
+            encrypted_password: "v1:nonce:cipher".to_string(),
+            host_key_fingerprint: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_connected_at_ms: None,
+        }
+    }
+
     /// 验证终端输出会进入 alacritty grid。
     #[test]
     fn 终端模拟器可以解析普通输出() {
@@ -1130,7 +1604,8 @@ mod tests {
             CONNECTION_CREATE_KINDS,
             &[
                 ConnectionCreateKind::Ssh,
-                ConnectionCreateKind::LocalTerminal
+                ConnectionCreateKind::LocalTerminal,
+                ConnectionCreateKind::Category
             ]
         );
 
@@ -1144,6 +1619,91 @@ mod tests {
             char::from(ConnectionCreateKind::LocalTerminal.icon()),
             char::from(Icon::SquareTerminal)
         );
+        assert_eq!(ConnectionCreateKind::Category.label(), "新建分类");
+        assert_eq!(
+            char::from(ConnectionCreateKind::Category.icon()),
+            char::from(Icon::FolderPlus)
+        );
+    }
+
+    /// 验证连接树普通模式按展开状态显示分类和连接。
+    #[test]
+    fn 连接树普通模式遵循分类展开状态() {
+        let categories = vec![
+            test_category("生产", None, 1),
+            test_category("华东", Some("生产"), 2),
+        ];
+        let profiles = vec![
+            test_profile("conn-root", "根连接", None),
+            test_profile("conn-prod", "生产连接", Some("生产")),
+            test_profile("conn-east", "华东连接", Some("华东")),
+        ];
+        let expanded = HashSet::from(["生产".to_string()]);
+
+        let rows = build_connection_tree_rows(&categories, &profiles, &expanded, "");
+        let labels = rows
+            .iter()
+            .map(|row| match row {
+                ConnectionTreeRow::Category {
+                    category, depth, ..
+                } => {
+                    format!("C{depth}:{}", category.name)
+                }
+                ConnectionTreeRow::Profile { profile, depth } => {
+                    format!("P{depth}:{}", profile.name)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            labels,
+            vec!["C0:生产", "C1:华东", "P1:生产连接", "P0:根连接"]
+        );
+    }
+
+    /// 验证搜索只匹配连接名称，并保留匹配连接的祖先分类。
+    #[test]
+    fn 连接树搜索显示匹配连接及祖先分类() {
+        let categories = vec![
+            test_category("生产", None, 1),
+            test_category("华东", Some("生产"), 2),
+            test_category("测试", None, 3),
+        ];
+        let profiles = vec![
+            test_profile("conn-east", "Redis 主库", Some("华东")),
+            test_profile("conn-test", "普通连接", Some("测试")),
+        ];
+        let rows = build_connection_tree_rows(&categories, &profiles, &HashSet::new(), "redis");
+        let labels = rows
+            .iter()
+            .map(|row| match row {
+                ConnectionTreeRow::Category {
+                    category,
+                    depth,
+                    expanded,
+                } => {
+                    format!("C{depth}:{}:{expanded}", category.name)
+                }
+                ConnectionTreeRow::Profile { profile, depth } => {
+                    format!("P{depth}:{}", profile.name)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            labels,
+            vec!["C0:生产:true", "C1:华东:true", "P2:Redis 主库"]
+        );
+    }
+
+    /// 验证搜索不会因为分类名称匹配而显示无匹配连接的分类。
+    #[test]
+    fn 连接树搜索不匹配分类名称() {
+        let categories = vec![test_category("Redis 分类", None, 1)];
+        let profiles = vec![test_profile("conn-1", "普通连接", Some("Redis 分类"))];
+        let rows = build_connection_tree_rows(&categories, &profiles, &HashSet::new(), "redis");
+
+        assert!(rows.is_empty());
     }
 
     /// 验证终端尺寸会按内容区像素换算为行列。

@@ -34,9 +34,13 @@ impl MainView {
     /// 业务意图：
     /// - 新建类型菜单和连接行右键菜单共享左侧栏浮层层级；任一菜单外部点击都应统一关闭，避免两个菜单同时残留。
     pub(in crate::app) fn close_connection_tree_menus(&mut self, context: &mut Context<Self>) {
-        if self.connections.create_menu_open || self.connections.profile_context_menu.is_some() {
+        if self.connections.create_menu_open
+            || self.connections.profile_context_menu.is_some()
+            || self.connections.category_context_menu.is_some()
+        {
             self.connections.create_menu_open = false;
             self.connections.profile_context_menu = None;
+            self.connections.category_context_menu = None;
             context.notify();
         }
     }
@@ -50,6 +54,7 @@ impl MainView {
     ) {
         self.connections.create_menu_open = false;
         self.connections.profile_context_menu = None;
+        self.connections.category_context_menu = None;
         self.open_connection_create_entry(kind, window, context);
         context.stop_propagation();
         context.notify();
@@ -75,6 +80,9 @@ impl MainView {
             ConnectionCreateKind::LocalTerminal => {
                 self.open_local_terminal(window, context);
             }
+            ConnectionCreateKind::Category => {
+                self.open_connection_category_dialog(None, window, context);
+            }
         }
     }
 
@@ -94,7 +102,55 @@ impl MainView {
         window.focus(&dialog.name.focus);
         self.connections.create_menu_open = false;
         self.connections.profile_context_menu = None;
+        self.connections.category_context_menu = None;
         self.connections.dialog = Some(dialog);
+        context.notify();
+    }
+
+    /// 打开新增或编辑连接分类弹窗。
+    ///
+    /// 业务意图：
+    /// - 顶部新增菜单创建根分类，分类右键菜单创建子分类或重命名；三种入口统一收敛到一个弹窗状态。
+    pub(in crate::app) fn open_connection_category_dialog(
+        &mut self,
+        parent_id: Option<String>,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if let Some(parent_id) = parent_id.as_deref()
+            && self.connections.category_by_id(parent_id).is_none()
+        {
+            self.connections.status_message = Some("分类不存在，无法新建子分类".to_string());
+            context.notify();
+            return;
+        }
+        let dialog = ConnectionCategoryDialogState::create(parent_id, context);
+        window.focus(&dialog.name.focus);
+        self.connections.create_menu_open = false;
+        self.connections.profile_context_menu = None;
+        self.connections.category_context_menu = None;
+        self.connections.category_dialog = Some(dialog);
+        context.notify();
+    }
+
+    /// 打开编辑连接分类弹窗。
+    pub(in crate::app) fn open_edit_connection_category_dialog(
+        &mut self,
+        category_id: &str,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let Some(category) = self.connections.category_by_id(category_id).cloned() else {
+            self.connections.status_message = Some("分类不存在，无法编辑".to_string());
+            context.notify();
+            return;
+        };
+        let dialog = ConnectionCategoryDialogState::edit(&category, context);
+        window.focus(&dialog.name.focus);
+        self.connections.create_menu_open = false;
+        self.connections.profile_context_menu = None;
+        self.connections.category_context_menu = None;
+        self.connections.category_dialog = Some(dialog);
         context.notify();
     }
 
@@ -115,6 +171,110 @@ impl MainView {
         context.notify();
     }
 
+    /// 通过鼠标按下事件关闭分类弹窗。
+    pub(in crate::app) fn close_connection_category_dialog_from_mouse_down(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.connections.category_dialog = None;
+        context.stop_propagation();
+        context.notify();
+    }
+
+    /// 保存新增或编辑分类。
+    pub(in crate::app) fn save_connection_category_dialog(
+        &mut self,
+        _event: &ClickEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let Some(path) = self.connections.database_path.clone() else {
+            self.set_connection_category_dialog_error(
+                "无法定位应用配置目录，不能保存分类".to_string(),
+            );
+            context.stop_propagation();
+            context.notify();
+            return;
+        };
+        let Some(dialog) = self.connections.category_dialog.as_ref() else {
+            return;
+        };
+        let draft = dialog.to_category_draft();
+        let name = match validate_connection_category_draft(&draft) {
+            Ok(name) => name,
+            Err(error) => {
+                self.set_connection_category_dialog_error(error);
+                context.stop_propagation();
+                context.notify();
+                return;
+            }
+        };
+
+        let save_result = match dialog.mode.clone() {
+            ConnectionCategoryDialogMode::Create { parent_id } => {
+                if let Some(parent_id) = parent_id.as_deref()
+                    && self.connections.category_by_id(parent_id).is_none()
+                {
+                    self.set_connection_category_dialog_error("父分类不存在，无法保存".to_string());
+                    context.stop_propagation();
+                    context.notify();
+                    return;
+                }
+                let now = current_connection_time_millis();
+                let category = ConnectionCategory {
+                    id: new_connection_entity_id("cat"),
+                    parent_id: parent_id.clone(),
+                    name,
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                };
+                if let Some(parent_id) = parent_id {
+                    self.connections.expanded_category_ids.insert(parent_id);
+                }
+                insert_connection_category(&path, &category)
+            }
+            ConnectionCategoryDialogMode::Edit { category_id } => {
+                let Some(existing) = self.connections.category_by_id(&category_id).cloned() else {
+                    self.set_connection_category_dialog_error("分类不存在，无法保存".to_string());
+                    context.stop_propagation();
+                    context.notify();
+                    return;
+                };
+                let category = ConnectionCategory {
+                    id: existing.id,
+                    parent_id: existing.parent_id,
+                    name,
+                    created_at_ms: existing.created_at_ms,
+                    updated_at_ms: current_connection_time_millis(),
+                };
+                update_connection_category(&path, &category)
+            }
+        };
+
+        match save_result {
+            Ok(()) => {
+                self.connections.category_dialog = None;
+                self.connections.reload_tree_data();
+                self.connections.status_message = Some("分类已保存".to_string());
+            }
+            Err(error) => self.set_connection_category_dialog_error(error),
+        }
+        context.stop_propagation();
+        context.notify();
+    }
+
+    /// 通过鼠标按下事件保存分类弹窗。
+    pub(in crate::app) fn save_connection_category_dialog_from_mouse_down(
+        &mut self,
+        _event: &MouseDownEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.save_connection_category_dialog(&ClickEvent::default(), window, context);
+    }
+
     /// 保存新增或编辑连接。
     pub(in crate::app) fn save_connection_dialog(
         &mut self,
@@ -128,6 +288,7 @@ impl MainView {
             context.notify();
             return;
         };
+        self.close_connection_dialog_category_select();
         let Some(dialog) = self.connections.dialog.as_ref() else {
             return;
         };
@@ -143,6 +304,14 @@ impl MainView {
             }
         };
         let (name, host, port, username, password) = normalized;
+        if let Some(category_id) = draft.category_id.as_deref()
+            && self.connections.category_by_id(category_id).is_none()
+        {
+            self.set_connection_dialog_error("所选分类不存在，请重新选择".to_string());
+            context.stop_propagation();
+            context.notify();
+            return;
+        }
 
         let save_result = match dialog.mode.clone() {
             ConnectionDialogMode::Create => {
@@ -169,6 +338,7 @@ impl MainView {
                     host,
                     port,
                     username,
+                    category_id: draft.category_id.clone(),
                     encrypted_password,
                     host_key_fingerprint: None,
                     created_at_ms: now,
@@ -208,6 +378,7 @@ impl MainView {
                     host,
                     port,
                     username,
+                    category_id: draft.category_id.clone(),
                     encrypted_password,
                     host_key_fingerprint,
                     created_at_ms: existing.created_at_ms,
@@ -230,6 +401,57 @@ impl MainView {
         context.notify();
     }
 
+    /// 切换连接表单中的分类选择器。
+    pub(in crate::app) fn toggle_connection_dialog_category_select(
+        &mut self,
+        _event: &ClickEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if let Some(dialog) = self.connections.dialog.as_mut() {
+            dialog.category_select_open = !dialog.category_select_open;
+        }
+        self.connections.create_menu_open = false;
+        self.connections.profile_context_menu = None;
+        self.connections.category_context_menu = None;
+        context.stop_propagation();
+        context.notify();
+    }
+
+    /// 选择连接表单中的分类。
+    pub(in crate::app) fn select_connection_dialog_category(
+        &mut self,
+        category_id: Option<String>,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if let Some(dialog) = self.connections.dialog.as_mut() {
+            dialog.category_id = category_id;
+            dialog.category_select_open = false;
+            dialog.error = None;
+        }
+        context.stop_propagation();
+        context.notify();
+    }
+
+    /// 通过鼠标按下事件关闭连接表单中的分类选择器。
+    ///
+    /// 业务意图：
+    /// - 分类 Select 是连接弹窗内部的浮层；用户点击表单空白区域时应立即收起，避免菜单继续覆盖密码框、
+    ///   错误提示或底部按钮。
+    /// - 该动作只收起 Select，不关闭整个连接弹窗，保持和普通表单控件失焦一致的交互语义。
+    pub(in crate::app) fn close_connection_dialog_category_select_from_mouse_down(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.close_connection_dialog_category_select();
+        context.stop_propagation();
+        context.notify();
+    }
+
     /// 通过鼠标按下事件保存新增或编辑连接。
     ///
     /// 业务意图：
@@ -241,12 +463,33 @@ impl MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
+        self.close_connection_dialog_category_select();
         self.save_connection_dialog(&ClickEvent::default(), window, context);
+    }
+
+    /// 静默收起连接表单分类 Select。
+    ///
+    /// 业务意图：
+    /// - 保存、外部点击和后续可能的快捷键路径都需要复用同一个状态收口，避免多个入口分别遗漏
+    ///   `category_select_open`。
+    pub(in crate::app) fn close_connection_dialog_category_select(&mut self) {
+        if let Some(dialog) = self.connections.dialog.as_mut() {
+            dialog.category_select_open = false;
+        }
     }
 
     /// 在连接弹窗上设置错误消息。
     fn set_connection_dialog_error(&mut self, error: String) {
         if let Some(dialog) = self.connections.dialog.as_mut() {
+            dialog.error = Some(error);
+        } else {
+            self.connections.status_message = Some(error);
+        }
+    }
+
+    /// 在分类弹窗上设置错误消息。
+    fn set_connection_category_dialog_error(&mut self, error: String) {
+        if let Some(dialog) = self.connections.category_dialog.as_mut() {
             dialog.error = Some(error);
         } else {
             self.connections.status_message = Some(error);
@@ -270,6 +513,29 @@ impl MainView {
         });
         self.connections.create_menu_open = false;
         self.connections.profile_context_menu = None;
+        self.connections.category_context_menu = None;
+        context.notify();
+    }
+
+    /// 打开删除分类确认弹窗。
+    pub(in crate::app) fn open_delete_connection_category_dialog(
+        &mut self,
+        category_id: &str,
+        context: &mut Context<Self>,
+    ) {
+        let Some(category) = self.connections.category_by_id(category_id) else {
+            self.connections.status_message = Some("分类不存在，无法删除".to_string());
+            context.notify();
+            return;
+        };
+        self.connections.category_delete_confirm_dialog =
+            Some(ConnectionCategoryDeleteConfirmDialog {
+                category_id: category.id.clone(),
+                category_name: category.name.clone(),
+            });
+        self.connections.create_menu_open = false;
+        self.connections.profile_context_menu = None;
+        self.connections.category_context_menu = None;
         context.notify();
     }
 
@@ -281,6 +547,18 @@ impl MainView {
         context: &mut Context<Self>,
     ) {
         self.connections.delete_confirm_dialog = None;
+        context.stop_propagation();
+        context.notify();
+    }
+
+    /// 通过鼠标按下事件关闭删除分类确认弹窗。
+    pub(in crate::app) fn close_delete_connection_category_dialog_from_mouse_down(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.connections.category_delete_confirm_dialog = None;
         context.stop_propagation();
         context.notify();
     }
@@ -317,6 +595,40 @@ impl MainView {
         context.notify();
     }
 
+    /// 删除空分类。
+    pub(in crate::app) fn confirm_delete_connection_category(
+        &mut self,
+        _event: &ClickEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let Some(dialog) = self.connections.category_delete_confirm_dialog.take() else {
+            return;
+        };
+        let Some(path) = self.connections.database_path.clone() else {
+            self.connections.status_message =
+                Some("无法定位应用配置目录，不能删除分类".to_string());
+            context.stop_propagation();
+            context.notify();
+            return;
+        };
+
+        match delete_connection_category(&path, &dialog.category_id) {
+            Ok(()) => {
+                self.connections
+                    .expanded_category_ids
+                    .remove(&dialog.category_id);
+                self.connections.reload_tree_data();
+                self.connections.status_message = Some("分类已删除".to_string());
+            }
+            Err(error) => {
+                self.connections.status_message = Some(error);
+            }
+        }
+        context.stop_propagation();
+        context.notify();
+    }
+
     /// 通过鼠标按下事件确认删除连接。
     ///
     /// 业务意图：
@@ -330,6 +642,16 @@ impl MainView {
         self.confirm_delete_connection(&ClickEvent::default(), window, context);
     }
 
+    /// 通过鼠标按下事件确认删除分类。
+    pub(in crate::app) fn confirm_delete_connection_category_from_mouse_down(
+        &mut self,
+        _event: &MouseDownEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.confirm_delete_connection_category(&ClickEvent::default(), window, context);
+    }
+
     /// 重置当前编辑连接的可信主机指纹。
     pub(in crate::app) fn reset_connection_host_key_from_dialog(
         &mut self,
@@ -337,6 +659,7 @@ impl MainView {
         _window: &mut Window,
         context: &mut Context<Self>,
     ) {
+        self.close_connection_dialog_category_select();
         let Some(path) = self.connections.database_path.clone() else {
             self.set_connection_dialog_error("无法定位应用配置目录，不能重置信任指纹".to_string());
             context.stop_propagation();
@@ -435,6 +758,38 @@ impl MainView {
             ),
         });
         self.connections.create_menu_open = false;
+        self.connections.category_context_menu = None;
+        context.stop_propagation();
+        context.notify();
+    }
+
+    /// 打开左侧分类行右键菜单。
+    pub(in crate::app) fn open_connection_category_context_menu(
+        &mut self,
+        category_id: &str,
+        event: &MouseDownEvent,
+        window: &Window,
+        context: &mut Context<Self>,
+    ) {
+        let Some(category) = self.connections.category_by_id(category_id) else {
+            self.connections.status_message = Some("分类不存在，无法打开菜单".to_string());
+            context.stop_propagation();
+            context.notify();
+            return;
+        };
+        self.connections.category_context_menu = Some(ConnectionCategoryContextMenu {
+            category_id: category.id.clone(),
+            x: Self::connection_profile_context_menu_x(
+                f32::from(event.position.x),
+                self.connections.tree_width,
+            ),
+            y: Self::connection_profile_context_menu_y(
+                f32::from(event.position.y),
+                f32::from(window.viewport_size().height),
+            ),
+        });
+        self.connections.create_menu_open = false;
+        self.connections.profile_context_menu = None;
         context.stop_propagation();
         context.notify();
     }
@@ -454,6 +809,7 @@ impl MainView {
         let profile_id = menu.profile_id;
         self.connections.selected_profile_id = Some(profile_id.clone());
         self.connections.create_menu_open = false;
+        self.connections.category_context_menu = None;
 
         match action {
             ConnectionProfileContextMenuAction::Connect => {
@@ -464,6 +820,40 @@ impl MainView {
             }
             ConnectionProfileContextMenuAction::Delete => {
                 self.open_delete_connection_dialog(&profile_id, context);
+            }
+        }
+        context.stop_propagation();
+        context.notify();
+    }
+
+    /// 执行左侧分类行右键菜单动作。
+    pub(in crate::app) fn handle_connection_category_context_menu_action(
+        &mut self,
+        action: ConnectionCategoryContextMenuAction,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let Some(menu) = self.connections.category_context_menu.take() else {
+            context.stop_propagation();
+            context.notify();
+            return;
+        };
+        let category_id = menu.category_id;
+        self.connections.create_menu_open = false;
+        self.connections.profile_context_menu = None;
+
+        match action {
+            ConnectionCategoryContextMenuAction::CreateChild => {
+                self.connections
+                    .expanded_category_ids
+                    .insert(category_id.clone());
+                self.open_connection_category_dialog(Some(category_id), window, context);
+            }
+            ConnectionCategoryContextMenuAction::Edit => {
+                self.open_edit_connection_category_dialog(&category_id, window, context);
+            }
+            ConnectionCategoryContextMenuAction::Delete => {
+                self.open_delete_connection_category_dialog(&category_id, context);
             }
         }
         context.stop_propagation();
@@ -485,6 +875,8 @@ impl MainView {
         self.connections.selected_profile_id = Some(profile.id.clone());
         self.connections.create_menu_open = false;
         self.connections.profile_context_menu = None;
+        self.connections.category_context_menu = None;
+        self.connections.tab_context_menu = None;
         let password = match decrypt_connection_password(&profile.id, &profile.encrypted_password) {
             Ok(password) => password,
             Err(error) => {
@@ -559,6 +951,8 @@ impl MainView {
 
         self.connections.create_menu_open = false;
         self.connections.profile_context_menu = None;
+        self.connections.category_context_menu = None;
+        self.connections.tab_context_menu = None;
         self.connections.tabs.push(tab);
         self.connections.active_tab_id = Some(tab_id);
         if let Some(active) = self.connections.active_tab() {
@@ -578,6 +972,22 @@ impl MainView {
         context.notify();
     }
 
+    /// 按给定像素距离横向滚动连接终端 tab 栏。
+    pub(in crate::app) fn scroll_connection_tab_bar(
+        &mut self,
+        delta: f32,
+        context: &mut Context<Self>,
+    ) {
+        let current_offset = self.connections.tab_bar_scroll_handle.offset();
+        let max_scroll = self.connections.tab_bar_scroll_handle.max_offset().width;
+        let next_x = (current_offset.x - px(delta)).clamp(-max_scroll, px(0.0));
+        self.connections
+            .tab_bar_scroll_handle
+            .set_offset(point(next_x, current_offset.y));
+        self.connections.tab_context_menu = None;
+        context.notify();
+    }
+
     /// 激活指定终端 tab。
     pub(in crate::app) fn activate_connection_terminal_tab(
         &mut self,
@@ -589,6 +999,66 @@ impl MainView {
         if let Some(tab) = self.connections.active_tab() {
             window.focus(&tab.focus);
         }
+        context.notify();
+    }
+
+    /// 打开连接终端 tab 右键菜单。
+    pub(in crate::app) fn open_connection_tab_context_menu(
+        &mut self,
+        tab_id: usize,
+        window_x: f32,
+        window_y: f32,
+        context: &mut Context<Self>,
+    ) {
+        if !self.connections.tabs.iter().any(|tab| tab.id == tab_id) {
+            return;
+        }
+        let panel_x = (window_x - MAIN_NAV_WIDTH - self.connections.tree_width).max(0.0);
+        let panel_y = window_y.max(0.0);
+        self.connections.active_tab_id = Some(tab_id);
+        self.connections.tab_context_menu = Some(ConnectionTabContextMenu {
+            tab_id,
+            x: panel_x,
+            y: panel_y,
+        });
+        self.connections.create_menu_open = false;
+        self.connections.profile_context_menu = None;
+        self.connections.category_context_menu = None;
+        context.notify();
+    }
+
+    /// 执行连接终端 tab 右键菜单动作。
+    pub(in crate::app) fn handle_connection_tab_context_menu_action(
+        &mut self,
+        tab_id: usize,
+        action: ConnectionTabContextMenuAction,
+        context: &mut Context<Self>,
+    ) {
+        self.connections.tab_context_menu = None;
+        match action {
+            ConnectionTabContextMenuAction::Current => self.connections.close_tab(tab_id),
+            ConnectionTabContextMenuAction::OtherTabs => self.connections.close_other_tabs(tab_id),
+            ConnectionTabContextMenuAction::AllTabs => self.connections.close_all_tabs(),
+        }
+        context.notify();
+    }
+
+    /// 展开或收起连接分类。
+    pub(in crate::app) fn toggle_connection_category(
+        &mut self,
+        category_id: &str,
+        context: &mut Context<Self>,
+    ) {
+        if self.connections.expanded_category_ids.contains(category_id) {
+            self.connections.expanded_category_ids.remove(category_id);
+        } else {
+            self.connections
+                .expanded_category_ids
+                .insert(category_id.to_string());
+        }
+        self.connections.create_menu_open = false;
+        self.connections.profile_context_menu = None;
+        self.connections.category_context_menu = None;
         context.notify();
     }
 
@@ -847,9 +1317,65 @@ impl MainView {
         }
     }
 
+    /// 判断连接分类弹窗名称输入框是否聚焦。
+    pub(in crate::app) fn connection_category_name_focused(&self, window: &Window) -> bool {
+        self.connections
+            .category_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.name.focus.is_focused(window))
+    }
+
     /// 判断连接页是否有文本输入框聚焦。
     pub(in crate::app) fn connection_text_input_focused(&self, window: &Window) -> bool {
-        self.active_connection_form_field(window).is_some()
+        self.connections.tree_search.focus.is_focused(window)
+            || self.active_connection_form_field(window).is_some()
+            || self.connection_category_name_focused(window)
+    }
+
+    /// 返回连接树搜索框绘制快照。
+    pub(in crate::app) fn connection_tree_search_text_snapshot(
+        &self,
+    ) -> Option<SingleLineTextInputSnapshot> {
+        Some(SingleLineTextInputSnapshot {
+            text: self.connections.tree_search.input.text.clone(),
+            selection_range: self.connections.tree_search.input.selection_range.clone(),
+            marked_range: self.connections.tree_search.input.marked_range.clone(),
+            horizontal_scroll_px: self.connections.tree_search.input.horizontal_scroll_px,
+        })
+    }
+
+    /// 保存连接树搜索框最近一次文本布局。
+    pub(in crate::app) fn store_connection_tree_search_text_layout(
+        &mut self,
+        line: ShapedLine,
+        bounds: Bounds<Pixels>,
+        horizontal_scroll_px: f32,
+    ) {
+        self.connections
+            .tree_search
+            .store_layout(line, bounds, horizontal_scroll_px);
+    }
+
+    /// 根据鼠标窗口坐标返回连接树搜索框中的 UTF-8 字节下标。
+    pub(in crate::app) fn connection_tree_search_text_index_for_point(
+        &self,
+        position: gpui::Point<Pixels>,
+    ) -> usize {
+        let state = &self.connections.tree_search;
+        let text = &state.input.text;
+        let (Some(layout), Some(bounds)) = (state.last_layout.as_ref(), state.last_bounds.as_ref())
+        else {
+            return text.len();
+        };
+        if position.y < bounds.top() {
+            return 0;
+        }
+        if position.y > bounds.bottom() {
+            return text.len();
+        }
+        let display_index = layout
+            .closest_index_for_x(position.x - bounds.left() + px(state.input.horizontal_scroll_px));
+        text_input_clamp_byte_index(text, display_index.min(text.len()))
     }
 
     /// 判断连接页当前是否存在需要阻断底层终端输入的模态弹窗。
@@ -859,7 +1385,9 @@ impl MainView {
     /// - 该判断不包含左侧新增类型菜单，因为它不是模态弹窗，只负责自身区域的鼠标消费。
     pub(in crate::app) fn connection_modal_open(&self) -> bool {
         self.connections.dialog.is_some()
+            || self.connections.category_dialog.is_some()
             || self.connections.delete_confirm_dialog.is_some()
+            || self.connections.category_delete_confirm_dialog.is_some()
             || self.connections.host_key_dialog.is_some()
     }
 
@@ -896,6 +1424,19 @@ impl MainView {
         })
     }
 
+    /// 返回连接分类名称输入框绘制快照。
+    pub(in crate::app) fn connection_category_text_snapshot(
+        &self,
+    ) -> Option<SingleLineTextInputSnapshot> {
+        let state = &self.connections.category_dialog.as_ref()?.name;
+        Some(SingleLineTextInputSnapshot {
+            text: state.input.text.clone(),
+            selection_range: state.input.selection_range.clone(),
+            marked_range: state.input.marked_range.clone(),
+            horizontal_scroll_px: state.input.horizontal_scroll_px,
+        })
+    }
+
     /// 保存连接表单字段最近一次文本布局。
     pub(in crate::app) fn store_connection_form_text_layout(
         &mut self,
@@ -908,6 +1449,18 @@ impl MainView {
             dialog
                 .field_mut(field)
                 .store_layout(line, bounds, horizontal_scroll_px);
+        }
+    }
+
+    /// 保存连接分类名称输入框最近一次文本布局。
+    pub(in crate::app) fn store_connection_category_text_layout(
+        &mut self,
+        line: ShapedLine,
+        bounds: Bounds<Pixels>,
+        horizontal_scroll_px: f32,
+    ) {
+        if let Some(dialog) = self.connections.category_dialog.as_mut() {
+            dialog.name.store_layout(line, bounds, horizontal_scroll_px);
         }
     }
 
@@ -940,6 +1493,31 @@ impl MainView {
         } else {
             text_input_clamp_byte_index(text, display_index.min(text.len()))
         }
+    }
+
+    /// 根据鼠标窗口坐标返回连接分类名称输入框中的 UTF-8 字节下标。
+    pub(in crate::app) fn connection_category_text_index_for_point(
+        &self,
+        position: gpui::Point<Pixels>,
+    ) -> usize {
+        let Some(dialog) = self.connections.category_dialog.as_ref() else {
+            return 0;
+        };
+        let state = &dialog.name;
+        let text = &state.input.text;
+        let (Some(layout), Some(bounds)) = (state.last_layout.as_ref(), state.last_bounds.as_ref())
+        else {
+            return text.len();
+        };
+        if position.y < bounds.top() {
+            return 0;
+        }
+        if position.y > bounds.bottom() {
+            return text.len();
+        }
+        let display_index = layout
+            .closest_index_for_x(position.x - bounds.left() + px(state.input.horizontal_scroll_px));
+        text_input_clamp_byte_index(text, display_index.min(text.len()))
     }
 
     /// 处理连接表单按键。
@@ -1017,6 +1595,167 @@ impl MainView {
             }
             context.stop_propagation();
             context.notify();
+        }
+    }
+
+    /// 处理连接树搜索框按键。
+    ///
+    /// 业务意图：
+    /// - 普通字符和中文 IME 由 `EntityInputHandler` 提交；这里只处理剪贴板、方向键、删除和清空。
+    /// - 搜索框只过滤左侧连接树，不启动网络连接、不修改 SQLite。
+    pub(in crate::app) fn handle_connection_tree_search_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if self.handle_connection_single_line_input_key_down(
+            TextInputBinding::ConnectionTreeSearch,
+            event,
+            context,
+        ) {
+            return;
+        }
+
+        if event.keystroke.key == "escape" && !self.connections.tree_search.input.text.is_empty() {
+            self.connections.tree_search.input = SingleLineTextInputState::empty();
+            self.connections.tree_search.clear_layout();
+            self.touch_search_text_cursor_activity();
+            context.stop_propagation();
+            context.notify();
+        }
+    }
+
+    /// 处理连接分类名称输入框按键。
+    pub(in crate::app) fn handle_connection_category_name_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if event.keystroke.key == "escape" {
+            self.connections.category_dialog = None;
+            context.stop_propagation();
+            context.notify();
+            return;
+        }
+        if event.keystroke.key == "enter" {
+            self.save_connection_category_dialog(&ClickEvent::default(), window, context);
+            return;
+        }
+
+        if self.handle_connection_single_line_input_key_down(
+            TextInputBinding::ConnectionCategoryName,
+            event,
+            context,
+        ) && let Some(dialog) = self.connections.category_dialog.as_mut()
+        {
+            dialog.error = None;
+        }
+    }
+
+    /// 处理连接页通用单行输入框基础编辑按键。
+    fn handle_connection_single_line_input_key_down(
+        &mut self,
+        binding: TextInputBinding,
+        event: &KeyDownEvent,
+        context: &mut Context<Self>,
+    ) -> bool {
+        if Self::is_paste_keystroke(&event.keystroke) {
+            if let Some(text) = context.read_from_clipboard().and_then(|item| item.text())
+                && let Some(input) = self.connection_single_line_input_mut(binding)
+            {
+                replace_text_input_selection(input, &sanitize_text_input_single_line_text(&text));
+                self.after_connection_text_input_changed(binding);
+            }
+            self.touch_search_text_cursor_activity();
+            context.stop_propagation();
+            context.notify();
+            return true;
+        }
+
+        let Some(input) = self.connection_single_line_input_mut(binding) else {
+            return false;
+        };
+        if Self::is_copy_keystroke(&event.keystroke) {
+            if let Some(text) = text_input_selected_text(input) {
+                context.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            context.stop_propagation();
+            return true;
+        }
+        if Self::is_cut_keystroke(&event.keystroke) {
+            if let Some(text) = text_input_selected_text(input) {
+                context.write_to_clipboard(ClipboardItem::new_string(text));
+                replace_text_input_selection(input, "");
+                self.after_connection_text_input_changed(binding);
+            }
+            self.touch_search_text_cursor_activity();
+            context.stop_propagation();
+            context.notify();
+            return true;
+        }
+        if Self::is_select_all_keystroke(&event.keystroke) {
+            select_all_text_input(input);
+            self.touch_search_text_cursor_activity();
+            context.stop_propagation();
+            context.notify();
+            return true;
+        }
+
+        let outcome = match event.keystroke.key.as_str() {
+            "left" => move_text_input_left(input, event.keystroke.modifiers.shift),
+            "right" => move_text_input_right(input, event.keystroke.modifiers.shift),
+            "home" | "up" => move_text_input_home(input, event.keystroke.modifiers.shift),
+            "end" | "down" => move_text_input_end(input, event.keystroke.modifiers.shift),
+            "backspace" => backspace_text_input(input),
+            "delete" => delete_text_input(input),
+            _ => TextInputEditOutcome::default(),
+        };
+        if outcome.consumed {
+            if outcome.changed {
+                self.after_connection_text_input_changed(binding);
+            }
+            self.touch_search_text_cursor_activity();
+            context.stop_propagation();
+            context.notify();
+            return true;
+        }
+        false
+    }
+
+    /// 返回连接页通用单行输入框可变状态。
+    fn connection_single_line_input_mut(
+        &mut self,
+        binding: TextInputBinding,
+    ) -> Option<&mut SingleLineTextInputState> {
+        match binding {
+            TextInputBinding::ConnectionTreeSearch => Some(&mut self.connections.tree_search.input),
+            TextInputBinding::ConnectionCategoryName => self
+                .connections
+                .category_dialog
+                .as_mut()
+                .map(|dialog| &mut dialog.name.input),
+            _ => None,
+        }
+    }
+
+    /// 连接页单行输入框文本变更后的本地副作用。
+    fn after_connection_text_input_changed(&mut self, binding: TextInputBinding) {
+        match binding {
+            TextInputBinding::ConnectionTreeSearch => {
+                self.connections.tree_search.clear_layout();
+                self.connections.create_menu_open = false;
+                self.connections.profile_context_menu = None;
+                self.connections.category_context_menu = None;
+            }
+            TextInputBinding::ConnectionCategoryName => {
+                if let Some(dialog) = self.connections.category_dialog.as_mut() {
+                    dialog.name.clear_layout();
+                    dialog.error = None;
+                }
+            }
+            _ => {}
         }
     }
 

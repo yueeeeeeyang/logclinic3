@@ -53,7 +53,9 @@ impl MainView {
                 )
             })
             .child(self.render_connection_dialog(palette, context))
+            .child(self.render_connection_category_dialog(palette, context))
             .child(self.render_connection_delete_dialog(palette, context))
+            .child(self.render_connection_category_delete_dialog(palette, context))
             .child(self.render_connection_host_key_dialog(palette, context))
     }
 
@@ -80,6 +82,7 @@ impl MainView {
             .child(self.render_connections_tree_menu_dismiss_overlay(context))
             .child(self.render_connections_create_menu(palette, context))
             .child(self.render_connection_profile_context_menu(palette, context))
+            .child(self.render_connection_category_context_menu(palette, context))
     }
 
     /// 渲染连接左侧栏工具栏。
@@ -145,7 +148,10 @@ impl MainView {
         &self,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        if !self.connections.create_menu_open && self.connections.profile_context_menu.is_none() {
+        if !self.connections.create_menu_open
+            && self.connections.profile_context_menu.is_none()
+            && self.connections.category_context_menu.is_none()
+        {
             return div().id("connections-tree-menu-overlay-empty").hidden();
         }
 
@@ -281,7 +287,96 @@ impl MainView {
                 .into_any_element();
         }
 
-        if self.connections.profiles.is_empty() {
+        div()
+            .id("connections-tree-body")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(self.render_connections_tree_search_bar(palette, context))
+            .child(self.render_connections_tree_rows(palette, context))
+            .into_any_element()
+    }
+
+    /// 渲染连接树搜索框。
+    fn render_connections_tree_search_bar(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let focus_handle = self.connections.tree_search.focus.clone();
+        div()
+            .id("connections-tree-search-bar")
+            .flex()
+            .items_center()
+            .gap_2()
+            .mx_2()
+            .my_2()
+            .h(px(CONNECTIONS_TREE_SEARCH_HEIGHT))
+            .px_2()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.input))
+            .text_sm()
+            .text_color(rgb(palette.text))
+            .track_focus(&focus_handle)
+            .key_context("connection-tree-search-input")
+            .on_key_down(context.listener(Self::handle_connection_tree_search_key_down))
+            .child(Self::render_lucide_icon(
+                Some(Icon::Search),
+                15.0,
+                14.0,
+                palette.muted_text,
+            ))
+            .child(TextInputElement {
+                view: context.entity(),
+                binding: TextInputBinding::ConnectionTreeSearch,
+                focus_handle,
+                placeholder: "搜索连接名称",
+                palette,
+            })
+            .when(!self.connections.tree_search.input.text.is_empty(), |bar| {
+                bar.child(
+                    div()
+                        .id("connections-tree-search-clear")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(18.0))
+                        .rounded(px(4.0))
+                        .cursor_pointer()
+                        .hover(move |button| button.bg(rgb(palette.hover)))
+                        .child(Self::render_lucide_icon(
+                            Some(Icon::X),
+                            12.0,
+                            12.0,
+                            palette.muted_text,
+                        ))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            context.listener(|view, _event: &MouseDownEvent, _window, context| {
+                                view.connections.tree_search.input =
+                                    SingleLineTextInputState::empty();
+                                view.connections.tree_search.clear_layout();
+                                view.connections.profile_context_menu = None;
+                                view.connections.category_context_menu = None;
+                                context.stop_propagation();
+                                context.notify();
+                            }),
+                        ),
+                )
+            })
+    }
+
+    /// 渲染连接树分类和连接行。
+    fn render_connections_tree_rows(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let search_query = self.connections.tree_search.query();
+        if self.connections.profiles.is_empty() && self.connections.categories.is_empty() {
             return div()
                 .id("connections-empty-list")
                 .flex()
@@ -304,9 +399,24 @@ impl MainView {
                 .into_any_element();
         }
 
-        let mut rows = Vec::new();
-        for profile in &self.connections.profiles {
-            rows.push(self.render_connection_profile_row(profile, palette, context));
+        let rows = build_connection_tree_rows(
+            &self.connections.categories,
+            &self.connections.profiles,
+            &self.connections.expanded_category_ids,
+            &search_query,
+        );
+        if rows.is_empty() {
+            return div()
+                .id("connections-search-empty")
+                .flex()
+                .items_center()
+                .justify_center()
+                .flex_1()
+                .px_4()
+                .text_sm()
+                .text_color(rgb(palette.muted_text))
+                .child("没有匹配的连接")
+                .into_any_element();
         }
 
         div()
@@ -317,7 +427,99 @@ impl MainView {
             .min_h_0()
             .overflow_y_scroll()
             .p_2()
-            .children(rows)
+            .children(
+                rows.into_iter()
+                    .map(|row| match row {
+                        ConnectionTreeRow::Category {
+                            category,
+                            depth,
+                            expanded,
+                        } => self.render_connection_category_row(
+                            &category, depth, expanded, palette, context,
+                        ),
+                        ConnectionTreeRow::Profile { profile, depth } => {
+                            self.render_connection_profile_row(&profile, depth, palette, context)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .into_any_element()
+    }
+
+    /// 渲染单个分类行。
+    fn render_connection_category_row(
+        &self,
+        category: &ConnectionCategory,
+        depth: usize,
+        expanded: bool,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let click_category_id = category.id.clone();
+        let context_category_id = category.id.clone();
+        div()
+            .id(SharedString::from(format!(
+                "connection-category-{}",
+                category.id
+            )))
+            .flex()
+            .items_center()
+            .gap_1()
+            .h(px(30.0))
+            .mb_1()
+            .pl(px(6.0 + depth as f32 * CONNECTIONS_TREE_DEPTH_INDENT))
+            .pr_2()
+            .rounded(px(6.0))
+            .text_sm()
+            .text_color(rgb(palette.text))
+            .cursor_pointer()
+            .hover(move |row| row.bg(rgb(palette.hover)))
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, _window, context| {
+                    view.toggle_connection_category(&click_category_id, context);
+                    context.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(move |view, event: &MouseDownEvent, window, context| {
+                    view.open_connection_category_context_menu(
+                        &context_category_id,
+                        event,
+                        window,
+                        context,
+                    );
+                }),
+            )
+            .child(Self::render_lucide_icon(
+                Some(if expanded {
+                    Icon::ChevronDown
+                } else {
+                    Icon::ChevronRight
+                }),
+                14.0,
+                13.0,
+                palette.muted_text,
+            ))
+            .child(Self::render_lucide_icon(
+                Some(if expanded {
+                    Icon::FolderOpen
+                } else {
+                    Icon::Folder
+                }),
+                17.0,
+                15.0,
+                palette.muted_text,
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(category.name.clone()),
+            )
             .into_any_element()
     }
 
@@ -325,6 +527,7 @@ impl MainView {
     fn render_connection_profile_row(
         &self,
         profile: &ConnectionProfile,
+        depth: usize,
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -338,6 +541,7 @@ impl MainView {
             .flex_col()
             .gap_2()
             .p_2()
+            .pl(px(8.0 + depth as f32 * CONNECTIONS_TREE_DEPTH_INDENT))
             .mb_1()
             .rounded(px(6.0))
             .bg(rgb(background))
@@ -492,6 +696,100 @@ impl MainView {
             )
     }
 
+    /// 渲染分类行右键菜单。
+    fn render_connection_category_context_menu(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let Some(menu) = self.connections.category_context_menu.as_ref() else {
+            return div().id("connection-category-context-menu-empty").hidden();
+        };
+
+        div()
+            .id("connection-category-context-menu")
+            .absolute()
+            .left(px(menu.x))
+            .top(px(menu.y))
+            .w(px(CONNECTIONS_CONTEXT_MENU_WIDTH))
+            .py_1()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.menu))
+            .shadow_lg()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    context.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    context.stop_propagation();
+                }),
+            )
+            .child(self.render_connection_category_context_menu_item(
+                ConnectionCategoryContextMenuAction::CreateChild,
+                "新建子分类",
+                Icon::FolderPlus,
+                palette,
+                context,
+            ))
+            .child(self.render_connection_category_context_menu_item(
+                ConnectionCategoryContextMenuAction::Edit,
+                "编辑",
+                Icon::Pencil,
+                palette,
+                context,
+            ))
+            .child(self.render_connection_category_context_menu_item(
+                ConnectionCategoryContextMenuAction::Delete,
+                "删除",
+                Icon::Trash2,
+                palette,
+                context,
+            ))
+    }
+
+    /// 渲染分类行右键菜单单项。
+    fn render_connection_category_context_menu_item(
+        &self,
+        action: ConnectionCategoryContextMenuAction,
+        label: &'static str,
+        icon: Icon,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(SharedString::from(format!(
+                "connection-category-menu-{label}"
+            )))
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(CONNECTIONS_CONTEXT_MENU_ITEM_HEIGHT))
+            .px_3()
+            .text_sm()
+            .text_color(rgb(palette.text))
+            .cursor_pointer()
+            .hover(move |item| item.bg(rgb(palette.hover)))
+            .child(Self::render_lucide_icon(
+                Some(icon),
+                16.0,
+                15.0,
+                palette.muted_text,
+            ))
+            .child(label)
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(move |view, _event: &MouseDownEvent, window, context| {
+                    view.handle_connection_category_context_menu_action(action, window, context);
+                }),
+            )
+    }
+
     /// 渲染左侧栏拖拽命中区。
     fn render_connections_tree_resize_handle(
         &self,
@@ -520,6 +818,7 @@ impl MainView {
     ) -> impl IntoElement {
         div()
             .id("connections-workspace")
+            .relative()
             .flex()
             .flex_col()
             .flex_1()
@@ -528,6 +827,46 @@ impl MainView {
             .bg(rgb(terminal_colors.background))
             .child(self.render_connections_tab_bar(palette, context))
             .child(self.render_connection_terminal_area(palette, terminal_colors, context))
+            .child(self.render_connection_workspace_menu_dismiss_overlay(context))
+            .child(self.render_connection_tab_context_menu(palette, context))
+    }
+
+    /// 渲染右侧终端工作区菜单关闭遮罩。
+    ///
+    /// 业务意图：
+    /// - 连接 tab 右键菜单打开后，点击终端空白或其它 tab 区域应先关闭菜单，不能把同一次点击继续发给底层终端。
+    /// - 遮罩只在菜单打开时出现，并且绘制在菜单下方，保证菜单项自身仍可点击。
+    fn render_connection_workspace_menu_dismiss_overlay(
+        &self,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        if self.connections.tab_context_menu.is_none() {
+            return div().id("connection-workspace-menu-overlay-empty").hidden();
+        }
+
+        div()
+            .id("connection-workspace-menu-overlay")
+            .absolute()
+            .left(px(0.0))
+            .right(px(0.0))
+            .top(px(0.0))
+            .bottom(px(0.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|view, _event: &MouseDownEvent, _window, context| {
+                    view.connections.tab_context_menu = None;
+                    context.stop_propagation();
+                    context.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(|view, _event: &MouseDownEvent, _window, context| {
+                    view.connections.tab_context_menu = None;
+                    context.stop_propagation();
+                    context.notify();
+                }),
+            )
     }
 
     /// 渲染终端 tab 栏。
@@ -552,18 +891,84 @@ impl MainView {
         }
         div()
             .id("connections-tab-bar")
+            .relative()
             .flex()
             .items_center()
             .h(px(CONNECTIONS_TAB_BAR_HEIGHT))
             .flex_none()
-            .overflow_x_scroll()
-            .scrollbar_width(px(0.0))
-            .track_scroll(&self.connections.tab_bar_scroll_handle)
+            .overflow_hidden()
             .border_b_1()
             .border_color(rgb(palette.border))
             .bg(rgb(palette.panel))
-            .children(tabs)
+            .child(self.render_connection_tab_scroll_button(
+                Icon::ChevronLeft,
+                -LOG_TAB_SCROLL_STEP,
+                palette,
+                context,
+            ))
+            .child(
+                div()
+                    .id("connections-tab-scroll-viewport")
+                    .flex()
+                    .items_end()
+                    .h_full()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_x_scroll()
+                    .scrollbar_width(px(0.0))
+                    .track_scroll(&self.connections.tab_bar_scroll_handle)
+                    .children(tabs),
+            )
+            .child(self.render_connection_tab_scroll_button(
+                Icon::ChevronRight,
+                LOG_TAB_SCROLL_STEP,
+                palette,
+                context,
+            ))
             .into_any_element()
+    }
+
+    /// 渲染连接终端 tab 栏横向滚动按钮。
+    fn render_connection_tab_scroll_button(
+        &self,
+        icon: Icon,
+        delta: f32,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(SharedString::from(format!(
+                "connection-tab-scroll-{}",
+                delta
+            )))
+            .flex()
+            .items_center()
+            .justify_center()
+            .h_full()
+            .w(px(LOG_TAB_SCROLL_BUTTON_WIDTH))
+            .flex_none()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.panel))
+            .cursor_pointer()
+            .hover(move |button| {
+                button
+                    .bg(rgb(palette.surface))
+                    .text_color(rgb(palette.accent))
+            })
+            .when(delta < 0.0, |button| button.border_r_1())
+            .when(delta > 0.0, |button| button.border_l_1())
+            .child(Self::render_lucide_icon(
+                Some(icon),
+                14.0,
+                14.0,
+                palette.muted_text,
+            ))
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, _window, context| {
+                    view.scroll_connection_tab_bar(delta, context);
+                    context.stop_propagation();
+                }),
+            )
     }
 
     /// 渲染单个终端 tab。
@@ -603,6 +1008,18 @@ impl MainView {
             .on_click(
                 context.listener(move |view, _event: &ClickEvent, window, context| {
                     view.activate_connection_terminal_tab(tab_id, window, context);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(move |view, event: &MouseDownEvent, _window, context| {
+                    view.open_connection_tab_context_menu(
+                        tab_id,
+                        f32::from(event.position.x),
+                        f32::from(event.position.y),
+                        context,
+                    );
+                    context.stop_propagation();
                 }),
             )
             .child(Self::render_lucide_icon(
@@ -654,6 +1071,95 @@ impl MainView {
                     )),
             )
             .into_any_element()
+    }
+
+    /// 渲染连接终端 tab 右键菜单。
+    fn render_connection_tab_context_menu(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let Some(menu) = self.connections.tab_context_menu.as_ref() else {
+            return div().id("connection-tab-context-menu-empty").hidden();
+        };
+        let tab_id = menu.tab_id;
+        div()
+            .id("connection-tab-context-menu")
+            .absolute()
+            .left(px(menu.x))
+            .top(px(menu.y))
+            .w(px(TAB_CONTEXT_MENU_WIDTH))
+            .py_1()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.menu))
+            .shadow_lg()
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    context.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(|_view, _event: &MouseDownEvent, _window, context| {
+                    context.stop_propagation();
+                }),
+            )
+            .child(self.render_connection_tab_context_menu_item(
+                tab_id,
+                ConnectionTabContextMenuAction::Current,
+                "关闭当前",
+                palette,
+                context,
+            ))
+            .child(self.render_connection_tab_context_menu_item(
+                tab_id,
+                ConnectionTabContextMenuAction::OtherTabs,
+                "关闭其他",
+                palette,
+                context,
+            ))
+            .child(self.render_connection_tab_context_menu_item(
+                tab_id,
+                ConnectionTabContextMenuAction::AllTabs,
+                "关闭所有",
+                palette,
+                context,
+            ))
+    }
+
+    /// 渲染连接终端 tab 右键菜单单项。
+    fn render_connection_tab_context_menu_item(
+        &self,
+        tab_id: usize,
+        action: ConnectionTabContextMenuAction,
+        label: &'static str,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(SharedString::from(format!(
+                "connection-tab-menu-{}-{}",
+                tab_id, label
+            )))
+            .flex()
+            .items_center()
+            .h(px(TAB_CONTEXT_MENU_ITEM_HEIGHT))
+            .px_3()
+            .text_sm()
+            .text_color(rgb(palette.text))
+            .cursor_pointer()
+            .hover(move |item| item.bg(rgb(palette.hover)))
+            .child(label)
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(move |view, _event: &MouseDownEvent, _window, context| {
+                    view.handle_connection_tab_context_menu_action(tab_id, action, context);
+                    context.stop_propagation();
+                }),
+            )
     }
 
     /// 渲染终端区域。
@@ -773,6 +1279,9 @@ impl MainView {
             "新增 SSH 连接"
         };
         self.render_connections_modal_shell("connection-dialog-overlay", palette, context)
+            .when(dialog.category_select_open, |shell| {
+                shell.child(self.render_connection_dialog_select_background_overlay(context))
+            })
             .child(
                 div()
                     .id("connection-dialog")
@@ -789,8 +1298,14 @@ impl MainView {
                         div()
                             .flex()
                             .flex_col()
+                            .relative()
                             .gap_3()
                             .p_4()
+                            .when(dialog.category_select_open, |body| {
+                                body.child(
+                                    self.render_connection_category_select_dismiss_overlay(context),
+                                )
+                            })
                             .child(self.render_connection_form_field(
                                 "名称",
                                 ConnectionFormField::Name,
@@ -819,6 +1334,7 @@ impl MainView {
                                 palette,
                                 context,
                             ))
+                            .child(self.render_connection_category_select_field(palette, context))
                             .child(self.render_connection_form_field(
                                 "密码",
                                 ConnectionFormField::Password,
@@ -838,6 +1354,32 @@ impl MainView {
                     .child(self.render_connection_dialog_footer(is_edit, palette, context)),
             )
             .into_any_element()
+    }
+
+    /// 渲染连接弹窗背景层上的分类 Select 关闭区域。
+    ///
+    /// 业务意图：
+    /// - 用户点击弹窗卡片外部时不关闭连接弹窗，但应收起卡片内部打开的 Select，符合普通表单失焦体验。
+    /// - 该层插入在弹窗卡片之前，卡片本身仍位于上方，避免影响触发器、输入框和按钮的点击命中。
+    fn render_connection_dialog_select_background_overlay(
+        &self,
+        context: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id("connection-dialog-select-background-overlay")
+            .absolute()
+            .left(px(0.0))
+            .right(px(0.0))
+            .top(px(0.0))
+            .bottom(px(0.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(Self::close_connection_dialog_category_select_from_mouse_down),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(Self::close_connection_dialog_category_select_from_mouse_down),
+            )
     }
 
     /// 渲染连接弹窗标题栏。
@@ -936,6 +1478,134 @@ impl MainView {
             )
     }
 
+    /// 渲染连接表单分类选择器。
+    ///
+    /// 业务意图：
+    /// - 连接可以挂在任意分类；新增和编辑都通过同一个受控 Select 修改 `category_id`，保存时再写入 SQLite。
+    /// - “无分类”对应根层，兼容升级前没有分类的旧连接。
+    fn render_connection_category_select_field(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (selected_category_id, open) = self
+            .connections
+            .dialog
+            .as_ref()
+            .map(|dialog| (dialog.category_id.clone(), dialog.category_select_open))
+            .unwrap_or((None, false));
+        let options = self.connection_category_select_options();
+        let selected_label = options
+            .iter()
+            .find(|option| option.value == selected_category_id)
+            .map(|option| option.label.clone())
+            .unwrap_or_else(|| "无分类".to_string());
+        let metrics = SelectMetrics::new(408.0, 32.0, 408.0, 30.0, 180.0, 2.0);
+        let select = Select::new(
+            "connection-category-select",
+            selected_label,
+            selected_category_id,
+            options,
+            metrics,
+            palette,
+        )
+        .open_anchor(open.then_some(SelectAnchor::new(
+            0.0,
+            metrics.button_height + metrics.menu_gap,
+        )));
+
+        div()
+            .id("connection-category-select-field")
+            .relative()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(palette.muted_text))
+                    .child("分类"),
+            )
+            .child(
+                select.render_trigger(
+                    context.listener(Self::toggle_connection_dialog_category_select),
+                ),
+            )
+            .child(select.render_menu(|category_id| {
+                Box::new(
+                    context.listener(move |view, event: &MouseDownEvent, window, context| {
+                        view.select_connection_dialog_category(
+                            category_id.clone(),
+                            event,
+                            window,
+                            context,
+                        );
+                    }),
+                )
+            }))
+    }
+
+    /// 渲染连接表单分类 Select 的弹窗内关闭层。
+    ///
+    /// 业务意图：
+    /// - 分类菜单打开后，用户点击同一弹窗内的空白区域应只收起菜单，不应关闭整个连接弹窗。
+    /// - 该层先于表单字段插入，后续字段和菜单仍位于其上方；因此输入框、按钮和菜单项可以继续接收自己的鼠标事件。
+    /// - 左右键都需要消费，避免右键点击空白时穿透到底层连接树或终端。
+    fn render_connection_category_select_dismiss_overlay(
+        &self,
+        context: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id("connection-category-select-dismiss-overlay")
+            .absolute()
+            .left(px(0.0))
+            .right(px(0.0))
+            .top(px(0.0))
+            .bottom(px(0.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(Self::close_connection_dialog_category_select_from_mouse_down),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(Self::close_connection_dialog_category_select_from_mouse_down),
+            )
+    }
+
+    /// 生成连接表单分类 Select 选项。
+    fn connection_category_select_options(&self) -> Vec<SelectOption<Option<String>>> {
+        let mut options = vec![SelectOption::new("root", "无分类", None)];
+        for category in &self.connections.categories {
+            let label = self.connection_category_path_label(category);
+            options.push(SelectOption::new(
+                format!("category-{}", category.id),
+                label,
+                Some(category.id.clone()),
+            ));
+        }
+        options
+    }
+
+    /// 返回分类路径文案。
+    fn connection_category_path_label(&self, category: &ConnectionCategory) -> String {
+        let mut names = vec![category.name.clone()];
+        let mut parent_id = category.parent_id.as_deref();
+        let mut visited = std::collections::HashSet::new();
+        while let Some(id) = parent_id {
+            if !visited.insert(id.to_string()) {
+                break;
+            }
+            let Some(parent) = self.connections.category_by_id(id) else {
+                break;
+            };
+            names.push(parent.name.clone());
+            parent_id = parent.parent_id.as_deref();
+        }
+        names.reverse();
+        names.join(" / ")
+    }
+
     /// 渲染连接弹窗底部操作。
     fn render_connection_dialog_footer(
         &self,
@@ -971,6 +1641,159 @@ impl MainView {
                         palette,
                         context.listener(Self::save_connection_dialog_from_mouse_down),
                     )),
+            )
+    }
+
+    /// 渲染新增/编辑分类弹窗。
+    fn render_connection_category_dialog(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(dialog) = self.connections.category_dialog.as_ref() else {
+            return div().hidden().into_any_element();
+        };
+        let is_edit = matches!(dialog.mode, ConnectionCategoryDialogMode::Edit { .. });
+        let title = if is_edit {
+            "编辑分类"
+        } else {
+            "新建分类"
+        };
+        let focus_handle = dialog.name.focus.clone();
+        self.render_connections_modal_shell("connection-category-dialog-overlay", palette, context)
+            .child(
+                div()
+                    .id("connection-category-dialog")
+                    .flex()
+                    .flex_col()
+                    .w(px(380.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.background))
+                    .shadow_lg()
+                    .child(self.render_connection_category_dialog_header(title, palette, context))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .p_4()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(palette.muted_text))
+                                            .child("名称"),
+                                    )
+                                    .child(
+                                        div()
+                                            .h(px(32.0))
+                                            .flex()
+                                            .items_center()
+                                            .px_2()
+                                            .rounded(px(6.0))
+                                            .border_1()
+                                            .border_color(rgb(palette.border))
+                                            .bg(rgb(palette.panel))
+                                            .text_sm()
+                                            .text_color(rgb(palette.text))
+                                            .track_focus(&focus_handle)
+                                            .key_context("connection-category-name-input")
+                                            .on_key_down(context.listener(
+                                                Self::handle_connection_category_name_key_down,
+                                            ))
+                                            .child(TextInputElement {
+                                                view: context.entity(),
+                                                binding: TextInputBinding::ConnectionCategoryName,
+                                                focus_handle,
+                                                placeholder: "",
+                                                palette,
+                                            }),
+                                    ),
+                            )
+                            .when_some(dialog.error.as_ref(), |body, error| {
+                                body.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0xb91c1c))
+                                        .child(error.clone()),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .px_4()
+                            .pb_4()
+                            .child(self.render_modal_secondary_button(
+                                "取消",
+                                palette,
+                                context.listener(
+                                    Self::close_connection_category_dialog_from_mouse_down,
+                                ),
+                            ))
+                            .child(self.render_modal_primary_button(
+                                "保存",
+                                palette,
+                                context.listener(
+                                    Self::save_connection_category_dialog_from_mouse_down,
+                                ),
+                            )),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// 渲染分类弹窗标题栏。
+    fn render_connection_category_dialog_header(
+        &self,
+        title: &'static str,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .h(px(44.0))
+            .px_4()
+            .border_b_1()
+            .border_color(rgb(palette.border))
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(palette.text))
+                    .child(title),
+            )
+            .child(
+                div()
+                    .id("connection-category-dialog-close-button")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(26.0))
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(rgb(palette.hover)))
+                    .child(Self::render_lucide_icon(
+                        Some(Icon::X),
+                        16.0,
+                        15.0,
+                        palette.muted_text,
+                    ))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        context.listener(Self::close_connection_category_dialog_from_mouse_down),
+                    ),
             )
     }
 
@@ -1035,6 +1858,75 @@ impl MainView {
                     ),
             )
             .into_any_element()
+    }
+
+    /// 渲染删除分类确认弹窗。
+    fn render_connection_category_delete_dialog(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(dialog) = self.connections.category_delete_confirm_dialog.as_ref() else {
+            return div().hidden().into_any_element();
+        };
+        self.render_connections_modal_shell(
+            "connection-category-delete-dialog-overlay",
+            palette,
+            context,
+        )
+        .child(
+            div()
+                .id("connection-category-delete-dialog")
+                .flex()
+                .flex_col()
+                .gap_4()
+                .w(px(380.0))
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(rgb(palette.border))
+                .bg(rgb(palette.background))
+                .shadow_lg()
+                .p_4()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(palette.text))
+                        .child("删除分类"),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(palette.muted_text))
+                        .child(format!(
+                            "仅空分类可以删除。确认删除 {}？",
+                            dialog.category_name
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(self.render_modal_secondary_button(
+                            "取消",
+                            palette,
+                            context.listener(
+                                Self::close_delete_connection_category_dialog_from_mouse_down,
+                            ),
+                        ))
+                        .child(
+                            self.render_modal_danger_button(
+                                "删除",
+                                palette,
+                                context.listener(
+                                    Self::confirm_delete_connection_category_from_mouse_down,
+                                ),
+                            ),
+                        ),
+                ),
+        )
+        .into_any_element()
     }
 
     /// 渲染 SSH 主机指纹弹窗。

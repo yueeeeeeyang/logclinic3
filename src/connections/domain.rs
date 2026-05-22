@@ -29,6 +29,8 @@ pub(crate) struct ConnectionProfile {
     pub(crate) port: u16,
     /// SSH 用户名。
     pub(crate) username: String,
+    /// 连接所属分类 ID；`None` 表示挂在根层，兼容升级前没有分类的旧连接。
+    pub(crate) category_id: Option<String>,
     /// 加密后的 SSH 密码。
     pub(crate) encrypted_password: String,
     /// 首次信任保存的服务器公钥指纹；`None` 表示下一次连接需要用户确认。
@@ -39,6 +41,25 @@ pub(crate) struct ConnectionProfile {
     pub(crate) updated_at_ms: i64,
     /// 最近连接成功时间，Unix epoch 毫秒。
     pub(crate) last_connected_at_ms: Option<i64>,
+}
+
+/// 连接分类。
+///
+/// 业务意图：
+/// - 分类只管理左侧连接树展示和连接归属，不直接影响 SSH 连接参数或终端 tab 生命周期。
+/// - 根层是 UI 虚拟节点，不写入数据库；`parent_id=None` 表示顶级分类。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConnectionCategory {
+    /// 本地稳定 ID，用于 SQLite 主键、父子关系和 UI 展开状态。
+    pub(crate) id: String,
+    /// 父分类 ID；`None` 表示顶级分类。
+    pub(crate) parent_id: Option<String>,
+    /// 用户可见分类名称。
+    pub(crate) name: String,
+    /// 创建时间，Unix epoch 毫秒；同级分类按该值稳定排序。
+    pub(crate) created_at_ms: i64,
+    /// 最近更新时间，Unix epoch 毫秒。
+    pub(crate) updated_at_ms: i64,
 }
 
 /// SSH 连接表单草稿。
@@ -55,6 +76,8 @@ pub(crate) struct ConnectionProfileDraft {
     pub(crate) port_text: String,
     /// SSH 用户名。
     pub(crate) username: String,
+    /// 连接所属分类 ID；`None` 表示挂在根层。
+    pub(crate) category_id: Option<String>,
     /// SSH 密码明文草稿；保存后必须立即清空 UI 草稿。
     pub(crate) password: String,
 }
@@ -68,7 +91,28 @@ impl ConnectionProfileDraft {
             host: String::new(),
             port_text: DEFAULT_SSH_PORT.to_string(),
             username: String::new(),
+            category_id: None,
             password: String::new(),
+        }
+    }
+}
+
+/// 连接分类表单草稿。
+///
+/// 业务意图：
+/// - 新建根分类、新建子分类和重命名分类都只需要名称字段；父分类由对话框模式保存，避免用户误改层级。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConnectionCategoryDraft {
+    /// 用户可见分类名称。
+    pub(crate) name: String,
+}
+
+impl ConnectionCategoryDraft {
+    /// 创建空分类草稿。
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
+        Self {
+            name: String::new(),
         }
     }
 }
@@ -146,6 +190,50 @@ pub(crate) fn validate_connection_profile_draft(
     let password = (!draft.password.is_empty()).then(|| Zeroizing::new(draft.password.clone()));
 
     Ok((name, host, port, username, password))
+}
+
+/// 校验连接分类表单并返回规范化名称。
+///
+/// 业务意图：
+/// - 分类名称只用于左侧树展示，允许中文、空格和常见符号，但首尾空白不应参与保存。
+/// - 空名称会导致右键菜单和连接表单分类选择器难以识别，必须在保存入口统一拒绝。
+pub(crate) fn validate_connection_category_draft(
+    draft: &ConnectionCategoryDraft,
+) -> Result<String, String> {
+    let name = draft.name.trim().to_string();
+    if name.is_empty() {
+        return Err("分类名称不能为空".to_string());
+    }
+    Ok(name)
+}
+
+/// 判断候选父分类是否会让分类树形成环。
+///
+/// 业务意图：
+/// - 第一版 UI 不暴露拖拽移动分类，但存储和后续扩展仍可能更新父级；提前提供纯函数可以锁住“树不能成环”的边界。
+/// - 当 `next_parent_id` 为目标分类自己或其任意后代时，设置父级会形成循环，必须拒绝。
+#[cfg(test)]
+pub(crate) fn connection_category_parent_would_cycle(
+    categories: &[ConnectionCategory],
+    category_id: &str,
+    next_parent_id: Option<&str>,
+) -> bool {
+    let Some(mut current_parent_id) = next_parent_id else {
+        return false;
+    };
+    while let Some(parent) = categories
+        .iter()
+        .find(|category| category.id == current_parent_id)
+    {
+        if parent.id == category_id {
+            return true;
+        }
+        let Some(parent_id) = parent.parent_id.as_deref() else {
+            return false;
+        };
+        current_parent_id = parent_id;
+    }
+    current_parent_id == category_id
 }
 
 /// 根据编辑后的 SSH 端点决定是否保留已信任主机指纹。
@@ -235,6 +323,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port_text: "70000".to_string(),
             username: "root".to_string(),
+            category_id: None,
             password: "secret".to_string(),
         };
 
@@ -251,6 +340,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port_text: "22".to_string(),
             username: "root".to_string(),
+            category_id: None,
             password: String::new(),
         };
 
@@ -268,6 +358,7 @@ mod tests {
             host: "old.example.com".to_string(),
             port: 22,
             username: "root".to_string(),
+            category_id: None,
             encrypted_password: "v1:nonce:cipher".to_string(),
             host_key_fingerprint: Some("SHA256:old".to_string()),
             created_at_ms: 1,
@@ -324,5 +415,57 @@ mod tests {
                 actual: "SHA256:new".to_string()
             }
         );
+    }
+
+    /// 验证分类名称保存前会去掉首尾空白，并拒绝空名称。
+    #[test]
+    fn 分类表单会校验名称() {
+        let draft = ConnectionCategoryDraft::new();
+        assert!(validate_connection_category_draft(&draft).is_err());
+
+        let draft = ConnectionCategoryDraft {
+            name: "  生产环境  ".to_string(),
+        };
+        assert_eq!(
+            validate_connection_category_draft(&draft).expect("有效分类名称应通过校验"),
+            "生产环境"
+        );
+    }
+
+    /// 验证分类父级关系不能形成循环。
+    #[test]
+    fn 分类父级不能形成循环() {
+        let categories = vec![
+            ConnectionCategory {
+                id: "cat-root".to_string(),
+                parent_id: None,
+                name: "根分类".to_string(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+            ConnectionCategory {
+                id: "cat-child".to_string(),
+                parent_id: Some("cat-root".to_string()),
+                name: "子分类".to_string(),
+                created_at_ms: 2,
+                updated_at_ms: 2,
+            },
+        ];
+
+        assert!(connection_category_parent_would_cycle(
+            &categories,
+            "cat-root",
+            Some("cat-child")
+        ));
+        assert!(connection_category_parent_would_cycle(
+            &categories,
+            "cat-root",
+            Some("cat-root")
+        ));
+        assert!(!connection_category_parent_would_cycle(
+            &categories,
+            "cat-child",
+            None
+        ));
     }
 }
