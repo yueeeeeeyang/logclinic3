@@ -1629,7 +1629,7 @@ impl ShellIntegrationUiState {
 /// 主窗口当前展示的大功能页。
 ///
 /// 业务意图：
-/// - 主窗口左侧固定大导航只负责在日志分析、笔记、连接、HPROF 解析和 AI 对话主要工作区之间切换。
+/// - 主窗口左侧固定大导航只负责在日志分析、笔记、终端、连接、HPROF 解析和 AI 对话主要工作区之间切换。
 /// - 状态只保存在当前会话，不写入配置文件，避免后续调整默认入口或恢复策略时被旧配置约束。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::app) enum MainFeature {
@@ -1637,7 +1637,9 @@ pub(in crate::app) enum MainFeature {
     LogAnalysis,
     /// 笔记页，承载本地目录树、只读阅读器和编辑器。
     Notes,
-    /// 连接页，承载 SSH 连接配置和内嵌终端 tab。
+    /// 本地终端页，承载本机 shell 多 tab。
+    Terminal,
+    /// 连接页，承载 SSH/SMB 连接配置和 SSH 内嵌终端 tab。
     Connections,
     /// HPROF 解析页，承载 heap dump 文件选择、解析进度和 dominator tree 结果。
     HprofAnalysis,
@@ -1658,6 +1660,7 @@ impl MainFeature {
         &[
             Self::LogAnalysis,
             Self::Notes,
+            Self::Terminal,
             Self::Connections,
             Self::HprofAnalysis,
             Self::AiChat,
@@ -1669,6 +1672,7 @@ impl MainFeature {
         match self {
             Self::LogAnalysis => "日志分析",
             Self::Notes => "笔记",
+            Self::Terminal => "终端",
             Self::Connections => "连接",
             Self::HprofAnalysis => "HPROF解析",
             Self::AiChat => "AI对话",
@@ -1680,6 +1684,7 @@ impl MainFeature {
         match self {
             Self::LogAnalysis => Icon::Search,
             Self::Notes => Icon::NotebookText,
+            Self::Terminal => Icon::SquareTerminal,
             Self::Connections => Icon::Cable,
             Self::HprofAnalysis => Icon::ChartNoAxesCombined,
             Self::AiChat => Icon::BotMessageSquare,
@@ -1693,7 +1698,7 @@ impl MainFeature {
 /// - 导航栏只显示图标，hover 气泡需要知道当前入口名称和纵向位置；设置属于通用入口，不计入主功能状态。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::app) enum MainNavigationItem {
-    /// 三个主功能页入口。
+    /// 主功能页入口。
     Feature(MainFeature),
     /// 设置独立窗口入口。
     Settings,
@@ -1732,19 +1737,24 @@ impl MainNavigationItem {
                     + MAIN_NAV_BUTTON_GAP
                     + MAIN_NAV_TOOLTIP_BUTTON_INSET,
             ),
-            Self::Feature(MainFeature::Connections) => MainNavigationTooltipAnchor::Top(
+            Self::Feature(MainFeature::Terminal) => MainNavigationTooltipAnchor::Top(
                 MAIN_NAV_PADDING
                     + (MAIN_NAV_BUTTON_SIZE + MAIN_NAV_BUTTON_GAP) * 2.0
                     + MAIN_NAV_TOOLTIP_BUTTON_INSET,
             ),
-            Self::Feature(MainFeature::HprofAnalysis) => MainNavigationTooltipAnchor::Top(
+            Self::Feature(MainFeature::Connections) => MainNavigationTooltipAnchor::Top(
                 MAIN_NAV_PADDING
                     + (MAIN_NAV_BUTTON_SIZE + MAIN_NAV_BUTTON_GAP) * 3.0
                     + MAIN_NAV_TOOLTIP_BUTTON_INSET,
             ),
-            Self::Feature(MainFeature::AiChat) => MainNavigationTooltipAnchor::Top(
+            Self::Feature(MainFeature::HprofAnalysis) => MainNavigationTooltipAnchor::Top(
                 MAIN_NAV_PADDING
                     + (MAIN_NAV_BUTTON_SIZE + MAIN_NAV_BUTTON_GAP) * 4.0
+                    + MAIN_NAV_TOOLTIP_BUTTON_INSET,
+            ),
+            Self::Feature(MainFeature::AiChat) => MainNavigationTooltipAnchor::Top(
+                MAIN_NAV_PADDING
+                    + (MAIN_NAV_BUTTON_SIZE + MAIN_NAV_BUTTON_GAP) * 5.0
                     + MAIN_NAV_TOOLTIP_BUTTON_INSET,
             ),
             Self::Settings => MainNavigationTooltipAnchor::Bottom(

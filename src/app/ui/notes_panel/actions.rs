@@ -1755,8 +1755,7 @@ impl MainView {
                 self.apply_note_tree_selection(selection, context)
             }
             NotesPendingAction::SwitchFeature(feature) => {
-                self.navigation.active_main_feature = feature;
-                context.notify();
+                self.select_main_feature(feature, window, context);
             }
             NotesPendingAction::CreateDirectory(parent_id) => {
                 self.create_note_directory_under(parent_id, context)

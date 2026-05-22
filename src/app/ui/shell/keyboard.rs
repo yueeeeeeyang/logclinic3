@@ -51,18 +51,28 @@ impl MainView {
             return true;
         }
 
-        if self.navigation.active_main_feature == MainFeature::Connections
-            && self.connection_terminal_focused_without_modal(window)
-        {
-            // 连接终端聚焦时，复制/粘贴快捷键必须优先归终端处理：
+        if self.terminal_input_focused_without_modal(window) {
+            // 终端聚焦时，复制/粘贴快捷键必须优先归当前终端处理：
             // - 有终端选区时 `Ctrl/Cmd+C` 复制终端文本并消费事件。
             // - 没有终端选区时返回 false，让终端按键处理继续把 `Ctrl+C` 作为 ETX 发给 PTY/SSH。
             // - 粘贴只写入当前终端，避免继续落到日志选区或搜索框的全局粘贴兜底逻辑。
             if Self::is_copy_keystroke(&keystroke) {
-                return self.copy_selected_connection_terminal_text(context);
+                return match self.navigation.active_main_feature {
+                    MainFeature::Terminal => self.copy_selected_terminal_text(context),
+                    MainFeature::Connections => {
+                        self.copy_selected_connection_terminal_text(context)
+                    }
+                    _ => false,
+                };
             }
             if Self::is_paste_keystroke(&keystroke) {
-                return self.paste_clipboard_text_into_connection_terminal(context);
+                return match self.navigation.active_main_feature {
+                    MainFeature::Terminal => self.paste_clipboard_text_into_terminal(context),
+                    MainFeature::Connections => {
+                        self.paste_clipboard_text_into_connection_terminal(context)
+                    }
+                    _ => false,
+                };
             }
         }
 

@@ -185,7 +185,7 @@ impl MainView {
                 context.listener(move |view, _event: &ClickEvent, window, context| {
                     match item {
                         MainNavigationItem::Feature(feature) => {
-                            view.select_main_feature(feature, context);
+                            view.select_main_feature(feature, window, context);
                         }
                         MainNavigationItem::Settings => {
                             view.schedule_open_settings_window(window, context);
@@ -402,6 +402,7 @@ impl MainView {
     pub(in crate::app) fn select_main_feature(
         &mut self,
         feature: MainFeature,
+        window: &mut Window,
         context: &mut Context<Self>,
     ) {
         if self.navigation.active_main_feature == MainFeature::Notes
@@ -428,9 +429,21 @@ impl MainView {
             self.connections.tree_resize_drag = None;
             self.connections.create_menu_open = false;
             self.connections.profile_context_menu = None;
+            self.connections.category_context_menu = None;
+            self.connections.tab_context_menu = None;
+            self.connections.terminal_context_menu = None;
+        }
+        if feature != MainFeature::Terminal {
+            self.terminal.tab_context_menu = None;
+            self.terminal.terminal_context_menu = None;
         }
         if feature == MainFeature::AiChat {
             self.ensure_ai_chat_initial_data_loaded(context);
+        }
+        if feature == MainFeature::Terminal && self.terminal.tabs.is_empty() {
+            // 终端页没有连接树或文件列表等可选对象；用户切进该功能时若没有任何 tab，
+            // 自动打开一个本地 shell，避免首屏停留在空态还要再点一次新增按钮。
+            self.open_terminal_tab(window, context);
         }
         context.notify();
     }

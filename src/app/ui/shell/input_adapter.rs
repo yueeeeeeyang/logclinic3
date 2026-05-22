@@ -19,8 +19,8 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<String> {
-        if self.connection_terminal_focused_without_modal(window) {
-            let ime = &self.connections.active_tab()?.ime;
+        if let Some(tab) = self.focused_terminal_tab(window) {
+            let ime = &tab.ime;
             let range = Self::search_input_range_from_utf16(&ime.text, range_utf16);
             adjusted_range.replace(Self::search_input_range_to_utf16(&ime.text, range.clone()));
             return Some(ime.text[range].to_string());
@@ -156,8 +156,8 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        if self.connection_terminal_focused_without_modal(window) {
-            let ime = &self.connections.active_tab()?.ime;
+        if let Some(tab) = self.focused_terminal_tab(window) {
+            let ime = &tab.ime;
             return Some(UTF16Selection {
                 range: Self::search_input_range_to_utf16(&ime.text, ime.selection_range.clone()),
                 reversed: false,
@@ -304,8 +304,8 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<Range<usize>> {
-        if self.connection_terminal_focused_without_modal(window) {
-            let ime = &self.connections.active_tab()?.ime;
+        if let Some(tab) = self.focused_terminal_tab(window) {
+            let ime = &tab.ime;
             return ime
                 .marked_range
                 .clone()
@@ -436,8 +436,8 @@ impl EntityInputHandler for MainView {
 
     /// 清除输入法组合文本状态。
     fn unmark_text(&mut self, window: &mut Window, context: &mut Context<Self>) {
-        if self.connection_terminal_focused_without_modal(window) {
-            if let Some(tab) = self.connections.active_tab_mut() {
+        if self.terminal_input_focused_without_modal(window) {
+            if let Some(tab) = self.focused_terminal_tab_mut(window) {
                 tab.clear_ime();
             }
             context.notify();
@@ -541,8 +541,8 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
-        if self.connection_terminal_focused_without_modal(window) {
-            if let Some(tab) = self.connections.active_tab_mut() {
+        if self.terminal_input_focused_without_modal(window) {
+            if let Some(tab) = self.focused_terminal_tab_mut(window) {
                 tab.clear_ime();
                 if !text.is_empty() {
                     // 终端输入必须按 UTF-8 原样发送给 PTY/SSH；中文 IME 最终提交会走到这里。
@@ -868,8 +868,8 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
-        if self.connection_terminal_focused_without_modal(window) {
-            if let Some(tab) = self.connections.active_tab_mut() {
+        if self.terminal_input_focused_without_modal(window) {
+            if let Some(tab) = self.focused_terminal_tab_mut(window) {
                 let ime = &mut tab.ime;
                 let range = range_utf16
                     .map(|range| Self::search_input_range_from_utf16(&ime.text, range))
@@ -1468,8 +1468,7 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        if self.connection_terminal_focused_without_modal(window) {
-            let tab = self.connections.active_tab()?;
+        if let Some(tab) = self.focused_terminal_tab(window) {
             let bounds = tab.content_bounds.unwrap_or(element_bounds);
             let cursor = tab.emulator.cursor_point();
             let column = cursor.column.0 as f32;
@@ -1781,7 +1780,7 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<usize> {
-        if self.connection_terminal_focused_without_modal(window) {
+        if self.terminal_input_focused_without_modal(window) {
             // 终端 IME 没有可编辑文档坐标，平台只需要一个合法插入点来维持候选窗口交互。
             return Some(0);
         }

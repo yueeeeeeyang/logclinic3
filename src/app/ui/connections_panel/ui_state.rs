@@ -258,7 +258,7 @@ pub(in crate::app) struct ConnectionsWorkspaceState {
     /// 新建连接类型菜单是否打开。
     ///
     /// 业务意图：
-    /// - 顶部新增按钮不直接假定只有 SSH，而是先打开类型菜单；当前菜单包含 SSH 和本地终端，后续可追加其它协议。
+    /// - 顶部新增按钮不直接假定只有 SSH，而是先打开类型菜单；当前菜单包含 SSH、SMB 和分类入口，后续可追加其它协议。
     /// - 菜单状态只属于左侧连接栏，关闭或选择后必须立即复位，避免遮挡连接列表点击。
     pub(in crate::app) create_menu_open: bool,
     /// 左侧连接行右键菜单。
@@ -647,7 +647,8 @@ pub(super) fn connection_profile_key_exists(
 /// 新建连接菜单中的连接类型。
 ///
 /// 业务意图：
-/// - 新增入口从一开始按类型建模；SSH 需要持久化配置和表单，本地终端则直接启动 PTY tab。
+/// - 新增入口从一开始按类型建模；连接页只管理需要保存配置的远程/文件共享连接和分类。
+/// - 本地终端已经拆到独立“终端”导航页，不再作为连接类型出现，避免把本机 shell 生命周期混入连接树。
 /// - 后续扩展串口、跳板机或其它协议时，只需要追加类型和分发动作，避免重写新增菜单交互。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::app) enum ConnectionCreateKind {
@@ -655,8 +656,6 @@ pub(in crate::app) enum ConnectionCreateKind {
     Ssh,
     /// SMB 文件共享连接。
     Smb,
-    /// 本机 shell 终端，不保存连接配置。
-    LocalTerminal,
     /// 新建连接分类。
     Category,
 }
@@ -664,11 +663,10 @@ pub(in crate::app) enum ConnectionCreateKind {
 /// 新建连接菜单当前展示的连接类型顺序。
 ///
 /// UI 约束：
-/// - SSH 放在第一项，保持已有用户路径不变；本地终端作为无需配置的快捷入口紧随其后。
+/// - SSH 放在第一项，保持已有用户路径不变；SMB 紧随其后，分类入口放在末尾。
 pub(in crate::app) const CONNECTION_CREATE_KINDS: &[ConnectionCreateKind] = &[
     ConnectionCreateKind::Ssh,
     ConnectionCreateKind::Smb,
-    ConnectionCreateKind::LocalTerminal,
     ConnectionCreateKind::Category,
 ];
 
@@ -678,7 +676,6 @@ impl ConnectionCreateKind {
         match self {
             Self::Ssh => "SSH 连接",
             Self::Smb => "SMB 连接",
-            Self::LocalTerminal => "本地终端",
             Self::Category => "新建分类",
         }
     }
@@ -688,7 +685,6 @@ impl ConnectionCreateKind {
         match self {
             Self::Ssh => Icon::Terminal,
             Self::Smb => Icon::HardDrive,
-            Self::LocalTerminal => Icon::SquareTerminal,
             Self::Category => Icon::FolderPlus,
         }
     }
@@ -1458,7 +1454,7 @@ pub(in crate::app) struct ConnectionTerminalTab {
     /// 文件管理目标类型。
     ///
     /// 业务意图：
-    /// - SSH 连接和本地终端共用同一套终端 tab 渲染；文件管理打开时需要明确选择 SFTP 或本机文件系统。
+    /// - SSH 连接页和独立本地终端页共用同一套终端 tab 渲染；文件管理打开时需要明确选择 SFTP 或本机文件系统。
     pub(in crate::app) file_target_kind: ConnectionTerminalFileTargetKind,
     /// tab 标题快照。
     pub(in crate::app) title: String,
@@ -1478,7 +1474,7 @@ pub(in crate::app) struct ConnectionTerminalTab {
     ///
     /// 业务意图：
     /// - GPUI 文本系统会根据平台字体实际测量字符宽度，不能长期使用经验常量做鼠标选区和 pty resize。
-    /// - 本地终端和 SSH 终端共用该值，避免不同后端打开后选区位置一前一后。
+    /// - 独立本地终端和 SSH 终端共用该值，避免不同后端打开后选区位置一前一后。
     pub(in crate::app) cell_width: f32,
     /// 终端内容区最近一次 GPUI 实际 bounds。
     ///
@@ -2077,18 +2073,17 @@ mod tests {
         assert_eq!(CONNECTIONS_TOOLBAR_HEIGHT, TOOLBAR_HEIGHT);
     }
 
-    /// 验证新建连接菜单同时暴露 SSH、SMB、本地终端和分类入口。
+    /// 验证新建连接菜单只暴露连接配置和分类入口。
     ///
     /// 业务风险：
-    /// - 如果新增按钮再次直接绑定某一种连接，用户将无法从菜单打开无需配置的本地终端。
+    /// - 本地终端已经拆到独立主导航页，连接菜单若继续出现本地终端，会让用户误以为它仍属于连接树。
     #[test]
-    fn 新建连接类型菜单保留_ssh_smb_和本地终端入口() {
+    fn 新建连接类型菜单保留_ssh_smb_和分类入口() {
         assert_eq!(
             CONNECTION_CREATE_KINDS,
             &[
                 ConnectionCreateKind::Ssh,
                 ConnectionCreateKind::Smb,
-                ConnectionCreateKind::LocalTerminal,
                 ConnectionCreateKind::Category
             ]
         );
@@ -2102,11 +2097,6 @@ mod tests {
         assert_eq!(
             char::from(ConnectionCreateKind::Smb.icon()),
             char::from(Icon::HardDrive)
-        );
-        assert_eq!(ConnectionCreateKind::LocalTerminal.label(), "本地终端");
-        assert_eq!(
-            char::from(ConnectionCreateKind::LocalTerminal.icon()),
-            char::from(Icon::SquareTerminal)
         );
         assert_eq!(ConnectionCreateKind::Category.label(), "新建分类");
         assert_eq!(

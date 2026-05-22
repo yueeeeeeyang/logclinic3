@@ -139,11 +139,18 @@ pub(in crate::app) struct MainView {
     /// - 主视图只负责在大功能页之间协调，避免根实体直接理解笔记文件扫描和迁移细节。
     pub(in crate::app) notes: NotesWorkspaceState,
 
-    /// SSH 连接管理和内嵌终端工作区状态。
+    /// 独立本地终端工作区状态。
     ///
     /// 业务意图：
-    /// - 连接列表、加密配置加载错误、主机指纹确认弹窗和终端 tab 都集中在该字段，主窗口只负责页面切换。
-    /// - 后台 SSH 或本地 PTY 线程不能直接触碰 GPUI 状态，只能通过该状态持有的事件队列轮询更新。
+    /// - 本地 shell 从“连接”页拆出后，独立导航页需要保存自己的 tab、焦点、右键菜单和后台轮询状态。
+    /// - 本地终端不读取连接数据库，不参与 SSH/SMB 分类，避免连接管理页承担本机 shell 生命周期。
+    pub(in crate::app) terminal: TerminalWorkspaceState,
+
+    /// SSH/SMB 连接管理和 SSH 内嵌终端工作区状态。
+    ///
+    /// 业务意图：
+    /// - 连接列表、加密配置加载错误、主机指纹确认弹窗和 SSH 终端 tab 都集中在该字段，主窗口只负责页面切换。
+    /// - 后台 SSH 线程不能直接触碰 GPUI 状态，只能通过该状态持有的事件队列轮询更新。
     pub(in crate::app) connections: ConnectionsWorkspaceState,
 
     /// 当前窗口系统外观。
@@ -211,6 +218,7 @@ impl MainView {
             hprof_analysis_view: None,
             ai_chat,
             notes,
+            terminal: TerminalWorkspaceState::new(),
             connections,
             system_window_appearance: WindowAppearance::Light,
             window_appearance_subscription: None,

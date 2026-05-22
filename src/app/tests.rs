@@ -366,7 +366,7 @@ mod state_tests {
     /// - 左侧大导航只显示图标，hover 气泡依赖 `label()` 返回中文名称；图标和名称错配会直接影响用户识别功能入口。
     #[test]
     fn 主功能导航名称和图标稳定() {
-        assert_eq!(MainFeature::all().len(), 5);
+        assert_eq!(MainFeature::all().len(), 6);
         assert_eq!(MainFeature::LogAnalysis.label(), "日志分析");
         assert_eq!(
             char::from(MainFeature::LogAnalysis.icon()),
@@ -376,6 +376,11 @@ mod state_tests {
         assert_eq!(
             char::from(MainFeature::Notes.icon()),
             char::from(Icon::NotebookText)
+        );
+        assert_eq!(MainFeature::Terminal.label(), "终端");
+        assert_eq!(
+            char::from(MainFeature::Terminal.icon()),
+            char::from(Icon::SquareTerminal)
         );
         assert_eq!(MainFeature::Connections.label(), "连接");
         assert_eq!(
@@ -505,7 +510,7 @@ mod state_tests {
             )
         );
         assert_eq!(
-            MainNavigationItem::Feature(MainFeature::Connections).tooltip_anchor(),
+            MainNavigationItem::Feature(MainFeature::Terminal).tooltip_anchor(),
             MainNavigationTooltipAnchor::Top(
                 MAIN_NAV_PADDING
                     + (MAIN_NAV_BUTTON_SIZE + MAIN_NAV_BUTTON_GAP) * 2.0
@@ -513,7 +518,7 @@ mod state_tests {
             )
         );
         assert_eq!(
-            MainNavigationItem::Feature(MainFeature::HprofAnalysis).tooltip_anchor(),
+            MainNavigationItem::Feature(MainFeature::Connections).tooltip_anchor(),
             MainNavigationTooltipAnchor::Top(
                 MAIN_NAV_PADDING
                     + (MAIN_NAV_BUTTON_SIZE + MAIN_NAV_BUTTON_GAP) * 3.0
@@ -521,10 +526,18 @@ mod state_tests {
             )
         );
         assert_eq!(
-            MainNavigationItem::Feature(MainFeature::AiChat).tooltip_anchor(),
+            MainNavigationItem::Feature(MainFeature::HprofAnalysis).tooltip_anchor(),
             MainNavigationTooltipAnchor::Top(
                 MAIN_NAV_PADDING
                     + (MAIN_NAV_BUTTON_SIZE + MAIN_NAV_BUTTON_GAP) * 4.0
+                    + MAIN_NAV_TOOLTIP_BUTTON_INSET
+            )
+        );
+        assert_eq!(
+            MainNavigationItem::Feature(MainFeature::AiChat).tooltip_anchor(),
+            MainNavigationTooltipAnchor::Top(
+                MAIN_NAV_PADDING
+                    + (MAIN_NAV_BUTTON_SIZE + MAIN_NAV_BUTTON_GAP) * 5.0
                     + MAIN_NAV_TOOLTIP_BUTTON_INSET
             )
         );

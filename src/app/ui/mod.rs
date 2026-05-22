@@ -31,6 +31,10 @@ mod search_panel;
 mod settings_panel;
 /// 主窗口外壳、导航、输入和工作区协调。
 mod shell;
+/// 独立本地终端 GPUI 面板。
+mod terminal_panel;
+/// 本地和远程终端共用的键盘与鼠标协议映射。
+mod terminal_protocol;
 
 #[cfg(test)]
 pub(in crate::app) use analysis_panel::ThreadStackWindowView;
@@ -49,3 +53,5 @@ pub(in crate::app) use plugin_panel::PluginPageWindowView;
 pub(in crate::app) use search_panel::SearchDialogWindowView;
 pub(in crate::app) use settings_panel::SettingsWindowView;
 pub(in crate::app) use shell::*;
+pub(in crate::app) use terminal_panel::*;
+pub(in crate::app) use terminal_protocol::*;

@@ -63,7 +63,7 @@ impl MainView {
     /// 按指定类型执行新增入口动作。
     ///
     /// 业务意图：
-    /// - SSH 需要先打开配置表单，本地终端则直接打开 tab；二者都由新增菜单分发，避免按钮重新写死某一种连接。
+    /// - 连接页新增菜单只负责需要保存配置或分类的数据对象；本地终端已经拆到独立“终端”主导航页。
     fn open_connection_create_entry(
         &mut self,
         kind: ConnectionCreateKind,
@@ -84,9 +84,6 @@ impl MainView {
                 self.connections.create_menu_open = false;
                 self.connections.smb_dialog = Some(dialog);
                 self.connections.dialog = None;
-            }
-            ConnectionCreateKind::LocalTerminal => {
-                self.open_local_terminal(window, context);
             }
             ConnectionCreateKind::Category => {
                 self.open_connection_category_dialog(None, window, context);
@@ -1330,58 +1327,6 @@ impl MainView {
             last_reported_cwd: None,
             backend_finished: false,
         };
-        self.connections.tabs.push(tab);
-        self.connections.active_tab_id = Some(tab_id);
-        if let Some(active) = self.connections.active_tab() {
-            window.focus(&active.focus);
-        }
-        self.schedule_connections_terminal_poll(context);
-        context.notify();
-    }
-
-    /// 打开一个新的本地终端 tab。
-    ///
-    /// 业务意图：
-    /// - 本地终端不需要保存配置，也不需要 SSH 表单；用户从新增菜单选择后应立即获得一个独立 shell。
-    /// - 仍复用 `ConnectionTerminalTab` 和统一 `TerminalBackendHandle`，让输入、resize、关闭和渲染逻辑与 SSH tab 完全一致。
-    ///
-    /// 跨平台约束：
-    /// - 实际 shell 选择由 `LocalPtyBackend` 内部处理，macOS 走环境中的默认 shell，Windows 走 PowerShell。
-    pub(in crate::app) fn open_local_terminal(
-        &mut self,
-        window: &mut Window,
-        context: &mut Context<Self>,
-    ) {
-        let size = TerminalSize::default();
-        let tab_id = self.connections.next_tab_id;
-        self.connections.next_tab_id = self.connections.next_tab_id.saturating_add(1);
-        let backend = LocalPtyBackend::new(size).start();
-        let focus = context.focus_handle();
-        let tab = ConnectionTerminalTab {
-            id: tab_id,
-            profile_id: format!("local-terminal-{tab_id}"),
-            file_target_kind: ConnectionTerminalFileTargetKind::Local,
-            title: "本地终端".to_string(),
-            backend,
-            emulator: ConnectionTerminalEmulator::new(size),
-            status: ConnectionTerminalStatus::Connecting,
-            focus,
-            selection_anchor: None,
-            mouse_reporting_drag: false,
-            cell_width: CONNECTION_TERMINAL_CELL_WIDTH,
-            content_bounds: None,
-            ime: ConnectionTerminalImeState::default(),
-            osc7_buffer: Vec::new(),
-            last_reported_cwd: None,
-            backend_finished: false,
-        };
-
-        self.connections.create_menu_open = false;
-        self.connections.profile_context_menu = None;
-        self.connections.profile_hover_tooltip = None;
-        self.connections.category_context_menu = None;
-        self.connections.tab_context_menu = None;
-        self.connections.terminal_context_menu = None;
         self.connections.tabs.push(tab);
         self.connections.active_tab_id = Some(tab_id);
         if let Some(active) = self.connections.active_tab() {
@@ -2723,73 +2668,5 @@ impl MainView {
         context: &mut Context<Self>,
     ) {
         self.finish_connections_pointer_interaction(event, context);
-    }
-}
-
-/// 将 GPUI 按键映射为终端输入字节。
-///
-/// 边界条件：
-/// - `Ctrl+C` 在没有选区时由这里映射为 ETX，中断远端程序；存在选区时全局快捷键会先复制并消费。
-/// - 普通可打印字符由 `EntityInputHandler` 处理，避免注册 IME 后 ASCII 字符在 keydown 和平台输入提交两条路径重复写入。
-fn terminal_input_bytes_for_keystroke(keystroke: &Keystroke) -> Option<Vec<u8>> {
-    if keystroke.modifiers.control && keystroke.key.len() == 1 {
-        let byte = keystroke.key.as_bytes()[0].to_ascii_lowercase();
-        if byte.is_ascii_lowercase() {
-            return Some(vec![byte - b'a' + 1]);
-        }
-    }
-
-    let bytes = match keystroke.key.as_str() {
-        "enter" => b"\r".to_vec(),
-        "backspace" => vec![0x7f],
-        "tab" => b"\t".to_vec(),
-        "escape" => vec![0x1b],
-        "up" => b"\x1b[A".to_vec(),
-        "down" => b"\x1b[B".to_vec(),
-        "right" => b"\x1b[C".to_vec(),
-        "left" => b"\x1b[D".to_vec(),
-        "home" => b"\x1b[H".to_vec(),
-        "end" => b"\x1b[F".to_vec(),
-        "pageup" => b"\x1b[5~".to_vec(),
-        "pagedown" => b"\x1b[6~".to_vec(),
-        _ => return None,
-    };
-    Some(bytes)
-}
-
-/// 生成 xterm SGR 鼠标上报序列。
-///
-/// 协议约束：
-/// - alacritty 的格点是 0 基坐标，xterm 鼠标协议使用 1 基坐标，因此发送前必须同时加一。
-/// - 第一版只上报左键按下、左键拖拽和释放；滚轮和其它按钮后续可以复用该函数扩展。
-fn terminal_sgr_mouse_report(button_code: u8, point: Point, pressed: bool) -> Vec<u8> {
-    let suffix = if pressed { 'M' } else { 'm' };
-    format!(
-        "\x1b[<{};{};{}{}",
-        button_code,
-        point.column.0 + 1,
-        point.line.0 + 1,
-        suffix
-    )
-    .into_bytes()
-}
-
-#[cfg(test)]
-mod tests {
-    use alacritty_terminal::index::{Column, Line, Point};
-
-    use super::*;
-
-    /// 验证终端鼠标上报坐标遵循 xterm SGR 的 1 基坐标规则。
-    ///
-    /// 业务风险：
-    /// - 坐标如果仍按 alacritty 内部 0 基格式发送，vim、less 等远端 TUI 会把点击位置错一行一列。
-    #[test]
-    fn 终端鼠标上报使用_sgr_一基坐标() {
-        let bytes = terminal_sgr_mouse_report(0, Point::new(Line(2), Column(4)), true);
-        assert_eq!(
-            String::from_utf8(bytes).expect("测试鼠标序列应为 UTF-8"),
-            "\x1b[<0;5;3M"
-        );
     }
 }
