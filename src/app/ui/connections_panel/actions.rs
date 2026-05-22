@@ -514,6 +514,7 @@ impl MainView {
         self.connections.create_menu_open = false;
         self.connections.profile_context_menu = None;
         self.connections.category_context_menu = None;
+        self.connections.terminal_context_menu = None;
         context.notify();
     }
 
@@ -729,6 +730,74 @@ impl MainView {
             .clamp(0.0, (available_height - menu_height).max(0.0))
     }
 
+    /// 计算连接详情悬浮气泡在左侧栏内的横坐标。
+    ///
+    /// 业务意图：
+    /// - 气泡跟随鼠标出现，但需要保持在连接侧栏内部，避免遮挡右侧终端内容。
+    /// - 坐标从窗口坐标转换成侧栏局部坐标，和右键菜单使用同一套主导航宽度扣减规则。
+    pub(in crate::app) fn connection_profile_tooltip_x(window_x: f32, tree_width: f32) -> f32 {
+        (window_x - MAIN_NAV_WIDTH + CONNECTIONS_PROFILE_TOOLTIP_GAP)
+            .max(0.0)
+            .clamp(
+                0.0,
+                (tree_width - CONNECTIONS_PROFILE_TOOLTIP_WIDTH).max(0.0),
+            )
+    }
+
+    /// 计算连接详情悬浮气泡在左侧栏内的纵坐标。
+    ///
+    /// 边界条件：
+    /// - 靠近窗口底部悬浮时向上夹紧，保证用户和地址两行信息都可见。
+    pub(in crate::app) fn connection_profile_tooltip_y(
+        window_y: f32,
+        available_height: f32,
+    ) -> f32 {
+        (window_y + CONNECTIONS_PROFILE_TOOLTIP_GAP).max(0.0).clamp(
+            0.0,
+            (available_height - CONNECTIONS_PROFILE_TOOLTIP_HEIGHT).max(0.0),
+        )
+    }
+
+    /// 更新左侧连接行 hover 详情气泡。
+    ///
+    /// 业务意图：
+    /// - 连接列表默认只显示名称，鼠标悬浮时再展示用户名和主机地址，降低列表信息密度。
+    /// - 离开时只关闭同一个连接打开的气泡，避免快速移动到相邻连接时旧离开事件误关新气泡。
+    pub(in crate::app) fn update_connection_profile_hover_tooltip(
+        &mut self,
+        profile_id: &str,
+        is_hovered: bool,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if is_hovered {
+            let pointer = window.mouse_position();
+            self.connections.profile_hover_tooltip = Some(ConnectionProfileHoverTooltip {
+                profile_id: profile_id.to_string(),
+                x: Self::connection_profile_tooltip_x(
+                    f32::from(pointer.x),
+                    self.connections.tree_width,
+                ),
+                y: Self::connection_profile_tooltip_y(
+                    f32::from(pointer.y),
+                    f32::from(window.viewport_size().height),
+                ),
+            });
+            context.notify();
+            return;
+        }
+
+        let should_close = self
+            .connections
+            .profile_hover_tooltip
+            .as_ref()
+            .is_some_and(|tooltip| tooltip.profile_id == profile_id);
+        if should_close {
+            self.connections.profile_hover_tooltip = None;
+            context.notify();
+        }
+    }
+
     /// 打开左侧连接行右键菜单。
     pub(in crate::app) fn open_connection_profile_context_menu(
         &mut self,
@@ -757,6 +826,7 @@ impl MainView {
                 f32::from(window.viewport_size().height),
             ),
         });
+        self.connections.profile_hover_tooltip = None;
         self.connections.create_menu_open = false;
         self.connections.category_context_menu = None;
         context.stop_propagation();
@@ -790,6 +860,7 @@ impl MainView {
         });
         self.connections.create_menu_open = false;
         self.connections.profile_context_menu = None;
+        self.connections.profile_hover_tooltip = None;
         context.stop_propagation();
         context.notify();
     }
@@ -875,8 +946,10 @@ impl MainView {
         self.connections.selected_profile_id = Some(profile.id.clone());
         self.connections.create_menu_open = false;
         self.connections.profile_context_menu = None;
+        self.connections.profile_hover_tooltip = None;
         self.connections.category_context_menu = None;
         self.connections.tab_context_menu = None;
+        self.connections.terminal_context_menu = None;
         let password = match decrypt_connection_password(&profile.id, &profile.encrypted_password) {
             Ok(password) => password,
             Err(error) => {
@@ -900,6 +973,7 @@ impl MainView {
         let tab = ConnectionTerminalTab {
             id: tab_id,
             profile_id: profile.id.clone(),
+            file_target_kind: ConnectionTerminalFileTargetKind::Ssh,
             title: profile.name.clone(),
             backend,
             emulator: ConnectionTerminalEmulator::new(size),
@@ -907,6 +981,11 @@ impl MainView {
             focus,
             selection_anchor: None,
             mouse_reporting_drag: false,
+            cell_width: CONNECTION_TERMINAL_CELL_WIDTH,
+            content_bounds: None,
+            ime: ConnectionTerminalImeState::default(),
+            osc7_buffer: Vec::new(),
+            last_reported_cwd: None,
             backend_finished: false,
         };
         self.connections.tabs.push(tab);
@@ -939,6 +1018,7 @@ impl MainView {
         let tab = ConnectionTerminalTab {
             id: tab_id,
             profile_id: format!("local-terminal-{tab_id}"),
+            file_target_kind: ConnectionTerminalFileTargetKind::Local,
             title: "本地终端".to_string(),
             backend,
             emulator: ConnectionTerminalEmulator::new(size),
@@ -946,13 +1026,20 @@ impl MainView {
             focus,
             selection_anchor: None,
             mouse_reporting_drag: false,
+            cell_width: CONNECTION_TERMINAL_CELL_WIDTH,
+            content_bounds: None,
+            ime: ConnectionTerminalImeState::default(),
+            osc7_buffer: Vec::new(),
+            last_reported_cwd: None,
             backend_finished: false,
         };
 
         self.connections.create_menu_open = false;
         self.connections.profile_context_menu = None;
+        self.connections.profile_hover_tooltip = None;
         self.connections.category_context_menu = None;
         self.connections.tab_context_menu = None;
+        self.connections.terminal_context_menu = None;
         self.connections.tabs.push(tab);
         self.connections.active_tab_id = Some(tab_id);
         if let Some(active) = self.connections.active_tab() {
@@ -985,6 +1072,7 @@ impl MainView {
             .tab_bar_scroll_handle
             .set_offset(point(next_x, current_offset.y));
         self.connections.tab_context_menu = None;
+        self.connections.terminal_context_menu = None;
         context.notify();
     }
 
@@ -996,6 +1084,8 @@ impl MainView {
         context: &mut Context<Self>,
     ) {
         self.connections.active_tab_id = Some(tab_id);
+        self.connections.tab_context_menu = None;
+        self.connections.terminal_context_menu = None;
         if let Some(tab) = self.connections.active_tab() {
             window.focus(&tab.focus);
         }
@@ -1035,12 +1125,140 @@ impl MainView {
         context: &mut Context<Self>,
     ) {
         self.connections.tab_context_menu = None;
+        self.connections.terminal_context_menu = None;
         match action {
             ConnectionTabContextMenuAction::Current => self.connections.close_tab(tab_id),
             ConnectionTabContextMenuAction::OtherTabs => self.connections.close_other_tabs(tab_id),
             ConnectionTabContextMenuAction::AllTabs => self.connections.close_all_tabs(),
         }
         context.notify();
+    }
+
+    /// 打开终端正文右键菜单。
+    pub(in crate::app) fn open_connection_terminal_context_menu(
+        &mut self,
+        tab_id: usize,
+        window_x: f32,
+        window_y: f32,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.connections.tabs.iter().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        let panel_x = (window_x - MAIN_NAV_WIDTH - self.connections.tree_width).max(0.0);
+        let panel_y = window_y.max(0.0);
+        self.connections.active_tab_id = Some(tab_id);
+        window.focus(&tab.focus);
+        self.connections.terminal_context_menu = Some(ConnectionTerminalContextMenu {
+            tab_id,
+            x: panel_x,
+            y: panel_y,
+        });
+        self.connections.tab_context_menu = None;
+        self.connections.create_menu_open = false;
+        self.connections.profile_context_menu = None;
+        self.connections.category_context_menu = None;
+        self.connections.profile_hover_tooltip = None;
+        context.notify();
+    }
+
+    /// 执行终端正文右键菜单动作。
+    pub(in crate::app) fn handle_connection_terminal_context_menu_action(
+        &mut self,
+        tab_id: usize,
+        action: ConnectionTerminalContextMenuAction,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.connections.terminal_context_menu = None;
+        self.connections.active_tab_id = Some(tab_id);
+        match action {
+            ConnectionTerminalContextMenuAction::FileManager => {
+                self.open_connection_file_manager_for_tab(tab_id, window, context);
+            }
+            ConnectionTerminalContextMenuAction::Copy => {
+                let _ = self.copy_selected_connection_terminal_text(context);
+            }
+            ConnectionTerminalContextMenuAction::Paste => {
+                let _ = self.paste_clipboard_text_into_connection_terminal(context);
+            }
+        }
+        context.stop_propagation();
+        context.notify();
+    }
+
+    /// 打开指定终端 tab 的文件管理窗口。
+    ///
+    /// 业务意图：
+    /// - 文件管理窗口使用独立后端：SSH 重新建立 SFTP 会话，本地终端走本机文件系统。
+    /// - 当前阶段不再依赖终端当前目录，统一从当前用户家目录打开，避免 OSC 7 缺失时进入错误目录。
+    fn open_connection_file_manager_for_tab(
+        &mut self,
+        tab_id: usize,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.connections.tabs.iter().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        let initial_path = if tab.file_target_kind == ConnectionTerminalFileTargetKind::Local {
+            local_home_directory_text()
+        } else {
+            ssh_default_directory_text()
+        };
+        let remote = tab.file_target_kind == ConnectionTerminalFileTargetKind::Ssh;
+        let title = format!("{} - 文件管理", tab.title);
+        let backend_target = match tab.file_target_kind {
+            ConnectionTerminalFileTargetKind::Local => ConnectionFileBackendTarget::Local,
+            ConnectionTerminalFileTargetKind::Ssh => {
+                let Some(profile) = self.connections.profile_by_id(&tab.profile_id).cloned() else {
+                    self.connections.status_message =
+                        Some("连接配置不存在，无法打开文件管理".to_string());
+                    return;
+                };
+                let password =
+                    match decrypt_connection_password(&profile.id, &profile.encrypted_password) {
+                        Ok(password) => password,
+                        Err(error) => {
+                            self.connections.status_message = Some(error);
+                            return;
+                        }
+                    };
+                ConnectionFileBackendTarget::Ssh {
+                    trusted_fingerprint: profile.host_key_fingerprint.clone(),
+                    profile,
+                    password: zeroize::Zeroizing::new(password),
+                }
+            }
+        };
+        let main_view = context.entity();
+        window.defer(context, move |_window, app| {
+            // GPUI 不允许在 `MainView` 正处于更新租借时创建并渲染会读取 `MainView` 的新窗口。
+            // 因此文件管理窗口必须延迟到当前事件更新结束后再打开，避免触发实体重入读取保护。
+            let window_options = connection_file_manager_window_options(&title, app);
+            let main_view_for_window = main_view.clone();
+            let main_view_for_error = main_view.clone();
+            let open_result = app.open_window(window_options, move |_window, app| {
+                let backend = start_connection_file_backend(backend_target);
+                app.new(|context| {
+                    ConnectionFileManagerWindowView::new(
+                        main_view_for_window,
+                        title,
+                        backend,
+                        initial_path,
+                        remote,
+                        context,
+                    )
+                })
+            });
+            if open_result.is_err() {
+                let _ = main_view_for_error.update(app, |view, context| {
+                    view.connections.status_message = Some("打开文件管理窗口失败".to_string());
+                    context.notify();
+                });
+            }
+        });
     }
 
     /// 展开或收起连接分类。
@@ -1071,9 +1289,9 @@ impl MainView {
         &mut self,
         tab_id: usize,
         bounds: Bounds<Pixels>,
+        cell_width: f32,
         context: &mut Context<Self>,
     ) {
-        let next_size = connection_terminal_size_from_bounds(bounds);
         let Some(tab) = self
             .connections
             .tabs
@@ -1082,6 +1300,10 @@ impl MainView {
         else {
             return;
         };
+        tab.content_bounds = Some(bounds);
+        tab.cell_width = cell_width.max(1.0);
+        let next_size =
+            connection_terminal_size_from_bounds_with_cell_width(bounds, tab.cell_width);
         if tab.emulator.size == next_size {
             return;
         }
@@ -1153,6 +1375,10 @@ impl MainView {
                         connected_profile_ids.push(tab.profile_id.clone());
                     }
                     TerminalBackendEvent::Output(bytes) => {
+                        if let Some(cwd) = update_osc7_cwd_from_output(&mut tab.osc7_buffer, &bytes)
+                        {
+                            tab.last_reported_cwd = Some(cwd);
+                        }
                         tab.emulator.feed_output(&bytes);
                     }
                     TerminalBackendEvent::Exited(message) => {
@@ -1401,6 +1627,8 @@ impl MainView {
         window: &Window,
     ) -> bool {
         !self.connection_modal_open()
+            // 终端右键菜单打开时焦点仍可能停留在终端正文；此时键盘和粘贴不能继续写入背后的 shell。
+            && self.connections.terminal_context_menu.is_none()
             && self
                 .connections
                 .active_tab()
@@ -1944,10 +2172,13 @@ impl MainView {
         y: f32,
     ) -> Option<Point> {
         let tab = self.connections.active_tab()?;
-        let local_x =
-            x - MAIN_NAV_WIDTH - self.connections.tree_width - CONNECTION_TERMINAL_PADDING;
-        let local_y = y - CONNECTIONS_TAB_BAR_HEIGHT - CONNECTION_TERMINAL_PADDING;
-        Some(tab.emulator.point_from_panel_offset(local_x, local_y))
+        let bounds = tab.content_bounds?;
+        let local_x = x - f32::from(bounds.left());
+        let local_y = y - f32::from(bounds.top());
+        Some(
+            tab.emulator
+                .point_from_panel_offset(local_x, local_y, tab.cell_width),
+        )
     }
 
     /// 开始调整连接页左侧栏宽度。
@@ -1998,6 +2229,7 @@ impl MainView {
 ///
 /// 边界条件：
 /// - `Ctrl+C` 在没有选区时由这里映射为 ETX，中断远端程序；存在选区时全局快捷键会先复制并消费。
+/// - 普通可打印字符由 `EntityInputHandler` 处理，避免注册 IME 后 ASCII 字符在 keydown 和平台输入提交两条路径重复写入。
 fn terminal_input_bytes_for_keystroke(keystroke: &Keystroke) -> Option<Vec<u8>> {
     if keystroke.modifiers.control && keystroke.key.len() == 1 {
         let byte = keystroke.key.as_bytes()[0].to_ascii_lowercase();
@@ -2019,12 +2251,7 @@ fn terminal_input_bytes_for_keystroke(keystroke: &Keystroke) -> Option<Vec<u8>> 
         "end" => b"\x1b[F".to_vec(),
         "pageup" => b"\x1b[5~".to_vec(),
         "pagedown" => b"\x1b[6~".to_vec(),
-        _ => {
-            if keystroke.modifiers.platform || keystroke.modifiers.control {
-                return None;
-            }
-            keystroke.key_char.as_ref()?.as_bytes().to_vec()
-        }
+        _ => return None,
     };
     Some(bytes)
 }

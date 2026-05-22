@@ -8,7 +8,9 @@
 use super::*;
 
 mod actions;
+mod file_manager_window;
 mod ui_state;
 mod view;
 
+pub(in crate::app) use file_manager_window::*;
 pub(in crate::app) use ui_state::*;

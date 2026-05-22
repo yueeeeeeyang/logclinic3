@@ -11,11 +11,13 @@
 mod constants;
 mod crypto;
 mod domain;
+mod file_manager;
 mod storage;
 mod terminal;
 
 pub(crate) use constants::*;
 pub(crate) use crypto::*;
 pub(crate) use domain::*;
+pub(crate) use file_manager::*;
 pub(crate) use storage::*;
 pub(crate) use terminal::*;

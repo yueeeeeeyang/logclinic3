@@ -8,6 +8,8 @@ edition = "2024"
 [dependencies]
 # chardetng 用于日志正文的编码自动检测；检测失败时 UI 允许用户手动切换编码重新解码。
 chardetng = "1.0.0"
+# chrono 用于把本地/远端文件修改时间格式化为用户本地时区下的可读文本；只在 UI 展示层使用，不改变持久化时间戳。
+chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
 # encoding_rs 显式提供 UTF-8、GBK、GB18030 和 Big5 解码能力，避免只依赖 GPUI 的传递依赖。
 encoding_rs = "0.8.35"
 # flate2 用于流式解码 tar.gz/tgz 的 gzip 层和单文件 .gz 日志，不负责把压缩包内容解压到磁盘。
@@ -22,6 +24,8 @@ lucide-icons = "1.14.0"
 portable-pty = "0.9.0"
 # russh 提供纯 Rust SSH client；显式使用 ring+rsa，避免默认 aws-lc 原生构建扩大 macOS/Windows 打包面。
 russh = { version = "0.61.0", default-features = false, features = ["ring", "rsa"] }
+# russh-sftp 复用 russh SSH channel 的 SFTP subsystem；用于连接页文件管理，不引入系统 OpenSSH/WinSCP 依赖，跨 macOS/Windows 保持纯 Rust。
+russh-sftp = "2.1.1"
 # alacritty_terminal 提供成熟 VT/ANSI 解析和终端 grid 状态，GPUI 只负责把 grid 映射为自绘界面。
 alacritty_terminal = "0.26.0"
 # tokio 只服务 russh 后台运行时；不把异步运行时暴露到 GPUI 主线程，避免 UI 生命周期和网络任务耦合。

@@ -19,6 +19,12 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<String> {
+        if self.connection_terminal_focused_without_modal(window) {
+            let ime = &self.connections.active_tab()?.ime;
+            let range = Self::search_input_range_from_utf16(&ime.text, range_utf16);
+            adjusted_range.replace(Self::search_input_range_to_utf16(&ime.text, range.clone()));
+            return Some(ime.text[range].to_string());
+        }
         if let Some(kind) = self.active_model_config_input_kind(window) {
             let state = self.model_config_input_state(kind);
             let range = Self::search_input_range_from_utf16(&state.text, range_utf16);
@@ -130,6 +136,13 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
+        if self.connection_terminal_focused_without_modal(window) {
+            let ime = &self.connections.active_tab()?.ime;
+            return Some(UTF16Selection {
+                range: Self::search_input_range_to_utf16(&ime.text, ime.selection_range.clone()),
+                reversed: false,
+            });
+        }
         if let Some(kind) = self.active_model_config_input_kind(window) {
             let state = self.model_config_input_state(kind);
             return Some(UTF16Selection {
@@ -252,6 +265,13 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<Range<usize>> {
+        if self.connection_terminal_focused_without_modal(window) {
+            let ime = &self.connections.active_tab()?.ime;
+            return ime
+                .marked_range
+                .clone()
+                .map(|range| Self::search_input_range_to_utf16(&ime.text, range));
+        }
         if let Some(kind) = self.active_model_config_input_kind(window) {
             let state = self.model_config_input_state(kind);
             return state
@@ -358,6 +378,13 @@ impl EntityInputHandler for MainView {
 
     /// 清除输入法组合文本状态。
     fn unmark_text(&mut self, window: &mut Window, context: &mut Context<Self>) {
+        if self.connection_terminal_focused_without_modal(window) {
+            if let Some(tab) = self.connections.active_tab_mut() {
+                tab.clear_ime();
+            }
+            context.notify();
+            return;
+        }
         if let Some(kind) = self.active_model_config_input_kind(window) {
             self.model_config_input_state_mut(kind).marked_range = None;
             context.notify();
@@ -441,6 +468,17 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
+        if self.connection_terminal_focused_without_modal(window) {
+            if let Some(tab) = self.connections.active_tab_mut() {
+                tab.clear_ime();
+                if !text.is_empty() {
+                    // 终端输入必须按 UTF-8 原样发送给 PTY/SSH；中文 IME 最终提交会走到这里。
+                    tab.write_input(text.as_bytes().to_vec());
+                }
+            }
+            context.notify();
+            return;
+        }
         if let Some(kind) = self.active_model_config_input_kind(window) {
             let replacement = Self::sanitize_search_input_text(text);
             let state = self.model_config_input_state_mut(kind);
@@ -712,6 +750,35 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
+        if self.connection_terminal_focused_without_modal(window) {
+            if let Some(tab) = self.connections.active_tab_mut() {
+                let ime = &mut tab.ime;
+                let range = range_utf16
+                    .map(|range| Self::search_input_range_from_utf16(&ime.text, range))
+                    .or_else(|| ime.marked_range.clone())
+                    .unwrap_or_else(|| ime.selection_range.clone());
+                let range = Self::clamp_search_text_range(&ime.text, range);
+                ime.text.replace_range(range.clone(), new_text);
+
+                if new_text.is_empty() {
+                    ime.marked_range = None;
+                } else {
+                    ime.marked_range = Some(range.start..range.start + new_text.len());
+                }
+
+                ime.selection_range = new_selected_range_utf16
+                    .map(|utf16_range| Self::search_input_range_from_utf16(new_text, utf16_range))
+                    .map(|relative_range| {
+                        range.start + relative_range.start..range.start + relative_range.end
+                    })
+                    .unwrap_or_else(|| {
+                        let cursor = range.start + new_text.len();
+                        cursor..cursor
+                    });
+            }
+            context.notify();
+            return;
+        }
         if let Some(kind) = self.active_model_config_input_kind(window) {
             let replacement = Self::sanitize_search_input_text(new_text);
             let state = self.model_config_input_state_mut(kind);
@@ -1164,6 +1231,34 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        if self.connection_terminal_focused_without_modal(window) {
+            let tab = self.connections.active_tab()?;
+            let bounds = tab.content_bounds.unwrap_or(element_bounds);
+            let cursor = tab.emulator.cursor_point();
+            let column = cursor.column.0 as f32;
+            let line = cursor.line.0.max(0) as f32;
+            let cell_width = tab.cell_width.max(1.0);
+            let ime = &tab.ime;
+            let range = Self::search_input_range_from_utf16(&ime.text, range_utf16);
+            let start_offset = ime.text[..range.start].chars().count() as f32;
+            let end_offset = ime.text[..range.end]
+                .chars()
+                .count()
+                .max(ime.text[..range.start].chars().count().saturating_add(1))
+                as f32;
+            let start_column = column + start_offset;
+            let end_column = column + end_offset;
+            return Some(Bounds::from_corners(
+                point(
+                    bounds.left() + px(start_column * cell_width),
+                    bounds.top() + px(line * CONNECTION_TERMINAL_ROW_HEIGHT),
+                ),
+                point(
+                    bounds.left() + px(end_column * cell_width),
+                    bounds.top() + px((line + 1.0) * CONNECTION_TERMINAL_ROW_HEIGHT),
+                ),
+            ));
+        }
         if let Some(kind) = self.active_model_config_input_kind(window) {
             let state = self.model_config_input_state(kind);
             let range = Self::search_input_range_from_utf16(&state.text, range_utf16);
@@ -1408,6 +1503,10 @@ impl EntityInputHandler for MainView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<usize> {
+        if self.connection_terminal_focused_without_modal(window) {
+            // 终端 IME 没有可编辑文档坐标，平台只需要一个合法插入点来维持候选窗口交互。
+            return Some(0);
+        }
         if let Some(kind) = self.active_model_config_input_kind(window) {
             let utf8_index = self.model_config_input_index_for_point(kind, point);
             let state = self.model_config_input_state(kind);

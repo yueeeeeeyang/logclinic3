@@ -1119,10 +1119,16 @@ impl MainView {
             .unwrap_or_default();
 
         div()
+            .flex()
+            .items_center()
+            .justify_center()
             .w(px(width))
+            .h(px(width))
             .flex_none()
             .font_family(LUCIDE_FONT_FAMILY)
             .text_size(px(icon_size))
+            .line_height(px(width))
+            .text_center()
             .text_color(rgb(icon_color))
             .child(icon_text)
     }

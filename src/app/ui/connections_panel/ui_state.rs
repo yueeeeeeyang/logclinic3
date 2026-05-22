@@ -50,7 +50,7 @@ pub(in crate::app) const CONNECTIONS_TAB_BAR_HEIGHT: f32 = CONNECTIONS_TOOLBAR_H
 /// 实现原因：
 /// - 终端文本不能紧贴 tab 栏和右侧边界，否则光标、中文宽字符和选区边缘在亮色主题下会显得拥挤。
 /// - 该值同时参与鼠标格点换算，保证点击位置与实际绘制文本保持一致。
-pub(in crate::app) const CONNECTION_TERMINAL_PADDING: f32 = 2.0;
+pub(in crate::app) const CONNECTION_TERMINAL_PADDING: f32 = 4.0;
 
 /// 终端默认字体大小。
 pub(in crate::app) const CONNECTION_TERMINAL_FONT_SIZE: f32 = 13.0;
@@ -86,6 +86,21 @@ pub(in crate::app) const CONNECTIONS_CONTEXT_MENU_ITEM_HEIGHT: f32 = 32.0;
 /// - 右键菜单使用 `.py_1()`，上下各 4px；坐标夹紧必须把这部分高度算进去，否则底部菜单项仍可能被窗口裁掉。
 pub(in crate::app) const CONNECTIONS_CONTEXT_MENU_VERTICAL_PADDING: f32 = 8.0;
 
+/// 左侧连接详情悬浮气泡宽度。
+///
+/// UI 约束：
+/// - 连接卡片本身只显示名称，主机和用户信息放到 hover 气泡；固定宽度可以避免长地址导致侧栏布局抖动。
+pub(in crate::app) const CONNECTIONS_PROFILE_TOOLTIP_WIDTH: f32 = 224.0;
+
+/// 左侧连接详情悬浮气泡预估高度。
+///
+/// 边界条件：
+/// - GPUI hover 回调阶段无法读取气泡真实布局高度，坐标夹紧使用该值避免靠近窗口底部时被裁切。
+pub(in crate::app) const CONNECTIONS_PROFILE_TOOLTIP_HEIGHT: f32 = 72.0;
+
+/// 左侧连接详情悬浮气泡和鼠标点之间的间距。
+pub(in crate::app) const CONNECTIONS_PROFILE_TOOLTIP_GAP: f32 = 12.0;
+
 /// 左侧连接树搜索框高度。
 ///
 /// UI 约束：
@@ -97,6 +112,18 @@ pub(in crate::app) const CONNECTIONS_TREE_SEARCH_HEIGHT: f32 = 32.0;
 /// UI 约束：
 /// - 分类和连接共用树形列表，缩进必须稳定，避免搜索和展开/收起时行内容横向跳动。
 pub(in crate::app) const CONNECTIONS_TREE_DEPTH_INDENT: f32 = 16.0;
+
+/// 左侧连接树节点名称字号。
+///
+/// UI 约束：
+/// - 分类节点和连接节点必须使用同一个显式字号，不能依赖父级继承，避免不同图标组合或选中态导致视觉大小不一致。
+pub(in crate::app) const CONNECTIONS_TREE_NODE_TEXT_SIZE: f32 = 13.0;
+
+/// 左侧连接树节点名称行高。
+///
+/// UI 约束：
+/// - 分类名和连接名共用行高，保证中文、英文和数字混排时基线稳定。
+pub(in crate::app) const CONNECTIONS_TREE_NODE_LINE_HEIGHT: f32 = 18.0;
 
 /// 连接终端区域主题色。
 ///
@@ -173,21 +200,24 @@ fn connection_terminal_default_colors(theme: EffectiveTheme) -> ConnectionTermin
     connection_terminal_ui_colors(theme, AppThemePalette::for_theme(theme))
 }
 
-/// 根据终端内容区 bounds 计算 PTY 行列和像素尺寸。
+/// 根据指定终端单元格宽度计算 PTY 行列和像素尺寸。
 ///
 /// 业务意图：
 /// - GPUI 布局完成后才能知道右侧终端真实大小；连接 tab 初始只能使用 80x24，首帧后必须按实际面板同步。
 /// - 该计算同时服务 alacritty emulator 和 SSH remote pty，保证渲染行列、鼠标格点和远端 TUI 程序看到的窗口尺寸一致。
+/// - 终端渲染字体可能被平台字体回退、字号缩放或不同系统字体实现影响，固定 8px 列宽会让鼠标选区逐列累积偏差。
+/// - 渲染层测量到真实等宽字符宽度后，通过该函数同时驱动本地/远程 PTY resize 和鼠标格点换算。
 ///
 /// 边界条件：
-/// - 宽高为 0 时仍返回至少 1 行 1 列，避免底层终端状态机或 SSH `window-change` 收到非法尺寸。
-/// - 像素尺寸按 u16 夹紧，兼容 portable-pty 和 SSH pty 请求字段。
-pub(in crate::app) fn connection_terminal_size_from_bounds(bounds: Bounds<Pixels>) -> TerminalSize {
+/// - 测量失败或异常小时回退到默认列宽，避免除以 0 导致终端尺寸非法。
+pub(in crate::app) fn connection_terminal_size_from_bounds_with_cell_width(
+    bounds: Bounds<Pixels>,
+    cell_width: f32,
+) -> TerminalSize {
     let width = f32::from(bounds.size.width).max(0.0);
     let height = f32::from(bounds.size.height).max(0.0);
-    let cols = (width / CONNECTION_TERMINAL_CELL_WIDTH)
-        .floor()
-        .clamp(1.0, u16::MAX as f32) as u16;
+    let cell_width = cell_width.max(1.0);
+    let cols = (width / cell_width).floor().clamp(1.0, u16::MAX as f32) as u16;
     let rows = (height / CONNECTION_TERMINAL_ROW_HEIGHT)
         .floor()
         .clamp(1.0, u16::MAX as f32) as u16;
@@ -237,6 +267,12 @@ pub(in crate::app) struct ConnectionsWorkspaceState {
     /// - 连接卡片本身只负责单击直连，编辑和删除等低频动作统一收进右键菜单，避免卡片内按钮互相抢占点击区域。
     /// - 菜单坐标保存为左侧连接栏内部坐标；鼠标事件进入时需要扣除主导航宽度并限制在侧栏范围内。
     pub(in crate::app) profile_context_menu: Option<ConnectionProfileContextMenu>,
+    /// 左侧连接行悬浮详情气泡。
+    ///
+    /// UI 约束：
+    /// - 连接卡片只保留名称，用户和主机信息在 hover 时展示，避免列表在窄侧栏里显得拥挤。
+    /// - 气泡是纯展示状态，不持久化；连接树刷新或菜单打开后可以直接丢弃。
+    pub(in crate::app) profile_hover_tooltip: Option<ConnectionProfileHoverTooltip>,
     /// 左侧分类行右键菜单。
     ///
     /// UI 约束：
@@ -247,6 +283,12 @@ pub(in crate::app) struct ConnectionsWorkspaceState {
     /// UI 约束：
     /// - 菜单绘制在右侧终端工作区内部，坐标使用工作区局部坐标，避免受左侧栏宽度变化影响。
     pub(in crate::app) tab_context_menu: Option<ConnectionTabContextMenu>,
+    /// 终端正文右键菜单。
+    ///
+    /// UI 约束：
+    /// - 菜单只在终端正文区域打开，坐标同样使用右侧工作区局部坐标。
+    /// - 打开时必须关闭 tab 菜单和左侧菜单，避免同一次右键产生多个浮层竞争输入。
+    pub(in crate::app) terminal_context_menu: Option<ConnectionTerminalContextMenu>,
     /// 新增/编辑连接弹窗状态。
     pub(in crate::app) dialog: Option<ConnectionDialogState>,
     /// 新增/编辑分类弹窗状态。
@@ -303,8 +345,10 @@ impl ConnectionsWorkspaceState {
             tab_bar_scroll_handle: ScrollHandle::new(),
             create_menu_open: false,
             profile_context_menu: None,
+            profile_hover_tooltip: None,
             category_context_menu: None,
             tab_context_menu: None,
+            terminal_context_menu: None,
             dialog: None,
             category_dialog: None,
             delete_confirm_dialog: None,
@@ -327,6 +371,22 @@ impl ConnectionsWorkspaceState {
         self.categories
             .iter()
             .find(|category| category.id == category_id)
+    }
+
+    /// 生成连接 hover 气泡展示的用户文案。
+    ///
+    /// 业务意图：
+    /// - 连接卡片主区域只显示名称；悬浮信息统一由这里格式化，避免列表渲染和测试各自拼接。
+    pub(in crate::app) fn profile_tooltip_user_label(profile: &ConnectionProfile) -> String {
+        format!("用户：{}", profile.username)
+    }
+
+    /// 生成连接 hover 气泡展示的地址文案。
+    ///
+    /// 边界条件：
+    /// - host 可能是 IP、域名或内网别名；这里只展示用户保存的原始主机和端口，不做解析或脱敏。
+    pub(in crate::app) fn profile_tooltip_address_label(profile: &ConnectionProfile) -> String {
+        format!("地址：{}:{}", profile.host, profile.port)
     }
 
     /// 重新加载 SQLite 中的连接和分类列表。
@@ -401,6 +461,7 @@ impl ConnectionsWorkspaceState {
             }
         }
         self.tab_context_menu = None;
+        self.terminal_context_menu = None;
     }
 
     /// 关闭指定 tab 之外的所有终端 tab。
@@ -411,6 +472,7 @@ impl ConnectionsWorkspaceState {
         self.tabs.retain(|tab| tab.id == tab_id);
         self.active_tab_id = self.tabs.first().map(|tab| tab.id);
         self.tab_context_menu = None;
+        self.terminal_context_menu = None;
         self.tab_bar_scroll_handle
             .set_offset(point(px(0.0), px(0.0)));
     }
@@ -423,6 +485,7 @@ impl ConnectionsWorkspaceState {
         self.tabs.clear();
         self.active_tab_id = None;
         self.tab_context_menu = None;
+        self.terminal_context_menu = None;
         self.tab_bar_scroll_handle
             .set_offset(point(px(0.0), px(0.0)));
     }
@@ -555,6 +618,20 @@ pub(in crate::app) struct ConnectionProfileContextMenu {
     pub(in crate::app) y: f32,
 }
 
+/// 左侧连接详情悬浮气泡状态。
+///
+/// 业务意图：
+/// - 用户需要快速确认连接的用户名和主机地址，但这些信息不应长期占用连接列表空间。
+/// - 坐标保存在左侧栏局部坐标中，渲染时可以直接作为侧栏绝对定位浮层使用。
+pub(in crate::app) struct ConnectionProfileHoverTooltip {
+    /// 悬浮目标连接 ID。
+    pub(in crate::app) profile_id: String,
+    /// 气泡在连接侧栏内部的横坐标。
+    pub(in crate::app) x: f32,
+    /// 气泡在连接侧栏内部的纵坐标。
+    pub(in crate::app) y: f32,
+}
+
 /// 左侧连接行右键菜单动作。
 ///
 /// 业务意图：
@@ -613,6 +690,40 @@ pub(in crate::app) enum ConnectionTabContextMenuAction {
     OtherTabs,
     /// 关闭全部连接终端 tab。
     AllTabs,
+}
+
+/// 终端正文右键菜单状态。
+pub(in crate::app) struct ConnectionTerminalContextMenu {
+    /// 菜单目标 tab ID。
+    pub(in crate::app) tab_id: usize,
+    /// 菜单在右侧终端工作区内部的横坐标。
+    pub(in crate::app) x: f32,
+    /// 菜单在右侧终端工作区内部的纵坐标。
+    pub(in crate::app) y: f32,
+}
+
+/// 终端正文右键菜单动作。
+///
+/// 业务意图：
+/// - 终端正文的右键菜单承载和当前终端内容相关的动作；复制/粘贴复用现有终端选区和 bracketed paste 逻辑，
+///   文件管理则从当前 tab 的 OSC 7 目录打开独立窗口。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::app) enum ConnectionTerminalContextMenuAction {
+    /// 打开文件管理窗口。
+    FileManager,
+    /// 复制当前终端选区。
+    Copy,
+    /// 粘贴系统剪贴板内容。
+    Paste,
+}
+
+/// 终端 tab 对应的文件管理目标类型。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::app) enum ConnectionTerminalFileTargetKind {
+    /// 本地终端，文件管理走本机文件系统。
+    Local,
+    /// SSH 终端，文件管理走独立 SFTP 会话。
+    Ssh,
 }
 
 /// 新增/编辑连接弹窗状态。
@@ -1064,6 +1175,11 @@ pub(in crate::app) struct ConnectionTerminalTab {
     pub(in crate::app) id: usize,
     /// 连接配置 ID。
     pub(in crate::app) profile_id: String,
+    /// 文件管理目标类型。
+    ///
+    /// 业务意图：
+    /// - SSH 连接和本地终端共用同一套终端 tab 渲染；文件管理打开时需要明确选择 SFTP 或本机文件系统。
+    pub(in crate::app) file_target_kind: ConnectionTerminalFileTargetKind,
     /// tab 标题快照。
     pub(in crate::app) title: String,
     /// 后端命令和事件通道。
@@ -1078,11 +1194,65 @@ pub(in crate::app) struct ConnectionTerminalTab {
     pub(in crate::app) selection_anchor: Option<Point>,
     /// xterm 鼠标上报拖拽状态；远端开启鼠标模式时使用它决定移动和释放事件是否要写回后端。
     pub(in crate::app) mouse_reporting_drag: bool,
+    /// 当前 tab 渲染使用的真实终端列宽。
+    ///
+    /// 业务意图：
+    /// - GPUI 文本系统会根据平台字体实际测量字符宽度，不能长期使用经验常量做鼠标选区和 pty resize。
+    /// - 本地终端和 SSH 终端共用该值，避免不同后端打开后选区位置一前一后。
+    pub(in crate::app) cell_width: f32,
+    /// 终端内容区最近一次 GPUI 实际 bounds。
+    ///
+    /// 业务意图：
+    /// - 鼠标选区、xterm 鼠标上报和 IME 候选窗口都必须使用真实内容区坐标，而不能用左侧栏宽度、
+    ///   tab 栏高度等常量反推，否则在 resize、边框和平台标题栏差异下会出现点击位置错位。
+    pub(in crate::app) content_bounds: Option<Bounds<Pixels>>,
+    /// 终端中文输入法组合状态。
+    ///
+    /// 业务意图：
+    /// - IME 组合文本不能直接写入 PTY/SSH；只有平台提交最终文本时才发送 UTF-8 字节到后端。
+    /// - 该状态只服务当前 tab 的候选窗口定位和组合文本预览，终端真实内容仍由后端回显驱动。
+    pub(in crate::app) ime: ConnectionTerminalImeState,
+    /// OSC 7 解析缓存。
+    ///
+    /// 业务意图：
+    /// - 当前目录上报序列可能跨后端输出 chunk；这里保留尚未闭合的片段，只用于解析 OSC 7，不进入终端显示。
+    pub(in crate::app) osc7_buffer: Vec<u8>,
+    /// 最近一次由 OSC 7 上报的当前目录。
+    ///
+    /// 边界条件：
+    /// - 不是所有 shell 都启用 OSC 7；为空时文件管理窗口回退到本地 home 或 SSH `~`，并允许用户在路径栏手动切换。
+    pub(in crate::app) last_reported_cwd: Option<String>,
     /// 后端事件通道是否已经结束。
     ///
     /// 业务意图：
     /// - 终端 tab 可以保留退出状态供用户查看，但后台轮询必须停止读取已经断开的通道，避免持续 30ms 刷新 UI。
     pub(in crate::app) backend_finished: bool,
+}
+
+/// 终端 IME 组合状态。
+///
+/// 业务意图：
+/// - 自绘终端不是传统文本框，但平台输入法仍需要“当前文本、选区、marked range、候选窗口位置”
+///   这组最小协议来完成中文输入。
+/// - 这里只保存尚未提交到 shell 的组合文本；最终提交后立即清空，避免下次输入把旧拼音重复发送。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::app) struct ConnectionTerminalImeState {
+    /// 当前组合文本，通常是拼音或输入法临时候选内容。
+    pub(in crate::app) text: String,
+    /// 平台标记的组合文本范围，按 UTF-8 字节下标保存。
+    pub(in crate::app) marked_range: Option<Range<usize>>,
+    /// 组合文本内部选择范围，按 UTF-8 字节下标保存。
+    pub(in crate::app) selection_range: Range<usize>,
+}
+
+impl Default for ConnectionTerminalImeState {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            marked_range: None,
+            selection_range: 0..0,
+        }
+    }
 }
 
 impl ConnectionTerminalTab {
@@ -1102,6 +1272,11 @@ impl ConnectionTerminalTab {
             .backend
             .command_sender
             .send(TerminalBackendCommand::Resize(size));
+    }
+
+    /// 清空终端 IME 组合状态。
+    pub(in crate::app) fn clear_ime(&mut self) {
+        self.ime = ConnectionTerminalImeState::default();
     }
 }
 
@@ -1199,8 +1374,9 @@ impl ConnectionTerminalEmulator {
     ///
     /// 边界条件：
     /// - 鼠标可能拖到终端面板外，行列统一夹到可见区域，避免 Selection 收到越界点。
-    pub(in crate::app) fn point_from_panel_offset(&self, x: f32, y: f32) -> Point {
-        let column = (x / CONNECTION_TERMINAL_CELL_WIDTH)
+    pub(in crate::app) fn point_from_panel_offset(&self, x: f32, y: f32, cell_width: f32) -> Point {
+        let cell_width = cell_width.max(1.0);
+        let column = (x / cell_width)
             .floor()
             .max(0.0)
             .min((self.size.cols.saturating_sub(1)) as f32) as usize;
@@ -1209,6 +1385,15 @@ impl ConnectionTerminalEmulator {
             .max(0.0)
             .min((self.size.rows.saturating_sub(1)) as f32) as i32;
         Point::new(Line(line), Column(column))
+    }
+
+    /// 返回当前终端光标格点。
+    ///
+    /// 业务意图：
+    /// - IME 候选窗口需要跟随 shell 光标，而不是跟随整个终端面板左上角。
+    /// - 这里直接读取 alacritty 当前 grid cursor，保证远端程序移动光标后候选框仍出现在正确行列附近。
+    pub(in crate::app) fn cursor_point(&self) -> Point {
+        self.term.grid().cursor.point
     }
 
     /// 生成 GPUI 渲染用行快照。
@@ -1706,20 +1891,74 @@ mod tests {
         assert!(rows.is_empty());
     }
 
+    /// 验证连接详情气泡只负责展示用户和地址信息。
+    ///
+    /// 业务风险：
+    /// - 连接卡片主区域已收敛为名称，如果气泡格式不稳定，用户悬浮后仍无法确认具体目标主机。
+    #[test]
+    fn 连接详情气泡格式化用户和地址() {
+        let profile = test_profile("conn-1", "火山云 Server0", None);
+
+        assert_eq!(
+            ConnectionsWorkspaceState::profile_tooltip_user_label(&profile),
+            "用户：root"
+        );
+        assert_eq!(
+            ConnectionsWorkspaceState::profile_tooltip_address_label(&profile),
+            "地址：127.0.0.1:22"
+        );
+    }
+
     /// 验证终端尺寸会按内容区像素换算为行列。
     ///
     /// 业务风险：
     /// - 如果窗口 resize 后行列仍停在默认 80x24，远端 TUI 和本地渲染会在可视区域内错位。
     #[test]
     fn 终端尺寸会从面板_bounds_计算() {
-        let size = connection_terminal_size_from_bounds(Bounds::new(
-            point(px(0.0), px(0.0)),
-            size(px(805.0), px(365.0)),
-        ));
+        let size = connection_terminal_size_from_bounds_with_cell_width(
+            Bounds::new(point(px(0.0), px(0.0)), size(px(805.0), px(365.0))),
+            CONNECTION_TERMINAL_CELL_WIDTH,
+        );
 
         assert_eq!(size.cols, 100);
         assert_eq!(size.rows, 20);
         assert_eq!(size.pixel_width, 805);
         assert_eq!(size.pixel_height, 365);
+    }
+
+    /// 验证终端内容区内边距按产品要求保持 4px。
+    ///
+    /// 业务风险：
+    /// - 终端边距同时影响文本绘制、IME 候选窗口和鼠标格点换算，值不一致会再次造成点击选区错位。
+    #[test]
+    fn 终端内容区内边距为四像素() {
+        assert_eq!(CONNECTION_TERMINAL_PADDING, 4.0);
+    }
+
+    /// 验证终端尺寸计算可以使用渲染层测量到的真实列宽。
+    ///
+    /// 业务风险：
+    /// - 如果本地/SSH 终端继续共用经验列宽，字体实际宽度偏差会同时影响 pty 列数和鼠标选区。
+    #[test]
+    fn 终端尺寸支持真实列宽() {
+        let size = connection_terminal_size_from_bounds_with_cell_width(
+            Bounds::new(point(px(0.0), px(0.0)), size(px(90.0), px(36.0))),
+            9.0,
+        );
+
+        assert_eq!(size.cols, 10);
+        assert_eq!(size.rows, 2);
+    }
+
+    /// 验证鼠标坐标换算使用当前 tab 的真实列宽。
+    ///
+    /// 业务风险：
+    /// - 拖拽选区时如果仍用固定 8px 列宽，终端内容越靠右，选区和鼠标位置偏差越大。
+    #[test]
+    fn 终端鼠标格点使用真实列宽() {
+        let emulator = ConnectionTerminalEmulator::new(TerminalSize::new(10, 2, 0, 0));
+
+        assert_eq!(emulator.point_from_panel_offset(17.9, 0.0, 9.0).column.0, 1);
+        assert_eq!(emulator.point_from_panel_offset(18.1, 0.0, 9.0).column.0, 2);
     }
 }

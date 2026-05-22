@@ -427,6 +427,8 @@ fn render_select_menu(
         .shadow_md()
         .overflow_y_scroll()
         .scrollbar_width(px(6.0))
+        // 菜单是覆盖在业务内容上的浮层，必须阻断鼠标命中继续落到下层输入框、日志正文或 tab。
+        .occlude()
         .on_mouse_down(
             MouseButton::Left,
             |_event: &MouseDownEvent, _window: &mut Window, context: &mut App| {
