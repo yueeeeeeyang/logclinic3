@@ -24,7 +24,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use zip::ZipArchive;
 
-use crate::config::{plugin_registry_path, plugins_install_dir};
+use crate::config::{plugin_registry_path, plugin_settings_dir, plugins_install_dir};
 use crate::log_source::LogFileSource;
 
 /// 当前宿主支持的插件协议版本。
@@ -113,6 +113,52 @@ impl PluginManifest {
                 return Err(format!("插件贡献点 ID 重复：{}", contribution.id));
             }
         }
+        for contribution in &self.contributes.log_toolbar {
+            if contribution.id.trim().is_empty() {
+                return Err("插件日志工具栏贡献点 ID 不能为空".to_string());
+            }
+            if contribution.title.trim().is_empty() {
+                return Err(format!(
+                    "插件日志工具栏贡献点 {} 的标题不能为空",
+                    contribution.id
+                ));
+            }
+            if !contribution_ids.insert(contribution.id.clone()) {
+                return Err(format!("插件贡献点 ID 重复：{}", contribution.id));
+            }
+        }
+        let mut setting_keys = HashSet::new();
+        for contribution in &self.contributes.settings_tabs {
+            if contribution.id.trim().is_empty() {
+                return Err("插件设置页签贡献点 ID 不能为空".to_string());
+            }
+            if contribution.title.trim().is_empty() {
+                return Err(format!(
+                    "插件设置页签贡献点 {} 的标题不能为空",
+                    contribution.id
+                ));
+            }
+            if !contribution_ids.insert(contribution.id.clone()) {
+                return Err(format!("插件贡献点 ID 重复：{}", contribution.id));
+            }
+            for setting in &contribution.pattern_settings {
+                if setting.key.trim().is_empty() {
+                    return Err(format!("插件设置页签 {} 的规则键不能为空", contribution.id));
+                }
+                if setting.label.trim().is_empty() {
+                    return Err(format!(
+                        "插件设置页签 {} 的规则 {} 标题不能为空",
+                        contribution.id, setting.key
+                    ));
+                }
+                if !setting_keys.insert(setting.key.clone()) {
+                    return Err(format!(
+                        "插件设置规则键重复：{}，所在页签：{}",
+                        setting.key, contribution.id
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -149,6 +195,20 @@ pub(crate) struct PluginContributes {
     /// 笔记树右键菜单贡献。
     #[serde(default)]
     pub(crate) notes_tree_context_menu: Vec<PluginMenuContribution>,
+    /// 日志分析页顶部工具栏贡献。
+    ///
+    /// 业务意图：
+    /// - 第三方插件可以在用户已经加载日志树后提供独立分析入口，例如泛微日志分析。
+    /// - 宿主只暴露当前左侧树快照，不允许插件自行扩大扫描范围。
+    #[serde(default)]
+    pub(crate) log_toolbar: Vec<PluginToolbarContribution>,
+    /// 设置窗口中的插件配置页签贡献。
+    ///
+    /// 业务意图：
+    /// - 插件可声明宿主可渲染的轻量配置表单，配置保存到插件专属 JSON 文件。
+    /// - 当前版本只支持通配规则文本，避免外部插件执行设置页代码。
+    #[serde(default)]
+    pub(crate) settings_tabs: Vec<PluginSettingsTabContribution>,
 }
 
 /// 插件主导航页贡献。
@@ -191,6 +251,68 @@ impl PluginMenuContribution {
     pub(crate) fn command_id(&self) -> &str {
         self.command.as_deref().unwrap_or(&self.id)
     }
+}
+
+/// 插件日志工具栏按钮贡献。
+///
+/// 业务意图：
+/// - 工具栏按钮必须由 manifest 静态声明，宿主才能在不启动插件进程的情况下渲染入口。
+/// - 点击后宿主会收集当前左侧日志树快照，并通过 `LogToolbarAction` 上下文交给插件处理。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PluginToolbarContribution {
+    /// 贡献点 ID。
+    pub(crate) id: String,
+    /// 按钮标题。
+    pub(crate) title: String,
+    /// 图标名称。
+    pub(crate) icon: Option<String>,
+    /// 触发命令；缺省时使用贡献点 ID。
+    pub(crate) command: Option<String>,
+    /// 简单启用条件；第一版只保留给后续扩展，当前不在宿主侧解析表达式。
+    pub(crate) when: Option<String>,
+}
+
+impl PluginToolbarContribution {
+    /// 返回实际调用插件时使用的命令 ID。
+    pub(crate) fn command_id(&self) -> &str {
+        self.command.as_deref().unwrap_or(&self.id)
+    }
+}
+
+/// 插件设置页签贡献。
+///
+/// 业务意图：
+/// - 设置页签由宿主声明式渲染，插件进程不会在设置窗口打开时启动，避免配置页成为任意代码执行入口。
+/// - 第一版只支持按键保存字符串规则，满足日志类型匹配规则这种轻量配置。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PluginSettingsTabContribution {
+    /// 设置页签 ID。
+    pub(crate) id: String,
+    /// 设置页签标题。
+    pub(crate) title: String,
+    /// 图标名称。
+    pub(crate) icon: Option<String>,
+    /// 可编辑的匹配规则列表。
+    #[serde(default)]
+    pub(crate) pattern_settings: Vec<PluginPatternSettingContribution>,
+}
+
+/// 插件声明式匹配规则配置项。
+///
+/// 边界条件：
+/// - `default` 保持原始字符串，宿主不解析语义；插件命令执行时再按自身规则解释。
+/// - 多个 glob 用分号分隔是 `weaver-logext` 的业务约定，宿主只负责保存和恢复。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PluginPatternSettingContribution {
+    /// 配置键。
+    pub(crate) key: String,
+    /// 设置页展示名称。
+    pub(crate) label: String,
+    /// 默认规则文本。
+    #[serde(default)]
+    pub(crate) default: String,
+    /// 可选说明。
+    pub(crate) description: Option<String>,
 }
 
 /// 插件安装来源。
@@ -324,6 +446,20 @@ pub(crate) enum PluginCommandContext {
         menu_id: String,
         /// 候选日志元数据。
         files: Vec<PluginLogFile>,
+    },
+    /// 日志工具栏按钮上下文。
+    ///
+    /// 业务意图：
+    /// - 工具栏入口面向“当前已加载日志树”的整体分析，不依赖右键选中节点。
+    /// - 宿主传入的 `files` 是左侧树授权范围快照，插件只能基于这份快照做元数据或正文读取。
+    LogToolbarAction {
+        /// 工具栏贡献点 ID。
+        toolbar_id: String,
+        /// 当前左侧日志树快照中的候选日志元数据。
+        files: Vec<PluginLogFile>,
+        /// 合并 manifest 默认值和用户保存值后的插件设置。
+        #[serde(default)]
+        settings: BTreeMap<String, String>,
     },
     /// 插件表格行内动作针对单个日志文件发起的二次命令。
     ///
@@ -596,6 +732,140 @@ pub(crate) fn save_plugin_registry(registry: &PluginRegistry) -> Result<(), Stri
     let raw = serde_json::to_string_pretty(registry)
         .map_err(|error| format!("序列化插件注册表失败：{error}"))?;
     fs::write(&path, raw).map_err(|error| format!("写入插件注册表失败：{error}"))
+}
+
+/// 插件设置文件结构。
+///
+/// 业务意图：
+/// - 插件设置与注册表分离，注册表只保存安装和启用状态，设置文件只保存用户可编辑业务规则。
+/// - 外层 `settings` 字段方便后续追加更新时间、schema 版本等元信息，同时保持当前键值读取简单。
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct PluginSettingsFile {
+    /// 插件声明式设置键值。
+    #[serde(default)]
+    settings: BTreeMap<String, String>,
+}
+
+/// 返回 manifest 中所有设置项的默认值。
+///
+/// 边界条件：
+/// - 多个设置页签不应声明同名 key；manifest 校验会拦截重复，这里仍按最后一次写入兜底，避免损坏插件导致崩溃。
+pub(crate) fn plugin_settings_defaults(manifest: &PluginManifest) -> BTreeMap<String, String> {
+    manifest
+        .contributes
+        .settings_tabs
+        .iter()
+        .flat_map(|tab| tab.pattern_settings.iter())
+        .map(|setting| (setting.key.clone(), setting.default.clone()))
+        .collect()
+}
+
+/// 读取插件专属设置，并与 manifest 默认值合并。
+///
+/// 业务意图：
+/// - 设置文件缺失或损坏时回退默认规则，保证插件入口仍可使用。
+/// - manifest 新增规则后，旧设置文件不会覆盖新增项；manifest 删除规则后，旧文件中的孤立键不会再传给插件。
+pub(crate) fn load_plugin_settings(manifest: &PluginManifest) -> BTreeMap<String, String> {
+    let defaults = plugin_settings_defaults(manifest);
+    let Some(path) = plugin_settings_path_for(&manifest.id) else {
+        return defaults;
+    };
+    load_plugin_settings_from_path(&path, defaults)
+}
+
+/// 保存插件设置。
+///
+/// 边界条件：
+/// - 只保存 manifest 当前声明的 key，避免损坏 UI 或旧配置把未知键继续传给插件。
+/// - 写入失败不会修改内存默认值，调用方需要把中文错误展示给用户。
+pub(crate) fn save_plugin_settings(
+    manifest: &PluginManifest,
+    values: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let defaults = plugin_settings_defaults(manifest);
+    let filtered = defaults
+        .keys()
+        .map(|key| {
+            (
+                key.clone(),
+                values
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_else(|| defaults[key].clone()),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let Some(path) = plugin_settings_path_for(&manifest.id) else {
+        return Err("当前平台没有可用的应用配置目录，无法保存插件设置".to_string());
+    };
+    save_plugin_settings_to_path(&path, &filtered)
+}
+
+/// 将指定插件设置恢复为 manifest 默认值并落盘。
+pub(crate) fn restore_plugin_settings_defaults(manifest: &PluginManifest) -> Result<(), String> {
+    let defaults = plugin_settings_defaults(manifest);
+    save_plugin_settings(manifest, &defaults)
+}
+
+/// 返回插件设置文件路径。
+///
+/// 业务意图：
+/// - 插件 ID 会成为文件名，必须再次校验，避免损坏注册表或第三方 manifest 把设置写出配置目录。
+fn plugin_settings_path_for(plugin_id: &str) -> Option<PathBuf> {
+    if !is_valid_plugin_id(plugin_id) {
+        return None;
+    }
+    plugin_settings_dir().map(|dir| dir.join(format!("{plugin_id}.json")))
+}
+
+/// 从指定路径读取设置并按默认值过滤。
+///
+/// 边界条件：
+/// - 损坏 JSON、缺失字段或旧版本直接写入平铺 map 都要能回退或兼容，避免一次手工编辑错误让设置页不可用。
+fn load_plugin_settings_from_path(
+    path: &Path,
+    defaults: BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return defaults;
+    };
+    let saved = serde_json::from_str::<PluginSettingsFile>(&raw)
+        .map(|file| file.settings)
+        .or_else(|_| serde_json::from_str::<BTreeMap<String, String>>(&raw))
+        .unwrap_or_default();
+    merge_plugin_settings_with_defaults(defaults, saved)
+}
+
+/// 合并默认设置和用户保存设置。
+///
+/// 业务意图：
+/// - 只信任 manifest 当前声明的 key；旧设置文件里的未知键可能来自已经卸载的页签或手工误写，不能继续传给插件。
+fn merge_plugin_settings_with_defaults(
+    defaults: BTreeMap<String, String>,
+    saved: BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    defaults
+        .into_iter()
+        .map(|(key, default_value)| {
+            let value = saved.get(&key).cloned().unwrap_or(default_value);
+            (key, value)
+        })
+        .collect()
+}
+
+/// 将插件设置写入指定路径。
+fn save_plugin_settings_to_path(
+    path: &Path,
+    values: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("创建插件设置目录失败：{error}"))?;
+    }
+    let raw = serde_json::to_string_pretty(&PluginSettingsFile {
+        settings: values.clone(),
+    })
+    .map_err(|error| format!("序列化插件设置失败：{error}"))?;
+    fs::write(path, raw).map_err(|error| format!("写入插件设置失败：{error}"))
 }
 
 /// 加载当前所有插件定义。
@@ -932,6 +1202,18 @@ fn sanitize_plugin_context_for_permissions(
                 .into_iter()
                 .map(plugin_log_file_without_read_path)
                 .collect(),
+        },
+        PluginCommandContext::LogToolbarAction {
+            toolbar_id,
+            files,
+            settings,
+        } => PluginCommandContext::LogToolbarAction {
+            toolbar_id,
+            files: files
+                .into_iter()
+                .map(plugin_log_file_without_read_path)
+                .collect(),
+            settings,
         },
         PluginCommandContext::LogFileAction {
             action_id,
@@ -1524,6 +1806,141 @@ mod tests {
         assert_eq!(
             manifest.contributes.log_tree_context_menu[0].command_id(),
             "parse"
+        );
+    }
+
+    #[test]
+    fn manifest_兼容日志工具栏和插件设置页签贡献() {
+        let raw = r#"{
+  "api_version": 1,
+  "id": "weaver-logext",
+  "name": "泛微日志插件",
+  "version": "0.3.0",
+  "entry": {"command": ["weaver-logext"]},
+  "permissions": ["ui.log_toolbar", "ui.settings_tabs"],
+  "contributes": {
+    "log_toolbar": [
+      {
+        "id": "weaver.log_scan",
+        "title": "泛微日志分析",
+        "icon": "Search",
+        "command": "weaver_log_scan"
+      }
+    ],
+    "settings_tabs": [
+      {
+        "id": "weaver.settings",
+        "title": "泛微插件",
+        "icon": "Settings",
+        "pattern_settings": [
+          {
+            "key": "memory",
+            "label": "内存日志",
+            "default": "memory_yyyy-MM-dd.log"
+          }
+        ]
+      }
+    ]
+  }
+}"#;
+        let manifest = parse_plugin_manifest(raw).expect("新贡献点 manifest 应能解析");
+        manifest.validate().expect("新贡献点 manifest 应通过校验");
+
+        assert_eq!(
+            manifest.contributes.log_toolbar[0].command_id(),
+            "weaver_log_scan"
+        );
+        assert_eq!(manifest.contributes.settings_tabs[0].title, "泛微插件");
+        assert_eq!(
+            plugin_settings_defaults(&manifest)
+                .get("memory")
+                .map(String::as_str),
+            Some("memory_yyyy-MM-dd.log")
+        );
+    }
+
+    #[test]
+    fn manifest_拒绝跨设置页签重复规则键() {
+        let raw = r#"{
+  "api_version": 1,
+  "id": "duplicate-settings.plugin",
+  "name": "重复设置插件",
+  "version": "0.1.0",
+  "entry": {"command": ["settings-plugin"]},
+  "contributes": {
+    "settings_tabs": [
+      {
+        "id": "settings-a",
+        "title": "设置 A",
+        "pattern_settings": [
+          {"key": "memory", "label": "内存日志", "default": "memory.log"}
+        ]
+      },
+      {
+        "id": "settings-b",
+        "title": "设置 B",
+        "pattern_settings": [
+          {"key": "memory", "label": "另一个内存日志", "default": "memory2.log"}
+        ]
+      }
+    ]
+  }
+}"#;
+        let manifest = parse_plugin_manifest(raw).expect("重复 key manifest 应能先完成 JSON 解析");
+        let error = manifest
+            .validate()
+            .expect_err("跨设置页签重复 key 应被拒绝");
+
+        assert!(
+            error.contains("插件设置规则键重复：memory"),
+            "错误信息应指出重复的规则键，实际为：{error}"
+        );
+    }
+
+    #[test]
+    fn 插件设置读取损坏回退保存并恢复默认规则() {
+        let manifest_raw = r#"{
+  "api_version": 1,
+  "id": "settings.plugin",
+  "name": "设置插件",
+  "version": "0.1.0",
+  "entry": {"command": ["settings-plugin"]},
+  "contributes": {
+    "settings_tabs": [
+      {
+        "id": "settings",
+        "title": "插件设置",
+        "pattern_settings": [
+          {"key": "memory", "label": "内存日志", "default": "memory_yyyy-MM-dd.log"},
+          {"key": "stdout", "label": "输出日志", "default": "stdout.log"}
+        ]
+      }
+    ]
+  }
+}"#;
+        let manifest = parse_plugin_manifest(manifest_raw).expect("设置 manifest 应能解析");
+        let defaults = plugin_settings_defaults(&manifest);
+        let path = temp_dir("plugin-settings").join("settings.plugin.json");
+
+        fs::write(&path, "{broken").expect("测试损坏设置应能写入");
+        assert_eq!(
+            load_plugin_settings_from_path(&path, defaults.clone()),
+            defaults
+        );
+
+        let mut custom = BTreeMap::new();
+        custom.insert("memory".to_string(), "custom.log".to_string());
+        custom.insert("unknown".to_string(), "ignored".to_string());
+        save_plugin_settings_to_path(&path, &custom).expect("测试设置应能保存");
+        let merged = load_plugin_settings_from_path(&path, defaults.clone());
+        assert_eq!(merged.get("memory").map(String::as_str), Some("custom.log"));
+        assert_eq!(merged.get("stdout").map(String::as_str), Some("stdout.log"));
+        assert!(!merged.contains_key("unknown"));
+
+        save_plugin_settings_to_path(&path, &defaults).expect("默认设置应能写回");
+        assert_eq!(
+            load_plugin_settings_from_path(&path, defaults.clone()),
+            defaults
         );
     }
 

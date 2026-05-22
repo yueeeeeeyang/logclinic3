@@ -30,6 +30,16 @@ pub(in crate::app) struct SettingsWindowView {
 struct SettingsContentSnapshot {
     /// 当前设置页签。
     active_tab: SettingsTab,
+    /// 当前选中的插件声明式设置页签。
+    ///
+    /// 业务意图：
+    /// - 该字段只在 `active_tab == PluginSettings` 时生效，用于把内容区限定到插件贡献的具体页签。
+    active_plugin_tab: Option<PluginSettingsTabSelection>,
+    /// 当前已启用插件贡献的设置页签快照。
+    ///
+    /// 边界条件：
+    /// - 未加载插件或插件未启用时为空，设置窗口不能展示任何插件专属配置入口。
+    plugin_settings_tabs: Vec<PluginSettingsTabRenderItem>,
     /// 主题偏好。
     theme: ThemePreference,
     /// 日志正文字号。
@@ -98,12 +108,39 @@ impl SettingsWindowView {
     pub(in crate::app) fn select_tab(&mut self, tab: SettingsTab, context: &mut Context<Self>) {
         self.main_view.update(context, |view, context| {
             view.settings.settings_active_tab = tab;
+            if tab != SettingsTab::PluginSettings {
+                view.settings.settings_active_plugin_tab = None;
+            }
             context.notify();
         });
         // 存储页展示的是文件系统实时快照，用户切入页签时刷新一次，避免继续显示旧大小或旧错误。
         if tab == SettingsTab::Storage {
             self.refresh_storage_locations_from_settings(context);
         }
+        if tab == SettingsTab::PluginSettings {
+            self.main_view.update(context, |view, context| {
+                view.sync_plugin_pattern_setting_inputs(context);
+            });
+        }
+        context.notify();
+    }
+
+    /// 切换到插件贡献的设置页签。
+    ///
+    /// 业务意图：
+    /// - 插件设置页签不是宿主固定页签，点击时需要同时记录插件 ID 和页签 ID，再通过统一 `PluginSettings` 内容路由渲染。
+    /// - 切换时同步 manifest 设置项，保证内容区使用最新的插件配置结构。
+    fn select_plugin_settings_tab(
+        &mut self,
+        selection: PluginSettingsTabSelection,
+        context: &mut Context<Self>,
+    ) {
+        self.main_view.update(context, |view, context| {
+            view.settings.settings_active_tab = SettingsTab::PluginSettings;
+            view.settings.settings_active_plugin_tab = Some(selection);
+            view.sync_plugin_pattern_setting_inputs(context);
+            context.notify();
+        });
         context.notify();
     }
 
@@ -474,9 +511,18 @@ impl SettingsWindowView {
     fn render_tab_sidebar(
         &self,
         active_tab: SettingsTab,
+        active_plugin_tab: Option<PluginSettingsTabSelection>,
+        plugin_settings_tabs: Vec<PluginSettingsTabRenderItem>,
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Div {
+        // 插件配置入口应紧跟插件管理页，保持“管理插件 -> 配置插件”的操作顺序；没有插件贡献时该段为空。
+        let fixed_tabs = SettingsTab::all();
+        let plugin_insert_index = fixed_tabs
+            .iter()
+            .position(|tab| *tab == SettingsTab::Plugin)
+            .map(|index| index + 1)
+            .unwrap_or(fixed_tabs.len());
         div()
             .flex()
             .flex_col()
@@ -487,7 +533,22 @@ impl SettingsWindowView {
             .border_color(rgb(palette.border))
             .bg(rgb(palette.panel))
             .children(
-                SettingsTab::all()
+                fixed_tabs[..plugin_insert_index]
+                    .iter()
+                    .copied()
+                    .map(|tab| self.render_tab_button(tab, active_tab, palette, context)),
+            )
+            .children(plugin_settings_tabs.into_iter().map(|item| {
+                self.render_plugin_settings_tab_button(
+                    item,
+                    active_tab,
+                    active_plugin_tab.as_ref(),
+                    palette,
+                    context,
+                )
+            }))
+            .children(
+                fixed_tabs[plugin_insert_index..]
                     .iter()
                     .copied()
                     .map(|tab| self.render_tab_button(tab, active_tab, palette, context)),
@@ -548,6 +609,74 @@ impl SettingsWindowView {
             )
     }
 
+    /// 渲染插件贡献的设置页签按钮。
+    ///
+    /// 业务意图：
+    /// - 这里的按钮只来自已启用插件 manifest；未加载插件时不会生成任何插件设置入口。
+    /// - 按钮选中态同时比较插件 ID 和页签 ID，避免多个插件使用同名页签时状态串扰。
+    fn render_plugin_settings_tab_button(
+        &self,
+        item: PluginSettingsTabRenderItem,
+        active_tab: SettingsTab,
+        active_plugin_tab: Option<&PluginSettingsTabSelection>,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let selected = active_tab == SettingsTab::PluginSettings
+            && active_plugin_tab
+                .map(|selection| item.matches_selection(selection))
+                .unwrap_or(false);
+        let selection = item.selection();
+        let button_id = SharedString::from(format!(
+            "settings-plugin-tab-{}-{}",
+            item.plugin_id, item.tab_id
+        ));
+        div()
+            .id(button_id)
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(34.0))
+            .px_2()
+            .mb_1()
+            .rounded(px(6.0))
+            .text_sm()
+            .font_weight(if selected {
+                FontWeight::SEMIBOLD
+            } else {
+                FontWeight::NORMAL
+            })
+            .text_color(rgb(if selected {
+                palette.accent
+            } else {
+                palette.muted_text
+            }))
+            .bg(rgb(if selected {
+                palette.selected
+            } else {
+                palette.panel
+            }))
+            .cursor_pointer()
+            .hover(move |button| button.bg(rgb(palette.hover)))
+            .child(MainView::render_lucide_icon(
+                Some(item.icon),
+                16.0,
+                15.0,
+                if selected {
+                    palette.accent
+                } else {
+                    palette.muted_text
+                },
+            ))
+            .child(item.title)
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, _window, context| {
+                    view.select_plugin_settings_tab(selection.clone(), context);
+                    context.stop_propagation();
+                }),
+            )
+    }
+
     /// 渲染设置内容区域。
     ///
     /// 业务意图：
@@ -559,6 +688,8 @@ impl SettingsWindowView {
     ) -> gpui::Stateful<gpui::Div> {
         let SettingsContentSnapshot {
             active_tab,
+            active_plugin_tab,
+            plugin_settings_tabs,
             theme,
             log_viewer_font_size,
             log_minimap_enabled,
@@ -590,6 +721,12 @@ impl SettingsWindowView {
             ),
             SettingsTab::Model => self.render_model_tab(palette, context),
             SettingsTab::Plugin => self.render_plugin_tab(palette, context),
+            SettingsTab::PluginSettings => self.render_plugin_settings_tab(
+                active_plugin_tab,
+                plugin_settings_tabs,
+                palette,
+                context,
+            ),
             SettingsTab::Storage => self.render_storage_tab(palette, context),
             SettingsTab::About => super::about_view::render_about_settings_tab(palette),
         }
@@ -604,6 +741,8 @@ impl Render for SettingsWindowView {
     fn render(&mut self, _window: &mut Window, context: &mut Context<Self>) -> impl IntoElement {
         let (
             active_tab,
+            active_plugin_tab,
+            plugin_settings_tabs,
             theme,
             log_viewer_font_size,
             log_minimap_enabled,
@@ -615,9 +754,19 @@ impl Render for SettingsWindowView {
             thread_analysis_filter_focus,
             palette,
         ) = {
+            self.main_view.update(context, |view, context| {
+                if view.settings.settings_active_tab == SettingsTab::PluginSettings {
+                    view.sync_plugin_pattern_setting_inputs(context);
+                }
+                if view.ensure_active_plugin_settings_tab_selection() {
+                    context.notify();
+                }
+            });
             let main_view = self.main_view.read(context);
             (
                 main_view.settings.settings_active_tab,
+                main_view.settings.settings_active_plugin_tab.clone(),
+                main_view.plugin_settings_tab_items(),
                 main_view.settings.theme_preference,
                 main_view.settings.log_viewer_font_size,
                 main_view.settings.log_minimap_enabled,
@@ -636,7 +785,13 @@ impl Render for SettingsWindowView {
             .flex()
             .size_full()
             .bg(rgb(palette.background))
-            .child(self.render_tab_sidebar(active_tab, palette, context))
+            .child(self.render_tab_sidebar(
+                active_tab,
+                active_plugin_tab.clone(),
+                plugin_settings_tabs.clone(),
+                palette,
+                context,
+            ))
             .child(
                 div()
                     .flex()
@@ -646,6 +801,8 @@ impl Render for SettingsWindowView {
                     .child(self.render_content(
                         SettingsContentSnapshot {
                             active_tab,
+                            active_plugin_tab,
+                            plugin_settings_tabs,
                             theme,
                             log_viewer_font_size,
                             log_minimap_enabled,

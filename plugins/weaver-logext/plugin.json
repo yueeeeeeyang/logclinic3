@@ -2,12 +2,108 @@
   "api_version": 1,
   "id": "weaver-logext",
   "name": "泛微日志插件",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "entry": {
     "command": ["weaver-logext"]
   },
-  "permissions": ["ui.log_tree_menu", "logs.metadata", "logs.content"],
+  "permissions": [
+    "ui.log_tree_menu",
+    "ui.log_toolbar",
+    "ui.settings_tabs",
+    "logs.metadata",
+    "logs.content"
+  ],
   "contributes": {
+    "log_toolbar": [
+      {
+        "id": "weaver.log_scan",
+        "title": "E9日志分析",
+        "icon": "ChartNoAxesCombined",
+        "command": "weaver_log_scan",
+        "when": "log_tree_loaded"
+      }
+    ],
+    "settings_tabs": [
+      {
+        "id": "weaver.settings",
+        "title": "泛微插件",
+        "icon": "Settings",
+        "pattern_settings": [
+          {
+            "key": "memory",
+            "label": "内存日志",
+            "default": "memory_yyyy-MM-dd.log",
+            "description": "memory_YYYY-MM-DD.log"
+          },
+          {
+            "key": "pool",
+            "label": "连接池日志",
+            "default": "pool_yyyyMMdd_ecology.log",
+            "description": "pool_YYYYMMDD_ecology.log"
+          },
+          {
+            "key": "init_cache",
+            "label": "sql缓存配置文件",
+            "default": "initCache.properties"
+          },
+          {
+            "key": "resin3",
+            "label": "resin3配置文件",
+            "default": "resin.conf"
+          },
+          {
+            "key": "resin4",
+            "label": "resin4配置文件",
+            "default": "resin.properties"
+          },
+          {
+            "key": "web_xml",
+            "label": "web.xml配置文件",
+            "default": "web.xml"
+          },
+          {
+            "key": "ecology",
+            "label": "ecology日志",
+            "default": "ecology;ecology_yyyyMMdd.log"
+          },
+          {
+            "key": "stdout",
+            "label": "中间件标准输出日志",
+            "default": "stdout.log;stdout.*.log"
+          },
+          {
+            "key": "stderr",
+            "label": "中间件标准错误日志",
+            "default": "stderr.log;stderr.*.log"
+          },
+          {
+            "key": "jvm_app",
+            "label": "中间件启动日志",
+            "default": "jvm-app-0.log"
+          },
+          {
+            "key": "monitor_thread_40s",
+            "label": "40秒线程日志",
+            "default": "monitorThread/yyyyMMdd/thread_HHmmss.log;monitorThread/yyyyMMdd/thread_HHmmss.zip"
+          },
+          {
+            "key": "thread_3m",
+            "label": "3分钟线程日志",
+            "default": "yyyy-MM-dd/thread_HHmmss.log;yyyy-MM-dd/thread_HHmmss.zip"
+          },
+          {
+            "key": "messages",
+            "label": "服务器日志",
+            "default": "messages"
+          },
+          {
+            "key": "runtime",
+            "label": "runtime日志",
+            "default": "runtime/yyyy_MM_dd/**"
+          }
+        ]
+      }
+    ],
     "log_tree_context_menu": [
       {
         "id": "weaver.performance_list",

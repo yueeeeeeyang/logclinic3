@@ -246,6 +246,12 @@ pub(in crate::app) struct SettingsState {
     pub(in crate::app) settings_window_open_pending: bool,
     /// 设置窗口当前激活页签。
     pub(in crate::app) settings_active_tab: SettingsTab,
+    /// 当前选中的插件声明式设置页签。
+    ///
+    /// 业务意图：
+    /// - 插件设置页签由已启用插件的 manifest 动态贡献，宿主只能保存“当前路由到哪个插件页签”，不能把具体插件页签写进固定枚举。
+    /// - 当插件被禁用、卸载或加载失败后，该选择会在设置窗口渲染前校正为空，避免继续显示已经不存在的插件配置。
+    pub(in crate::app) settings_active_plugin_tab: Option<PluginSettingsTabSelection>,
     /// 当前主题偏好。
     pub(in crate::app) theme_preference: ThemePreference,
     /// 日志正文显示字号。
@@ -324,6 +330,60 @@ pub(in crate::app) struct SettingsState {
     /// - 存储页需要后台统计应用配置目录、数据库、插件目录和临时缓存大小；扫描结果保存在设置状态中，避免渲染阶段同步访问磁盘。
     /// - 该状态只存在于当前设置会话，不写入配置；真实来源始终是文件系统当前状态。
     pub(in crate::app) storage: StorageSettingsState,
+    /// 插件声明式设置输入框状态列表。
+    ///
+    /// 业务意图：
+    /// - 插件设置页签由 manifest 动态声明，输入框数量不能写死在视图层。
+    /// - 状态放在主视图设置状态中，设置窗口关闭再打开时可以保留当前会话内未保存草稿。
+    ///
+    /// 边界条件：
+    /// - 每个输入框只保存宿主允许的字符串规则；插件进程不会在设置页打开时执行。
+    /// - 重新加载插件或 manifest 设置项变化时会重建该列表，避免旧 key 写回新插件配置。
+    pub(in crate::app) plugin_pattern_inputs: Vec<PluginPatternSettingInputState>,
+    /// 插件设置页最近一次保存或恢复默认的提示。
+    pub(in crate::app) plugin_settings_status_message: Option<String>,
+}
+
+/// 插件声明式匹配规则输入框状态。
+///
+/// 业务意图：
+/// - 每条规则对应 manifest 中一个 `pattern_settings` 项，保存后写入插件专属 JSON。
+/// - `default_value` 保留 manifest 默认值，便于设置页展示和恢复默认。
+#[derive(Clone)]
+pub(in crate::app) struct PluginPatternSettingInputState {
+    /// 插件 ID。
+    pub(in crate::app) plugin_id: String,
+    /// 设置页签 ID。
+    pub(in crate::app) tab_id: String,
+    /// 设置键。
+    pub(in crate::app) key: String,
+    /// 设置项标题。
+    pub(in crate::app) label: String,
+    /// 默认规则。
+    pub(in crate::app) default_value: String,
+    /// 可选说明。
+    pub(in crate::app) description: Option<String>,
+    /// 当前输入状态。
+    pub(in crate::app) input: SingleLineTextInputState,
+    /// 输入框焦点。
+    pub(in crate::app) focus: gpui::FocusHandle,
+    /// 最近一次单行排版结果。
+    pub(in crate::app) last_layout: Option<ShapedLine>,
+    /// 最近一次绘制边界。
+    pub(in crate::app) last_bounds: Option<Bounds<Pixels>>,
+}
+
+/// 插件声明式设置页签的当前选择。
+///
+/// 业务意图：
+/// - 一个插件可以声明多个设置页签，不同插件也可能使用相同的页签 ID，因此必须同时记录插件 ID 和页签 ID。
+/// - 该结构只描述 UI 会话中的选择，不持久化到配置目录，避免卸载插件后留下不可解析的设置入口。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::app) struct PluginSettingsTabSelection {
+    /// 插件 manifest ID。
+    pub(in crate::app) plugin_id: String,
+    /// 插件 manifest 中的设置页签 ID。
+    pub(in crate::app) tab_id: String,
 }
 
 /// 存储位置类型。
@@ -511,6 +571,7 @@ impl SettingsState {
             settings_window: None,
             settings_window_open_pending: false,
             settings_active_tab: SettingsTab::General,
+            settings_active_plugin_tab: None,
             theme_preference: load_theme_preference(),
             log_viewer_font_size: load_log_viewer_font_size_preference(),
             log_minimap_enabled: load_log_minimap_enabled_preference(),
@@ -542,6 +603,8 @@ impl SettingsState {
             thread_analysis_filter_last_bounds: None,
             thread_analysis_filter_selection_drag: None,
             storage: StorageSettingsState::new(),
+            plugin_pattern_inputs: Vec::new(),
+            plugin_settings_status_message: None,
         }
     }
 }

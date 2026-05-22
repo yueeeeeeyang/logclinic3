@@ -381,6 +381,18 @@ impl SettingsWindowView {
                 manifest.contributes.notes_tree_context_menu.len()
             ));
         }
+        if !manifest.contributes.log_toolbar.is_empty() {
+            parts.push(format!(
+                "日志工具栏 {}",
+                manifest.contributes.log_toolbar.len()
+            ));
+        }
+        if !manifest.contributes.settings_tabs.is_empty() {
+            parts.push(format!(
+                "设置页签 {}",
+                manifest.contributes.settings_tabs.len()
+            ));
+        }
         if parts.is_empty() {
             "无".to_string()
         } else {

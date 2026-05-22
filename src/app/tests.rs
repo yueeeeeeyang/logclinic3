@@ -447,12 +447,13 @@ mod state_tests {
         );
     }
 
-    /// 验证设置窗口页签包含插件、存储和关于入口。
+    /// 验证设置窗口固定页签包含插件、存储和关于入口。
     ///
     /// 业务意图：
     /// - 插件管理、存储管理和关于功能都收入口设置窗口，页签顺序和图标必须稳定，避免用户找不到本地数据位置和关于信息。
+    /// - 插件声明式设置页签只能由已启用插件贡献，不能出现在宿主固定页签列表中，否则未加载插件也会展示插件专属入口。
     #[test]
-    fn 设置页签包含插件存储和关于入口() {
+    fn 设置固定页签不包含插件声明式设置入口() {
         assert_eq!(
             SettingsTab::all(),
             &[
@@ -464,6 +465,7 @@ mod state_tests {
                 SettingsTab::About
             ]
         );
+        assert!(!SettingsTab::all().contains(&SettingsTab::PluginSettings));
         assert_eq!(SettingsTab::Plugin.label(), "插件");
         assert_eq!(
             char::from(SettingsTab::Plugin.icon()),
@@ -479,6 +481,291 @@ mod state_tests {
             char::from(SettingsTab::About.icon()),
             char::from(Icon::Info)
         );
+    }
+
+    #[test]
+    fn 插件工具栏日志树快照输出相对路径和压缩包链路() {
+        let tree = LoadedLogTree {
+            summary: "测试树".to_string(),
+            error_count: 0,
+            temporary_paths: Vec::new(),
+            rows: vec![
+                LoadedLogTreeRow {
+                    id: 1,
+                    depth: 0,
+                    label: "root".to_string(),
+                    kind: LogTreeEntryKind::Directory,
+                    has_children: true,
+                    meta: None,
+                    error_message: None,
+                    source: None,
+                },
+                LoadedLogTreeRow {
+                    id: 2,
+                    depth: 1,
+                    label: "memory_2026-05-23.log".to_string(),
+                    kind: LogTreeEntryKind::File,
+                    has_children: false,
+                    meta: None,
+                    error_message: None,
+                    source: Some(LogFileSource::LocalFile {
+                        path: PathBuf::from("/tmp/root/memory_2026-05-23.log"),
+                    }),
+                },
+                LoadedLogTreeRow {
+                    id: 3,
+                    depth: 1,
+                    label: "logs.zip".to_string(),
+                    kind: LogTreeEntryKind::Archive,
+                    has_children: true,
+                    meta: None,
+                    error_message: None,
+                    source: None,
+                },
+                LoadedLogTreeRow {
+                    id: 4,
+                    depth: 2,
+                    label: "inner".to_string(),
+                    kind: LogTreeEntryKind::Directory,
+                    has_children: true,
+                    meta: None,
+                    error_message: None,
+                    source: None,
+                },
+                LoadedLogTreeRow {
+                    id: 5,
+                    depth: 3,
+                    label: "ecology_20260523.log".to_string(),
+                    kind: LogTreeEntryKind::File,
+                    has_children: false,
+                    meta: None,
+                    error_message: None,
+                    source: Some(LogFileSource::ArchiveMember {
+                        archive_path: PathBuf::from("/tmp/root/logs.zip"),
+                        archive_format: ArchiveFormat::Zip,
+                        member_path: "inner/ecology_20260523.log".to_string(),
+                    }),
+                },
+            ],
+        };
+        let snapshot = LoadedLogTreeState::new(tree).plugin_log_files_for_toolbar_snapshot();
+        let paths = snapshot
+            .iter()
+            .map(|file| file.path_label.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(paths.contains(&"root/memory_2026-05-23.log"));
+        assert!(paths.contains(&"root/logs.zip!/inner/ecology_20260523.log"));
+    }
+
+    /// 验证插件工具栏快照会继续展开单文件内层压缩包。
+    ///
+    /// 业务意图：
+    /// - 左侧树为了单文件压缩包可直接打开，会把只包含一个文件的内层 ZIP 当成文件展示。
+    /// - 泛微日志分析需要遍历所有嵌套压缩包路径，因此工具栏快照必须额外展开这类 ZIP，直到看到真正的日志文件名。
+    #[test]
+    fn 插件工具栏日志树快照展开单文件嵌套压缩包() {
+        use std::io::{Cursor, Write};
+        use zip::write::SimpleFileOptions;
+
+        let temp_root = test_save_as_directory("plugin-nested-archive-snapshot");
+        let _ = fs::remove_dir_all(&temp_root);
+        fs::create_dir_all(&temp_root).expect("应能创建测试临时目录");
+        let outer_path = temp_root.join("outer.zip");
+
+        let mut inner_bytes = Cursor::new(Vec::new());
+        {
+            let mut inner_writer = zip::ZipWriter::new(&mut inner_bytes);
+            inner_writer
+                .start_file("memory_2026-05-23.log", SimpleFileOptions::default())
+                .expect("应能创建内层日志条目");
+            inner_writer
+                .write_all(b"INFO memory")
+                .expect("应能写入内层日志内容");
+            inner_writer.finish().expect("应能结束最内层 ZIP");
+        }
+
+        let mut middle_bytes = Cursor::new(Vec::new());
+        {
+            let mut middle_writer = zip::ZipWriter::new(&mut middle_bytes);
+            middle_writer
+                .start_file("inner.zip", SimpleFileOptions::default())
+                .expect("应能创建中间 ZIP 条目");
+            middle_writer
+                .write_all(inner_bytes.get_ref())
+                .expect("应能写入中间 ZIP 内容");
+            middle_writer.finish().expect("应能结束中间 ZIP");
+        }
+
+        {
+            let outer_file = fs::File::create(&outer_path).expect("应能创建外层 ZIP 文件");
+            let mut outer_writer = zip::ZipWriter::new(outer_file);
+            outer_writer
+                .start_file("middle.zip", SimpleFileOptions::default())
+                .expect("应能创建外层 ZIP 条目");
+            outer_writer
+                .write_all(middle_bytes.get_ref())
+                .expect("应能写入外层 ZIP 内容");
+            outer_writer.finish().expect("应能结束外层 ZIP");
+        }
+
+        let tree = LoadedLogTree {
+            summary: "测试树".to_string(),
+            error_count: 0,
+            temporary_paths: Vec::new(),
+            rows: vec![
+                LoadedLogTreeRow {
+                    id: 1,
+                    depth: 0,
+                    label: "root".to_string(),
+                    kind: LogTreeEntryKind::Directory,
+                    has_children: true,
+                    meta: None,
+                    error_message: None,
+                    source: None,
+                },
+                LoadedLogTreeRow {
+                    id: 2,
+                    depth: 1,
+                    label: "outer.zip".to_string(),
+                    kind: LogTreeEntryKind::File,
+                    has_children: false,
+                    meta: None,
+                    error_message: None,
+                    source: Some(LogFileSource::LocalFile {
+                        path: outer_path.clone(),
+                    }),
+                },
+            ],
+        };
+
+        let snapshot = LoadedLogTreeState::new(tree).plugin_log_files_for_toolbar_snapshot();
+        let paths = snapshot
+            .iter()
+            .map(|file| file.path_label.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(paths.contains(&"root/outer.zip!/middle.zip!/inner.zip!/memory_2026-05-23.log"));
+
+        fs::remove_dir_all(temp_root).expect("应能清理测试临时目录");
+    }
+
+    /// 验证顶层压缩包内部的标准线程 ZIP 会作为终端日志保留。
+    ///
+    /// 业务意图：
+    /// - 现场线程日志常见形态是 `downLog.zip!/monitorThread/yyyyMMdd/thread_HHmmss.zip`。
+    /// - 这种节点数量通常很大，路径本身已经能按泛微线程日志规则命中；工具栏快照不应再逐个解压内部 `.log`，否则会拖慢扫描。
+    #[test]
+    fn 插件工具栏日志树快照保留线程_zip_但不逐个展开() {
+        use std::io::{Cursor, Write};
+        use zip::write::SimpleFileOptions;
+
+        let temp_root = test_save_as_directory("plugin-archive-member-thread-zip-snapshot");
+        let _ = fs::remove_dir_all(&temp_root);
+        fs::create_dir_all(&temp_root).expect("应能创建测试临时目录");
+        let outer_path = temp_root.join("downLog.zip");
+        let thread_zip_member = "2026-05-21/monitorThread/20260521/thread_000038.zip";
+
+        let mut thread_zip_bytes = Cursor::new(Vec::new());
+        {
+            let mut thread_zip_writer = zip::ZipWriter::new(&mut thread_zip_bytes);
+            thread_zip_writer
+                .start_file("thread_000038.log", SimpleFileOptions::default())
+                .expect("应能创建线程日志条目");
+            thread_zip_writer
+                .write_all(b"thread dump")
+                .expect("应能写入线程日志内容");
+            thread_zip_writer.finish().expect("应能结束线程 ZIP");
+        }
+
+        {
+            let outer_file = fs::File::create(&outer_path).expect("应能创建外层 ZIP 文件");
+            let mut outer_writer = zip::ZipWriter::new(outer_file);
+            outer_writer
+                .start_file(thread_zip_member, SimpleFileOptions::default())
+                .expect("应能创建外层线程 ZIP 条目");
+            outer_writer
+                .write_all(thread_zip_bytes.get_ref())
+                .expect("应能写入外层线程 ZIP 内容");
+            outer_writer.finish().expect("应能结束外层 ZIP");
+        }
+
+        let tree = LoadedLogTree {
+            summary: "测试树".to_string(),
+            error_count: 0,
+            temporary_paths: Vec::new(),
+            rows: vec![
+                LoadedLogTreeRow {
+                    id: 1,
+                    depth: 0,
+                    label: "downLog.zip".to_string(),
+                    kind: LogTreeEntryKind::Archive,
+                    has_children: true,
+                    meta: None,
+                    error_message: None,
+                    source: None,
+                },
+                LoadedLogTreeRow {
+                    id: 2,
+                    depth: 1,
+                    label: "2026-05-21".to_string(),
+                    kind: LogTreeEntryKind::Directory,
+                    has_children: true,
+                    meta: None,
+                    error_message: None,
+                    source: None,
+                },
+                LoadedLogTreeRow {
+                    id: 3,
+                    depth: 2,
+                    label: "monitorThread".to_string(),
+                    kind: LogTreeEntryKind::Directory,
+                    has_children: true,
+                    meta: None,
+                    error_message: None,
+                    source: None,
+                },
+                LoadedLogTreeRow {
+                    id: 4,
+                    depth: 3,
+                    label: "20260521".to_string(),
+                    kind: LogTreeEntryKind::Directory,
+                    has_children: true,
+                    meta: None,
+                    error_message: None,
+                    source: None,
+                },
+                LoadedLogTreeRow {
+                    id: 5,
+                    depth: 4,
+                    label: "thread_000038.zip".to_string(),
+                    kind: LogTreeEntryKind::File,
+                    has_children: false,
+                    meta: Some("38 KB".to_string()),
+                    error_message: None,
+                    source: Some(LogFileSource::ArchiveMember {
+                        archive_path: outer_path.clone(),
+                        archive_format: ArchiveFormat::Zip,
+                        member_path: thread_zip_member.to_string(),
+                    }),
+                },
+            ],
+        };
+
+        let snapshot = LoadedLogTreeState::new(tree).plugin_log_files_for_toolbar_snapshot();
+        let paths = snapshot
+            .iter()
+            .map(|file| file.path_label.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            paths.contains(&"downLog.zip!/2026-05-21/monitorThread/20260521/thread_000038.zip")
+        );
+        assert!(!paths.contains(
+            &"downLog.zip!/2026-05-21/monitorThread/20260521/thread_000038.zip!/thread_000038.log"
+        ));
+
+        fs::remove_dir_all(temp_root).expect("应能清理测试临时目录");
     }
 
     /// 验证主窗口默认进入日志分析功能页。

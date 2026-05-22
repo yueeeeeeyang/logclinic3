@@ -843,6 +843,309 @@ impl MainView {
             .min(text.len())
     }
 
+    /// 返回当前已启用插件贡献的设置页签。
+    ///
+    /// 业务意图：
+    /// - 插件设置页签必须完全由 manifest 提供；未启用、加载失败或没有 `settings_tabs` 的插件不能出现在宿主设置侧栏。
+    /// - 返回独立渲染快照，避免设置窗口按钮闭包持有插件定义借用。
+    pub(in crate::app) fn plugin_settings_tab_items(&self) -> Vec<PluginSettingsTabRenderItem> {
+        self.plugins
+            .definitions
+            .iter()
+            .filter(|plugin| plugin.active())
+            .filter_map(|plugin| plugin.manifest.as_ref())
+            .flat_map(|manifest| {
+                manifest.contributes.settings_tabs.iter().map(move |tab| {
+                    PluginSettingsTabRenderItem {
+                        plugin_id: manifest.id.clone(),
+                        tab_id: tab.id.clone(),
+                        title: tab.title.clone(),
+                        icon: Self::plugin_menu_icon(tab.icon.as_deref()),
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// 校正当前插件设置页签选择。
+    ///
+    /// 业务意图：
+    /// - 当用户禁用、卸载或加载失败某个插件时，之前选中的插件设置页签可能已经不存在。
+    /// - 如果当前正停留在插件声明式设置路由，宿主应自动切回插件管理页或选择第一个仍然有效的插件页签，避免显示主程序硬编码页签。
+    pub(in crate::app) fn ensure_active_plugin_settings_tab_selection(&mut self) -> bool {
+        if self.settings.settings_active_tab != SettingsTab::PluginSettings {
+            if self.settings.settings_active_plugin_tab.is_some() {
+                self.settings.settings_active_plugin_tab = None;
+                return true;
+            }
+            return false;
+        }
+
+        let items = self.plugin_settings_tab_items();
+        if items.is_empty() {
+            self.settings.settings_active_tab = SettingsTab::Plugin;
+            self.settings.settings_active_plugin_tab = None;
+            return true;
+        }
+
+        if let Some(selection) = self.settings.settings_active_plugin_tab.as_ref() {
+            if items.iter().any(|item| item.matches_selection(selection)) {
+                return false;
+            }
+        }
+
+        self.settings.settings_active_plugin_tab = Some(items[0].selection());
+        true
+    }
+
+    /// 根据当前启用插件的 manifest 同步插件设置输入框。
+    ///
+    /// 业务意图：
+    /// - 插件设置项来自 `plugin.json`，宿主需要在设置页打开或插件重载后把声明转换成可编辑输入状态。
+    /// - 如果当前输入列表的插件、页签、key 和展示元数据都没有变化，直接保留现状，避免设置窗口重绘时丢失编辑内容。
+    /// - 如果 key 不变但 manifest 展示元数据变化，保留用户未保存草稿并刷新标题、默认值和说明。
+    pub(in crate::app) fn sync_plugin_pattern_setting_inputs(
+        &mut self,
+        context: &mut Context<Self>,
+    ) {
+        let desired_signature = self
+            .plugins
+            .definitions
+            .iter()
+            .filter(|plugin| plugin.active())
+            .filter_map(|plugin| plugin.manifest.as_ref().map(|manifest| (plugin, manifest)))
+            .flat_map(|(_plugin, manifest)| {
+                manifest
+                    .contributes
+                    .settings_tabs
+                    .iter()
+                    .flat_map(move |tab| {
+                        tab.pattern_settings.iter().map(move |setting| {
+                            (
+                                manifest.id.clone(),
+                                tab.id.clone(),
+                                setting.key.clone(),
+                                setting.label.clone(),
+                                setting.default.clone(),
+                                setting.description.clone(),
+                            )
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
+        let current_signature = self
+            .settings
+            .plugin_pattern_inputs
+            .iter()
+            .map(|input| {
+                (
+                    input.plugin_id.clone(),
+                    input.tab_id.clone(),
+                    input.key.clone(),
+                    input.label.clone(),
+                    input.default_value.clone(),
+                    input.description.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if desired_signature == current_signature {
+            return;
+        }
+
+        let mut existing_inputs = self
+            .settings
+            .plugin_pattern_inputs
+            .iter()
+            .cloned()
+            .map(|input| {
+                (
+                    (
+                        input.plugin_id.clone(),
+                        input.tab_id.clone(),
+                        input.key.clone(),
+                    ),
+                    input,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut inputs = Vec::new();
+        for plugin in self
+            .plugins
+            .definitions
+            .iter()
+            .filter(|plugin| plugin.active())
+        {
+            let Some(manifest) = plugin.manifest.as_ref() else {
+                continue;
+            };
+            let saved_values = load_plugin_settings(manifest);
+            for tab in &manifest.contributes.settings_tabs {
+                for setting in &tab.pattern_settings {
+                    let input_identity = (manifest.id.clone(), tab.id.clone(), setting.key.clone());
+                    if let Some(mut existing_input) = existing_inputs.remove(&input_identity) {
+                        existing_input.label = setting.label.clone();
+                        existing_input.default_value = setting.default.clone();
+                        existing_input.description = setting.description.clone();
+                        // 插件重载后同一输入项可能移动到新的行位，旧布局边界不再可靠；
+                        // 保留用户草稿文本和焦点句柄即可，下一帧会重新测量输入框。
+                        existing_input.last_layout = None;
+                        existing_input.last_bounds = None;
+                        inputs.push(existing_input);
+                        continue;
+                    }
+                    let text = saved_values
+                        .get(&setting.key)
+                        .cloned()
+                        .unwrap_or_else(|| setting.default.clone());
+                    inputs.push(PluginPatternSettingInputState {
+                        plugin_id: manifest.id.clone(),
+                        tab_id: tab.id.clone(),
+                        key: setting.key.clone(),
+                        label: setting.label.clone(),
+                        default_value: setting.default.clone(),
+                        description: setting.description.clone(),
+                        input: SingleLineTextInputState::from_text(text),
+                        focus: context.focus_handle(),
+                        last_layout: None,
+                        last_bounds: None,
+                    });
+                }
+            }
+        }
+        self.settings.plugin_pattern_inputs = inputs;
+    }
+
+    /// 读取插件规则输入框快照。
+    pub(in crate::app) fn plugin_pattern_setting_text_snapshot(
+        &self,
+        index: usize,
+    ) -> Option<SingleLineTextInputSnapshot> {
+        let state = self.settings.plugin_pattern_inputs.get(index)?;
+        Some(SingleLineTextInputSnapshot {
+            text: state.input.text.clone(),
+            selection_range: Self::clamp_search_text_range(
+                &state.input.text,
+                state.input.selection_range.clone(),
+            ),
+            marked_range: state.input.marked_range.clone(),
+            horizontal_scroll_px: state.input.horizontal_scroll_px,
+        })
+    }
+
+    /// 保存插件规则输入框最近一次单行排版结果。
+    pub(in crate::app) fn store_plugin_pattern_setting_text_layout(
+        &mut self,
+        index: usize,
+        line: ShapedLine,
+        bounds: Bounds<Pixels>,
+        horizontal_scroll_px: f32,
+    ) {
+        let Some(state) = self.settings.plugin_pattern_inputs.get_mut(index) else {
+            return;
+        };
+        state.last_layout = Some(line);
+        state.last_bounds = Some(bounds);
+        state.input.horizontal_scroll_px = horizontal_scroll_px;
+    }
+
+    /// 根据鼠标窗口坐标返回插件规则输入框中的 UTF-8 字节下标。
+    pub(in crate::app) fn plugin_pattern_setting_text_index_for_point(
+        &self,
+        index: usize,
+        position: Point<Pixels>,
+    ) -> usize {
+        let Some(state) = self.settings.plugin_pattern_inputs.get(index) else {
+            return 0;
+        };
+        let text = &state.input.text;
+        let (Some(layout), Some(bounds)) = (state.last_layout.as_ref(), state.last_bounds.as_ref())
+        else {
+            return text.len();
+        };
+        if position.y < bounds.top() {
+            return 0;
+        }
+        if position.y > bounds.bottom() {
+            return text.len();
+        }
+        layout
+            .closest_index_for_x(position.x - bounds.left() + px(state.input.horizontal_scroll_px))
+            .min(text.len())
+    }
+
+    /// 保存当前插件设置输入内容。
+    pub(in crate::app) fn save_plugin_pattern_settings_from_inputs(&mut self) {
+        let mut saved_plugins = 0usize;
+        let mut last_error = None;
+        for plugin in self
+            .plugins
+            .definitions
+            .iter()
+            .filter(|plugin| plugin.active())
+        {
+            let Some(manifest) = plugin.manifest.as_ref() else {
+                continue;
+            };
+            if manifest.contributes.settings_tabs.is_empty() {
+                continue;
+            }
+            let values = self
+                .settings
+                .plugin_pattern_inputs
+                .iter()
+                .filter(|input| input.plugin_id == manifest.id)
+                .map(|input| (input.key.clone(), input.input.text.clone()))
+                .collect::<BTreeMap<_, _>>();
+            match save_plugin_settings(manifest, &values) {
+                Ok(()) => saved_plugins += 1,
+                Err(message) => last_error = Some(message),
+            }
+        }
+        self.settings.plugin_settings_status_message = last_error.or_else(|| {
+            Some(if saved_plugins == 0 {
+                "当前没有可保存的插件设置".to_string()
+            } else {
+                "插件设置已保存，下次执行插件分析时生效".to_string()
+            })
+        });
+    }
+
+    /// 恢复插件设置默认值并保存。
+    pub(in crate::app) fn restore_plugin_pattern_settings_defaults(&mut self) {
+        let mut restored_plugins = 0usize;
+        let mut last_error = None;
+        for plugin in self
+            .plugins
+            .definitions
+            .iter()
+            .filter(|plugin| plugin.active())
+        {
+            let Some(manifest) = plugin.manifest.as_ref() else {
+                continue;
+            };
+            if manifest.contributes.settings_tabs.is_empty() {
+                continue;
+            }
+            if let Err(message) = restore_plugin_settings_defaults(manifest) {
+                last_error = Some(message);
+            } else {
+                restored_plugins += 1;
+            }
+        }
+        for input in &mut self.settings.plugin_pattern_inputs {
+            input.input = SingleLineTextInputState::from_text(input.default_value.clone());
+            input.last_layout = None;
+            input.last_bounds = None;
+        }
+        self.settings.plugin_settings_status_message = last_error.or_else(|| {
+            Some(if restored_plugins == 0 {
+                "当前没有可恢复的插件设置".to_string()
+            } else {
+                "插件设置已恢复默认值".to_string()
+            })
+        });
+    }
+
     /// 开始快搜关键字输入区的鼠标选择。
     pub(in crate::app) fn start_quick_search_keywords_mouse_selection(
         &mut self,

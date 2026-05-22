@@ -24,6 +24,12 @@ pub(in crate::app) enum TextInputBinding {
     SmbConnectionForm(SmbConnectionFormField),
     /// 连接分类弹窗中的名称输入框。
     ConnectionCategoryName,
+    /// 插件声明式设置中的匹配规则输入框。
+    ///
+    /// 业务意图：
+    /// - 插件设置项数量来自 manifest，使用下标绑定到当前会话内的输入状态。
+    /// - 下标只在当前设置页渲染周期内稳定；重新加载插件后会重建输入列表。
+    PluginPatternSetting(usize),
     /// 连接文件管理窗口的路径地址栏。
     ///
     /// 业务意图：
@@ -186,6 +192,11 @@ impl MainView {
                     TextInputSnapshot::from_single_line(snapshot, TextInputDisplayMode::Plain)
                 })
             }
+            TextInputBinding::PluginPatternSetting(index) => self
+                .plugin_pattern_setting_text_snapshot(index)
+                .map(|snapshot| {
+                    TextInputSnapshot::from_single_line(snapshot, TextInputDisplayMode::Plain)
+                }),
             TextInputBinding::FileManagerPath => None,
         }
     }
@@ -219,6 +230,13 @@ impl MainView {
             TextInputBinding::ConnectionCategoryName => {
                 self.store_connection_category_text_layout(line, bounds, horizontal_scroll_px)
             }
+            TextInputBinding::PluginPatternSetting(index) => self
+                .store_plugin_pattern_setting_text_layout(
+                    index,
+                    line,
+                    bounds,
+                    horizontal_scroll_px,
+                ),
             TextInputBinding::FileManagerPath => {}
         }
     }
@@ -258,6 +276,11 @@ impl MainView {
                 .category_dialog
                 .as_mut()
                 .map(|dialog| &mut dialog.name.input),
+            TextInputBinding::PluginPatternSetting(index) => self
+                .settings
+                .plugin_pattern_inputs
+                .get_mut(index)
+                .map(|input| &mut input.input),
             TextInputBinding::FileManagerPath => None,
         }
     }
@@ -290,6 +313,11 @@ impl MainView {
                 .category_dialog
                 .as_ref()
                 .map(|dialog| &dialog.name.input),
+            TextInputBinding::PluginPatternSetting(index) => self
+                .settings
+                .plugin_pattern_inputs
+                .get(index)
+                .map(|input| &input.input),
             TextInputBinding::FileManagerPath => None,
         }
     }
@@ -322,6 +350,9 @@ impl MainView {
             }
             TextInputBinding::ConnectionCategoryName => {
                 self.connection_category_text_index_for_point(position)
+            }
+            TextInputBinding::PluginPatternSetting(index) => {
+                self.plugin_pattern_setting_text_index_for_point(index, position)
             }
             TextInputBinding::FileManagerPath => 0,
         }
@@ -557,6 +588,23 @@ impl MainView {
                 };
                 dialog.name.input.horizontal_scroll_px = next_single_line_input_scroll_to_cursor(
                     &dialog.name.input,
+                    layout,
+                    bounds,
+                    TextInputDisplayMode::Plain,
+                );
+            }
+            TextInputBinding::PluginPatternSetting(index) => {
+                let Some(state) = self.settings.plugin_pattern_inputs.get_mut(index) else {
+                    return;
+                };
+                let Some(layout) = state.last_layout.as_ref() else {
+                    return;
+                };
+                let Some(bounds) = state.last_bounds else {
+                    return;
+                };
+                state.input.horizontal_scroll_px = next_single_line_input_scroll_to_cursor(
+                    &state.input,
                     layout,
                     bounds,
                     TextInputDisplayMode::Plain,

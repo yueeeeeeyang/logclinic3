@@ -18,6 +18,8 @@ mod log_view;
 mod model_input;
 /// 设置窗口模型页签视图。
 mod model_view;
+/// 插件声明式设置页签视图。
+mod plugin_settings_view;
 /// 设置窗口插件页签视图。
 mod plugin_view;
 /// 设置页快搜关键字输入元素。
@@ -30,6 +32,38 @@ mod thread_filter_input;
 mod window_view;
 
 pub(in crate::app) use window_view::SettingsWindowView;
+
+/// 插件声明式设置页签的渲染快照。
+///
+/// 业务意图：
+/// - 设置侧栏需要从运行时插件 manifest 生成页签按钮，但按钮点击闭包不能持有插件列表借用。
+/// - 快照只保存渲染和选择所需字段；插件启用状态变化后会在下一次渲染重新生成。
+#[derive(Clone)]
+pub(in crate::app) struct PluginSettingsTabRenderItem {
+    /// 插件 manifest ID。
+    pub(in crate::app) plugin_id: String,
+    /// 设置页签贡献 ID。
+    pub(in crate::app) tab_id: String,
+    /// 设置页签展示标题。
+    pub(in crate::app) title: String,
+    /// 设置页签图标。
+    pub(in crate::app) icon: Icon,
+}
+
+impl PluginSettingsTabRenderItem {
+    /// 转成可保存在设置窗口状态中的选择值。
+    pub(in crate::app) fn selection(&self) -> PluginSettingsTabSelection {
+        PluginSettingsTabSelection {
+            plugin_id: self.plugin_id.clone(),
+            tab_id: self.tab_id.clone(),
+        }
+    }
+
+    /// 判断该渲染项是否对应当前选择。
+    pub(in crate::app) fn matches_selection(&self, selection: &PluginSettingsTabSelection) -> bool {
+        self.plugin_id == selection.plugin_id && self.tab_id == selection.tab_id
+    }
+}
 
 /// 用系统文件管理器打开目录。
 ///

@@ -31,6 +31,24 @@ struct PluginNavigationRenderItem {
     icon: Icon,
 }
 
+/// 插件日志工具栏按钮渲染快照。
+///
+/// 业务意图：
+/// - 日志工具栏贡献来自运行时 manifest，渲染时需要先整理成独立值，避免点击闭包持有插件定义借用。
+/// - 点击后宿主重新收集日志树快照，保证传给插件的是用户点击瞬间的授权范围。
+struct PluginLogToolbarRenderItem {
+    /// 插件 ID。
+    plugin_id: String,
+    /// 工具栏贡献点 ID。
+    toolbar_id: String,
+    /// 命令 ID。
+    command_id: String,
+    /// 展示标题。
+    title: String,
+    /// 图标。
+    icon: Icon,
+}
+
 impl MainView {
     /// 返回当前主视图实际生效的主题。
     pub(in crate::app) fn effective_theme(&self) -> EffectiveTheme {
@@ -471,6 +489,11 @@ impl MainView {
             .border_color(rgb(palette.border))
             .child(self.render_load_toolbar_button(context))
             .child(self.render_search_toolbar_button(context))
+            .children(
+                self.plugin_log_toolbar_items()
+                    .into_iter()
+                    .map(|item| self.render_plugin_log_toolbar_button(item, context)),
+            )
     }
 
     /// 构建“加载日志”工具栏按钮。
@@ -552,6 +575,74 @@ impl MainView {
             ))
             .child(action.label)
             .on_click(context.listener(Self::open_search_from_toolbar))
+    }
+
+    /// 返回当前启用插件贡献的日志工具栏按钮。
+    fn plugin_log_toolbar_items(&self) -> Vec<PluginLogToolbarRenderItem> {
+        self.plugins
+            .definitions
+            .iter()
+            .filter(|plugin| plugin.active())
+            .filter_map(|plugin| {
+                let manifest = plugin.manifest.as_ref()?;
+                Some((manifest.id.clone(), &manifest.contributes.log_toolbar))
+            })
+            .flat_map(|(plugin_id, contributions)| {
+                contributions
+                    .iter()
+                    .map(move |contribution| PluginLogToolbarRenderItem {
+                        plugin_id: plugin_id.clone(),
+                        toolbar_id: contribution.id.clone(),
+                        command_id: contribution.command_id().to_string(),
+                        title: contribution.title.clone(),
+                        icon: Self::plugin_menu_icon(contribution.icon.as_deref()),
+                    })
+            })
+            .collect()
+    }
+
+    /// 构建插件日志工具栏按钮。
+    fn render_plugin_log_toolbar_button(
+        &self,
+        item: PluginLogToolbarRenderItem,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let palette = self.palette();
+        let button_id = SharedString::from(format!("log-toolbar-plugin-{}", item.toolbar_id));
+
+        div()
+            .id(button_id)
+            .flex()
+            .items_center()
+            .gap_1()
+            .flex_none()
+            .px(px(TOOLBAR_BUTTON_HORIZONTAL_PADDING))
+            .py(px(TOOLBAR_BUTTON_VERTICAL_PADDING))
+            .text_sm()
+            .text_color(rgb(palette.text))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .hover(move |button| button.text_color(rgb(palette.accent)))
+            .active(|button| button.opacity(0.82))
+            .child(Self::render_lucide_icon(
+                Some(item.icon),
+                TOOLBAR_BUTTON_ICON_WIDTH,
+                TOOLBAR_BUTTON_ICON_SIZE,
+                palette.muted_text,
+            ))
+            .child(item.title)
+            .on_click(
+                context.listener(move |view, _event: &ClickEvent, window, context| {
+                    view.invoke_log_toolbar_plugin_action(
+                        item.plugin_id.clone(),
+                        item.toolbar_id.clone(),
+                        item.command_id.clone(),
+                        window,
+                        context,
+                    );
+                    context.stop_propagation();
+                }),
+            )
     }
 
     /// 打开日志来源选择器。

@@ -135,6 +135,15 @@ impl EntityInputHandler for MainView {
             ));
             return Some(self.settings.quick_search_keywords_input.text[range].to_string());
         }
+        if let Some(index) = self.active_plugin_pattern_setting_index(window) {
+            let state = self.settings.plugin_pattern_inputs.get(index)?;
+            let range = Self::search_input_range_from_utf16(&state.input.text, range_utf16);
+            adjusted_range.replace(Self::search_input_range_to_utf16(
+                &state.input.text,
+                range.clone(),
+            ));
+            return Some(state.input.text[range].to_string());
+        }
         if let Some(kind) = self.active_thread_analysis_filter_input_kind(window) {
             let text = self.thread_analysis_filter_input_text(kind);
             let range = Self::search_input_range_from_utf16(text, range_utf16);
@@ -275,6 +284,16 @@ impl EntityInputHandler for MainView {
                         .quick_search_keywords_input
                         .selection_range
                         .clone(),
+                ),
+                reversed: false,
+            });
+        }
+        if let Some(index) = self.active_plugin_pattern_setting_index(window) {
+            let state = self.settings.plugin_pattern_inputs.get(index)?;
+            return Some(UTF16Selection {
+                range: Self::search_input_range_to_utf16(
+                    &state.input.text,
+                    state.input.selection_range.clone(),
                 ),
                 reversed: false,
             });
@@ -422,6 +441,14 @@ impl EntityInputHandler for MainView {
                     )
                 });
         }
+        if let Some(index) = self.active_plugin_pattern_setting_index(window) {
+            let state = self.settings.plugin_pattern_inputs.get(index)?;
+            return state
+                .input
+                .marked_range
+                .clone()
+                .map(|range| Self::search_input_range_to_utf16(&state.input.text, range));
+        }
         if let Some(kind) = self.active_thread_analysis_filter_input_kind(window) {
             let text = self.thread_analysis_filter_input_text(kind);
             return self
@@ -513,6 +540,14 @@ impl EntityInputHandler for MainView {
         }
         if self.settings.quick_search_keywords_focus.is_focused(window) {
             self.settings.quick_search_keywords_input.marked_range = None;
+            context.notify();
+            return;
+        }
+        if let Some(index) = self.active_plugin_pattern_setting_index(window) {
+            if let Some(state) = self.settings.plugin_pattern_inputs.get_mut(index) {
+                state.input.marked_range = None;
+                state.input.selection_drag = None;
+            }
             context.notify();
             return;
         }
@@ -808,6 +843,26 @@ impl EntityInputHandler for MainView {
             let cursor = range.start + replacement.len();
             self.settings.quick_search_keywords_input.selection_range = cursor..cursor;
             self.settings.quick_search_keywords_input.marked_range = None;
+            self.touch_search_text_cursor_activity();
+            context.notify();
+            return;
+        }
+        if let Some(index) = self.active_plugin_pattern_setting_index(window) {
+            let replacement = Self::sanitize_search_input_text(text);
+            if let Some(state) = self.settings.plugin_pattern_inputs.get_mut(index) {
+                let range = range_utf16
+                    .map(|range| Self::search_input_range_from_utf16(&state.input.text, range))
+                    .or_else(|| state.input.marked_range.clone())
+                    .unwrap_or_else(|| state.input.selection_range.clone());
+                let range = Self::clamp_search_text_range(&state.input.text, range);
+                state.input.text.replace_range(range.clone(), &replacement);
+                let cursor = range.start + replacement.len();
+                state.input.selection_range = cursor..cursor;
+                state.input.marked_range = None;
+                state.input.selection_drag = None;
+                state.last_layout = None;
+                state.last_bounds = None;
+            }
             self.touch_search_text_cursor_activity();
             context.notify();
             return;
@@ -1381,6 +1436,41 @@ impl EntityInputHandler for MainView {
             context.notify();
             return;
         }
+        if let Some(index) = self.active_plugin_pattern_setting_index(window) {
+            let replacement = Self::sanitize_search_input_text(new_text);
+            if let Some(state) = self.settings.plugin_pattern_inputs.get_mut(index) {
+                let range = range_utf16
+                    .map(|range| Self::search_input_range_from_utf16(&state.input.text, range))
+                    .or_else(|| state.input.marked_range.clone())
+                    .unwrap_or_else(|| state.input.selection_range.clone());
+                let range = Self::clamp_search_text_range(&state.input.text, range);
+                state.input.text.replace_range(range.clone(), &replacement);
+
+                if replacement.is_empty() {
+                    state.input.marked_range = None;
+                } else {
+                    state.input.marked_range = Some(range.start..range.start + replacement.len());
+                }
+
+                state.input.selection_range = new_selected_range_utf16
+                    .map(|utf16_range| {
+                        Self::search_input_range_from_utf16(&replacement, utf16_range)
+                    })
+                    .map(|relative_range| {
+                        range.start + relative_range.start..range.start + relative_range.end
+                    })
+                    .unwrap_or_else(|| {
+                        let cursor = range.start + replacement.len();
+                        cursor..cursor
+                    });
+                state.input.selection_drag = None;
+                state.last_layout = None;
+                state.last_bounds = None;
+            }
+            self.touch_search_text_cursor_activity();
+            context.notify();
+            return;
+        }
         if let Some(kind) = self.active_thread_analysis_filter_input_kind(window) {
             if !self.settings.thread_analysis_filter_is_editing {
                 return;
@@ -1719,6 +1809,26 @@ impl EntityInputHandler for MainView {
                 ),
             ));
         }
+        if let Some(index) = self.active_plugin_pattern_setting_index(window) {
+            let state = self.settings.plugin_pattern_inputs.get(index)?;
+            let range = Self::search_input_range_from_utf16(&state.input.text, range_utf16);
+            let Some(layout) = state.last_layout.as_ref() else {
+                return Some(element_bounds);
+            };
+            let horizontal_scroll_px = state.input.horizontal_scroll_px;
+            return Some(Bounds::from_corners(
+                point(
+                    element_bounds.left() + layout.x_for_index(range.start)
+                        - px(horizontal_scroll_px),
+                    element_bounds.top(),
+                ),
+                point(
+                    element_bounds.left() + layout.x_for_index(range.end)
+                        - px(horizontal_scroll_px),
+                    element_bounds.bottom(),
+                ),
+            ));
+        }
         if let Some(kind) = self.active_thread_analysis_filter_input_kind(window) {
             let text = self.thread_analysis_filter_input_text(kind);
             let range = Self::search_input_range_from_utf16(text, range_utf16);
@@ -1848,6 +1958,14 @@ impl EntityInputHandler for MainView {
                 utf8_index,
             ));
         }
+        if let Some(index) = self.active_plugin_pattern_setting_index(window) {
+            let utf8_index = self.plugin_pattern_setting_text_index_for_point(index, point);
+            let state = self.settings.plugin_pattern_inputs.get(index)?;
+            return Some(Self::search_input_utf16_offset_from_byte(
+                &state.input.text,
+                utf8_index,
+            ));
+        }
         if let Some(kind) = self.active_thread_analysis_filter_input_kind(window) {
             let utf8_index = self.thread_analysis_filter_index_for_point(kind, point);
             return Some(Self::search_input_utf16_offset_from_byte(
@@ -1860,5 +1978,19 @@ impl EntityInputHandler for MainView {
         let (text, _, _, _) = Self::search_text_state(dialog, input_kind);
         let utf8_index = self.search_text_index_for_point(input_kind, point);
         Some(Self::search_input_utf16_offset_from_byte(text, utf8_index))
+    }
+}
+
+impl MainView {
+    /// 返回当前聚焦的插件声明式设置输入框下标。
+    ///
+    /// 业务意图：
+    /// - 插件设置输入框数量由 manifest 决定，平台输入法回调需要先定位当前焦点属于哪一条规则。
+    /// - 下标只用于当前 `plugin_pattern_inputs` 列表，不跨插件重载或设置页重建保存。
+    fn active_plugin_pattern_setting_index(&self, window: &Window) -> Option<usize> {
+        self.settings
+            .plugin_pattern_inputs
+            .iter()
+            .position(|input| input.focus.is_focused(window))
     }
 }

@@ -83,6 +83,13 @@ pub(crate) const PLUGIN_REGISTRY_FILE_NAME: &str = "plugin-registry.json";
 /// - 开发目录插件只保存引用路径，不复制到该目录，方便第三方编辑后重新加载。
 pub(crate) const PLUGINS_INSTALL_DIR_NAME: &str = "plugins";
 
+/// 插件专属设置目录名。
+///
+/// 业务意图：
+/// - 外部插件可以声明自己的设置页签，但插件设置不能写入全局偏好文件或注册表，避免不同职责互相污染。
+/// - 每个插件使用独立 JSON 文件，损坏时只影响对应插件，并且方便用户手工定位和删除。
+pub(crate) const PLUGIN_SETTINGS_DIR_NAME: &str = "plugin-settings";
+
 /// 获取当前平台的应用配置目录。
 ///
 /// 跨平台约束：
@@ -169,4 +176,13 @@ pub(crate) fn plugin_registry_path() -> Option<PathBuf> {
 /// 获取 zip 插件安装根目录。
 pub(crate) fn plugins_install_dir() -> Option<PathBuf> {
     app_config_dir().map(|dir| dir.join(PLUGINS_INSTALL_DIR_NAME))
+}
+
+/// 获取插件专属设置根目录。
+///
+/// 跨平台约束：
+/// - macOS 和 Windows 仍复用 `app_config_dir`，只在应用配置目录下追加稳定子目录。
+/// - 函数只拼接路径，不创建目录；保存设置时再按需创建，避免只打开应用就产生无用目录。
+pub(crate) fn plugin_settings_dir() -> Option<PathBuf> {
+    app_config_dir().map(|dir| dir.join(PLUGIN_SETTINGS_DIR_NAME))
 }

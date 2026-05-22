@@ -3,11 +3,13 @@
 //! 业务意图：
 //! - 该二进制作为独立插件工程编译和打包，由宿主通过 stdin/stdout 传递 JSON 请求和响应。
 //! - “性能列表解析”先使用宿主传入的文件元数据解析文件名；用户点击“显示SQL”后才读取对应单个日志正文。
+//! - “泛微日志分析”由日志工具栏触发，当前阶段只扫描宿主授权日志树快照，按规则列出匹配路径和数量。
 //!
 //! 边界条件：
 //! - 只接收严格六段文件名：`耗时&用户&地址&时间戳&字段5&字段6.log`。
 //! - 耗时必须为毫秒数字，时间戳必须为 13 位毫秒数字；用户名允许为空，其余格式错误的文件直接跳过。
 //! - SQL 明细只读取宿主传入的 `read_path`，不会扫描任意目录；正文按 UTF-8 有损转换逐行解析，避免异常编码中断插件。
+//! - 泛微日志分析规则只使用相对路径通配匹配；日期 token 只校验数字位数，不校验真实日期是否合法。
 
 use std::{
     cmp::Ordering,
@@ -38,6 +40,16 @@ enum PluginCommandContext {
     LogTreeMenu {
         /// 候选日志元数据。
         files: Vec<PluginLogFile>,
+    },
+    /// 日志工具栏按钮上下文。
+    LogToolbarAction {
+        /// 工具栏贡献点 ID。
+        toolbar_id: String,
+        /// 当前左侧日志树快照。
+        files: Vec<PluginLogFile>,
+        /// 宿主合并默认值和用户保存值后的规则配置。
+        #[serde(default)]
+        settings: BTreeMap<String, String>,
     },
     /// 表格行按钮针对单个日志文件发起的二次命令。
     LogFileAction {
@@ -236,6 +248,95 @@ struct WeaverRouteSummary {
     logs: Vec<WeaverPerformanceLog>,
 }
 
+/// 泛微日志类型默认匹配规则。
+///
+/// 业务意图：
+/// - 这些规则对应泛微现场常见日志和配置文件，设置页可以覆盖每一项，但插件必须保留默认规则兜底。
+/// - `default_patterns` 使用分号分隔多个 glob，与宿主设置页保存格式保持一致。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WeaverLogRule {
+    /// 设置键和统计稳定键。
+    key: &'static str,
+    /// 用户可见日志类型。
+    label: &'static str,
+    /// 默认 glob 规则。
+    default_patterns: &'static str,
+}
+
+/// 14 类泛微日志默认规则。
+const WEAVER_LOG_RULES: &[WeaverLogRule] = &[
+    WeaverLogRule {
+        key: "memory",
+        label: "内存日志",
+        default_patterns: "memory_yyyy-MM-dd.log",
+    },
+    WeaverLogRule {
+        key: "pool",
+        label: "连接池日志",
+        default_patterns: "pool_yyyyMMdd_ecology.log",
+    },
+    WeaverLogRule {
+        key: "init_cache",
+        label: "sql缓存配置文件",
+        default_patterns: "initCache.properties",
+    },
+    WeaverLogRule {
+        key: "resin3",
+        label: "resin3配置文件",
+        default_patterns: "resin.conf",
+    },
+    WeaverLogRule {
+        key: "resin4",
+        label: "resin4配置文件",
+        default_patterns: "resin.properties",
+    },
+    WeaverLogRule {
+        key: "web_xml",
+        label: "web.xml配置文件",
+        default_patterns: "web.xml",
+    },
+    WeaverLogRule {
+        key: "ecology",
+        label: "ecology日志",
+        default_patterns: "ecology;ecology_yyyyMMdd.log",
+    },
+    WeaverLogRule {
+        key: "stdout",
+        label: "中间件标准输出日志",
+        default_patterns: "stdout.log;stdout.*.log",
+    },
+    WeaverLogRule {
+        key: "stderr",
+        label: "中间件标准错误日志",
+        default_patterns: "stderr.log;stderr.*.log",
+    },
+    WeaverLogRule {
+        key: "jvm_app",
+        label: "中间件启动日志",
+        default_patterns: "jvm-app-0.log",
+    },
+    WeaverLogRule {
+        key: "monitor_thread_40s",
+        label: "40秒线程日志",
+        default_patterns: "monitorThread/yyyyMMdd/thread_HHmmss.log;monitorThread/yyyyMMdd/thread_HHmmss.zip",
+    },
+    WeaverLogRule {
+        key: "thread_3m",
+        label: "3分钟线程日志",
+        default_patterns: "yyyy-MM-dd/thread_HHmmss.log;yyyy-MM-dd/thread_HHmmss.zip",
+    },
+    WeaverLogRule {
+        key: "messages",
+        label: "服务器日志",
+        default_patterns: "messages",
+    },
+    WeaverLogRule {
+        key: "runtime",
+        label: "runtime日志",
+        default_patterns: "runtime/yyyy_MM_dd/**",
+    },
+];
+
 impl WeaverRouteSummary {
     /// 请求出现次数。
     fn count(&self) -> usize {
@@ -300,6 +401,18 @@ fn handle_request<R: BufRead>(
             Ok(build_performance_list_response(files, emit_progress))
         }
         (
+            "weaver_log_scan",
+            PluginCommandContext::LogToolbarAction {
+                toolbar_id,
+                files,
+                settings,
+            },
+        ) if toolbar_id == "weaver.log_scan" => Ok(build_weaver_log_scan_response(
+            files,
+            settings,
+            emit_progress,
+        )),
+        (
             "show_request_sql",
             PluginCommandContext::LogFileAction {
                 action_id,
@@ -316,8 +429,352 @@ fn handle_request<R: BufRead>(
         ("performance_list_parse", PluginCommandContext::Unsupported) => {
             Err("性能列表解析只能从日志目录树右键菜单触发".to_string())
         }
+        ("weaver_log_scan", _) => Err("泛微日志分析只能从日志分析页工具栏触发".to_string()),
         (command_id, _) => Err(format!("未知插件命令：{command_id}")),
     }
+}
+
+/// 构造泛微日志分析扫描窗口响应。
+///
+/// 业务意图：
+/// - 当前阶段只完成“找到了哪些泛微相关日志”的可视化清单，不读取日志正文做业务诊断。
+/// - 匹配顺序按规则定义顺序和相对路径排序，保证同一批日志每次打开窗口时结果稳定。
+fn build_weaver_log_scan_response<F>(
+    files: Vec<PluginLogFile>,
+    settings: BTreeMap<String, String>,
+    mut report_progress: F,
+) -> PluginCommandResponse
+where
+    F: FnMut(PluginCommandProgress),
+{
+    let scanned_count = files.len();
+    report_progress(PluginCommandProgress {
+        message: "正在扫描泛微日志路径".to_string(),
+        detail: Some(format!("共收到 {scanned_count} 个日志树条目")),
+        done: 0,
+        total: Some(scanned_count as u64),
+        unit: Some("条目".to_string()),
+    });
+
+    let mut rows: Vec<(usize, String, String)> = Vec::new();
+    let mut counts = vec![0usize; WEAVER_LOG_RULES.len()];
+    for (file_index, file) in files.into_iter().enumerate() {
+        let relative_path = plugin_file_relative_path(&file);
+        for (rule_index, rule) in WEAVER_LOG_RULES.iter().enumerate() {
+            let patterns = settings
+                .get(rule.key)
+                .map(String::as_str)
+                .unwrap_or(rule.default_patterns);
+            if weaver_rule_matches(patterns, &relative_path) {
+                counts[rule_index] += 1;
+                rows.push((rule_index, rule.label.to_string(), relative_path.clone()));
+            }
+        }
+        let done = file_index + 1;
+        if should_report_progress(done, scanned_count) {
+            report_progress(PluginCommandProgress {
+                message: "正在扫描泛微日志路径".to_string(),
+                detail: Some(relative_path),
+                done: done as u64,
+                total: Some(scanned_count as u64),
+                unit: Some("条目".to_string()),
+            });
+        }
+    }
+
+    rows.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    let table_rows = rows
+        .into_iter()
+        .map(|(_, label, path)| vec![label, path])
+        .collect::<Vec<_>>();
+    let matched_count = table_rows.len();
+    let mut stats = vec![
+        PluginPageStat {
+            label: "扫描条目".to_string(),
+            value: scanned_count.to_string(),
+        },
+        PluginPageStat {
+            label: "匹配日志".to_string(),
+            value: matched_count.to_string(),
+        },
+    ];
+    for (rule, count) in WEAVER_LOG_RULES.iter().zip(counts.iter()) {
+        stats.push(PluginPageStat {
+            label: rule.label.to_string(),
+            value: count.to_string(),
+        });
+    }
+
+    PluginCommandResponse::OpenWindow {
+        title: "泛微日志分析".to_string(),
+        page: PluginPage {
+            title: "泛微日志分析".to_string(),
+            description: if matched_count == 0 {
+                Some("当前日志树快照中没有匹配到泛微日志类型。".to_string())
+            } else {
+                Some("当前阶段仅展示按规则扫描到的日志类型和相对路径。".to_string())
+            },
+            stats,
+            table: Some(PluginPageTable {
+                headers: vec!["日志类型".to_string(), "相对路径".to_string()],
+                rows: table_rows,
+                row_actions: Vec::new(),
+            }),
+        },
+    }
+}
+
+/// 返回插件日志快照中用于规则匹配的相对路径。
+///
+/// 边界条件：
+/// - 工具栏上下文由宿主把 `path_label` 填成相对路径；旧宿主或测试缺省时回退到文件名。
+/// - Windows 路径分隔符统一成 `/`，保证同一规则跨平台可用。
+fn plugin_file_relative_path(file: &PluginLogFile) -> String {
+    let raw = if file.path_label.trim().is_empty() {
+        file.display_name.as_str()
+    } else {
+        file.path_label.as_str()
+    };
+    normalize_weaver_path(raw)
+}
+
+/// 判断一组分号分隔规则是否命中指定相对路径。
+fn weaver_rule_matches(patterns: &str, relative_path: &str) -> bool {
+    patterns
+        .split(';')
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty())
+        .any(|pattern| weaver_pattern_matches(pattern, relative_path))
+}
+
+/// 判断单条 glob 规则是否命中相对路径。
+///
+/// 业务意图：
+/// - 无 `/` 的规则按文件名匹配，便于 `web.xml`、`messages` 这类文件在任意目录出现时都能命中。
+/// - 含 `/` 的规则按归一化相对路径匹配，同时允许规则出现在任意子目录下，避免用户必须知道加载根目录名称。
+fn weaver_pattern_matches(pattern: &str, relative_path: &str) -> bool {
+    let pattern = normalize_weaver_path(pattern);
+    let relative_path = normalize_weaver_path(relative_path);
+    if !pattern.contains('/') {
+        let basename = relative_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(relative_path.as_str());
+        return glob_pattern_matches(&pattern, basename);
+    }
+
+    for candidate_path in path_variants_for_matching(&relative_path) {
+        if path_suffixes_for_matching(&candidate_path)
+            .any(|candidate| glob_pattern_matches(&pattern, candidate))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// 生成全路径和每一级子路径后缀，支持规则在任意子目录下命中。
+fn path_suffixes_for_matching(path: &str) -> impl Iterator<Item = &str> {
+    std::iter::once(path).chain(path.match_indices('/').map(|(index, _)| &path[index + 1..]))
+}
+
+/// 生成规则匹配时使用的路径变体。
+///
+/// 业务意图：
+/// - 宿主会用 `archive.zip!/inner.log` 展示压缩包链路，但业务规则描述的是解压后的日志目录结构。
+/// - 路径型规则需要同时尝试原始链路和去掉压缩包容器段后的链路，让
+///   `monitorThread/yyyyMMdd/thread_HHmmss.log` 可以命中
+///   `thread_000038.zip!/thread_000038.log`。
+fn path_variants_for_matching(path: &str) -> Vec<String> {
+    let mut variants = vec![path.to_string()];
+    let transparent = path
+        .split('/')
+        .filter(|segment| !is_archive_chain_segment(segment))
+        .collect::<Vec<_>>()
+        .join("/");
+    if transparent != path && !transparent.is_empty() {
+        variants.push(transparent);
+    }
+    let existing = variants.clone();
+    for variant in existing {
+        if let Some(compressed_log_variant) = compressed_log_path_variant(&variant)
+            && !variants.contains(&compressed_log_variant)
+        {
+            variants.push(compressed_log_variant);
+        }
+    }
+    variants
+}
+
+/// 判断路径片段是否是宿主展示压缩包链路时生成的容器段。
+fn is_archive_chain_segment(segment: &str) -> bool {
+    let lower = segment.to_ascii_lowercase();
+    lower.ends_with(".zip!")
+        || lower.ends_with(".rar!")
+        || lower.ends_with(".7z!")
+        || lower.ends_with(".tar!")
+        || lower.ends_with(".gz!")
+        || lower.ends_with(".tgz!")
+        || lower.ends_with(".tar.gz!")
+}
+
+/// 为压缩日志文件生成“解压后日志名”的匹配变体。
+///
+/// 业务意图：
+/// - 现场 `monitorThread/yyyyMMdd/thread_HHmmss.zip` 本身就是线程日志的压缩形态；
+///   用户如果在设置中仍保存旧的 `.log` 规则，也应把它当作同名 `.log` 命中。
+/// - 这里只改变规则匹配用的虚拟路径，不改变窗口展示的真实相对路径，避免用户看不到原始 zip 文件。
+///
+/// 边界条件：
+/// - 仅处理常见单文件日志压缩后缀；普通目录压缩包内部的其它日志仍由宿主快照展开后匹配。
+/// - `.tar.gz` 和 `.tgz` 这类目录包通常不是单个线程日志文件，不在这里伪装成 `.log`。
+fn compressed_log_path_variant(path: &str) -> Option<String> {
+    let lower_path = path.to_ascii_lowercase();
+    for suffix in [".zip", ".gz", ".gzip"] {
+        if lower_path.ends_with(suffix) {
+            let prefix = &path[..path.len().saturating_sub(suffix.len())];
+            return Some(format!("{prefix}.log"));
+        }
+    }
+    None
+}
+
+/// 归一化插件路径文本。
+fn normalize_weaver_path(path: &str) -> String {
+    path.replace('\\', "/")
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// 执行 glob 和日期 token 匹配。
+///
+/// 边界条件：
+/// - `*` 只匹配单级路径片段，`**` 可以跨 `/`，`?` 匹配单个非 `/` 字符。
+/// - 日期 token 只校验数字位数；例如 `yyyyMMddHHmmss` 需要 14 位数字，但不校验真实日历日期。
+fn glob_pattern_matches(pattern: &str, target: &str) -> bool {
+    let pattern_chars = pattern.chars().collect::<Vec<_>>();
+    let target_chars = target.chars().collect::<Vec<_>>();
+    let mut memo = BTreeMap::<(usize, usize), bool>::new();
+    glob_pattern_matches_inner(&pattern_chars, &target_chars, 0, 0, &mut memo)
+}
+
+/// 递归匹配 glob 模式。
+fn glob_pattern_matches_inner(
+    pattern: &[char],
+    target: &[char],
+    pattern_index: usize,
+    target_index: usize,
+    memo: &mut BTreeMap<(usize, usize), bool>,
+) -> bool {
+    if let Some(value) = memo.get(&(pattern_index, target_index)) {
+        return *value;
+    }
+    let result = if pattern_index == pattern.len() {
+        target_index == target.len()
+    } else if pattern[pattern_index] == '*' {
+        if pattern.get(pattern_index + 1) == Some(&'*') {
+            glob_pattern_matches_inner(pattern, target, pattern_index + 2, target_index, memo)
+                || (target_index < target.len()
+                    && glob_pattern_matches_inner(
+                        pattern,
+                        target,
+                        pattern_index,
+                        target_index + 1,
+                        memo,
+                    ))
+        } else {
+            glob_pattern_matches_inner(pattern, target, pattern_index + 1, target_index, memo)
+                || (target_index < target.len()
+                    && target[target_index] != '/'
+                    && glob_pattern_matches_inner(
+                        pattern,
+                        target,
+                        pattern_index,
+                        target_index + 1,
+                        memo,
+                    ))
+        }
+    } else if pattern[pattern_index] == '?' {
+        target_index < target.len()
+            && target[target_index] != '/'
+            && glob_pattern_matches_inner(
+                pattern,
+                target,
+                pattern_index + 1,
+                target_index + 1,
+                memo,
+            )
+    } else if let Some(width) = date_token_width(pattern, pattern_index) {
+        target_index + width <= target.len()
+            && target[target_index..target_index + width]
+                .iter()
+                .all(|ch| ch.is_ascii_digit())
+            && glob_pattern_matches_inner(
+                pattern,
+                target,
+                pattern_index + width,
+                target_index + width,
+                memo,
+            )
+    } else {
+        target_index < target.len()
+            && pattern[pattern_index] == target[target_index]
+            && glob_pattern_matches_inner(
+                pattern,
+                target,
+                pattern_index + 1,
+                target_index + 1,
+                memo,
+            )
+    };
+    memo.insert((pattern_index, target_index), result);
+    result
+}
+
+/// 识别日期时间 token 并返回需要匹配的数字位数。
+fn date_token_width(pattern: &[char], index: usize) -> Option<usize> {
+    if !date_token_boundary_before(pattern, index) {
+        return None;
+    }
+    let remaining = &pattern[index..];
+    if remaining.starts_with(&['y', 'y', 'y', 'y']) || remaining.starts_with(&['Y', 'Y', 'Y', 'Y'])
+    {
+        return Some(4);
+    }
+    for token in [
+        ['M', 'M'],
+        ['d', 'd'],
+        ['D', 'D'],
+        ['H', 'H'],
+        ['m', 'm'],
+        ['s', 's'],
+    ] {
+        if remaining.starts_with(&token) {
+            return Some(2);
+        }
+    }
+    None
+}
+
+/// 判断当前位置是否可能是日期 token 的起点。
+///
+/// 业务意图：
+/// - 避免把普通单词里的 `ss` 误判为秒，例如服务器日志文件名 `messages` 必须按字面匹配。
+/// - 连续日期 token 内部仍允许直接相邻，例如 `yyyyMMddHHmmss`。
+fn date_token_boundary_before(pattern: &[char], index: usize) -> bool {
+    if index == 0 {
+        return true;
+    }
+    let previous = pattern[index - 1];
+    matches!(previous, '/' | '_' | '-' | '.')
+        || matches!(previous, 'y' | 'Y' | 'M' | 'd' | 'D' | 'H' | 'm' | 's')
 }
 
 /// 构造性能列表解析窗口响应。
@@ -883,6 +1340,127 @@ mod tests {
             node_kind: "file".to_string(),
             read_path: Some(read_path.to_string()),
         }
+    }
+
+    /// 构造带相对路径的日志树快照测试对象。
+    fn file_at(path: &str) -> PluginLogFile {
+        let display_name = path
+            .rsplit(['/', '\\'])
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(path)
+            .to_string();
+        PluginLogFile {
+            source_key: format!("local:{path}"),
+            display_name,
+            path_label: path.to_string(),
+            source_kind: "local_file".to_string(),
+            node_kind: "file".to_string(),
+            read_path: None,
+        }
+    }
+
+    #[test]
+    fn 十四类默认规则分别命中示例路径() {
+        let examples = [
+            ("memory", "root/memory_2026-05-23.log"),
+            ("pool", "root/pool_20260523_ecology.log"),
+            ("init_cache", "root/initCache.properties"),
+            ("resin3", "root/conf/resin.conf"),
+            ("resin4", "root/conf/resin.properties"),
+            ("web_xml", "root/WEB-INF/web.xml"),
+            ("ecology", "root/ecology_20260523.log"),
+            ("stdout", "root/stdout.20260523.log"),
+            ("stderr", "root/stderr.20260523.log"),
+            ("jvm_app", "root/jvm-app-0.log"),
+            (
+                "monitor_thread_40s",
+                "root/monitorThread/20260523/thread_101500.log",
+            ),
+            (
+                "monitor_thread_40s",
+                "root/monitorThread/20260523/thread_101500.zip",
+            ),
+            ("thread_3m", "root/2026-05-23/thread_101500.log"),
+            ("thread_3m", "root/2026-05-23/thread_101500.zip"),
+            ("messages", "root/messages"),
+            ("runtime", "root/runtime/2026_05_23/ecology/runtime.log"),
+        ];
+
+        for (key, path) in examples {
+            let rule = WEAVER_LOG_RULES
+                .iter()
+                .find(|rule| rule.key == key)
+                .expect("测试规则必须存在");
+            assert!(
+                weaver_rule_matches(rule.default_patterns, path),
+                "{key} 应命中 {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn glob_支持星号问号双星和日期数字形状() {
+        assert!(weaver_pattern_matches(
+            "stdout.*.log",
+            "root/stdout.abc.log"
+        ));
+        assert!(weaver_pattern_matches(
+            "thread_??????.log",
+            "thread_101500.log"
+        ));
+        assert!(weaver_pattern_matches(
+            "runtime/**",
+            "root/a/runtime/2026_05_23/a.log"
+        ));
+        assert!(weaver_pattern_matches(
+            "monitorThread/yyyyMMdd/thread_HHmmss.log",
+            "root/monitorThread/20260523/thread_101500.log"
+        ));
+        assert!(weaver_pattern_matches(
+            "monitorThread/yyyyMMdd/thread_HHmmss.log",
+            "downLog.zip!/2026-05-21/monitorThread/20260521/thread_000038.zip!/thread_000038.log"
+        ));
+        assert!(weaver_pattern_matches(
+            "monitorThread/yyyyMMdd/thread_HHmmss.log",
+            "downLog.zip!/2026-05-21/monitorThread/20260521/thread_000038.zip"
+        ));
+        assert!(!weaver_pattern_matches(
+            "monitorThread/yyyyMMdd/thread_HHmmss.log",
+            "root/monitorThread/2026-05-23/thread_101500.log"
+        ));
+        assert!(weaver_pattern_matches("messages", "root/messages"));
+        assert!(!weaver_pattern_matches("messages", "root/message12"));
+    }
+
+    #[test]
+    fn 泛微扫描响应统计总数各类型数量且排序稳定() {
+        let response = build_weaver_log_scan_response(
+            vec![
+                file_at("root/stdout.20260523.log"),
+                file_at("root/memory_2026-05-23.log"),
+                file_at("root/WEB-INF/web.xml"),
+                file_at("root/runtime/2026_05_23/a.log"),
+            ],
+            BTreeMap::new(),
+            |_| {},
+        );
+        let PluginCommandResponse::OpenWindow { page, .. } = response else {
+            panic!("应返回泛微日志分析窗口");
+        };
+        let table = page.table.expect("扫描结果应包含表格");
+
+        assert_eq!(page.stats[0].value, "4");
+        assert_eq!(page.stats[1].value, "4");
+        assert_eq!(
+            table.headers,
+            vec!["日志类型".to_string(), "相对路径".to_string()]
+        );
+        assert_eq!(table.rows.len(), 4);
+        assert_eq!(table.rows[0][0], "内存日志");
+        assert_eq!(table.rows[1][0], "web.xml配置文件");
+        assert_eq!(table.rows[2][0], "中间件标准输出日志");
+        assert_eq!(table.rows[3][0], "runtime日志");
     }
 
     #[test]

@@ -160,6 +160,11 @@ impl MainView {
                 .thread_analysis_filter_focus
                 .is_focused(window)
             || self.settings.quick_search_keywords_focus.is_focused(window)
+            || self
+                .settings
+                .plugin_pattern_inputs
+                .iter()
+                .any(|input| input.focus.is_focused(window))
             || self.active_model_config_input_kind(window).is_some()
     }
 

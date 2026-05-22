@@ -545,6 +545,572 @@ impl LoadedLogTreeState {
             .unwrap_or_default()
     }
 
+    /// 返回日志工具栏插件可接收的整棵日志树快照。
+    ///
+    /// 业务意图：
+    /// - 工具栏分析入口面向“当前已经加载的左侧日志树”，因此必须遍历加载树中的全部可打开文件，而不是右键选中节点。
+    /// - 普通目录中出现的压缩包在加载树里只是普通文件；这里会继续扫描压缩包目录元数据，让泛微日志分析能看到压缩包内部候选路径。
+    ///
+    /// 边界条件：
+    /// - 该函数只基于当前加载树和其中的本地压缩包文件扩展扫描，不访问用户未选择的其它路径。
+    /// - 嵌套压缩包链路最多保留 5 层，超过深度时不继续展开更深成员，避免一次工具栏点击造成不可控扫描。
+    /// - 快照中的 `path_label` 填写相对路径，压缩包链路使用 `archive.zip!/inner.log` 展示。
+    #[cfg(test)]
+    pub(in crate::app) fn plugin_log_files_for_toolbar_snapshot(&self) -> Vec<PluginLogFile> {
+        Self::plugin_log_files_for_toolbar_tree_snapshot(&self.tree)
+    }
+
+    /// 基于传入日志树生成工具栏插件快照。
+    ///
+    /// 业务意图：
+    /// - 日志工具栏分析会递归读取压缩包目录，用户加载的包很多时该过程可能耗时较长。
+    /// - 独立函数允许调用方先克隆 `LoadedLogTree`，再放到后台线程执行扫描，避免点击按钮时阻塞 GPUI 主线程。
+    ///
+    /// 边界条件：
+    /// - 输入树仍然来自当前已加载的左侧日志树，不会扩大用户授权范围。
+    /// - 该函数不读取 UI 展开状态，只遍历完整树数据；折叠节点仍属于当前加载范围，应被插件分析覆盖。
+    pub(in crate::app) fn plugin_log_files_for_toolbar_tree_snapshot(
+        tree: &LoadedLogTree,
+    ) -> Vec<PluginLogFile> {
+        const MAX_ARCHIVE_DEPTH: usize = 5;
+
+        let mut path_stack: Vec<(usize, String, LogTreeEntryKind)> = Vec::new();
+        let mut seen_keys = HashSet::new();
+        let mut files = Vec::new();
+
+        for row in &tree.rows {
+            while path_stack
+                .last()
+                .is_some_and(|(depth, _, _)| *depth >= row.depth)
+            {
+                path_stack.pop();
+            }
+            path_stack.push((row.depth, row.label.clone(), row.kind));
+
+            if row.kind != LogTreeEntryKind::File {
+                continue;
+            }
+
+            let relative_path = Self::plugin_relative_path_from_stack(&path_stack);
+            if let Some(source) = row.source.as_ref() {
+                let source_key = source.stable_key();
+                if seen_keys.insert(source_key.clone()) {
+                    files.push(Self::plugin_log_file_from_row_with_path(
+                        row,
+                        source,
+                        source_key,
+                        relative_path.clone(),
+                    ));
+                }
+            }
+
+            if let Some(source) = row.source.as_ref() {
+                Self::append_log_source_archive_snapshot_entries(
+                    source,
+                    &row.label,
+                    &relative_path,
+                    MAX_ARCHIVE_DEPTH,
+                    &mut seen_keys,
+                    &mut files,
+                );
+            }
+        }
+
+        files
+    }
+
+    /// 如果当前日志来源本身仍是压缩包，则继续展开其内部成员。
+    ///
+    /// 业务意图：
+    /// - 用户加载顶层压缩包后，左侧树中的 `thread_000038.zip` 会表现为 `ArchiveMember` 文件节点，而不是本地文件。
+    /// - 泛微日志分析要求遍历嵌套压缩包，因此工具栏快照必须对所有来源类型中的压缩包文件继续展开。
+    ///
+    /// 边界条件：
+    /// - 只读取当前树节点已经授权的来源字节，不根据路径文本访问其它本地文件。
+    /// - 顶层本地压缩包可直接按路径扫描；压缩包内部成员需要先读取为临时文件再扫描目录。
+    fn append_log_source_archive_snapshot_entries(
+        source: &LogFileSource,
+        row_label: &str,
+        relative_path: &str,
+        max_archive_depth: usize,
+        seen_keys: &mut HashSet<String>,
+        files: &mut Vec<PluginLogFile>,
+    ) {
+        if Self::should_skip_toolbar_archive_expansion(row_label, relative_path) {
+            return;
+        }
+
+        let current_archive_depth = relative_path.matches("!/").count();
+        if current_archive_depth >= max_archive_depth {
+            return;
+        }
+
+        if let LogFileSource::LocalFile { path } = source
+            && let Some(format) = ArchiveFormat::from_file(path)
+        {
+            Self::append_archive_snapshot_entries(
+                path,
+                format,
+                relative_path,
+                max_archive_depth,
+                seen_keys,
+                files,
+            );
+            return;
+        }
+
+        let Some(format) = ArchiveFormat::from_path(Path::new(row_label)) else {
+            return;
+        };
+        let Some(bytes) = Self::log_source_snapshot_archive_bytes(source) else {
+            return;
+        };
+        Self::append_archive_bytes_snapshot_entries(
+            &bytes,
+            format,
+            row_label,
+            relative_path,
+            max_archive_depth,
+            current_archive_depth.saturating_add(1),
+            seen_keys,
+            files,
+        );
+    }
+
+    /// 将当前目录树路径栈转换成插件展示相对路径。
+    ///
+    /// 业务意图：
+    /// - 左侧树本身已经按用户选择范围构造，因此路径栈可以作为“来源前缀 + 相对路径”的展示基础。
+    /// - 压缩包节点后的子路径使用 `!/`，让用户能区分真实目录和压缩包内部成员。
+    fn plugin_relative_path_from_stack(stack: &[(usize, String, LogTreeEntryKind)]) -> String {
+        let mut result = String::new();
+        for (index, (_, label, _kind)) in stack.iter().enumerate() {
+            if index == 0 {
+                result.push_str(label);
+            } else if stack[index - 1].2 == LogTreeEntryKind::Archive {
+                result.push_str("!/");
+                result.push_str(label);
+            } else {
+                result.push('/');
+                result.push_str(label);
+            }
+        }
+        result
+    }
+
+    /// 扫描普通目录中的压缩包文件，并把内部文件加入插件快照。
+    ///
+    /// 边界条件：
+    /// - 扫描失败表示该压缩包目录不可读；工具栏分析只忽略内部成员，仍保留压缩包文件自身。
+    /// - 扫描阶段可能为 7Z 或嵌套 RAR 创建临时文件；当前工具栏快照只展示路径，不读取正文，因此扫描后立即清理临时路径。
+    /// - 左侧树加载为了保持单文件压缩包可直接打开，可能不展开只包含一个文件的内层压缩包；工具栏分析必须额外递归这些压缩包文件。
+    fn append_archive_snapshot_entries(
+        archive_path: &Path,
+        format: ArchiveFormat,
+        relative_prefix: &str,
+        max_archive_depth: usize,
+        seen_keys: &mut HashSet<String>,
+        files: &mut Vec<PluginLogFile>,
+    ) {
+        let Ok(scan_result) = scan_archive_with_progress(archive_path, format, |_| {}) else {
+            return;
+        };
+        for node in &scan_result.children {
+            Self::append_archive_snapshot_node(
+                node,
+                relative_prefix,
+                max_archive_depth,
+                1,
+                seen_keys,
+                files,
+            );
+        }
+        for path in scan_result.temporary_paths {
+            if path.is_dir() {
+                let _ = fs::remove_dir_all(path);
+            } else {
+                cleanup_materialized_file(&path);
+            }
+        }
+    }
+
+    /// 递归展开压缩包扫描节点。
+    fn append_archive_snapshot_node(
+        node: &ArchiveScanNode,
+        relative_prefix: &str,
+        max_archive_depth: usize,
+        current_archive_depth: usize,
+        seen_keys: &mut HashSet<String>,
+        files: &mut Vec<PluginLogFile>,
+    ) {
+        if node.kind == ArchiveScanEntryKind::File {
+            let relative_path = Self::archive_snapshot_relative_path(relative_prefix, node)
+                .unwrap_or_else(|| {
+                    format!("{}!/{}/{}", relative_prefix, "", node.label).replace("!//", "!/")
+                });
+            let archive_depth = relative_path.matches("!/").count();
+            if archive_depth <= max_archive_depth {
+                let source_key = format!("archive-snapshot:{relative_path}");
+                if seen_keys.insert(source_key.clone()) {
+                    files.push(PluginLogFile {
+                        source_key,
+                        display_name: node.label.clone(),
+                        path_label: relative_path.clone(),
+                        source_kind: "archive_member".to_string(),
+                        node_kind: "file".to_string(),
+                        read_path: None,
+                        host_source: None,
+                    });
+                }
+            }
+
+            // 工具栏分析的业务语义是“遍历当前授权范围内所有压缩包”，不能沿用左侧树
+            // 对单文件内层压缩包的折叠展示规则；只要当前文件本身仍是压缩包，就继续展开其目录元数据。
+            if archive_depth < max_archive_depth
+                && current_archive_depth < max_archive_depth
+                && !Self::should_skip_toolbar_archive_expansion(&node.label, &relative_path)
+                && let Some(nested_format) = ArchiveFormat::from_path(Path::new(&node.label))
+            {
+                Self::append_nested_archive_snapshot_entries(
+                    node,
+                    nested_format,
+                    &relative_path,
+                    max_archive_depth,
+                    current_archive_depth.saturating_add(1),
+                    seen_keys,
+                    files,
+                );
+            }
+        }
+
+        for child in &node.children {
+            Self::append_archive_snapshot_node(
+                child,
+                relative_prefix,
+                max_archive_depth,
+                current_archive_depth,
+                seen_keys,
+                files,
+            );
+        }
+    }
+
+    /// 判断工具栏快照是否应跳过某个压缩包的递归展开。
+    ///
+    /// 业务意图：
+    /// - 泛微 `monitorThread/yyyyMMdd/thread_HHmmss.zip` 是大量出现的标准线程日志压缩文件，
+    ///   文件路径本身已经足够让插件按线程日志规则命中，不需要再逐个解开内部 `.log`。
+    /// - 现场一个日期目录下可能有几千个这种 ZIP；跳过展开可以把“泛微日志分析”的等待时间从大量 I/O 降到路径匹配。
+    ///
+    /// 边界条件：
+    /// - 只跳过形态非常明确的线程日志 ZIP，普通业务压缩包、嵌套诊断包和其它日志压缩包仍继续按最多 5 层展开。
+    /// - 判断只基于当前授权树里的相对路径，不访问磁盘，也不影响用户在左侧树中手动打开该 ZIP。
+    fn should_skip_toolbar_archive_expansion(row_label: &str, relative_path: &str) -> bool {
+        if !row_label.to_ascii_lowercase().ends_with(".zip") {
+            return false;
+        }
+        let normalized_path = relative_path.replace('\\', "/").replace("!/", "/");
+        let segments = normalized_path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        if segments.len() < 2 {
+            return false;
+        }
+        let file_name = segments.last().copied().unwrap_or_default();
+        if !Self::is_thread_log_zip_name(file_name) {
+            return false;
+        }
+        let date_segment = segments
+            .get(segments.len().saturating_sub(2))
+            .copied()
+            .unwrap_or_default();
+        if Self::is_yyyy_mm_dd_segment(date_segment) {
+            return true;
+        }
+        segments.len() >= 3
+            && segments[segments.len() - 3].eq_ignore_ascii_case("monitorThread")
+            && Self::is_yyyymmdd_segment(date_segment)
+    }
+
+    /// 判断文件名是否符合泛微线程日志压缩文件格式。
+    fn is_thread_log_zip_name(file_name: &str) -> bool {
+        let lower = file_name.to_ascii_lowercase();
+        let Some(time_part) = lower
+            .strip_prefix("thread_")
+            .and_then(|name| name.strip_suffix(".zip"))
+        else {
+            return false;
+        };
+        time_part.len() == 6 && time_part.chars().all(|ch| ch.is_ascii_digit())
+    }
+
+    /// 判断路径片段是否是 `yyyyMMdd` 日期形状。
+    fn is_yyyymmdd_segment(segment: &str) -> bool {
+        segment.len() == 8 && segment.chars().all(|ch| ch.is_ascii_digit())
+    }
+
+    /// 判断路径片段是否是 `yyyy-MM-dd` 日期形状。
+    fn is_yyyy_mm_dd_segment(segment: &str) -> bool {
+        let bytes = segment.as_bytes();
+        bytes.len() == 10
+            && bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+    }
+
+    /// 继续展开压缩包成员本身。
+    ///
+    /// 业务意图：
+    /// - `scan_archive_with_progress` 服务左侧树展示，会把单文件内层压缩包当成可打开文件保留。
+    /// - 泛微扫描只关心路径命中，需要把这类文件继续作为压缩包读取目录，否则 `inner.zip!/memory_...log` 这类路径永远不会进入插件。
+    ///
+    /// 边界条件：
+    /// - 只读取已经由用户加载树授权的压缩包成员，不扩大到任意本地路径。
+    /// - 读取失败表示该成员不能作为压缩包展开，保留成员自身路径，不中断整个快照收集。
+    fn append_nested_archive_snapshot_entries(
+        node: &ArchiveScanNode,
+        nested_format: ArchiveFormat,
+        relative_path: &str,
+        max_archive_depth: usize,
+        current_archive_depth: usize,
+        seen_keys: &mut HashSet<String>,
+        files: &mut Vec<PluginLogFile>,
+    ) {
+        let Some(source) = node.source.as_ref() else {
+            return;
+        };
+        let Some(bytes) = Self::archive_snapshot_member_bytes(source) else {
+            return;
+        };
+        Self::append_archive_bytes_snapshot_entries(
+            &bytes,
+            nested_format,
+            &node.label,
+            relative_path,
+            max_archive_depth,
+            current_archive_depth,
+            seen_keys,
+            files,
+        );
+    }
+
+    /// 展开已经读入内存的压缩包字节。
+    ///
+    /// 业务意图：
+    /// - 该函数服务两种场景：左侧树中直接出现的压缩包成员，以及扫描树中发现的压缩包文件节点。
+    /// - 两者都已经处在用户授权范围内，区别只是来源模型不同，因此统一成“字节 + 展示标签”继续扫描。
+    fn append_archive_bytes_snapshot_entries(
+        archive_bytes: &[u8],
+        format: ArchiveFormat,
+        archive_label: &str,
+        relative_path: &str,
+        max_archive_depth: usize,
+        current_archive_depth: usize,
+        seen_keys: &mut HashSet<String>,
+        files: &mut Vec<PluginLogFile>,
+    ) {
+        let format = format.resolve_from_bytes(archive_bytes);
+        if format == ArchiveFormat::Gzip {
+            Self::append_nested_gzip_snapshot_entry(archive_label, relative_path, seen_keys, files);
+            return;
+        }
+
+        let Ok(temp_path) = write_temporary_nested_archive_bytes(archive_bytes, archive_label)
+        else {
+            return;
+        };
+        Self::append_archive_snapshot_entries_at_depth(
+            &temp_path,
+            format,
+            relative_path,
+            max_archive_depth,
+            current_archive_depth,
+            seen_keys,
+            files,
+        );
+        let _ = fs::remove_file(temp_path);
+    }
+
+    /// 为嵌套 GZIP 生成虚拟解压后文件路径。
+    ///
+    /// 业务意图：
+    /// - GZIP 没有目录表，左侧树会按“单文件压缩日志”处理；工具栏快照也应暴露去掉 `.gz` 后的日志名。
+    /// - 不能使用临时文件名推导展示名，否则会把随机时间戳带入 `stdout.log.gz!/stdout.log` 这类匹配路径。
+    fn append_nested_gzip_snapshot_entry(
+        archive_label: &str,
+        relative_path: &str,
+        seen_keys: &mut HashSet<String>,
+        files: &mut Vec<PluginLogFile>,
+    ) {
+        let member_path = single_gzip_member_path_for_archive(Path::new(archive_label));
+        let display_name = single_gzip_member_display_name(&member_path);
+        let nested_relative_path = format!("{relative_path}!/{display_name}");
+        let source_key = format!("archive-snapshot:{nested_relative_path}");
+        if seen_keys.insert(source_key.clone()) {
+            files.push(PluginLogFile {
+                source_key,
+                display_name,
+                path_label: nested_relative_path,
+                source_kind: "archive_member".to_string(),
+                node_kind: "file".to_string(),
+                read_path: None,
+                host_source: None,
+            });
+        }
+    }
+
+    /// 按指定压缩包深度扫描临时内层压缩包。
+    fn append_archive_snapshot_entries_at_depth(
+        archive_path: &Path,
+        format: ArchiveFormat,
+        relative_prefix: &str,
+        max_archive_depth: usize,
+        current_archive_depth: usize,
+        seen_keys: &mut HashSet<String>,
+        files: &mut Vec<PluginLogFile>,
+    ) {
+        let Ok(scan_result) = scan_archive_with_progress(archive_path, format, |_| {}) else {
+            return;
+        };
+        for node in &scan_result.children {
+            Self::append_archive_snapshot_node(
+                node,
+                relative_prefix,
+                max_archive_depth,
+                current_archive_depth,
+                seen_keys,
+                files,
+            );
+        }
+        for path in scan_result.temporary_paths {
+            if path.is_dir() {
+                let _ = fs::remove_dir_all(path);
+            } else {
+                cleanup_materialized_file(&path);
+            }
+        }
+    }
+
+    /// 读取压缩包快照节点对应的原始字节。
+    ///
+    /// 边界条件：
+    /// - `Materialized` 来源来自 7Z 扫描阶段的临时文件，在当前快照递归结束前仍然有效。
+    /// - RAR 内层成员需要真实路径，读取后必须立即删除临时文件，避免工具栏扫描留下垃圾文件。
+    fn archive_snapshot_member_bytes(source: &ArchiveMemberSource) -> Option<Vec<u8>> {
+        match source {
+            ArchiveMemberSource::Direct {
+                archive_path,
+                archive_format,
+                member_path,
+            } => read_archive_member(archive_path, *archive_format, member_path).ok(),
+            ArchiveMemberSource::Materialized { temp_path, .. } => fs::read(temp_path).ok(),
+            ArchiveMemberSource::Nested {
+                outer_archive_path,
+                outer_archive_format,
+                archive_member_path,
+                nested_archive_format,
+                nested_member_path,
+            } => {
+                let archive_bytes = read_archive_member(
+                    outer_archive_path,
+                    *outer_archive_format,
+                    archive_member_path,
+                )
+                .ok()?;
+                if *nested_archive_format == ArchiveFormat::Rar {
+                    let temp_path =
+                        write_temporary_nested_archive_bytes(&archive_bytes, archive_member_path)
+                            .ok()?;
+                    let result =
+                        read_archive_member(&temp_path, *nested_archive_format, nested_member_path)
+                            .ok();
+                    let _ = fs::remove_file(temp_path);
+                    result
+                } else {
+                    read_archive_member_from_bytes(
+                        &archive_bytes,
+                        *nested_archive_format,
+                        nested_member_path,
+                        archive_member_path,
+                    )
+                    .ok()
+                }
+            }
+        }
+    }
+
+    /// 读取当前日志来源对应的压缩包文件字节。
+    ///
+    /// 边界条件：
+    /// - 本地文件来源不走该函数，避免把真实磁盘压缩包整体读入内存。
+    /// - 对嵌套 RAR 的读取需要短暂落盘，读取完成立即删除临时文件。
+    fn log_source_snapshot_archive_bytes(source: &LogFileSource) -> Option<Vec<u8>> {
+        match source {
+            LogFileSource::LocalFile { .. } => None,
+            LogFileSource::ArchiveMember {
+                archive_path,
+                archive_format,
+                member_path,
+            } => read_archive_member(archive_path, *archive_format, member_path).ok(),
+            LogFileSource::MaterializedArchiveMember { temp_path, .. } => fs::read(temp_path).ok(),
+            LogFileSource::NestedArchiveMember {
+                outer_archive_path,
+                outer_archive_format,
+                archive_member_path,
+                nested_archive_format,
+                nested_member_path,
+            } => {
+                let archive_bytes = read_archive_member(
+                    outer_archive_path,
+                    *outer_archive_format,
+                    archive_member_path,
+                )
+                .ok()?;
+                if *nested_archive_format == ArchiveFormat::Rar {
+                    let temp_path =
+                        write_temporary_nested_archive_bytes(&archive_bytes, archive_member_path)
+                            .ok()?;
+                    let result =
+                        read_archive_member(&temp_path, *nested_archive_format, nested_member_path)
+                            .ok();
+                    let _ = fs::remove_file(temp_path);
+                    result
+                } else {
+                    read_archive_member_from_bytes(
+                        &archive_bytes,
+                        *nested_archive_format,
+                        nested_member_path,
+                        archive_member_path,
+                    )
+                    .ok()
+                }
+            }
+        }
+    }
+
+    /// 根据压缩包成员来源生成含 `!` 链路的相对路径。
+    fn archive_snapshot_relative_path(
+        relative_prefix: &str,
+        node: &ArchiveScanNode,
+    ) -> Option<String> {
+        let source = node.source.as_ref()?;
+        Some(match source {
+            ArchiveMemberSource::Direct { member_path, .. }
+            | ArchiveMemberSource::Materialized { member_path, .. } => {
+                format!("{relative_prefix}!/{member_path}")
+            }
+            ArchiveMemberSource::Nested {
+                archive_member_path,
+                nested_member_path,
+                ..
+            } => format!("{relative_prefix}!/{archive_member_path}!/{nested_member_path}"),
+        })
+    }
+
     /// 按右键菜单规则判断插件候选日志是否存在。
     ///
     /// 业务意图：
@@ -570,10 +1136,25 @@ impl LoadedLogTreeState {
         source: &LogFileSource,
         source_key: String,
     ) -> PluginLogFile {
+        Self::plugin_log_file_from_row_with_path(
+            row,
+            source,
+            source_key,
+            source_location_label(source),
+        )
+    }
+
+    /// 把加载树文件节点转换为插件协议日志元数据，并指定展示路径。
+    fn plugin_log_file_from_row_with_path(
+        row: &LoadedLogTreeRow,
+        source: &LogFileSource,
+        source_key: String,
+        path_label: String,
+    ) -> PluginLogFile {
         PluginLogFile {
             source_key,
             display_name: source.display_name(),
-            path_label: source_location_label(source),
+            path_label,
             source_kind: Self::plugin_source_kind_label(source).to_string(),
             node_kind: Self::plugin_node_kind_label(row.kind).to_string(),
             read_path: Self::plugin_read_path(source),
@@ -1779,7 +2360,8 @@ pub(in crate::app) enum MainNavigationTooltipAnchor {
 /// 设置窗口当前激活的页签。
 ///
 /// 业务意图：
-/// - 设置窗口按用户要求拆成“通用 / 日志 / 模型 / 插件 / 存储 / 关于”页签；状态放在主视图中，避免关闭窗口后当前会话选择丢失。
+/// - 设置窗口按用户要求拆成“通用 / 日志 / 模型 / 插件 / 存储 / 关于”等宿主固定页签；状态放在主视图中，避免关闭窗口后当前会话选择丢失。
+/// - 插件声明的设置页签不属于宿主固定页签，只在已启用插件贡献 `settings_tabs` 时通过 `PluginSettings` 路由承载。
 /// - 当前页签状态只存在于进程内，不写入配置文件；后续若需要记忆页签，应先定义设置持久化策略。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::app) enum SettingsTab {
@@ -1795,6 +2377,12 @@ pub(in crate::app) enum SettingsTab {
     /// - 插件管理会读写应用配置目录中的 JSON 注册表，因此作为独立页签呈现，避免和普通显示偏好混在一起。
     /// - 当前页签只管理插件元数据和进程入口，不允许插件直接改写日志或笔记数据。
     Plugin,
+    /// 插件声明式设置页签。
+    ///
+    /// 业务意图：
+    /// - 外部插件可以通过 manifest 声明轻量配置项；宿主集中渲染并保存到插件专属 JSON。
+    /// - 该枚举值只是内容路由，不在 `all()` 中作为固定页签出现，避免未加载插件时显示“泛微插件”。
+    PluginSettings,
     /// 存储页签，集中展示配置文件、数据库、插件目录和临时缓存位置。
     ///
     /// 业务意图：
@@ -1827,6 +2415,7 @@ impl SettingsTab {
             Self::Log => "日志",
             Self::Model => "模型",
             Self::Plugin => "插件",
+            Self::PluginSettings => "插件设置",
             Self::Storage => "存储",
             Self::About => "关于",
         }
@@ -1842,6 +2431,7 @@ impl SettingsTab {
             Self::Log => Icon::FileText,
             Self::Model => Icon::MonitorCog,
             Self::Plugin => Icon::FileArchive,
+            Self::PluginSettings => Icon::Settings,
             Self::Storage => Icon::Database,
             Self::About => Icon::Info,
         }

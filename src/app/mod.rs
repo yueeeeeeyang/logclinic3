@@ -13,7 +13,7 @@
 use std::{
     borrow::Cow,
     cell::RefCell,
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     env, fs,
     ops::{Deref, DerefMut, Range},
     path::{Path, PathBuf},
@@ -23,7 +23,11 @@ use std::{
 };
 
 use crate::archive::{
+    ArchiveFormat, ArchiveMemberSource, ArchiveScanEntryKind, ArchiveScanNode,
     cleanup_materialized_file, cleanup_stale_large_log_cache, materialize_source_for_paging,
+    read_archive_member, read_archive_member_from_bytes, scan_archive_with_progress,
+    single_gzip_member_display_name, single_gzip_member_path_for_archive,
+    write_temporary_nested_archive_bytes,
 };
 use crate::config::*;
 use crate::connections::*;

@@ -3618,6 +3618,7 @@ impl MainView {
             "ChartNoAxesCombined" => Icon::ChartNoAxesCombined,
             "FolderOpen" => Icon::FolderOpen,
             "FileText" => Icon::FileText,
+            "Settings" => Icon::Settings,
             "RefreshCw" => Icon::RefreshCw,
             "Trash2" => Icon::Trash2,
             _ => Icon::FileArchive,
@@ -3686,6 +3687,128 @@ impl MainView {
                             command_context,
                             Some(progress_sender),
                         )
+                    })
+                    .await;
+                app.update(move |app| {
+                    Self::handle_plugin_command_result_after_main_update(
+                        main_view,
+                        generation,
+                        origin_plugin,
+                        origin_log_sources,
+                        result,
+                        app,
+                    );
+                })
+                .ok();
+            })
+            .detach();
+    }
+
+    /// 从日志分析页工具栏调用插件命令。
+    ///
+    /// 业务意图：
+    /// - 工具栏插件面向当前整棵日志树，例如泛微日志分析需要扫描所有已加载路径，而不是右键选中项。
+    /// - 宿主负责把日志树快照和插件设置合并后传入，插件不能自行访问未加载目录或读取全局配置。
+    ///
+    /// 边界条件：
+    /// - 未加载日志树时不启动插件进程，避免用户误以为插件会扫描任意本地目录。
+    /// - 插件设置读取失败会回退 manifest 默认值；保存设置时的错误在设置页展示，不影响工具栏入口可用性。
+    pub(in crate::app) fn invoke_log_toolbar_plugin_action(
+        &mut self,
+        plugin_id: String,
+        toolbar_id: String,
+        command_id: String,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let Some(plugin) = self
+            .plugins
+            .definitions
+            .iter()
+            .find(|plugin| plugin.id == plugin_id && plugin.active())
+            .cloned()
+        else {
+            self.plugins.status_message = Some("插件未启用或加载失败，无法执行命令".to_string());
+            return;
+        };
+        let Some(manifest) = plugin.manifest.as_ref() else {
+            self.plugins.status_message = Some("插件 manifest 不可用，无法执行命令".to_string());
+            return;
+        };
+        let tree = match &self.log.load_state {
+            LogTreeLoadState::Loaded(tree_state) => tree_state.tree.clone(),
+            _ => {
+                self.plugins.status_message = Some("请先加载日志，再执行插件分析".to_string());
+                return;
+            }
+        };
+        let settings = load_plugin_settings(manifest);
+        let generation = self.plugins.begin_command_generation();
+        let title = format!("{} 正在处理", plugin.name);
+        let initial_progress = PluginCommandProgress {
+            message: format!("正在收集日志树快照：{}", plugin.name),
+            detail: Some("正在后台遍历当前加载的日志树和压缩包目录".to_string()),
+            done: 0,
+            total: None,
+            unit: Some("条目".to_string()),
+        };
+        let (progress_sender, progress_receiver) = mpsc::channel();
+        self.plugins.status_message = Some(initial_progress.message.clone());
+        let origin_plugin = Some(plugin.clone());
+        self.schedule_open_plugin_page_window_from_context(
+            context.entity(),
+            generation,
+            title.clone(),
+            Self::plugin_running_page(title, initial_progress),
+            origin_plugin.clone(),
+            BTreeMap::new(),
+            context,
+        );
+        self.spawn_plugin_progress_poller(generation, progress_receiver, context);
+        let main_view = context.entity();
+        let progress_sender_for_snapshot = progress_sender.clone();
+        let plugin_name_for_worker = plugin.name.clone();
+        context
+            .spawn(async move |_view, app| {
+                let (origin_log_sources, result) = app
+                    .background_executor()
+                    .spawn(async move {
+                        let _ = progress_sender_for_snapshot.send(PluginCommandProgress {
+                            message: format!("正在收集日志树快照：{}", plugin_name_for_worker),
+                            detail: Some("正在后台遍历当前加载的日志树和压缩包目录".to_string()),
+                            done: 0,
+                            total: None,
+                            unit: Some("条目".to_string()),
+                        });
+
+                        // 日志树快照会读取压缩包目录元数据，尤其是线程日志目录下的大量
+                        // `thread_*.zip`；放在后台线程执行，避免点击工具栏按钮后阻塞主窗口。
+                        let files =
+                            LoadedLogTreeState::plugin_log_files_for_toolbar_tree_snapshot(&tree);
+                        let origin_log_sources = Self::plugin_log_source_map(&files);
+                        let _ = progress_sender_for_snapshot.send(PluginCommandProgress {
+                            message: format!("正在执行插件：{}", plugin_name_for_worker),
+                            detail: Some(format!(
+                                "已收集 {} 个日志树条目，正在启动插件进程",
+                                files.len()
+                            )),
+                            done: 0,
+                            total: Some(files.len() as u64),
+                            unit: Some("条目".to_string()),
+                        });
+
+                        let command_context = PluginCommandContext::LogToolbarAction {
+                            toolbar_id,
+                            files,
+                            settings,
+                        };
+                        let result = invoke_plugin_command_with_progress(
+                            &plugin,
+                            &command_id,
+                            command_context,
+                            Some(progress_sender),
+                        );
+                        (origin_log_sources, result)
                     })
                     .await;
                 app.update(move |app| {

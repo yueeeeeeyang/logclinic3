@@ -2,7 +2,7 @@
 # 插件包名与 manifest ID 保持一致，方便打包脚本定位二进制并生成 ZIP。
 name = "weaver-logext"
 # 插件版本需要和 plugin.json 中的 version 同步；宿主只读取 manifest，不读取 Cargo 元数据。
-version = "0.2.0"
+version = "0.3.0"
 # 插件独立于主程序编译，但仍使用稳定 Rust 2024 edition。
 edition = "2024"
 
