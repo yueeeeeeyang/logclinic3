@@ -233,11 +233,16 @@ pub(in crate::app) struct ConnectionsWorkspaceState {
     pub(in crate::app) database_path: Option<PathBuf>,
     /// SSH 连接配置列表，来自独立 SQLite。
     pub(in crate::app) profiles: Vec<ConnectionProfile>,
+    /// SMB 连接配置列表，来自独立 SQLite；SMB 不创建终端 tab，点击后直接打开文件管理窗口。
+    pub(in crate::app) smb_profiles: Vec<SmbConnectionProfile>,
     /// 连接分类列表，来自独立 SQLite；根层是虚拟节点，不包含在该列表中。
     pub(in crate::app) categories: Vec<ConnectionCategory>,
     /// 数据库初始化或读取错误，中文展示给用户。
     pub(in crate::app) database_error: Option<String>,
-    /// 左侧当前选中的连接 ID；只影响高亮和编辑/删除默认目标。
+    /// 左侧当前选中的连接 key；只影响高亮和编辑/删除默认目标。
+    ///
+    /// 业务意图：
+    /// - SSH 与 SMB 分别写入不同表，可能存在相同裸 ID；选中态使用 `ssh:<id>` / `smb:<id>` 避免协议类型丢失。
     pub(in crate::app) selected_profile_id: Option<String>,
     /// 左侧连接树已展开分类 ID 集合；搜索模式会临时展开匹配祖先但不写入该集合。
     pub(in crate::app) expanded_category_ids: HashSet<String>,
@@ -291,6 +296,8 @@ pub(in crate::app) struct ConnectionsWorkspaceState {
     pub(in crate::app) terminal_context_menu: Option<ConnectionTerminalContextMenu>,
     /// 新增/编辑连接弹窗状态。
     pub(in crate::app) dialog: Option<ConnectionDialogState>,
+    /// 新增/编辑 SMB 连接弹窗状态。
+    pub(in crate::app) smb_dialog: Option<SmbConnectionDialogState>,
     /// 新增/编辑分类弹窗状态。
     pub(in crate::app) category_dialog: Option<ConnectionCategoryDialogState>,
     /// 删除连接确认弹窗状态。
@@ -313,25 +320,39 @@ impl ConnectionsWorkspaceState {
     /// - 数据库不可用时保留空列表和错误消息，主窗口仍然可以打开日志、笔记、HPROF 和 AI 页。
     pub(in crate::app) fn load_or_initialize(context: &mut Context<MainView>) -> Self {
         let database_path = connections_database_path();
-        let (profiles, categories, database_error) = match database_path.as_ref() {
+        let (profiles, smb_profiles, categories, database_error) = match database_path.as_ref() {
             Some(path) => match (
                 load_connection_profiles(path),
+                load_smb_connection_profiles(path),
                 load_connection_categories(path),
             ) {
-                (Ok(profiles), Ok(categories)) => (profiles, categories, None),
-                (Err(error), _) | (_, Err(error)) => (Vec::new(), Vec::new(), Some(error)),
+                (Ok(profiles), Ok(smb_profiles), Ok(categories)) => {
+                    (profiles, smb_profiles, categories, None)
+                }
+                (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                    (Vec::new(), Vec::new(), Vec::new(), Some(error))
+                }
             },
             None => (
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Some("无法定位应用配置目录，连接配置不会被加载".to_string()),
             ),
         };
-        let selected_profile_id = profiles.first().map(|profile| profile.id.clone());
+        let selected_profile_id = profiles
+            .first()
+            .map(|profile| ConnectionProfileKey::ssh(&profile.id))
+            .or_else(|| {
+                smb_profiles
+                    .first()
+                    .map(|profile| ConnectionProfileKey::smb(&profile.id))
+            });
 
         Self {
             database_path,
             profiles,
+            smb_profiles,
             categories,
             database_error,
             selected_profile_id,
@@ -350,6 +371,7 @@ impl ConnectionsWorkspaceState {
             tab_context_menu: None,
             terminal_context_menu: None,
             dialog: None,
+            smb_dialog: None,
             category_dialog: None,
             delete_confirm_dialog: None,
             category_delete_confirm_dialog: None,
@@ -362,6 +384,16 @@ impl ConnectionsWorkspaceState {
     /// 根据连接 ID 查找配置。
     pub(in crate::app) fn profile_by_id(&self, profile_id: &str) -> Option<&ConnectionProfile> {
         self.profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+    }
+
+    /// 根据 SMB 连接 ID 查找配置。
+    pub(in crate::app) fn smb_profile_by_id(
+        &self,
+        profile_id: &str,
+    ) -> Option<&SmbConnectionProfile> {
+        self.smb_profiles
             .iter()
             .find(|profile| profile.id == profile_id)
     }
@@ -389,11 +421,24 @@ impl ConnectionsWorkspaceState {
         format!("地址：{}:{}", profile.host, profile.port)
     }
 
+    /// 生成 SMB 连接 hover 气泡展示的用户文案。
+    pub(in crate::app) fn smb_profile_tooltip_user_label(profile: &SmbConnectionProfile) -> String {
+        format!("用户：{}", profile.username)
+    }
+
+    /// 生成 SMB 连接 hover 气泡展示的地址文案。
+    pub(in crate::app) fn smb_profile_tooltip_address_label(
+        profile: &SmbConnectionProfile,
+    ) -> String {
+        format!("地址：{}:{}/{}", profile.host, profile.port, profile.share)
+    }
+
     /// 重新加载 SQLite 中的连接和分类列表。
     pub(in crate::app) fn reload_tree_data(&mut self) {
         let Some(path) = self.database_path.as_ref() else {
             self.database_error = Some("无法定位应用配置目录，连接配置不会被加载".to_string());
             self.profiles.clear();
+            self.smb_profiles.clear();
             self.categories.clear();
             self.selected_profile_id = None;
             return;
@@ -401,11 +446,13 @@ impl ConnectionsWorkspaceState {
 
         match (
             load_connection_profiles(path),
+            load_smb_connection_profiles(path),
             load_connection_categories(path),
         ) {
-            (Ok(profiles), Ok(categories)) => {
+            (Ok(profiles), Ok(smb_profiles), Ok(categories)) => {
                 self.database_error = None;
                 self.profiles = profiles;
+                self.smb_profiles = smb_profiles;
                 self.categories = categories;
                 self.expanded_category_ids.retain(|category_id| {
                     self.categories
@@ -413,13 +460,21 @@ impl ConnectionsWorkspaceState {
                         .any(|category| &category.id == category_id)
                 });
                 if let Some(selected) = self.selected_profile_id.as_ref()
-                    && self.profiles.iter().any(|profile| &profile.id == selected)
+                    && connection_profile_key_exists(selected, &self.profiles, &self.smb_profiles)
                 {
                     return;
                 }
-                self.selected_profile_id = self.profiles.first().map(|profile| profile.id.clone());
+                self.selected_profile_id = self
+                    .profiles
+                    .first()
+                    .map(|profile| ConnectionProfileKey::ssh(&profile.id))
+                    .or_else(|| {
+                        self.smb_profiles
+                            .first()
+                            .map(|profile| ConnectionProfileKey::smb(&profile.id))
+                    });
             }
-            (Err(error), _) | (_, Err(error)) => {
+            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
                 self.database_error = Some(error);
             }
         }
@@ -563,6 +618,62 @@ impl ConnectionTreeSearchState {
     }
 }
 
+/// 左侧连接树中的连接类型。
+///
+/// 业务意图：
+/// - SSH 点击后打开终端 tab，SMB 点击后打开文件管理窗口；树行、右键菜单和选中态必须携带协议类型。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::app) enum ConnectionProfileKind {
+    /// SSH 连接。
+    Ssh,
+    /// SMB 文件共享连接。
+    Smb,
+}
+
+/// 左侧连接树连接 key。
+///
+/// 业务意图：
+/// - 不同协议写入不同 SQLite 表，裸 ID 不能单独作为 UI 动作目标；key 使用稳定文本便于 existing GPUI 状态直接保存。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::app) struct ConnectionProfileKey;
+
+impl ConnectionProfileKey {
+    /// 构造 SSH key。
+    pub(in crate::app) fn ssh(id: &str) -> String {
+        format!("ssh:{id}")
+    }
+
+    /// 构造 SMB key。
+    pub(in crate::app) fn smb(id: &str) -> String {
+        format!("smb:{id}")
+    }
+
+    /// 解析连接 key。
+    pub(in crate::app) fn parse(key: &str) -> Option<(ConnectionProfileKind, &str)> {
+        if let Some(id) = key.strip_prefix("ssh:") {
+            Some((ConnectionProfileKind::Ssh, id))
+        } else {
+            key.strip_prefix("smb:")
+                .map(|id| (ConnectionProfileKind::Smb, id))
+        }
+    }
+}
+
+/// 判断连接 key 是否仍然存在。
+pub(super) fn connection_profile_key_exists(
+    key: &str,
+    profiles: &[ConnectionProfile],
+    smb_profiles: &[SmbConnectionProfile],
+) -> bool {
+    match ConnectionProfileKey::parse(key) {
+        Some((ConnectionProfileKind::Ssh, id)) => profiles.iter().any(|profile| profile.id == id),
+        Some((ConnectionProfileKind::Smb, id)) => {
+            smb_profiles.iter().any(|profile| profile.id == id)
+        }
+        None => false,
+    }
+}
+
 /// 新建连接菜单中的连接类型。
 ///
 /// 业务意图：
@@ -572,6 +683,8 @@ impl ConnectionTreeSearchState {
 pub(in crate::app) enum ConnectionCreateKind {
     /// SSH 远程连接。
     Ssh,
+    /// SMB 文件共享连接。
+    Smb,
     /// 本机 shell 终端，不保存连接配置。
     LocalTerminal,
     /// 新建连接分类。
@@ -584,6 +697,7 @@ pub(in crate::app) enum ConnectionCreateKind {
 /// - SSH 放在第一项，保持已有用户路径不变；本地终端作为无需配置的快捷入口紧随其后。
 pub(in crate::app) const CONNECTION_CREATE_KINDS: &[ConnectionCreateKind] = &[
     ConnectionCreateKind::Ssh,
+    ConnectionCreateKind::Smb,
     ConnectionCreateKind::LocalTerminal,
     ConnectionCreateKind::Category,
 ];
@@ -593,6 +707,7 @@ impl ConnectionCreateKind {
     pub(in crate::app) const fn label(self) -> &'static str {
         match self {
             Self::Ssh => "SSH 连接",
+            Self::Smb => "SMB 连接",
             Self::LocalTerminal => "本地终端",
             Self::Category => "新建分类",
         }
@@ -602,6 +717,7 @@ impl ConnectionCreateKind {
     pub(in crate::app) const fn icon(self) -> Icon {
         match self {
             Self::Ssh => Icon::Terminal,
+            Self::Smb => Icon::HardDrive,
             Self::LocalTerminal => Icon::SquareTerminal,
             Self::Category => Icon::FolderPlus,
         }
@@ -610,7 +726,7 @@ impl ConnectionCreateKind {
 
 /// 左侧连接行右键菜单状态。
 pub(in crate::app) struct ConnectionProfileContextMenu {
-    /// 菜单目标连接 ID。
+    /// 菜单目标连接 key。
     pub(in crate::app) profile_id: String,
     /// 菜单在连接侧栏内部的横坐标。
     pub(in crate::app) x: f32,
@@ -624,7 +740,7 @@ pub(in crate::app) struct ConnectionProfileContextMenu {
 /// - 用户需要快速确认连接的用户名和主机地址，但这些信息不应长期占用连接列表空间。
 /// - 坐标保存在左侧栏局部坐标中，渲染时可以直接作为侧栏绝对定位浮层使用。
 pub(in crate::app) struct ConnectionProfileHoverTooltip {
-    /// 悬浮目标连接 ID。
+    /// 悬浮目标连接 key。
     pub(in crate::app) profile_id: String,
     /// 气泡在连接侧栏内部的横坐标。
     pub(in crate::app) x: f32,
@@ -839,6 +955,112 @@ impl Drop for ConnectionDialogState {
     }
 }
 
+/// 新增/编辑 SMB 连接弹窗状态。
+pub(in crate::app) struct SmbConnectionDialogState {
+    /// 弹窗模式。
+    pub(in crate::app) mode: ConnectionDialogMode,
+    /// 表单错误消息。
+    pub(in crate::app) error: Option<String>,
+    /// 名称输入状态。
+    pub(in crate::app) name: ConnectionFormTextFieldState,
+    /// SMB 地址输入状态。
+    pub(in crate::app) address: ConnectionFormTextFieldState,
+    /// 用户名输入状态。
+    pub(in crate::app) username: ConnectionFormTextFieldState,
+    /// 当前选择的分类 ID；`None` 表示根层无分类。
+    pub(in crate::app) category_id: Option<String>,
+    /// 分类 Select 是否展开。
+    pub(in crate::app) category_select_open: bool,
+    /// 密码输入状态；编辑时为空表示不修改旧密码。
+    pub(in crate::app) password: ConnectionFormTextFieldState,
+}
+
+impl SmbConnectionDialogState {
+    /// 创建新增 SMB 连接弹窗。
+    pub(in crate::app) fn create(context: &mut Context<MainView>) -> Self {
+        Self {
+            mode: ConnectionDialogMode::Create,
+            error: None,
+            name: ConnectionFormTextFieldState::new(String::new(), context),
+            address: ConnectionFormTextFieldState::new(String::new(), context),
+            username: ConnectionFormTextFieldState::new(String::new(), context),
+            category_id: None,
+            category_select_open: false,
+            password: ConnectionFormTextFieldState::new(String::new(), context),
+        }
+    }
+
+    /// 创建编辑 SMB 连接弹窗。
+    pub(in crate::app) fn edit(
+        profile: &SmbConnectionProfile,
+        context: &mut Context<MainView>,
+    ) -> Self {
+        let address = ParsedSmbAddress {
+            host: profile.host.clone(),
+            port: profile.port,
+            share: profile.share.clone(),
+            initial_path: profile.initial_path.clone(),
+        }
+        .to_address_text();
+        Self {
+            mode: ConnectionDialogMode::Edit {
+                profile_id: profile.id.clone(),
+            },
+            error: None,
+            name: ConnectionFormTextFieldState::new(profile.name.clone(), context),
+            address: ConnectionFormTextFieldState::new(address, context),
+            username: ConnectionFormTextFieldState::new(profile.username.clone(), context),
+            category_id: profile.category_id.clone(),
+            category_select_open: false,
+            password: ConnectionFormTextFieldState::new(String::new(), context),
+        }
+    }
+
+    /// 生成保存校验使用的纯 SMB 连接草稿。
+    pub(in crate::app) fn to_profile_draft(&self) -> SmbConnectionProfileDraft {
+        SmbConnectionProfileDraft {
+            name: self.name.input.text.clone(),
+            address: self.address.input.text.clone(),
+            username: self.username.input.text.clone(),
+            category_id: self.category_id.clone(),
+            password: self.password.input.text.clone(),
+        }
+    }
+
+    /// 返回指定 SMB 字段的输入状态。
+    pub(in crate::app) fn field(
+        &self,
+        field: SmbConnectionFormField,
+    ) -> &ConnectionFormTextFieldState {
+        match field {
+            SmbConnectionFormField::Name => &self.name,
+            SmbConnectionFormField::Address => &self.address,
+            SmbConnectionFormField::Username => &self.username,
+            SmbConnectionFormField::Password => &self.password,
+        }
+    }
+
+    /// 返回指定 SMB 字段的可变输入状态。
+    pub(in crate::app) fn field_mut(
+        &mut self,
+        field: SmbConnectionFormField,
+    ) -> &mut ConnectionFormTextFieldState {
+        match field {
+            SmbConnectionFormField::Name => &mut self.name,
+            SmbConnectionFormField::Address => &mut self.address,
+            SmbConnectionFormField::Username => &mut self.username,
+            SmbConnectionFormField::Password => &mut self.password,
+        }
+    }
+}
+
+impl Drop for SmbConnectionDialogState {
+    /// 弹窗销毁时清理 SMB 密码明文。
+    fn drop(&mut self) {
+        self.password.input.text.zeroize();
+    }
+}
+
 /// 连接表单单行输入状态。
 ///
 /// 业务意图：
@@ -913,6 +1135,19 @@ pub(in crate::app) enum ConnectionFormField {
     Password,
 }
 
+/// SMB 连接表单字段。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::app) enum SmbConnectionFormField {
+    /// 名称。
+    Name,
+    /// 地址。
+    Address,
+    /// 用户名。
+    Username,
+    /// 密码。
+    Password,
+}
+
 /// 新增/编辑分类弹窗状态。
 pub(in crate::app) struct ConnectionCategoryDialogState {
     /// 弹窗模式。
@@ -975,7 +1210,7 @@ pub(in crate::app) enum ConnectionCategoryDialogMode {
 
 /// 删除连接确认弹窗。
 pub(in crate::app) struct ConnectionDeleteConfirmDialog {
-    /// 待删除连接 ID。
+    /// 待删除连接 key。
     pub(in crate::app) profile_id: String,
     /// 待删除连接名称，用于确认文案。
     pub(in crate::app) profile_name: String,
@@ -1019,10 +1254,72 @@ pub(in crate::app) enum ConnectionTreeRow {
     /// 连接行。
     Profile {
         /// 连接快照。
-        profile: ConnectionProfile,
+        profile: ConnectionTreeProfile,
         /// 树形缩进层级。
         depth: usize,
     },
+}
+
+/// 左侧连接树中的连接快照。
+///
+/// 业务意图：
+/// - 树构建和渲染需要统一处理 SSH/SMB 名称、分类、排序和搜索，同时保留具体协议类型用于点击动作分发。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::app) enum ConnectionTreeProfile {
+    /// SSH 连接。
+    Ssh(ConnectionProfile),
+    /// SMB 连接。
+    Smb(SmbConnectionProfile),
+}
+
+impl ConnectionTreeProfile {
+    /// 返回连接 key。
+    pub(in crate::app) fn key(&self) -> String {
+        match self {
+            Self::Ssh(profile) => ConnectionProfileKey::ssh(&profile.id),
+            Self::Smb(profile) => ConnectionProfileKey::smb(&profile.id),
+        }
+    }
+
+    /// 返回裸连接 ID。
+    pub(in crate::app) fn id(&self) -> &str {
+        match self {
+            Self::Ssh(profile) => &profile.id,
+            Self::Smb(profile) => &profile.id,
+        }
+    }
+
+    /// 返回连接名称。
+    pub(in crate::app) fn name(&self) -> &str {
+        match self {
+            Self::Ssh(profile) => &profile.name,
+            Self::Smb(profile) => &profile.name,
+        }
+    }
+
+    /// 返回连接所属分类。
+    fn category_id(&self) -> Option<&str> {
+        match self {
+            Self::Ssh(profile) => profile.category_id.as_deref(),
+            Self::Smb(profile) => profile.category_id.as_deref(),
+        }
+    }
+
+    /// 返回更新时间，供同一分类下混合协议排序。
+    fn updated_at_ms(&self) -> i64 {
+        match self {
+            Self::Ssh(profile) => profile.updated_at_ms,
+            Self::Smb(profile) => profile.updated_at_ms,
+        }
+    }
+
+    /// 返回连接图标。
+    pub(in crate::app) fn icon(&self) -> Icon {
+        match self {
+            Self::Ssh(_) => Icon::Terminal,
+            Self::Smb(_) => Icon::HardDrive,
+        }
+    }
 }
 
 /// 根据分类、连接、展开状态和搜索词生成左侧连接树行。
@@ -1037,11 +1334,24 @@ pub(in crate::app) enum ConnectionTreeRow {
 pub(in crate::app) fn build_connection_tree_rows(
     categories: &[ConnectionCategory],
     profiles: &[ConnectionProfile],
+    smb_profiles: &[SmbConnectionProfile],
     expanded_category_ids: &HashSet<String>,
     search_query: &str,
 ) -> Vec<ConnectionTreeRow> {
     let normalized_query = search_query.trim().to_lowercase();
     let searching = !normalized_query.is_empty();
+    let mut all_profiles = profiles
+        .iter()
+        .cloned()
+        .map(ConnectionTreeProfile::Ssh)
+        .chain(smb_profiles.iter().cloned().map(ConnectionTreeProfile::Smb))
+        .collect::<Vec<_>>();
+    all_profiles.sort_by(|left, right| {
+        right
+            .updated_at_ms()
+            .cmp(&left.updated_at_ms())
+            .then_with(|| left.name().cmp(right.name()))
+    });
     let mut rows = Vec::new();
     let mut visited = HashSet::new();
 
@@ -1049,7 +1359,7 @@ pub(in crate::app) fn build_connection_tree_rows(
         None,
         0,
         categories,
-        profiles,
+        &all_profiles,
         expanded_category_ids,
         searching,
         &normalized_query,
@@ -1063,7 +1373,7 @@ fn build_connection_tree_rows_for_parent(
     parent_id: Option<&str>,
     depth: usize,
     categories: &[ConnectionCategory],
-    profiles: &[ConnectionProfile],
+    profiles: &[ConnectionTreeProfile],
     expanded_category_ids: &HashSet<String>,
     searching: bool,
     normalized_query: &str,
@@ -1109,7 +1419,7 @@ fn build_connection_tree_rows_for_parent(
 
     for profile in profiles.iter().filter(|profile| {
         connection_profile_visible_under_parent(profile, parent_id, categories)
-            && (!searching || profile.name.to_lowercase().contains(normalized_query))
+            && (!searching || profile.name().to_lowercase().contains(normalized_query))
     }) {
         rows.push(ConnectionTreeRow::Profile {
             profile: profile.clone(),
@@ -1132,11 +1442,11 @@ fn connection_category_visible_under_parent(
 }
 
 fn connection_profile_visible_under_parent(
-    profile: &ConnectionProfile,
+    profile: &ConnectionTreeProfile,
     parent_id: Option<&str>,
     categories: &[ConnectionCategory],
 ) -> bool {
-    match (profile.category_id.as_deref(), parent_id) {
+    match (profile.category_id(), parent_id) {
         (None, None) => true,
         (Some(category_id), Some(expected)) => category_id == expected,
         (Some(category_id), None) => !categories.iter().any(|category| category.id == category_id),
@@ -1146,7 +1456,7 @@ fn connection_profile_visible_under_parent(
 
 fn connection_category_has_matching_profile(
     categories: &[ConnectionCategory],
-    profiles: &[ConnectionProfile],
+    profiles: &[ConnectionTreeProfile],
     category_id: &str,
     normalized_query: &str,
     visited: &mut HashSet<String>,
@@ -1155,8 +1465,8 @@ fn connection_category_has_matching_profile(
         return false;
     }
     profiles.iter().any(|profile| {
-        profile.category_id.as_deref() == Some(category_id)
-            && profile.name.to_lowercase().contains(normalized_query)
+        profile.category_id() == Some(category_id)
+            && profile.name().to_lowercase().contains(normalized_query)
     }) || categories.iter().any(|category| {
         category.parent_id.as_deref() == Some(category_id)
             && connection_category_has_matching_profile(
@@ -1702,6 +2012,24 @@ mod tests {
         }
     }
 
+    /// 构造连接树测试 SMB 连接。
+    fn test_smb_profile(id: &str, name: &str, category_id: Option<&str>) -> SmbConnectionProfile {
+        SmbConnectionProfile {
+            id: id.to_string(),
+            name: name.to_string(),
+            host: "fileserver".to_string(),
+            port: DEFAULT_SMB_PORT,
+            share: "logs".to_string(),
+            initial_path: "/".to_string(),
+            username: "root".to_string(),
+            category_id: category_id.map(ToString::to_string),
+            encrypted_password: "v1:nonce:cipher".to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            last_connected_at_ms: None,
+        }
+    }
+
     /// 验证终端输出会进入 alacritty grid。
     #[test]
     fn 终端模拟器可以解析普通输出() {
@@ -1779,16 +2107,17 @@ mod tests {
         assert_eq!(CONNECTIONS_TOOLBAR_HEIGHT, TOOLBAR_HEIGHT);
     }
 
-    /// 验证新建连接菜单同时暴露 SSH 和本地终端类型。
+    /// 验证新建连接菜单同时暴露 SSH、SMB、本地终端和分类入口。
     ///
     /// 业务风险：
     /// - 如果新增按钮再次直接绑定某一种连接，用户将无法从菜单打开无需配置的本地终端。
     #[test]
-    fn 新建连接类型菜单保留_ssh_和本地终端入口() {
+    fn 新建连接类型菜单保留_ssh_smb_和本地终端入口() {
         assert_eq!(
             CONNECTION_CREATE_KINDS,
             &[
                 ConnectionCreateKind::Ssh,
+                ConnectionCreateKind::Smb,
                 ConnectionCreateKind::LocalTerminal,
                 ConnectionCreateKind::Category
             ]
@@ -1798,6 +2127,11 @@ mod tests {
         assert_eq!(
             char::from(ConnectionCreateKind::Ssh.icon()),
             char::from(Icon::Terminal)
+        );
+        assert_eq!(ConnectionCreateKind::Smb.label(), "SMB 连接");
+        assert_eq!(
+            char::from(ConnectionCreateKind::Smb.icon()),
+            char::from(Icon::HardDrive)
         );
         assert_eq!(ConnectionCreateKind::LocalTerminal.label(), "本地终端");
         assert_eq!(
@@ -1825,7 +2159,7 @@ mod tests {
         ];
         let expanded = HashSet::from(["生产".to_string()]);
 
-        let rows = build_connection_tree_rows(&categories, &profiles, &expanded, "");
+        let rows = build_connection_tree_rows(&categories, &profiles, &[], &expanded, "");
         let labels = rows
             .iter()
             .map(|row| match row {
@@ -1835,7 +2169,7 @@ mod tests {
                     format!("C{depth}:{}", category.name)
                 }
                 ConnectionTreeRow::Profile { profile, depth } => {
-                    format!("P{depth}:{}", profile.name)
+                    format!("P{depth}:{}", profile.name())
                 }
             })
             .collect::<Vec<_>>();
@@ -1858,7 +2192,8 @@ mod tests {
             test_profile("conn-east", "Redis 主库", Some("华东")),
             test_profile("conn-test", "普通连接", Some("测试")),
         ];
-        let rows = build_connection_tree_rows(&categories, &profiles, &HashSet::new(), "redis");
+        let rows =
+            build_connection_tree_rows(&categories, &profiles, &[], &HashSet::new(), "redis");
         let labels = rows
             .iter()
             .map(|row| match row {
@@ -1870,7 +2205,7 @@ mod tests {
                     format!("C{depth}:{}:{expanded}", category.name)
                 }
                 ConnectionTreeRow::Profile { profile, depth } => {
-                    format!("P{depth}:{}", profile.name)
+                    format!("P{depth}:{}", profile.name())
                 }
             })
             .collect::<Vec<_>>();
@@ -1886,9 +2221,35 @@ mod tests {
     fn 连接树搜索不匹配分类名称() {
         let categories = vec![test_category("Redis 分类", None, 1)];
         let profiles = vec![test_profile("conn-1", "普通连接", Some("Redis 分类"))];
-        let rows = build_connection_tree_rows(&categories, &profiles, &HashSet::new(), "redis");
+        let rows =
+            build_connection_tree_rows(&categories, &profiles, &[], &HashSet::new(), "redis");
 
         assert!(rows.is_empty());
+    }
+
+    /// 验证连接树会混合展示 SSH 与 SMB 连接，并继续只按连接名称搜索。
+    #[test]
+    fn 连接树混合展示_ssh_和_smb_连接() {
+        let categories = vec![test_category("文件服务", None, 1)];
+        let profiles = vec![test_profile("ssh-1", "SSH 主机", None)];
+        let smb_profiles = vec![test_smb_profile("smb-1", "SMB 共享", Some("文件服务"))];
+        let expanded = HashSet::from(["文件服务".to_string()]);
+
+        let rows =
+            build_connection_tree_rows(&categories, &profiles, &smb_profiles, &expanded, "smb");
+        let labels = rows
+            .iter()
+            .map(|row| match row {
+                ConnectionTreeRow::Category {
+                    category, depth, ..
+                } => format!("C{depth}:{}", category.name),
+                ConnectionTreeRow::Profile { profile, depth } => {
+                    format!("P{depth}:{}", profile.name())
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(labels, vec!["C0:文件服务", "P1:SMB 共享"]);
     }
 
     /// 验证连接详情气泡只负责展示用户和地址信息。

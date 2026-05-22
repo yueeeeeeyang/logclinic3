@@ -39,6 +39,7 @@ pub(crate) fn open_connections_database(path: &Path) -> Result<Connection, Strin
 /// 边界条件：
 /// - `user_version` 大于当前版本时说明数据库来自未来版本，不能安全降级读取，直接返回中文错误。
 /// - v1 数据库只有 SSH 连接表；升级到 v2 时新增分类表和连接的 `category_id` 列，旧连接默认继续显示在根层。
+/// - v3 新增 SMB 连接表；旧数据库升级后没有 SMB 连接，分类删除校验会同时检查 SSH 和 SMB 两类连接。
 pub(crate) fn initialize_connections_database(connection: &Connection) -> Result<(), String> {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -77,6 +78,23 @@ pub(crate) fn initialize_connections_database(connection: &Connection) -> Result
             );
             CREATE INDEX IF NOT EXISTS idx_ssh_connections_updated_at
                 ON ssh_connections(updated_at_ms DESC);
+
+            CREATE TABLE IF NOT EXISTS smb_connections (
+                id TEXT PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL,
+                host TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                share TEXT NOT NULL,
+                initial_path TEXT NOT NULL,
+                username TEXT NOT NULL,
+                category_id TEXT,
+                encrypted_password TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                last_connected_at_ms INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_smb_connections_updated_at
+                ON smb_connections(updated_at_ms DESC);
             "#,
         )
         .map_err(|error| format!("初始化连接数据库失败：{error}"))?;
@@ -95,6 +113,16 @@ pub(crate) fn initialize_connections_database(connection: &Connection) -> Result
             r#"
             CREATE INDEX IF NOT EXISTS idx_ssh_connections_category_updated
                 ON ssh_connections(category_id, updated_at_ms DESC)
+            "#,
+            [],
+        )
+        .map_err(|error| format!("初始化连接分类索引失败：{error}"))?;
+
+    connection
+        .execute(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_smb_connections_category_updated
+                ON smb_connections(category_id, updated_at_ms DESC)
             "#,
             [],
         )
@@ -198,6 +226,47 @@ pub(crate) fn load_connection_profiles(path: &Path) -> Result<Vec<ConnectionProf
         .map_err(|error| format!("解析连接列表失败：{error}"))
 }
 
+/// 加载 SMB 连接列表。
+pub(crate) fn load_smb_connection_profiles(
+    path: &Path,
+) -> Result<Vec<SmbConnectionProfile>, String> {
+    let connection = open_connections_database(path)?;
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT id, name, host, port, share, initial_path, username, category_id,
+                   encrypted_password, created_at_ms, updated_at_ms, last_connected_at_ms
+            FROM smb_connections
+            ORDER BY updated_at_ms DESC, created_at_ms DESC
+            "#,
+        )
+        .map_err(|error| format!("读取 SMB 连接列表失败：{error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            let port_i64: i64 = row.get(3)?;
+            let port = u16::try_from(port_i64)
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, port_i64))?;
+            Ok(SmbConnectionProfile {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                host: row.get(2)?,
+                port,
+                share: row.get(4)?,
+                initial_path: row.get(5)?,
+                username: row.get(6)?,
+                category_id: row.get(7)?,
+                encrypted_password: row.get(8)?,
+                created_at_ms: row.get(9)?,
+                updated_at_ms: row.get(10)?,
+                last_connected_at_ms: row.get(11)?,
+            })
+        })
+        .map_err(|error| format!("读取 SMB 连接列表失败：{error}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 SMB 连接列表失败：{error}"))
+}
+
 /// 新增 SSH 连接。
 pub(crate) fn insert_connection_profile(
     path: &Path,
@@ -227,6 +296,39 @@ pub(crate) fn insert_connection_profile(
             ],
         )
         .map_err(|error| format!("保存连接失败：{error}"))?;
+    Ok(())
+}
+
+/// 新增 SMB 连接。
+pub(crate) fn insert_smb_connection_profile(
+    path: &Path,
+    profile: &SmbConnectionProfile,
+) -> Result<(), String> {
+    let connection = open_connections_database(path)?;
+    connection
+        .execute(
+            r#"
+            INSERT INTO smb_connections
+                (id, name, host, port, share, initial_path, username, category_id,
+                 encrypted_password, created_at_ms, updated_at_ms, last_connected_at_ms)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "#,
+            params![
+                profile.id,
+                profile.name,
+                profile.host,
+                i64::from(profile.port),
+                profile.share,
+                profile.initial_path,
+                profile.username,
+                profile.category_id,
+                profile.encrypted_password,
+                profile.created_at_ms,
+                profile.updated_at_ms,
+                profile.last_connected_at_ms,
+            ],
+        )
+        .map_err(|error| format!("保存 SMB 连接失败：{error}"))?;
     Ok(())
 }
 
@@ -265,6 +367,46 @@ pub(crate) fn update_connection_profile(
             ],
         )
         .map_err(|error| format!("更新连接失败：{error}"))?;
+    Ok(())
+}
+
+/// 更新 SMB 连接。
+pub(crate) fn update_smb_connection_profile(
+    path: &Path,
+    profile: &SmbConnectionProfile,
+) -> Result<(), String> {
+    let connection = open_connections_database(path)?;
+    connection
+        .execute(
+            r#"
+            UPDATE smb_connections
+            SET name = ?2,
+                host = ?3,
+                port = ?4,
+                share = ?5,
+                initial_path = ?6,
+                username = ?7,
+                category_id = ?8,
+                encrypted_password = ?9,
+                updated_at_ms = ?10,
+                last_connected_at_ms = ?11
+            WHERE id = ?1
+            "#,
+            params![
+                profile.id,
+                profile.name,
+                profile.host,
+                i64::from(profile.port),
+                profile.share,
+                profile.initial_path,
+                profile.username,
+                profile.category_id,
+                profile.encrypted_password,
+                profile.updated_at_ms,
+                profile.last_connected_at_ms,
+            ],
+        )
+        .map_err(|error| format!("更新 SMB 连接失败：{error}"))?;
     Ok(())
 }
 
@@ -335,14 +477,21 @@ pub(crate) fn delete_connection_category(path: &Path, category_id: &str) -> Resu
     if child_count > 0 {
         return Err("分类下还有子分类，不能删除".to_string());
     }
-    let profile_count: i64 = connection
+    let ssh_profile_count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM ssh_connections WHERE category_id = ?1",
             params![category_id],
             |row| row.get(0),
         )
         .map_err(|error| format!("检查连接分类下连接失败：{error}"))?;
-    if profile_count > 0 {
+    let smb_profile_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM smb_connections WHERE category_id = ?1",
+            params![category_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("检查连接分类下 SMB 连接失败：{error}"))?;
+    if ssh_profile_count + smb_profile_count > 0 {
         return Err("分类下还有连接，不能删除".to_string());
     }
 
@@ -364,6 +513,18 @@ pub(crate) fn delete_connection_profile(path: &Path, profile_id: &str) -> Result
             params![profile_id],
         )
         .map_err(|error| format!("删除连接失败：{error}"))?;
+    Ok(())
+}
+
+/// 删除 SMB 连接。
+pub(crate) fn delete_smb_connection_profile(path: &Path, profile_id: &str) -> Result<(), String> {
+    let connection = open_connections_database(path)?;
+    connection
+        .execute(
+            "DELETE FROM smb_connections WHERE id = ?1",
+            params![profile_id],
+        )
+        .map_err(|error| format!("删除 SMB 连接失败：{error}"))?;
     Ok(())
 }
 
@@ -408,6 +569,26 @@ pub(crate) fn update_connection_last_connected_at(
     Ok(())
 }
 
+/// 更新 SMB 最近连接成功时间。
+pub(crate) fn update_smb_connection_last_connected_at(
+    path: &Path,
+    profile_id: &str,
+    connected_at_ms: i64,
+) -> Result<(), String> {
+    let connection = open_connections_database(path)?;
+    connection
+        .execute(
+            r#"
+            UPDATE smb_connections
+            SET last_connected_at_ms = ?2
+            WHERE id = ?1
+            "#,
+            params![profile_id, connected_at_ms],
+        )
+        .map_err(|error| format!("更新 SMB 连接最近使用时间失败：{error}"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{env, fs};
@@ -436,6 +617,25 @@ mod tests {
             category_id: None,
             encrypted_password: "v1:nonce:cipher".to_string(),
             host_key_fingerprint: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_connected_at_ms: None,
+        }
+    }
+
+    /// 构造测试 SMB 连接配置。
+    fn test_smb_profile(id: &str) -> SmbConnectionProfile {
+        let now = current_connection_time_millis();
+        SmbConnectionProfile {
+            id: id.to_string(),
+            name: "测试 SMB".to_string(),
+            host: "fileserver".to_string(),
+            port: DEFAULT_SMB_PORT,
+            share: "logs".to_string(),
+            initial_path: "/".to_string(),
+            username: "root".to_string(),
+            category_id: None,
+            encrypted_password: "v1:nonce:cipher".to_string(),
             created_at_ms: now,
             updated_at_ms: now,
             last_connected_at_ms: None,
@@ -477,6 +677,38 @@ mod tests {
 
         delete_connection_profile(&path, "conn-1").unwrap();
         assert!(load_connection_profiles(&path).unwrap().is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    /// 验证 SMB 连接数据库可以完成基础 CRUD。
+    ///
+    /// 业务风险：
+    /// - SMB 与 SSH 共用分类和密码加密规则，但落在不同表；CRUD 测试可以防止 schema v3 字段顺序或端口转换写错。
+    #[test]
+    fn smb_连接数据库可以读写更新和删除() {
+        let path = test_connections_database_path("smb-crud");
+        let mut profile = test_smb_profile("smb-1");
+        insert_smb_connection_profile(&path, &profile).unwrap();
+        let loaded = load_smb_connection_profiles(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "测试 SMB");
+        assert_eq!(loaded[0].initial_path, "/");
+
+        profile.name = "修改后 SMB".to_string();
+        profile.category_id = Some("cat-1".to_string());
+        profile.initial_path = "/logs".to_string();
+        update_smb_connection_profile(&path, &profile).unwrap();
+        let loaded = load_smb_connection_profiles(&path).unwrap();
+        assert_eq!(loaded[0].name, "修改后 SMB");
+        assert_eq!(loaded[0].category_id.as_deref(), Some("cat-1"));
+        assert_eq!(loaded[0].initial_path, "/logs");
+
+        update_smb_connection_last_connected_at(&path, "smb-1", 42).unwrap();
+        let loaded = load_smb_connection_profiles(&path).unwrap();
+        assert_eq!(loaded[0].last_connected_at_ms, Some(42));
+
+        delete_smb_connection_profile(&path, "smb-1").unwrap();
+        assert!(load_smb_connection_profiles(&path).unwrap().is_empty());
         let _ = fs::remove_file(&path);
     }
 
@@ -523,9 +755,25 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    /// 验证 v1 数据库升级到 v2 后旧连接会保留并显示在根层。
+    /// 验证分类删除会同时识别 SMB 连接占用。
     #[test]
-    fn 连接数据库_v1_升级后旧连接保留在根层() {
+    fn 连接分类被_smb_连接占用时拒绝删除() {
+        let path = test_connections_database_path("category-smb-non-empty");
+        let parent = test_category("cat-parent", None, 1);
+        insert_connection_category(&path, &parent).unwrap();
+        let mut profile = test_smb_profile("smb-1");
+        profile.category_id = Some("cat-parent".to_string());
+        insert_smb_connection_profile(&path, &profile).unwrap();
+
+        let error =
+            delete_connection_category(&path, "cat-parent").expect_err("有 SMB 连接时必须拒绝删除");
+        assert!(error.contains("连接"));
+        let _ = fs::remove_file(&path);
+    }
+
+    /// 验证 v1 数据库升级到 v3 后旧连接会保留并显示在根层。
+    #[test]
+    fn 连接数据库_v1_升级后旧连接保留在根层并创建_smb_表() {
         let path = test_connections_database_path("migrate-v1");
         let connection = Connection::open(&path).unwrap();
         connection
@@ -560,6 +808,61 @@ mod tests {
         assert_eq!(loaded[0].id, "conn-old");
         assert!(loaded[0].category_id.is_none());
         assert!(load_connection_categories(&path).unwrap().is_empty());
+        assert!(load_smb_connection_profiles(&path).unwrap().is_empty());
+        let connection = Connection::open(&path).unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CONNECTIONS_DATABASE_SCHEMA_VERSION);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// 验证 v2 数据库升级到 v3 时新增 SMB 表但不影响已有分类和 SSH 连接。
+    #[test]
+    fn 连接数据库_v2_升级到_v3_会创建_smb_表() {
+        let path = test_connections_database_path("migrate-v2-to-v3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE connection_categories (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    parent_id TEXT,
+                    name TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                CREATE TABLE ssh_connections (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    name TEXT NOT NULL,
+                    host TEXT NOT NULL,
+                    port INTEGER NOT NULL,
+                    username TEXT NOT NULL,
+                    category_id TEXT,
+                    encrypted_password TEXT NOT NULL,
+                    host_key_fingerprint TEXT,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    last_connected_at_ms INTEGER
+                );
+                INSERT INTO connection_categories
+                    (id, parent_id, name, created_at_ms, updated_at_ms)
+                VALUES ('cat-1', NULL, '分类', 1, 1);
+                INSERT INTO ssh_connections
+                    (id, name, host, port, username, category_id, encrypted_password, host_key_fingerprint,
+                     created_at_ms, updated_at_ms, last_connected_at_ms)
+                VALUES
+                    ('conn-old', '旧连接', '127.0.0.1', 22, 'root', 'cat-1', 'v1:nonce:cipher',
+                     NULL, 1, 1, NULL);
+                PRAGMA user_version = 2;
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(load_connection_profiles(&path).unwrap().len(), 1);
+        assert_eq!(load_connection_categories(&path).unwrap().len(), 1);
+        assert!(load_smb_connection_profiles(&path).unwrap().is_empty());
         let connection = Connection::open(&path).unwrap();
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))

@@ -27,11 +27,11 @@ pub(in crate::app) struct TextInputPrepaint {
 /// 可复用的 GPUI 单行文本输入元素。
 ///
 /// 边界条件：
-/// - 该元素只绘制和注册平台输入，不直接保存业务文本；真实状态通过 `TextInputBinding` 回写到 `MainView`。
+/// - 该元素只绘制和注册平台输入，不直接保存业务文本；真实状态通过 `TextInputBinding` 回写到宿主视图。
 /// - 外层容器需要负责 `track_focus`、键盘事件和视觉边框；鼠标定位、拖拽选区与释放清理由组件统一处理。
-pub(in crate::app) struct TextInputElement {
-    /// 主视图实体，用于读取输入快照并回写布局。
-    pub(in crate::app) view: Entity<MainView>,
+pub(in crate::app) struct TextInputElement<V: TextInputElementHost> {
+    /// 宿主视图实体，用于读取输入快照并回写布局。
+    pub(in crate::app) view: Entity<V>,
     /// 输入框绑定位置。
     pub(in crate::app) binding: TextInputBinding,
     /// 焦点句柄。
@@ -42,7 +42,52 @@ pub(in crate::app) struct TextInputElement {
     pub(in crate::app) palette: AppThemePalette,
 }
 
-impl IntoElement for TextInputElement {
+/// 通用输入框宿主视图接口。
+///
+/// 业务意图：
+/// - 搜索、连接弹窗和文件管理地址栏都需要同一套单行输入框元素，但它们分别属于不同 GPUI `Entity`。
+/// - 组件只依赖该接口读取快照、回写布局和驱动鼠标选区，避免把文件管理窗口强行塞进 `MainView` 状态。
+///
+/// 边界条件：
+/// - 宿主必须同时实现 `EntityInputHandler`，这样组件才能在绘制阶段向 GPUI 注册平台输入法处理器。
+/// - 鼠标事件可能在弹窗或窗口关闭后的下一帧到达，宿主方法应在绑定不存在时返回 `false`。
+pub(in crate::app) trait TextInputElementHost: EntityInputHandler {
+    /// 读取当前输入框绘制快照。
+    fn text_input_snapshot(&self, binding: TextInputBinding) -> Option<TextInputSnapshot>;
+    /// 保存最近一次绘制布局，供鼠标命中和 IME 候选窗口定位使用。
+    fn store_text_input_layout(
+        &mut self,
+        binding: TextInputBinding,
+        line: ShapedLine,
+        bounds: Bounds<Pixels>,
+        horizontal_scroll_px: f32,
+    );
+    /// 处理鼠标按下，开始定位、选词、全选或拖拽选区。
+    fn begin_text_input_mouse_interaction(
+        &mut self,
+        binding: TextInputBinding,
+        event: &MouseDownEvent,
+        was_focused: bool,
+        context: &mut Context<Self>,
+    ) -> bool;
+    /// 鼠标拖拽时扩展选区。
+    fn update_text_input_mouse_drag(
+        &mut self,
+        binding: TextInputBinding,
+        position: Point<Pixels>,
+        context: &mut Context<Self>,
+    ) -> bool;
+    /// 鼠标释放时结束拖拽状态。
+    fn finish_text_input_mouse_drag(
+        &mut self,
+        binding: TextInputBinding,
+        context: &mut Context<Self>,
+    ) -> bool;
+    /// 当前光标是否需要绘制。
+    fn text_input_cursor_visible(&self) -> bool;
+}
+
+impl<V: TextInputElementHost> IntoElement for TextInputElement<V> {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {
@@ -50,7 +95,7 @@ impl IntoElement for TextInputElement {
     }
 }
 
-impl Element for TextInputElement {
+impl<V: TextInputElementHost> Element for TextInputElement<V> {
     type RequestLayoutState = ();
     type PrepaintState = Option<TextInputPrepaint>;
 
@@ -187,7 +232,7 @@ impl Element for TextInputElement {
             )
         });
         let cursor_visible =
-            focused && !has_selection && self.view.read(context).search_text_cursor_visible();
+            focused && !has_selection && self.view.read(context).text_input_cursor_visible();
         let cursor = cursor_visible.then(|| {
             let cursor_right_limit = (f32::from(bounds.right()) - SINGLE_LINE_INPUT_CARET_WIDTH)
                 .max(f32::from(bounds.left()));
@@ -240,18 +285,22 @@ impl Element for TextInputElement {
         if let Some(selection) = prepaint.selection {
             window.paint_quad(selection);
         }
-        prepaint
-            .line
-            .paint(
-                point(
-                    bounds.left() - px(prepaint.horizontal_scroll_px),
-                    bounds.top(),
-                ),
-                window.line_height(),
-                window,
-                context,
-            )
-            .ok();
+        // 长文本水平滚动后仍可能有字形位于输入框外侧；这里用 GPUI 内容裁剪限制文本绘制区域，
+        // 避免 SMB 地址、长路径或长关键字溢出到标签和弹窗外部。
+        window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+            prepaint
+                .line
+                .paint(
+                    point(
+                        bounds.left() - px(prepaint.horizontal_scroll_px),
+                        bounds.top(),
+                    ),
+                    window.line_height(),
+                    window,
+                    context,
+                )
+                .ok();
+        });
         if let Some(cursor) = prepaint.cursor {
             window.paint_quad(cursor);
         }
@@ -269,7 +318,7 @@ impl Element for TextInputElement {
     }
 }
 
-impl TextInputElement {
+impl<V: TextInputElementHost> TextInputElement<V> {
     /// 注册输入框内部鼠标事件。
     ///
     /// 业务意图：

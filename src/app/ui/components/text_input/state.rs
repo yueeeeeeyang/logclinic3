@@ -18,8 +18,16 @@ pub(in crate::app) enum TextInputBinding {
     ConnectionTreeSearch,
     /// SSH 连接表单中的单行输入框。
     ConnectionForm(ConnectionFormField),
+    /// SMB 连接表单中的单行输入框。
+    SmbConnectionForm(SmbConnectionFormField),
     /// 连接分类弹窗中的名称输入框。
     ConnectionCategoryName,
+    /// 连接文件管理窗口的路径地址栏。
+    ///
+    /// 业务意图：
+    /// - 文件管理窗口不是 `MainView` 的子状态，但地址栏仍需要复用通用输入框的裁剪、IME、选区和水平滚动行为。
+    /// - 该绑定由 `ConnectionFileManagerWindowView` 实现，`MainView` 遇到时会安全返回空结果。
+    FileManagerPath,
 }
 
 /// 输入框展示模式。
@@ -157,11 +165,21 @@ impl MainView {
                 self.connection_form_text_snapshot(field)
                     .map(|snapshot| TextInputSnapshot::from_single_line(snapshot, display_mode))
             }
+            TextInputBinding::SmbConnectionForm(field) => {
+                let display_mode = if field == SmbConnectionFormField::Password {
+                    TextInputDisplayMode::Masked { mask_char: '*' }
+                } else {
+                    TextInputDisplayMode::Plain
+                };
+                self.smb_connection_form_text_snapshot(field)
+                    .map(|snapshot| TextInputSnapshot::from_single_line(snapshot, display_mode))
+            }
             TextInputBinding::ConnectionCategoryName => {
                 self.connection_category_text_snapshot().map(|snapshot| {
                     TextInputSnapshot::from_single_line(snapshot, TextInputDisplayMode::Plain)
                 })
             }
+            TextInputBinding::FileManagerPath => None,
         }
     }
 
@@ -186,9 +204,12 @@ impl MainView {
             TextInputBinding::ConnectionForm(field) => {
                 self.store_connection_form_text_layout(field, line, bounds, horizontal_scroll_px)
             }
+            TextInputBinding::SmbConnectionForm(field) => self
+                .store_smb_connection_form_text_layout(field, line, bounds, horizontal_scroll_px),
             TextInputBinding::ConnectionCategoryName => {
                 self.store_connection_category_text_layout(line, bounds, horizontal_scroll_px)
             }
+            TextInputBinding::FileManagerPath => {}
         }
     }
 
@@ -216,11 +237,17 @@ impl MainView {
                 .dialog
                 .as_mut()
                 .map(|dialog| &mut dialog.field_mut(field).input),
+            TextInputBinding::SmbConnectionForm(field) => self
+                .connections
+                .smb_dialog
+                .as_mut()
+                .map(|dialog| &mut dialog.field_mut(field).input),
             TextInputBinding::ConnectionCategoryName => self
                 .connections
                 .category_dialog
                 .as_mut()
                 .map(|dialog| &mut dialog.name.input),
+            TextInputBinding::FileManagerPath => None,
         }
     }
 
@@ -241,11 +268,17 @@ impl MainView {
                 .dialog
                 .as_ref()
                 .map(|dialog| &dialog.field(field).input),
+            TextInputBinding::SmbConnectionForm(field) => self
+                .connections
+                .smb_dialog
+                .as_ref()
+                .map(|dialog| &dialog.field(field).input),
             TextInputBinding::ConnectionCategoryName => self
                 .connections
                 .category_dialog
                 .as_ref()
                 .map(|dialog| &dialog.name.input),
+            TextInputBinding::FileManagerPath => None,
         }
     }
 
@@ -269,9 +302,13 @@ impl MainView {
             TextInputBinding::ConnectionForm(field) => {
                 self.connection_form_text_index_for_point(field, position)
             }
+            TextInputBinding::SmbConnectionForm(field) => {
+                self.smb_connection_form_text_index_for_point(field, position)
+            }
             TextInputBinding::ConnectionCategoryName => {
                 self.connection_category_text_index_for_point(position)
             }
+            TextInputBinding::FileManagerPath => 0,
         }
     }
 
@@ -291,10 +328,14 @@ impl MainView {
         was_focused: bool,
         context: &mut Context<Self>,
     ) -> bool {
-        if matches!(binding, TextInputBinding::ConnectionForm(_)) {
+        if matches!(
+            binding,
+            TextInputBinding::ConnectionForm(_) | TextInputBinding::SmbConnectionForm(_)
+        ) {
             // 连接表单中的分类 Select 与文本输入框处于同一个弹窗层级；点击任意文本字段时应先收起
             // Select，避免浮层继续覆盖后续输入区域或底部按钮。
             self.close_connection_dialog_category_select();
+            self.close_smb_connection_dialog_category_select();
         }
         if !was_focused {
             match binding {
@@ -388,6 +429,59 @@ impl MainView {
             context.notify();
         }
         handled
+    }
+}
+
+impl TextInputElementHost for MainView {
+    /// 将主窗口已有的通用输入框状态暴露给 `TextInputElement`。
+    fn text_input_snapshot(&self, binding: TextInputBinding) -> Option<TextInputSnapshot> {
+        MainView::text_input_snapshot(self, binding)
+    }
+
+    /// 保存主窗口输入框最近一次布局。
+    fn store_text_input_layout(
+        &mut self,
+        binding: TextInputBinding,
+        line: ShapedLine,
+        bounds: Bounds<Pixels>,
+        horizontal_scroll_px: f32,
+    ) {
+        MainView::store_text_input_layout(self, binding, line, bounds, horizontal_scroll_px);
+    }
+
+    /// 委托主窗口处理输入框鼠标按下行为。
+    fn begin_text_input_mouse_interaction(
+        &mut self,
+        binding: TextInputBinding,
+        event: &MouseDownEvent,
+        was_focused: bool,
+        context: &mut Context<Self>,
+    ) -> bool {
+        MainView::begin_text_input_mouse_interaction(self, binding, event, was_focused, context)
+    }
+
+    /// 委托主窗口处理输入框鼠标拖拽行为。
+    fn update_text_input_mouse_drag(
+        &mut self,
+        binding: TextInputBinding,
+        position: Point<Pixels>,
+        context: &mut Context<Self>,
+    ) -> bool {
+        MainView::update_text_input_mouse_drag(self, binding, position, context)
+    }
+
+    /// 委托主窗口清理输入框拖拽状态。
+    fn finish_text_input_mouse_drag(
+        &mut self,
+        binding: TextInputBinding,
+        context: &mut Context<Self>,
+    ) -> bool {
+        MainView::finish_text_input_mouse_drag(self, binding, context)
+    }
+
+    /// 主窗口输入框沿用现有光标闪烁节奏。
+    fn text_input_cursor_visible(&self) -> bool {
+        self.search_text_cursor_visible()
     }
 }
 

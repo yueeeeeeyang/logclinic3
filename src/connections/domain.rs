@@ -43,6 +43,80 @@ pub(crate) struct ConnectionProfile {
     pub(crate) last_connected_at_ms: Option<i64>,
 }
 
+/// SMB 文件共享连接配置。
+///
+/// 业务意图：
+/// - SMB 连接只提供文件管理，不创建终端 tab；该结构保存连接共享所需的最小参数和分类归属。
+/// - `host/port/share/initial_path` 是规范化后的地址拆分结果，UI 地址输入允许 UNC、URL 和普通斜线路径，
+///   但持久化层始终保存拆分字段，方便后端直接建立 SMB 会话和连接固定 share。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SmbConnectionProfile {
+    /// 本地稳定 ID，用于 SQLite 主键、左侧树选中和 AEAD 附加认证数据。
+    pub(crate) id: String,
+    /// 用户可见连接名称。
+    pub(crate) name: String,
+    /// SMB 服务器主机名或 IP。
+    pub(crate) host: String,
+    /// SMB TCP 端口，默认 445。
+    pub(crate) port: u16,
+    /// 固定连接的共享名。
+    pub(crate) share: String,
+    /// 文件管理窗口初始进入的共享内路径，始终以 `/` 开头。
+    pub(crate) initial_path: String,
+    /// SMB 用户名；如需域账号，第一版由用户输入服务端接受的完整格式。
+    pub(crate) username: String,
+    /// 连接所属分类 ID；`None` 表示挂在根层。
+    pub(crate) category_id: Option<String>,
+    /// 加密后的 SMB 密码。
+    pub(crate) encrypted_password: String,
+    /// 创建时间，Unix epoch 毫秒。
+    pub(crate) created_at_ms: i64,
+    /// 最近更新时间，Unix epoch 毫秒。
+    pub(crate) updated_at_ms: i64,
+    /// 最近成功打开文件管理列表的时间，Unix epoch 毫秒。
+    pub(crate) last_connected_at_ms: Option<i64>,
+}
+
+/// 规范化后的 SMB 地址。
+///
+/// 业务意图：
+/// - 表单只暴露一个“地址”输入框，用户可以粘贴 `server/share/path`、UNC 或 `smb://` URL。
+/// - 解析后将服务器、端口、共享名和共享内路径拆开，避免后端再依赖字符串切割。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ParsedSmbAddress {
+    /// SMB 服务器主机名或 IP。
+    pub(crate) host: String,
+    /// SMB TCP 端口。
+    pub(crate) port: u16,
+    /// SMB share 名称。
+    pub(crate) share: String,
+    /// 共享内初始路径，始终以 `/` 开头；根路径为 `/`。
+    pub(crate) initial_path: String,
+}
+
+impl ParsedSmbAddress {
+    /// 返回适合在编辑表单展示的规范化地址文本。
+    ///
+    /// 边界条件：
+    /// - 默认端口 445 使用用户最熟悉的 UNC 写法，避免编辑时把 `\\server\share` 视觉上改成
+    ///   `server/share`，让用户误以为连接目标被改变。
+    /// - UNC 无法表达非默认端口；非 445 端口使用 `smb://host:port/share/path`，避免端口信息丢失。
+    /// - 初始路径为根目录时只展示到 share，其它路径继续展示共享内路径。
+    pub(crate) fn to_address_text(&self) -> String {
+        if self.port == DEFAULT_SMB_PORT {
+            let path = self.initial_path.trim_matches('/').replace('/', "\\");
+            if path.is_empty() {
+                format!(r"\\{}\{}", self.host, self.share)
+            } else {
+                format!(r"\\{}\{}\{}", self.host, self.share, path)
+            }
+        } else {
+            let path = self.initial_path.trim_end_matches('/');
+            format!("smb://{}:{}/{}{}", self.host, self.port, self.share, path)
+        }
+    }
+}
+
 /// 连接分类。
 ///
 /// 业务意图：
@@ -80,6 +154,35 @@ pub(crate) struct ConnectionProfileDraft {
     pub(crate) category_id: Option<String>,
     /// SSH 密码明文草稿；保存后必须立即清空 UI 草稿。
     pub(crate) password: String,
+}
+
+/// SMB 连接表单草稿。
+///
+/// 业务意图：
+/// - SMB 新增和编辑弹窗字段与 SSH 不同：地址是一个整体输入，保存时再解析成 host/port/share/path。
+/// - 编辑时密码允许为空，表示继续使用 SQLite 中已有密文。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SmbConnectionProfileDraft {
+    /// 用户可见连接名称。
+    pub(crate) name: String,
+    /// SMB 地址文本，接受普通斜线、UNC 和 `smb://` 形式。
+    pub(crate) address: String,
+    /// SMB 用户名。
+    pub(crate) username: String,
+    /// 连接所属分类 ID；`None` 表示挂在根层。
+    pub(crate) category_id: Option<String>,
+    /// SMB 密码明文草稿；保存后必须立即清空 UI 草稿。
+    pub(crate) password: String,
+}
+
+impl Drop for SmbConnectionProfileDraft {
+    /// 草稿销毁时清理 SMB 密码明文。
+    ///
+    /// 安全边界：
+    /// - 这里只能清理当前字符串缓冲区，不能追溯清理平台输入法或分配器历史副本。
+    fn drop(&mut self) {
+        self.password.zeroize();
+    }
 }
 
 impl ConnectionProfileDraft {
@@ -192,6 +295,127 @@ pub(crate) fn validate_connection_profile_draft(
     Ok((name, host, port, username, password))
 }
 
+/// 校验 SMB 连接表单并返回规范化字段。
+///
+/// 业务意图：
+/// - SMB 地址支持多种用户常见输入，但保存入口必须统一成 `ParsedSmbAddress`，避免存储层和后端各自解释。
+/// - 新增时密码必填；编辑时空密码表示不修改旧密文。
+pub(crate) fn validate_smb_connection_profile_draft(
+    draft: &SmbConnectionProfileDraft,
+    password_required: bool,
+) -> Result<(String, ParsedSmbAddress, String, Option<Zeroizing<String>>), String> {
+    let name = draft.name.trim().to_string();
+    if name.is_empty() {
+        return Err("连接名称不能为空".to_string());
+    }
+
+    let parsed = parse_smb_connection_address(&draft.address)?;
+    let username = draft.username.trim().to_string();
+    if username.is_empty() {
+        return Err("用户名不能为空".to_string());
+    }
+
+    if password_required && draft.password.is_empty() {
+        return Err("密码不能为空".to_string());
+    }
+    let password = (!draft.password.is_empty()).then(|| Zeroizing::new(draft.password.clone()));
+    Ok((name, parsed, username, password))
+}
+
+/// 解析 SMB 地址文本。
+///
+/// 业务意图：
+/// - 用户可能从 Windows 资源管理器、浏览器或文档中复制不同格式的 SMB 地址；解析函数集中兼容这些入口。
+/// - 保存时不保留原始字符串，避免 `\\server\share` 与 `server/share` 在后续比较、编辑和测试中表现不一致。
+///
+/// 边界条件：
+/// - 地址至少需要 host 和 share；缺少路径时共享内路径默认 `/`。
+/// - `host:port/share` 支持自定义端口，端口必须是 1 到 65535。
+pub(crate) fn parse_smb_connection_address(text: &str) -> Result<ParsedSmbAddress, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("SMB 地址不能为空".to_string());
+    }
+
+    let without_scheme = trimmed
+        .strip_prefix("smb://")
+        .or_else(|| trimmed.strip_prefix("SMB://"))
+        .unwrap_or(trimmed);
+    let normalized_separators = without_scheme.replace('\\', "/");
+    let normalized = normalized_separators.trim_start_matches('/');
+    let mut parts = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() < 2 {
+        return Err("SMB 地址必须包含服务器和共享名，例如 server/share".to_string());
+    }
+
+    let host_port = parts.remove(0).trim();
+    let (host, port) = parse_smb_host_and_port(host_port)?;
+    let share = parts.remove(0).trim().to_string();
+    if share.is_empty() {
+        return Err("SMB 共享名不能为空".to_string());
+    }
+
+    let initial_path = normalize_smb_initial_path(&parts);
+    Ok(ParsedSmbAddress {
+        host,
+        port,
+        share,
+        initial_path,
+    })
+}
+
+/// 解析 SMB 地址中的 host 和可选端口。
+fn parse_smb_host_and_port(host_port: &str) -> Result<(String, u16), String> {
+    if host_port.is_empty() {
+        return Err("SMB 服务器不能为空".to_string());
+    }
+    if let Some((host, port_text)) = host_port.rsplit_once(':')
+        && !port_text.is_empty()
+        && port_text
+            .chars()
+            .all(|character| character.is_ascii_digit())
+    {
+        let host = host.trim().to_string();
+        if host.is_empty() {
+            return Err("SMB 服务器不能为空".to_string());
+        }
+        let port = port_text
+            .parse::<u16>()
+            .map_err(|_| "SMB 端口必须是 1 到 65535 的数字".to_string())?;
+        if port == 0 {
+            return Err("SMB 端口必须是 1 到 65535 的数字".to_string());
+        }
+        return Ok((host, port));
+    }
+    Ok((host_port.to_string(), DEFAULT_SMB_PORT))
+}
+
+/// 规范化共享内路径。
+///
+/// 边界条件：
+/// - 用户地址中的多余斜线和 `.` 不参与保存。
+/// - `..` 只在共享内部向上一级，不能越过 share 根目录。
+fn normalize_smb_initial_path(parts: &[&str]) -> String {
+    let mut normalized = Vec::new();
+    for part in parts {
+        match part.trim() {
+            "" | "." => {}
+            ".." => {
+                normalized.pop();
+            }
+            value => normalized.push(value),
+        }
+    }
+    if normalized.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", normalized.join("/"))
+    }
+}
+
 /// 校验连接分类表单并返回规范化名称。
 ///
 /// 业务意图：
@@ -291,6 +515,82 @@ pub(crate) enum HostKeyVerification {
         /// 服务器本次返回的公钥指纹。
         actual: String,
     },
+}
+
+#[cfg(test)]
+mod smb_tests {
+    use super::*;
+
+    /// 验证 SMB 地址解析兼容普通斜线、UNC、URL 和自定义端口。
+    #[test]
+    fn smb_地址解析会规范化常见输入格式() {
+        let parsed = parse_smb_connection_address("server/share/logs").unwrap();
+        assert_eq!(parsed.host, "server");
+        assert_eq!(parsed.port, DEFAULT_SMB_PORT);
+        assert_eq!(parsed.share, "share");
+        assert_eq!(parsed.initial_path, "/logs");
+        assert_eq!(parsed.to_address_text(), r"\\server\share\logs");
+
+        let parsed = parse_smb_connection_address(r"\\server\share\logs\app").unwrap();
+        assert_eq!(parsed.initial_path, "/logs/app");
+        assert_eq!(parsed.to_address_text(), r"\\server\share\logs\app");
+
+        let parsed = parse_smb_connection_address("//server:1445/share").unwrap();
+        assert_eq!(parsed.host, "server");
+        assert_eq!(parsed.port, 1445);
+        assert_eq!(parsed.initial_path, "/");
+        assert_eq!(parsed.to_address_text(), "smb://server:1445/share");
+
+        let parsed = parse_smb_connection_address("smb://server/share/a/../b").unwrap();
+        assert_eq!(parsed.initial_path, "/b");
+    }
+
+    /// 验证非法 SMB 地址会返回中文错误。
+    #[test]
+    fn smb_地址缺少服务器或共享名会拒绝() {
+        assert!(
+            parse_smb_connection_address("")
+                .unwrap_err()
+                .contains("不能为空")
+        );
+        assert!(
+            parse_smb_connection_address("server")
+                .unwrap_err()
+                .contains("共享")
+        );
+        assert!(
+            parse_smb_connection_address("server:0/share")
+                .unwrap_err()
+                .contains("端口")
+        );
+    }
+
+    /// 验证 SMB 表单校验覆盖必填字段和编辑空密码语义。
+    #[test]
+    fn smb_连接草稿校验处理必填字段和编辑密码() {
+        let mut draft = SmbConnectionProfileDraft {
+            name: "SMB".to_string(),
+            address: "server/share".to_string(),
+            username: "user".to_string(),
+            category_id: None,
+            password: "secret".to_string(),
+        };
+        let (name, parsed, username, password) =
+            validate_smb_connection_profile_draft(&draft, true).unwrap();
+        assert_eq!(name, "SMB");
+        assert_eq!(parsed.share, "share");
+        assert_eq!(username, "user");
+        assert!(password.is_some());
+
+        draft.password.clear();
+        let (_, _, _, password) = validate_smb_connection_profile_draft(&draft, false).unwrap();
+        assert!(password.is_none());
+        assert!(
+            validate_smb_connection_profile_draft(&draft, true)
+                .unwrap_err()
+                .contains("密码")
+        );
+    }
 }
 
 #[cfg(test)]

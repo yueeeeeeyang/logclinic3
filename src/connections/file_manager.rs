@@ -10,6 +10,7 @@
 // - 文件预览最多读取 1 MiB + 1 byte；超过上限或疑似二进制时不尝试解码，避免大文件和不可见字节拖垮 UI。
 
 use std::{
+    collections::HashMap,
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -27,6 +28,10 @@ use russh::{
     keys::{HashAlg, ssh_key},
 };
 use russh_sftp::{client::SftpSession, protocol::FileType as SftpFileType};
+use smb2::{
+    ClientConfig as SmbClientConfig, DirectoryEntry as SmbDirectoryEntry,
+    ErrorKind as SmbErrorKind, FileInfo as SmbFileInfo, SmbClient as Smb2Client, Tree as SmbTree,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zeroize::Zeroizing;
 
@@ -39,6 +44,39 @@ use super::*;
 /// 边界条件：
 /// - 读取时会额外读取 1 byte 用于判断是否超过上限，真正展示内容仍限制在 1 MiB 内。
 pub(crate) const CONNECTION_FILE_PREVIEW_LIMIT_BYTES: usize = 1024 * 1024;
+
+/// SMB 分块传输大小。
+///
+/// 实现原因：
+/// - `smb2` 内部会根据服务端能力再切分 wire chunk；这里控制本地文件读写粒度，便于进度上报和取消检查。
+/// - 选择略小于 64 KiB，避免不同 SMB 服务端对单包大小的边界处理差异。
+const SMB_TRANSFER_CHUNK_BYTES: usize = 60 * 1024;
+
+/// SMB 文件管理后台持有的 share 会话类型。
+///
+/// 业务意图：
+/// - `smb2` 把认证会话放在 `SmbClient`，把 share 连接放在 `Tree`，文件管理后台需要二者一起保存。
+/// - 类型不暴露到 UI 层，避免 `smb2` 的预发布 crypto 依赖类型污染本地密码加密和 GPUI 状态。
+struct ActiveSmbShare {
+    /// SMB 客户端会话，内部持有 TCP 连接、认证上下文和 DFS/压缩等协议状态。
+    client: Smb2Client,
+    /// 当前文件管理窗口固定连接的 share。
+    tree: SmbTree,
+}
+
+impl ActiveSmbShare {
+    /// 重新连接当前 share。
+    ///
+    /// 业务意图：
+    /// - `smb2::FileDownload` 在主动取消时没有公开异步 close 方法；直接丢弃会让服务端句柄等到会话结束。
+    /// - 取消下载后通过 TreeDisconnect + TreeConnect 回收该 share 下的未关闭句柄，同时保持认证会话继续可用。
+    async fn reconnect_tree(&mut self) -> Result<(), smb2::Error> {
+        let share_name = self.tree.share_name.clone();
+        let _ = self.client.disconnect_share(&self.tree).await;
+        self.tree = self.client.connect_share(&share_name).await?;
+        Ok(())
+    }
+}
 
 /// 文件管理后台命令通道句柄。
 ///
@@ -82,6 +120,13 @@ pub(crate) enum ConnectionFileBackendTarget {
         password: Zeroizing<String>,
         /// 打开 SFTP 会话时需要复用的可信主机指纹。
         trusted_fingerprint: Option<String>,
+    },
+    /// SMB 文件共享目标，密码只在后台认证使用。
+    Smb {
+        /// SMB 连接配置快照。
+        profile: SmbConnectionProfile,
+        /// 解密后的 SMB 密码；后台线程使用 `Zeroizing` 缩短明文驻留时间。
+        password: Zeroizing<String>,
     },
 }
 
@@ -145,6 +190,17 @@ pub(crate) enum ConnectionFileConflictPolicy {
 /// 文件管理后台事件。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConnectionFileEvent {
+    /// SMB 首次成功列目录后上报连接成功时间。
+    ///
+    /// 业务意图：
+    /// - SMB 没有终端 tab 的 `Connected` 事件；文件管理首次成功读取目录才算连接可用。
+    /// - UI 收到该事件后再更新 SQLite 最近使用时间，避免认证失败也被记录为成功连接。
+    SmbConnected {
+        /// SMB 连接 ID。
+        profile_id: String,
+        /// 成功时间，Unix epoch 毫秒。
+        connected_at_ms: i64,
+    },
     /// 目录列表刷新完成。
     Listed {
         /// 实际列出的目录路径。
@@ -426,6 +482,28 @@ fn run_connection_file_backend(
                 cancel_requested,
             ));
         }
+        ConnectionFileBackendTarget::Smb { profile, password } => {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    send_file_event(
+                        &event_sender,
+                        ConnectionFileEvent::Error(format!("启动 SMB 运行时失败：{error}")),
+                    );
+                    return;
+                }
+            };
+            runtime.block_on(run_smb_file_backend(
+                profile,
+                password,
+                command_receiver,
+                event_sender,
+                cancel_requested,
+            ));
+        }
     }
 }
 
@@ -512,6 +590,107 @@ async fn run_ssh_file_backend(
             }
         }
     }
+}
+
+/// 运行 SMB 文件后端。
+///
+/// 业务意图：
+/// - SMB 连接没有终端，因此文件管理窗口就是唯一交互入口；后台线程持有独立 SMB 会话并复用统一文件命令事件。
+/// - 所有 SMB 网络 IO 均在该 tokio runtime 中执行，GPUI 主线程只通过事件队列接收中文结果。
+async fn run_smb_file_backend(
+    profile: SmbConnectionProfile,
+    password: Zeroizing<String>,
+    command_receiver: Receiver<ConnectionFileCommand>,
+    event_sender: Sender<ConnectionFileEvent>,
+    cancel_requested: Arc<AtomicBool>,
+) {
+    let profile_id = profile.id.clone();
+    let mut share = match open_smb_share(&profile, password).await {
+        Ok(share) => Some(share),
+        Err(error) => {
+            send_file_event(&event_sender, ConnectionFileEvent::Error(error));
+            return;
+        }
+    };
+    let mut connected_reported = false;
+
+    while let Ok(command) = command_receiver.recv() {
+        match command {
+            ConnectionFileCommand::List { path } => {
+                let result = match share.as_mut() {
+                    Some(share) => list_smb_directory(share, &path).await,
+                    None => Err("SMB 会话已关闭，无法读取目录".to_string()),
+                };
+                if result.is_ok() && !connected_reported {
+                    connected_reported = true;
+                    send_file_event(
+                        &event_sender,
+                        ConnectionFileEvent::SmbConnected {
+                            profile_id: profile_id.clone(),
+                            connected_at_ms: current_connection_time_millis(),
+                        },
+                    );
+                }
+                send_file_result(&event_sender, result);
+            }
+            ConnectionFileCommand::Preview { path } => {
+                let result = match share.as_mut() {
+                    Some(share) => preview_smb_file(share, &path).await,
+                    None => Err("SMB 会话已关闭，无法预览文件".to_string()),
+                };
+                send_file_result(&event_sender, result);
+            }
+            ConnectionFileCommand::Upload(request) => {
+                let result =
+                    upload_smb_files(&mut share, request, &event_sender, &cancel_requested).await;
+                send_file_result(&event_sender, result);
+            }
+            ConnectionFileCommand::Download(request) => {
+                let result =
+                    download_smb_files(&mut share, request, &event_sender, &cancel_requested).await;
+                send_file_result(&event_sender, result);
+            }
+            ConnectionFileCommand::Delete(request) => {
+                let result = match share.as_mut() {
+                    Some(share) => delete_smb_entry(share, request).await,
+                    None => Err("SMB 会话已关闭，无法删除文件".to_string()),
+                };
+                send_file_result(&event_sender, result);
+            }
+            ConnectionFileCommand::Shutdown => {
+                if let Some(mut share) = share.take() {
+                    let _ = share.client.disconnect_share(&share.tree).await;
+                }
+                break;
+            }
+        }
+    }
+}
+
+/// 建立独立 SMB share 会话。
+async fn open_smb_share(
+    profile: &SmbConnectionProfile,
+    password: Zeroizing<String>,
+) -> Result<ActiveSmbShare, String> {
+    let addr = format!("{}:{}", profile.host, profile.port);
+    let mut client = Smb2Client::connect(SmbClientConfig {
+        addr: addr.clone(),
+        timeout: Duration::from_secs(8),
+        username: profile.username.clone(),
+        password: password.to_string(),
+        domain: String::new(),
+        auto_reconnect: false,
+        compression: true,
+        dfs_enabled: true,
+        dfs_target_overrides: HashMap::new(),
+    })
+    .await
+    .map_err(|error| format!("连接 SMB 服务器 {addr} 失败：{error}"))?;
+    let tree = client
+        .connect_share(&profile.share)
+        .await
+        .map_err(|error| format!("连接 SMB 共享 {} 失败：{error}", profile.share))?;
+    Ok(ActiveSmbShare { client, tree })
 }
 
 /// 建立独立 SFTP 会话。
@@ -760,6 +939,128 @@ async fn delete_ssh_entry(
         }
         ConnectionFileEntryKind::Other => {
             return Err("仅支持删除普通文件、符号链接或空目录".to_string());
+        }
+    }
+    Ok(ConnectionFileEvent::OperationFinished(format!(
+        "已删除 {}",
+        request.name
+    )))
+}
+
+/// 列出 SMB 目录。
+async fn list_smb_directory(
+    share: &mut ActiveSmbShare,
+    path: &str,
+) -> Result<ConnectionFileEvent, String> {
+    let ui_path = normalize_smb_ui_path(path);
+    let wire_path = smb_wire_path(&ui_path);
+    let entries = share
+        .client
+        .list_directory(&mut share.tree, &wire_path)
+        .await
+        .map_err(|error| format!("读取 SMB 目录 {ui_path} 失败：{error}"))?;
+    let mut mapped = Vec::new();
+    for entry in entries {
+        if entry.name == "." || entry.name == ".." {
+            continue;
+        }
+        mapped.push(ConnectionFileEntry {
+            name: entry.name.clone(),
+            path: join_remote_path(&ui_path, &entry.name),
+            kind: smb_entry_kind(&entry),
+            size: (!entry.is_directory).then_some(entry.size),
+            modified_at_ms: entry
+                .modified
+                .to_system_time()
+                .and_then(system_time_to_millis),
+        });
+    }
+    sort_file_entries(&mut mapped);
+    Ok(ConnectionFileEvent::Listed {
+        path: ui_path,
+        entries: mapped,
+    })
+}
+
+/// 将 `smb2` 目录项类型映射为文件管理通用类型。
+fn smb_entry_kind(entry: &SmbDirectoryEntry) -> ConnectionFileEntryKind {
+    if entry.is_directory {
+        ConnectionFileEntryKind::Directory
+    } else {
+        ConnectionFileEntryKind::File
+    }
+}
+
+/// 判断 `smb2` 文件元信息是否为目录。
+fn smb_file_info_is_directory(info: &SmbFileInfo) -> bool {
+    info.is_directory
+}
+
+/// 预览 SMB 普通文件。
+async fn preview_smb_file(
+    share: &mut ActiveSmbShare,
+    path: &str,
+) -> Result<ConnectionFileEvent, String> {
+    let ui_path = normalize_smb_ui_path(path);
+    let wire_path = smb_wire_path(&ui_path);
+    let metadata = share
+        .client
+        .stat(&mut share.tree, &wire_path)
+        .await
+        .map_err(|error| format!("读取 SMB 文件 {ui_path} 元信息失败：{error}"))?;
+    if smb_file_info_is_directory(&metadata) {
+        return Err("只能预览普通文件".to_string());
+    }
+    let bytes = if metadata.size as usize > CONNECTION_FILE_PREVIEW_LIMIT_BYTES {
+        PreviewBytes::Oversize
+    } else {
+        let data = share
+            .client
+            .read_file(&mut share.tree, &wire_path)
+            .await
+            .map_err(|error| format!("读取 SMB 文件 {ui_path} 失败：{error}"))?;
+        PreviewBytes::Bytes(data)
+    };
+    let preview = build_preview(
+        ui_path.clone(),
+        remote_file_name(&ui_path).unwrap_or_else(|| ui_path.clone()),
+        Some(metadata.size),
+        metadata
+            .modified
+            .to_system_time()
+            .and_then(system_time_to_millis),
+        bytes,
+    );
+    Ok(ConnectionFileEvent::Previewed(preview))
+}
+
+/// 删除 SMB 端普通文件或空目录。
+async fn delete_smb_entry(
+    share: &mut ActiveSmbShare,
+    request: ConnectionFileDeleteRequest,
+) -> Result<ConnectionFileEvent, String> {
+    if !request.kind.is_deletable() {
+        return Err("仅支持删除普通文件或空目录".to_string());
+    }
+    let ui_path = normalize_smb_ui_path(&request.path);
+    let wire_path = smb_wire_path(&ui_path);
+    match request.kind {
+        ConnectionFileEntryKind::File | ConnectionFileEntryKind::Symlink => {
+            share
+                .client
+                .delete_file(&mut share.tree, &wire_path)
+                .await
+                .map_err(|error| format!("删除 SMB 文件 {ui_path} 失败：{error}"))?;
+        }
+        ConnectionFileEntryKind::Directory => {
+            share
+                .client
+                .delete_directory(&mut share.tree, &wire_path)
+                .await
+                .map_err(|error| format!("删除 SMB 空目录 {ui_path} 失败：{error}"))?;
+        }
+        ConnectionFileEntryKind::Other => {
+            return Err("仅支持删除普通文件或空目录".to_string());
         }
     }
     Ok(ConnectionFileEvent::OperationFinished(format!(
@@ -1048,6 +1349,282 @@ async fn download_ssh_files(
             return Ok(cancelled_transfer_event(
                 ConnectionFileTransferOperation::Download,
             ));
+        }
+        replace_local_file_with_temp(&temp, &dest)?;
+        copied = copied.saturating_add(1);
+        progress.complete_file();
+    }
+    progress.finish();
+    Ok(ConnectionFileEvent::OperationFinished(format!(
+        "已下载 {copied} 个文件"
+    )))
+}
+
+/// 上传本地文件到 SMB 目录。
+async fn upload_smb_files(
+    share: &mut Option<ActiveSmbShare>,
+    request: ConnectionFileTransferRequest,
+    event_sender: &Sender<ConnectionFileEvent>,
+    cancel_requested: &Arc<AtomicBool>,
+) -> Result<ConnectionFileEvent, String> {
+    let target_dir = normalize_smb_ui_path(&request.target_dir);
+    let conflicts = {
+        let active = share
+            .as_mut()
+            .ok_or_else(|| "SMB 会话已关闭，无法检查上传冲突".to_string())?;
+        transfer_conflicts_upload_smb(active, &request.source_paths, &target_dir).await?
+    };
+    if request.conflict_policy == ConnectionFileConflictPolicy::Ask && !conflicts.is_empty() {
+        return Ok(ConnectionFileEvent::Conflict(ConnectionFileConflict {
+            command: ConnectionFileCommand::Upload(request),
+            names: conflicts,
+        }));
+    }
+
+    let mut transfer_items = Vec::new();
+    for source in &request.source_paths {
+        let source_path = PathBuf::from(source);
+        let metadata = fs::metadata(&source_path)
+            .map_err(|error| format!("读取本地文件 {} 失败：{error}", source_path.display()))?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let file_name = source_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .ok_or_else(|| "本地文件名无效，无法上传".to_string())?;
+        let dest = join_remote_path(&target_dir, &file_name);
+        if request.conflict_policy == ConnectionFileConflictPolicy::Skip
+            && smb_path_exists(
+                share
+                    .as_mut()
+                    .ok_or_else(|| "SMB 会话已关闭，无法检查目标文件".to_string())?,
+                &dest,
+            )
+            .await?
+        {
+            continue;
+        }
+        transfer_items.push((source_path, dest, metadata.len()));
+    }
+
+    let total_files = transfer_items.len();
+    let total_bytes = transfer_items.iter().map(|(_, _, size)| *size).sum::<u64>();
+    let mut progress = ConnectionFileProgressReporter::new(
+        event_sender,
+        ConnectionFileTransferOperation::Upload,
+        total_files,
+        total_bytes,
+    );
+    cancel_requested.store(false, Ordering::SeqCst);
+    progress.emit_if_due(true);
+
+    let mut copied = 0usize;
+    for (source_path, dest, _) in transfer_items {
+        if cancel_requested.load(Ordering::SeqCst) {
+            return Ok(cancelled_transfer_event(
+                ConnectionFileTransferOperation::Upload,
+            ));
+        }
+        let temp = remote_transfer_sidecar_path(&dest, "tmp");
+        let temp_wire = smb_wire_path(&temp);
+        let active_share = share
+            .as_mut()
+            .ok_or_else(|| "SMB 会话已关闭，无法继续文件传输".to_string())?;
+        let mut source_file = fs::File::open(&source_path)
+            .map_err(|error| format!("打开本地文件 {} 失败：{error}", source_path.display()))?;
+        let mut writer = active_share
+            .client
+            .create_file_writer(&active_share.tree, &temp_wire)
+            .await
+            .map_err(|error| format!("创建 SMB 临时文件 {temp} 失败：{error}"))?;
+        let mut cancelled = false;
+        let mut transfer_error = None;
+        let mut buffer = [0u8; SMB_TRANSFER_CHUNK_BYTES];
+        loop {
+            if cancel_requested.load(Ordering::SeqCst) {
+                cancelled = true;
+                break;
+            }
+            let read = match source_file.read(&mut buffer) {
+                Ok(read) => read,
+                Err(error) => {
+                    transfer_error = Some(format!(
+                        "读取本地文件 {} 失败：{error}",
+                        source_path.display()
+                    ));
+                    break;
+                }
+            };
+            if read == 0 {
+                break;
+            }
+            if cancel_requested.load(Ordering::SeqCst) {
+                cancelled = true;
+                break;
+            }
+            if let Err(error) = writer.write_chunk(&buffer[..read]).await {
+                transfer_error = Some(format!("写入 SMB 临时文件 {temp} 失败：{error}"));
+                break;
+            }
+            progress.add_bytes(read as u64);
+        }
+        if cancelled || cancel_requested.load(Ordering::SeqCst) {
+            let _ = writer.abort().await;
+            let _ = active_share
+                .client
+                .delete_file(&mut active_share.tree, &temp_wire)
+                .await;
+            return Ok(cancelled_transfer_event(
+                ConnectionFileTransferOperation::Upload,
+            ));
+        }
+        if let Some(error) = transfer_error {
+            let _ = writer.abort().await;
+            let _ = active_share
+                .client
+                .delete_file(&mut active_share.tree, &temp_wire)
+                .await;
+            return Err(error);
+        }
+        if let Err(error) = writer.finish().await {
+            let _ = active_share
+                .client
+                .delete_file(&mut active_share.tree, &temp_wire)
+                .await;
+            return Err(format!("关闭 SMB 临时文件 {temp} 失败：{error}"));
+        }
+        if let Err(error) = replace_smb_file_with_temp(active_share, &temp, &dest).await {
+            let _ = active_share
+                .client
+                .delete_file(&mut active_share.tree, &temp_wire)
+                .await;
+            return Err(error);
+        }
+        copied = copied.saturating_add(1);
+        progress.complete_file();
+    }
+    progress.finish();
+    Ok(ConnectionFileEvent::OperationFinished(format!(
+        "已上传 {copied} 个文件"
+    )))
+}
+
+/// 下载 SMB 文件到本地目录。
+async fn download_smb_files(
+    share: &mut Option<ActiveSmbShare>,
+    request: ConnectionFileTransferRequest,
+    event_sender: &Sender<ConnectionFileEvent>,
+    cancel_requested: &Arc<AtomicBool>,
+) -> Result<ConnectionFileEvent, String> {
+    let target_dir = normalize_local_path(&request.target_dir);
+    let conflicts = {
+        let active = share
+            .as_mut()
+            .ok_or_else(|| "SMB 会话已关闭，无法检查下载冲突".to_string())?;
+        transfer_conflicts_download_smb(active, &request.source_paths, &target_dir).await?
+    };
+    if request.conflict_policy == ConnectionFileConflictPolicy::Ask && !conflicts.is_empty() {
+        return Ok(ConnectionFileEvent::Conflict(ConnectionFileConflict {
+            command: ConnectionFileCommand::Download(request),
+            names: conflicts,
+        }));
+    }
+
+    let mut transfer_items = Vec::new();
+    for source in &request.source_paths {
+        let ui_source = normalize_smb_ui_path(source);
+        let active = share
+            .as_mut()
+            .ok_or_else(|| "SMB 会话已关闭，无法读取文件元信息".to_string())?;
+        let metadata = active
+            .client
+            .stat(&mut active.tree, &smb_wire_path(&ui_source))
+            .await
+            .map_err(|error| format!("读取 SMB 文件 {ui_source} 元信息失败：{error}"))?;
+        if smb_file_info_is_directory(&metadata) {
+            continue;
+        }
+        let file_name =
+            remote_file_name(&ui_source).ok_or_else(|| "SMB 文件名无效，无法下载".to_string())?;
+        let dest = target_dir.join(file_name);
+        if request.conflict_policy == ConnectionFileConflictPolicy::Skip && dest.exists() {
+            continue;
+        }
+        transfer_items.push((ui_source, dest, metadata.size));
+    }
+
+    let total_files = transfer_items.len();
+    let total_bytes = transfer_items.iter().map(|(_, _, size)| *size).sum::<u64>();
+    let mut progress = ConnectionFileProgressReporter::new(
+        event_sender,
+        ConnectionFileTransferOperation::Download,
+        total_files,
+        total_bytes,
+    );
+    cancel_requested.store(false, Ordering::SeqCst);
+    progress.emit_if_due(true);
+
+    let mut copied = 0usize;
+    for (source, dest, _) in transfer_items {
+        if cancel_requested.load(Ordering::SeqCst) {
+            return Ok(cancelled_transfer_event(
+                ConnectionFileTransferOperation::Download,
+            ));
+        }
+        let active_share = share
+            .as_mut()
+            .ok_or_else(|| "SMB 会话已关闭，无法继续文件传输".to_string())?;
+        let source_wire = smb_wire_path(&source);
+        let mut remote_file = active_share
+            .client
+            .download(&active_share.tree, &source_wire)
+            .await
+            .map_err(|error| format!("打开 SMB 文件 {source} 失败：{error}"))?;
+        let temp = local_transfer_sidecar_path(&dest, "tmp");
+        let mut dest_file = fs::File::create(&temp)
+            .map_err(|error| format!("创建本地临时文件 {} 失败：{error}", temp.display()))?;
+        let mut cancelled = false;
+        let mut transfer_error = None;
+        while let Some(chunk_result) = remote_file.next_chunk().await {
+            if cancel_requested.load(Ordering::SeqCst) {
+                cancelled = true;
+                break;
+            }
+            let data = match chunk_result {
+                Ok(data) => data,
+                Err(error) => {
+                    transfer_error = Some(format!("读取 SMB 文件 {source} 失败：{error}"));
+                    break;
+                }
+            };
+            if cancel_requested.load(Ordering::SeqCst) {
+                cancelled = true;
+                break;
+            }
+            if let Err(error) = dest_file.write_all(&data) {
+                transfer_error = Some(format!("写入本地临时文件 {} 失败：{error}", temp.display()));
+                break;
+            }
+            progress.add_bytes(data.len() as u64);
+        }
+        drop(remote_file);
+        if transfer_error.is_none()
+            && let Err(error) = dest_file.flush()
+        {
+            transfer_error = Some(format!("刷新本地临时文件 {} 失败：{error}", temp.display()));
+        }
+        drop(dest_file);
+        if cancelled || cancel_requested.load(Ordering::SeqCst) {
+            let _ = fs::remove_file(&temp);
+            let _ = active_share.reconnect_tree().await;
+            return Ok(cancelled_transfer_event(
+                ConnectionFileTransferOperation::Download,
+            ));
+        }
+        if let Some(error) = transfer_error {
+            let _ = fs::remove_file(&temp);
+            return Err(error);
         }
         replace_local_file_with_temp(&temp, &dest)?;
         copied = copied.saturating_add(1);
@@ -1493,6 +2070,65 @@ async fn replace_ssh_file_with_temp(
     }
 }
 
+/// 用 SMB 临时文件替换目标文件。
+///
+/// 业务意图：
+/// - SMB 上传也采用“先写临时文件，再替换目标”的策略，避免取消或传输失败时破坏已有文件。
+/// - 不同 SMB 服务端对 rename 覆盖支持不一致，失败时走备份回滚路径，尽量保持原文件可恢复。
+async fn replace_smb_file_with_temp(
+    share: &mut ActiveSmbShare,
+    temp: &str,
+    dest: &str,
+) -> Result<(), String> {
+    let temp_wire = smb_wire_path(temp);
+    let dest_wire = smb_wire_path(dest);
+    match share
+        .client
+        .rename(&mut share.tree, &temp_wire, &dest_wire)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(first_error) => {
+            if !smb_path_exists(share, dest).await? {
+                let _ = share.client.delete_file(&mut share.tree, &temp_wire).await;
+                return Err(format!("替换 SMB 文件 {dest} 失败：{first_error}"));
+            }
+
+            let backup = remote_transfer_sidecar_path(dest, "backup");
+            let backup_wire = smb_wire_path(&backup);
+            if let Err(error) = share
+                .client
+                .rename(&mut share.tree, &dest_wire, &backup_wire)
+                .await
+            {
+                let _ = share.client.delete_file(&mut share.tree, &temp_wire).await;
+                return Err(format!("备份 SMB 文件 {dest} 失败：{error}"));
+            }
+            match share
+                .client
+                .rename(&mut share.tree, &temp_wire, &dest_wire)
+                .await
+            {
+                Ok(()) => {
+                    let _ = share
+                        .client
+                        .delete_file(&mut share.tree, &backup_wire)
+                        .await;
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = share
+                        .client
+                        .rename(&mut share.tree, &backup_wire, &dest_wire)
+                        .await;
+                    let _ = share.client.delete_file(&mut share.tree, &temp_wire).await;
+                    Err(format!("替换 SMB 文件 {dest} 失败：{error}"))
+                }
+            }
+        }
+    }
+}
+
 /// 构建用户主动取消后的完成事件。
 fn cancelled_transfer_event(operation: ConnectionFileTransferOperation) -> ConnectionFileEvent {
     ConnectionFileEvent::OperationFinished(format!("已取消{}", operation.label()))
@@ -1568,6 +2204,74 @@ async fn transfer_conflicts_download_ssh(
     Ok(conflicts)
 }
 
+/// 检查 SMB 上传的远端同名冲突。
+async fn transfer_conflicts_upload_smb(
+    share: &mut ActiveSmbShare,
+    source_paths: &[String],
+    target_dir: &str,
+) -> Result<Vec<String>, String> {
+    let mut conflicts = Vec::new();
+    for source in source_paths {
+        let source_path = PathBuf::from(source);
+        let Some(file_name) = source_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+        else {
+            continue;
+        };
+        let dest = join_remote_path(target_dir, &file_name);
+        if smb_path_exists(share, &dest).await? {
+            conflicts.push(file_name);
+        }
+    }
+    Ok(conflicts)
+}
+
+/// 检查 SMB 下载到本地时的同名冲突。
+async fn transfer_conflicts_download_smb(
+    share: &mut ActiveSmbShare,
+    source_paths: &[String],
+    target_dir: &Path,
+) -> Result<Vec<String>, String> {
+    let mut conflicts = Vec::new();
+    for source in source_paths {
+        let ui_source = normalize_smb_ui_path(source);
+        let metadata = share
+            .client
+            .stat(&mut share.tree, &smb_wire_path(&ui_source))
+            .await
+            .map_err(|error| format!("读取 SMB 文件 {ui_source} 元信息失败：{error}"))?;
+        if smb_file_info_is_directory(&metadata) {
+            continue;
+        }
+        let Some(file_name) = remote_file_name(&ui_source) else {
+            continue;
+        };
+        if target_dir.join(&file_name).exists() {
+            conflicts.push(file_name);
+        }
+    }
+    Ok(conflicts)
+}
+
+/// 判断 SMB 路径是否存在。
+///
+/// 边界条件：
+/// - `smb2` 当前没有稳定的 `try_exists` 高层方法；这里把 `stat` 成功视为存在，失败视为不存在。
+/// - 失败可能来自权限不足或网络错误，后续真正读写仍会返回完整中文错误，不在冲突预检阶段暴露低层细节。
+async fn smb_path_exists(share: &mut ActiveSmbShare, path: &str) -> Result<bool, String> {
+    let ui_path = normalize_smb_ui_path(path);
+    match share
+        .client
+        .stat(&mut share.tree, &smb_wire_path(&ui_path))
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == SmbErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("检查 SMB 路径 {ui_path} 是否存在失败：{error}")),
+    }
+}
+
 /// 将本地路径文本规范化。
 fn normalize_local_path(path: &str) -> PathBuf {
     let expanded = if path == "~" {
@@ -1587,6 +2291,44 @@ fn normalize_local_path(path: &str) -> PathBuf {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(path)
+    }
+}
+
+/// 规范化 SMB 共享内 UI 路径。
+///
+/// 业务意图：
+/// - 文件管理窗口路径栏展示的是 share 内路径，不包含服务器和共享名；统一以 `/` 开头，根路径为 `/`。
+/// - 该函数阻止 `..` 越过 share 根目录，避免用户在 UI 中构造出看似可以离开固定 share 的路径。
+fn normalize_smb_ui_path(path: &str) -> String {
+    let mut parts = Vec::new();
+    for part in path.replace('\\', "/").split('/') {
+        match part.trim() {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            value => parts.push(value.to_string()),
+        }
+    }
+    if parts.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", parts.join("/"))
+    }
+}
+
+/// 将 SMB UI 路径转换为 `smb2` 接口使用的 share 内路径。
+///
+/// 实现原因：
+/// - `smb2` 接受 share 内相对路径并在内部归一化为 SMB wire 路径；这里仍保留反斜杠形式，便于错误文案和测试与 Windows 习惯一致。
+fn smb_wire_path(path: &str) -> String {
+    let trimmed = normalize_smb_ui_path(path)
+        .trim_start_matches('/')
+        .replace('/', "\\");
+    if trimmed.is_empty() {
+        "\\".to_string()
+    } else {
+        trimmed
     }
 }
 
@@ -1837,6 +2579,21 @@ mod tests {
         assert!(ConnectionFileEntryKind::Symlink.is_deletable());
         assert!(ConnectionFileEntryKind::Directory.is_deletable());
         assert!(!ConnectionFileEntryKind::Other.is_deletable());
+    }
+
+    /// 验证 SMB UI 路径和 wire 路径会按 share 内语义规范化。
+    ///
+    /// 业务意图：
+    /// - 文件管理地址栏向用户展示 `/` 分隔的共享内路径，但底层 SMB2 `CREATE` 需要反斜杠路径。
+    /// - 根目录必须传 `\` 而不是空字符串，避免高层或底层目录枚举把根路径误判为非法空路径。
+    #[test]
+    fn smb_路径会规范化为共享内_wire_路径() {
+        assert_eq!(normalize_smb_ui_path(r"\logs\..\data\今天"), "/data/今天");
+        assert_eq!(smb_wire_path("/"), "\\");
+        assert_eq!(
+            smb_wire_path("/ECOLOGY_customer/历史文件"),
+            r"ECOLOGY_customer\历史文件"
+        );
     }
 
     /// 验证取消传输走普通完成事件，避免 UI 把用户主动取消展示成错误。

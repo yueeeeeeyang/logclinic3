@@ -76,6 +76,14 @@ impl MainView {
                 window.focus(&dialog.name.focus);
                 self.connections.create_menu_open = false;
                 self.connections.dialog = Some(dialog);
+                self.connections.smb_dialog = None;
+            }
+            ConnectionCreateKind::Smb => {
+                let dialog = SmbConnectionDialogState::create(context);
+                window.focus(&dialog.name.focus);
+                self.connections.create_menu_open = false;
+                self.connections.smb_dialog = Some(dialog);
+                self.connections.dialog = None;
             }
             ConnectionCreateKind::LocalTerminal => {
                 self.open_local_terminal(window, context);
@@ -89,21 +97,42 @@ impl MainView {
     /// 打开编辑连接弹窗。
     pub(in crate::app) fn open_edit_connection_dialog(
         &mut self,
-        profile_id: &str,
+        profile_key: &str,
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
-        let Some(profile) = self.connections.profile_by_id(profile_id).cloned() else {
-            self.connections.status_message = Some("连接不存在，无法编辑".to_string());
-            context.notify();
-            return;
-        };
-        let dialog = ConnectionDialogState::edit(&profile, context);
-        window.focus(&dialog.name.focus);
+        match ConnectionProfileKey::parse(profile_key) {
+            Some((ConnectionProfileKind::Ssh, profile_id)) => {
+                let Some(profile) = self.connections.profile_by_id(profile_id).cloned() else {
+                    self.connections.status_message = Some("连接不存在，无法编辑".to_string());
+                    context.notify();
+                    return;
+                };
+                let dialog = ConnectionDialogState::edit(&profile, context);
+                window.focus(&dialog.name.focus);
+                self.connections.dialog = Some(dialog);
+                self.connections.smb_dialog = None;
+            }
+            Some((ConnectionProfileKind::Smb, profile_id)) => {
+                let Some(profile) = self.connections.smb_profile_by_id(profile_id).cloned() else {
+                    self.connections.status_message = Some("连接不存在，无法编辑".to_string());
+                    context.notify();
+                    return;
+                };
+                let dialog = SmbConnectionDialogState::edit(&profile, context);
+                window.focus(&dialog.name.focus);
+                self.connections.smb_dialog = Some(dialog);
+                self.connections.dialog = None;
+            }
+            None => {
+                self.connections.status_message = Some("连接不存在，无法编辑".to_string());
+                context.notify();
+                return;
+            }
+        }
         self.connections.create_menu_open = false;
         self.connections.profile_context_menu = None;
         self.connections.category_context_menu = None;
-        self.connections.dialog = Some(dialog);
         context.notify();
     }
 
@@ -167,6 +196,7 @@ impl MainView {
         context: &mut Context<Self>,
     ) {
         self.connections.dialog = None;
+        self.connections.smb_dialog = None;
         context.stop_propagation();
         context.notify();
     }
@@ -435,6 +465,40 @@ impl MainView {
         context.notify();
     }
 
+    /// 切换 SMB 连接表单中的分类选择器。
+    pub(in crate::app) fn toggle_smb_connection_dialog_category_select(
+        &mut self,
+        _event: &ClickEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if let Some(dialog) = self.connections.smb_dialog.as_mut() {
+            dialog.category_select_open = !dialog.category_select_open;
+        }
+        self.connections.create_menu_open = false;
+        self.connections.profile_context_menu = None;
+        self.connections.category_context_menu = None;
+        context.stop_propagation();
+        context.notify();
+    }
+
+    /// 选择 SMB 连接表单中的分类。
+    pub(in crate::app) fn select_smb_connection_dialog_category(
+        &mut self,
+        category_id: Option<String>,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if let Some(dialog) = self.connections.smb_dialog.as_mut() {
+            dialog.category_id = category_id;
+            dialog.category_select_open = false;
+            dialog.error = None;
+        }
+        context.stop_propagation();
+        context.notify();
+    }
+
     /// 通过鼠标按下事件关闭连接表单中的分类选择器。
     ///
     /// 业务意图：
@@ -448,6 +512,18 @@ impl MainView {
         context: &mut Context<Self>,
     ) {
         self.close_connection_dialog_category_select();
+        context.stop_propagation();
+        context.notify();
+    }
+
+    /// 通过鼠标按下事件关闭 SMB 连接表单中的分类选择器。
+    pub(in crate::app) fn close_smb_connection_dialog_category_select_from_mouse_down(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.close_smb_connection_dialog_category_select();
         context.stop_propagation();
         context.notify();
     }
@@ -467,6 +543,142 @@ impl MainView {
         self.save_connection_dialog(&ClickEvent::default(), window, context);
     }
 
+    /// 保存新增或编辑 SMB 连接。
+    pub(in crate::app) fn save_smb_connection_dialog(
+        &mut self,
+        _event: &ClickEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let Some(path) = self.connections.database_path.clone() else {
+            self.set_smb_connection_dialog_error("无法定位应用配置目录，不能保存连接".to_string());
+            context.stop_propagation();
+            context.notify();
+            return;
+        };
+        self.close_smb_connection_dialog_category_select();
+        let Some(dialog) = self.connections.smb_dialog.as_ref() else {
+            return;
+        };
+        let password_required = matches!(dialog.mode, ConnectionDialogMode::Create);
+        let draft = dialog.to_profile_draft();
+        let normalized = match validate_smb_connection_profile_draft(&draft, password_required) {
+            Ok(normalized) => normalized,
+            Err(error) => {
+                self.set_smb_connection_dialog_error(error);
+                context.stop_propagation();
+                context.notify();
+                return;
+            }
+        };
+        let (name, parsed, username, password) = normalized;
+        if let Some(category_id) = draft.category_id.as_deref()
+            && self.connections.category_by_id(category_id).is_none()
+        {
+            self.set_smb_connection_dialog_error("所选分类不存在，请重新选择".to_string());
+            context.stop_propagation();
+            context.notify();
+            return;
+        }
+
+        let save_result = match dialog.mode.clone() {
+            ConnectionDialogMode::Create => {
+                let id = new_connection_entity_id("smb");
+                let Some(password) = password else {
+                    self.set_smb_connection_dialog_error("密码不能为空".to_string());
+                    context.stop_propagation();
+                    context.notify();
+                    return;
+                };
+                let encrypted_password = match encrypt_connection_password(&id, password.as_str()) {
+                    Ok(encrypted_password) => encrypted_password,
+                    Err(error) => {
+                        self.set_smb_connection_dialog_error(error);
+                        context.stop_propagation();
+                        context.notify();
+                        return;
+                    }
+                };
+                let now = current_connection_time_millis();
+                let profile = SmbConnectionProfile {
+                    id,
+                    name,
+                    host: parsed.host,
+                    port: parsed.port,
+                    share: parsed.share,
+                    initial_path: parsed.initial_path,
+                    username,
+                    category_id: draft.category_id.clone(),
+                    encrypted_password,
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                    last_connected_at_ms: None,
+                };
+                insert_smb_connection_profile(&path, &profile)
+            }
+            ConnectionDialogMode::Edit { profile_id } => {
+                let Some(existing) = self.connections.smb_profile_by_id(&profile_id).cloned()
+                else {
+                    self.set_smb_connection_dialog_error("连接不存在，无法保存".to_string());
+                    context.stop_propagation();
+                    context.notify();
+                    return;
+                };
+                let encrypted_password = match password {
+                    Some(password) => {
+                        match encrypt_connection_password(&existing.id, password.as_str()) {
+                            Ok(encrypted_password) => encrypted_password,
+                            Err(error) => {
+                                self.set_smb_connection_dialog_error(error);
+                                context.stop_propagation();
+                                context.notify();
+                                return;
+                            }
+                        }
+                    }
+                    None => existing.encrypted_password.clone(),
+                };
+                let profile = SmbConnectionProfile {
+                    id: existing.id,
+                    name,
+                    host: parsed.host,
+                    port: parsed.port,
+                    share: parsed.share,
+                    initial_path: parsed.initial_path,
+                    username,
+                    category_id: draft.category_id.clone(),
+                    encrypted_password,
+                    created_at_ms: existing.created_at_ms,
+                    updated_at_ms: current_connection_time_millis(),
+                    last_connected_at_ms: existing.last_connected_at_ms,
+                };
+                update_smb_connection_profile(&path, &profile)
+            }
+        };
+
+        match save_result {
+            Ok(()) => {
+                self.connections.smb_dialog = None;
+                self.connections.reload_tree_data();
+                self.connections.status_message = Some("连接已保存".to_string());
+            }
+            Err(error) => self.set_smb_connection_dialog_error(error),
+        }
+        context.stop_propagation();
+        context.notify();
+    }
+
+    /// 通过鼠标按下事件保存 SMB 连接。
+    pub(in crate::app) fn save_smb_connection_dialog_from_mouse_down(
+        &mut self,
+        _event: &MouseDownEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        self.close_smb_connection_dialog_category_select();
+        self.save_smb_connection_dialog(&ClickEvent::default(), window, context);
+    }
+
     /// 静默收起连接表单分类 Select。
     ///
     /// 业务意图：
@@ -478,9 +690,25 @@ impl MainView {
         }
     }
 
+    /// 静默收起 SMB 连接表单分类 Select。
+    pub(in crate::app) fn close_smb_connection_dialog_category_select(&mut self) {
+        if let Some(dialog) = self.connections.smb_dialog.as_mut() {
+            dialog.category_select_open = false;
+        }
+    }
+
     /// 在连接弹窗上设置错误消息。
     fn set_connection_dialog_error(&mut self, error: String) {
         if let Some(dialog) = self.connections.dialog.as_mut() {
+            dialog.error = Some(error);
+        } else {
+            self.connections.status_message = Some(error);
+        }
+    }
+
+    /// 在 SMB 连接弹窗上设置错误消息。
+    fn set_smb_connection_dialog_error(&mut self, error: String) {
+        if let Some(dialog) = self.connections.smb_dialog.as_mut() {
             dialog.error = Some(error);
         } else {
             self.connections.status_message = Some(error);
@@ -499,17 +727,35 @@ impl MainView {
     /// 打开删除连接确认弹窗。
     pub(in crate::app) fn open_delete_connection_dialog(
         &mut self,
-        profile_id: &str,
+        profile_key: &str,
         context: &mut Context<Self>,
     ) {
-        let Some(profile) = self.connections.profile_by_id(profile_id) else {
-            self.connections.status_message = Some("连接不存在，无法删除".to_string());
-            context.notify();
-            return;
+        let profile_name = match ConnectionProfileKey::parse(profile_key) {
+            Some((ConnectionProfileKind::Ssh, profile_id)) => {
+                let Some(profile) = self.connections.profile_by_id(profile_id) else {
+                    self.connections.status_message = Some("连接不存在，无法删除".to_string());
+                    context.notify();
+                    return;
+                };
+                profile.name.clone()
+            }
+            Some((ConnectionProfileKind::Smb, profile_id)) => {
+                let Some(profile) = self.connections.smb_profile_by_id(profile_id) else {
+                    self.connections.status_message = Some("连接不存在，无法删除".to_string());
+                    context.notify();
+                    return;
+                };
+                profile.name.clone()
+            }
+            None => {
+                self.connections.status_message = Some("连接不存在，无法删除".to_string());
+                context.notify();
+                return;
+            }
         };
         self.connections.delete_confirm_dialog = Some(ConnectionDeleteConfirmDialog {
-            profile_id: profile.id.clone(),
-            profile_name: profile.name.clone(),
+            profile_id: profile_key.to_string(),
+            profile_name,
         });
         self.connections.create_menu_open = false;
         self.connections.profile_context_menu = None;
@@ -582,10 +828,20 @@ impl MainView {
             return;
         };
 
-        match delete_connection_profile(&path, &dialog.profile_id) {
+        let delete_result = match ConnectionProfileKey::parse(&dialog.profile_id) {
+            Some((ConnectionProfileKind::Ssh, profile_id)) => {
+                delete_connection_profile(&path, profile_id).map(|()| {
+                    self.connections.close_tabs_for_profile(profile_id);
+                })
+            }
+            Some((ConnectionProfileKind::Smb, profile_id)) => {
+                delete_smb_connection_profile(&path, profile_id)
+            }
+            None => Err("连接不存在，无法删除".to_string()),
+        };
+        match delete_result {
             Ok(()) => {
-                self.connections.close_tabs_for_profile(&dialog.profile_id);
-                self.connections.reload_profiles();
+                self.connections.reload_tree_data();
                 self.connections.status_message = Some("连接已删除".to_string());
             }
             Err(error) => {
@@ -765,7 +1021,7 @@ impl MainView {
     /// - 离开时只关闭同一个连接打开的气泡，避免快速移动到相邻连接时旧离开事件误关新气泡。
     pub(in crate::app) fn update_connection_profile_hover_tooltip(
         &mut self,
-        profile_id: &str,
+        profile_key: &str,
         is_hovered: bool,
         window: &mut Window,
         context: &mut Context<Self>,
@@ -773,7 +1029,7 @@ impl MainView {
         if is_hovered {
             let pointer = window.mouse_position();
             self.connections.profile_hover_tooltip = Some(ConnectionProfileHoverTooltip {
-                profile_id: profile_id.to_string(),
+                profile_id: profile_key.to_string(),
                 x: Self::connection_profile_tooltip_x(
                     f32::from(pointer.x),
                     self.connections.tree_width,
@@ -791,7 +1047,7 @@ impl MainView {
             .connections
             .profile_hover_tooltip
             .as_ref()
-            .is_some_and(|tooltip| tooltip.profile_id == profile_id);
+            .is_some_and(|tooltip| tooltip.profile_id == profile_key);
         if should_close {
             self.connections.profile_hover_tooltip = None;
             context.notify();
@@ -801,18 +1057,22 @@ impl MainView {
     /// 打开左侧连接行右键菜单。
     pub(in crate::app) fn open_connection_profile_context_menu(
         &mut self,
-        profile_id: &str,
+        profile_key: &str,
         event: &MouseDownEvent,
         window: &Window,
         context: &mut Context<Self>,
     ) {
-        let Some(profile) = self.connections.profile_by_id(profile_id) else {
+        if !connection_profile_key_exists(
+            profile_key,
+            &self.connections.profiles,
+            &self.connections.smb_profiles,
+        ) {
             self.connections.status_message = Some("连接不存在，无法打开菜单".to_string());
             context.stop_propagation();
             context.notify();
             return;
-        };
-        let target_profile_id = profile.id.clone();
+        }
+        let target_profile_id = profile_key.to_string();
 
         self.connections.selected_profile_id = Some(target_profile_id.clone());
         self.connections.profile_context_menu = Some(ConnectionProfileContextMenu {
@@ -884,7 +1144,7 @@ impl MainView {
 
         match action {
             ConnectionProfileContextMenuAction::Connect => {
-                self.open_connection_terminal(&profile_id, window, context);
+                self.open_connection_entry(&profile_id, window, context);
             }
             ConnectionProfileContextMenuAction::Edit => {
                 self.open_edit_connection_dialog(&profile_id, window, context);
@@ -932,6 +1192,92 @@ impl MainView {
     }
 
     /// 打开一个新的 SSH 终端 tab。
+    pub(in crate::app) fn open_connection_entry(
+        &mut self,
+        profile_key: &str,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        match ConnectionProfileKey::parse(profile_key) {
+            Some((ConnectionProfileKind::Ssh, profile_id)) => {
+                self.open_connection_terminal(profile_id, window, context);
+            }
+            Some((ConnectionProfileKind::Smb, profile_id)) => {
+                self.open_smb_file_manager(profile_id, window, context);
+            }
+            None => {
+                self.connections.status_message = Some("连接不存在，无法打开".to_string());
+                context.notify();
+            }
+        }
+    }
+
+    /// 打开 SMB 连接对应的文件管理窗口。
+    ///
+    /// 业务意图：
+    /// - SMB 第一版只提供文件管理，不创建终端 tab；左侧点击连接时直接打开独立窗口。
+    /// - 文件管理窗口拿到当前连接快照和短生命周期明文密码，后续删除保存的连接不影响已经打开的窗口。
+    pub(in crate::app) fn open_smb_file_manager(
+        &mut self,
+        profile_id: &str,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let Some(profile) = self.connections.smb_profile_by_id(profile_id).cloned() else {
+            self.connections.status_message = Some("连接不存在，无法打开文件管理".to_string());
+            context.notify();
+            return;
+        };
+        self.connections.selected_profile_id = Some(ConnectionProfileKey::smb(&profile.id));
+        self.connections.create_menu_open = false;
+        self.connections.profile_context_menu = None;
+        self.connections.profile_hover_tooltip = None;
+        self.connections.category_context_menu = None;
+        self.connections.tab_context_menu = None;
+        self.connections.terminal_context_menu = None;
+        let password = match decrypt_connection_password(&profile.id, &profile.encrypted_password) {
+            Ok(password) => password,
+            Err(error) => {
+                self.connections.status_message = Some(error);
+                context.notify();
+                return;
+            }
+        };
+        let title = format!("{} - 文件管理", profile.name);
+        let initial_path = profile.initial_path.clone();
+        let backend_target = ConnectionFileBackendTarget::Smb {
+            profile,
+            password: zeroize::Zeroizing::new(password),
+        };
+        let main_view = context.entity();
+        window.defer(context, move |_window, app| {
+            let window_options = connection_file_manager_window_options(&title, app);
+            let main_view_for_window = main_view.clone();
+            let main_view_for_error = main_view.clone();
+            let open_result = app.open_window(window_options, move |_window, app| {
+                let backend = start_connection_file_backend(backend_target);
+                app.new(|context| {
+                    ConnectionFileManagerWindowView::new(
+                        main_view_for_window,
+                        title,
+                        backend,
+                        initial_path,
+                        true,
+                        context,
+                    )
+                })
+            });
+            if open_result.is_err() {
+                let _ = main_view_for_error.update(app, |view, context| {
+                    view.connections.status_message = Some("打开文件管理窗口失败".to_string());
+                    context.notify();
+                });
+            }
+        });
+        context.notify();
+    }
+
+    /// 打开一个新的 SSH 终端 tab。
     pub(in crate::app) fn open_connection_terminal(
         &mut self,
         profile_id: &str,
@@ -943,7 +1289,7 @@ impl MainView {
             context.notify();
             return;
         };
-        self.connections.selected_profile_id = Some(profile.id.clone());
+        self.connections.selected_profile_id = Some(ConnectionProfileKey::ssh(&profile.id));
         self.connections.create_menu_open = false;
         self.connections.profile_context_menu = None;
         self.connections.profile_hover_tooltip = None;
@@ -1543,6 +1889,25 @@ impl MainView {
         }
     }
 
+    /// 判断 SMB 连接表单当前聚焦字段。
+    pub(in crate::app) fn active_smb_connection_form_field(
+        &self,
+        window: &Window,
+    ) -> Option<SmbConnectionFormField> {
+        let dialog = self.connections.smb_dialog.as_ref()?;
+        if dialog.name.focus.is_focused(window) {
+            Some(SmbConnectionFormField::Name)
+        } else if dialog.address.focus.is_focused(window) {
+            Some(SmbConnectionFormField::Address)
+        } else if dialog.username.focus.is_focused(window) {
+            Some(SmbConnectionFormField::Username)
+        } else if dialog.password.focus.is_focused(window) {
+            Some(SmbConnectionFormField::Password)
+        } else {
+            None
+        }
+    }
+
     /// 判断连接分类弹窗名称输入框是否聚焦。
     pub(in crate::app) fn connection_category_name_focused(&self, window: &Window) -> bool {
         self.connections
@@ -1555,6 +1920,7 @@ impl MainView {
     pub(in crate::app) fn connection_text_input_focused(&self, window: &Window) -> bool {
         self.connections.tree_search.focus.is_focused(window)
             || self.active_connection_form_field(window).is_some()
+            || self.active_smb_connection_form_field(window).is_some()
             || self.connection_category_name_focused(window)
     }
 
@@ -1611,6 +1977,7 @@ impl MainView {
     /// - 该判断不包含左侧新增类型菜单，因为它不是模态弹窗，只负责自身区域的鼠标消费。
     pub(in crate::app) fn connection_modal_open(&self) -> bool {
         self.connections.dialog.is_some()
+            || self.connections.smb_dialog.is_some()
             || self.connections.category_dialog.is_some()
             || self.connections.delete_confirm_dialog.is_some()
             || self.connections.category_delete_confirm_dialog.is_some()
@@ -1652,6 +2019,20 @@ impl MainView {
         })
     }
 
+    /// 返回 SMB 连接表单字段的绘制快照。
+    pub(in crate::app) fn smb_connection_form_text_snapshot(
+        &self,
+        field: SmbConnectionFormField,
+    ) -> Option<SingleLineTextInputSnapshot> {
+        let state = self.connections.smb_dialog.as_ref()?.field(field);
+        Some(SingleLineTextInputSnapshot {
+            text: state.input.text.clone(),
+            selection_range: state.input.selection_range.clone(),
+            marked_range: state.input.marked_range.clone(),
+            horizontal_scroll_px: state.input.horizontal_scroll_px,
+        })
+    }
+
     /// 返回连接分类名称输入框绘制快照。
     pub(in crate::app) fn connection_category_text_snapshot(
         &self,
@@ -1674,6 +2055,21 @@ impl MainView {
         horizontal_scroll_px: f32,
     ) {
         if let Some(dialog) = self.connections.dialog.as_mut() {
+            dialog
+                .field_mut(field)
+                .store_layout(line, bounds, horizontal_scroll_px);
+        }
+    }
+
+    /// 保存 SMB 连接表单字段最近一次文本布局。
+    pub(in crate::app) fn store_smb_connection_form_text_layout(
+        &mut self,
+        field: SmbConnectionFormField,
+        line: ShapedLine,
+        bounds: Bounds<Pixels>,
+        horizontal_scroll_px: f32,
+    ) {
+        if let Some(dialog) = self.connections.smb_dialog.as_mut() {
             dialog
                 .field_mut(field)
                 .store_layout(line, bounds, horizontal_scroll_px);
@@ -1716,6 +2112,37 @@ impl MainView {
         let display_index = layout
             .closest_index_for_x(position.x - bounds.left() + px(state.input.horizontal_scroll_px));
         if field == ConnectionFormField::Password {
+            TextInputDisplayMode::Masked { mask_char: '*' }
+                .text_index_for_display_index(text, display_index)
+        } else {
+            text_input_clamp_byte_index(text, display_index.min(text.len()))
+        }
+    }
+
+    /// 根据鼠标窗口坐标返回 SMB 连接表单字段中的 UTF-8 字节下标。
+    pub(in crate::app) fn smb_connection_form_text_index_for_point(
+        &self,
+        field: SmbConnectionFormField,
+        position: gpui::Point<Pixels>,
+    ) -> usize {
+        let Some(dialog) = self.connections.smb_dialog.as_ref() else {
+            return 0;
+        };
+        let state = dialog.field(field);
+        let text = &state.input.text;
+        let (Some(layout), Some(bounds)) = (state.last_layout.as_ref(), state.last_bounds.as_ref())
+        else {
+            return text.len();
+        };
+        if position.y < bounds.top() {
+            return 0;
+        }
+        if position.y > bounds.bottom() {
+            return text.len();
+        }
+        let display_index = layout
+            .closest_index_for_x(position.x - bounds.left() + px(state.input.horizontal_scroll_px));
+        if field == SmbConnectionFormField::Password {
             TextInputDisplayMode::Masked { mask_char: '*' }
                 .text_index_for_display_index(text, display_index)
         } else {
@@ -1771,6 +2198,84 @@ impl MainView {
         }
 
         let Some(dialog) = self.connections.dialog.as_mut() else {
+            return;
+        };
+        let input = &mut dialog.field_mut(field).input;
+
+        if Self::is_paste_keystroke(&event.keystroke) {
+            if let Some(text) = context.read_from_clipboard().and_then(|item| item.text()) {
+                replace_text_input_selection(input, &sanitize_text_input_single_line_text(&text));
+                dialog.error = None;
+            }
+            context.stop_propagation();
+            context.notify();
+            return;
+        }
+        if Self::is_copy_keystroke(&event.keystroke) {
+            if let Some(text) = text_input_selected_text(input) {
+                context.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            context.stop_propagation();
+            return;
+        }
+        if Self::is_cut_keystroke(&event.keystroke) {
+            if let Some(text) = text_input_selected_text(input) {
+                context.write_to_clipboard(ClipboardItem::new_string(text));
+                replace_text_input_selection(input, "");
+                dialog.error = None;
+            }
+            context.stop_propagation();
+            context.notify();
+            return;
+        }
+        if Self::is_select_all_keystroke(&event.keystroke) {
+            select_all_text_input(input);
+            context.stop_propagation();
+            context.notify();
+            return;
+        }
+
+        let outcome = match event.keystroke.key.as_str() {
+            "left" => move_text_input_left(input, event.keystroke.modifiers.shift),
+            "right" => move_text_input_right(input, event.keystroke.modifiers.shift),
+            "home" | "up" => move_text_input_home(input, event.keystroke.modifiers.shift),
+            "end" | "down" => move_text_input_end(input, event.keystroke.modifiers.shift),
+            "backspace" => backspace_text_input(input),
+            "delete" => delete_text_input(input),
+            _ => TextInputEditOutcome::default(),
+        };
+        if outcome.consumed {
+            if outcome.changed {
+                dialog.error = None;
+            }
+            context.stop_propagation();
+            context.notify();
+        }
+    }
+
+    /// 处理 SMB 连接表单按键。
+    pub(in crate::app) fn handle_smb_connection_form_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let Some(field) = self.active_smb_connection_form_field(window) else {
+            return;
+        };
+
+        if event.keystroke.key == "escape" {
+            self.connections.smb_dialog = None;
+            context.stop_propagation();
+            context.notify();
+            return;
+        }
+        if event.keystroke.key == "enter" {
+            self.save_smb_connection_dialog(&ClickEvent::default(), window, context);
+            return;
+        }
+
+        let Some(dialog) = self.connections.smb_dialog.as_mut() else {
             return;
         };
         let input = &mut dialog.field_mut(field).input;

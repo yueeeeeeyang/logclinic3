@@ -9,7 +9,7 @@
 // - 上传和下载都通过 GPUI 系统文件选择器获取本地路径；Windows/macOS 的对话框差异由 GPUI 封装。
 // - SSH 路径是远端字符串，本地路径是 `PathBuf` 展示字符串，二者只在后端边界转换。
 
-use std::sync::mpsc;
+use std::{sync::mpsc, time::Instant};
 
 use chrono::{Local, TimeZone};
 
@@ -65,6 +65,21 @@ struct ConnectionFileSortState {
 struct ConnectionFileListScrollbarDrag {
     /// 鼠标按下点相对滑块顶部的偏移。
     cursor_offset: Pixels,
+}
+
+/// 文件管理路径输入框最近一次绘制布局。
+///
+/// 业务意图：
+/// - 地址栏现在复用通用 `TextInputElement`，鼠标定位、拖拽选区和 IME 候选窗口都依赖上一帧的字形布局。
+/// - 文件管理窗口是独立 `Entity`，不能把这些布局缓存写回主窗口状态，因此在窗口状态内保存一份。
+#[derive(Clone)]
+struct ConnectionFilePathInputLayout {
+    /// 路径文本的单行字形布局。
+    line: ShapedLine,
+    /// 输入框当前帧的窗口坐标边界。
+    bounds: Bounds<Pixels>,
+    /// 当前水平滚动偏移。
+    horizontal_scroll_px: f32,
 }
 
 /// 文件列表右键菜单动作。
@@ -127,10 +142,22 @@ pub(in crate::app) struct ConnectionFileManagerWindowView {
     remote: bool,
     /// 当前目录路径。
     current_path: String,
-    /// 路径栏编辑文本。
-    path_text: String,
+    /// 路径栏编辑状态。
+    ///
+    /// 业务意图：
+    /// - 文件管理地址栏需要支持长路径水平滚动、中文 IME、复制粘贴、选区和鼠标定位。
+    /// - 使用通用单行输入状态后，地址栏不再维护一套简化的字符串拼接逻辑。
+    path_input: SingleLineTextInputState,
     /// 路径栏焦点。
     path_focus: FocusHandle,
+    /// 路径栏最近一次字形布局。
+    path_layout: Option<ConnectionFilePathInputLayout>,
+    /// 路径栏光标最近一次用户活动时间。
+    ///
+    /// 业务意图：
+    /// - 通用输入框组件只询问宿主“本帧是否显示光标”，具体闪烁节奏由宿主维护。
+    /// - 文件管理窗口是独立窗口，不能复用主窗口搜索输入框的时间戳，因此这里保存自己的活动时间。
+    path_cursor_last_activity: Instant,
     /// 已加载的目录项。
     entries: Vec<ConnectionFileEntry>,
     /// 已按当前表头状态排序后的目录项缓存。
@@ -194,8 +221,10 @@ impl ConnectionFileManagerWindowView {
             backend,
             remote,
             current_path: initial_path.clone(),
-            path_text: initial_path,
+            path_input: SingleLineTextInputState::from_text(initial_path),
             path_focus: context.focus_handle(),
+            path_layout: None,
+            path_cursor_last_activity: Instant::now(),
             entries: Vec::new(),
             sorted_entries: Vec::new(),
             list_scroll_handle: UniformListScrollHandle::new(),
@@ -223,6 +252,56 @@ impl ConnectionFileManagerWindowView {
     /// 发送文件后端命令。
     fn send_command(&self, command: ConnectionFileCommand) {
         let _ = self.backend.command_sender.send(command);
+    }
+
+    /// 替换路径栏文本并重置单行输入派生状态。
+    ///
+    /// 业务意图：
+    /// - 后端列目录成功、双击进入目录或点击上级时，路径栏应整体切换到新目录并把光标放到末尾。
+    /// - 旧的选区、IME 组合范围和水平滚动偏移都属于旧路径，继续复用会导致光标位置和鼠标命中错位。
+    fn set_path_text(&mut self, text: String) {
+        self.path_input.set_text(text);
+        self.path_layout = None;
+        self.touch_path_input_cursor_activity();
+    }
+
+    /// 标记文件管理地址栏光标发生用户活动。
+    ///
+    /// 业务意图：
+    /// - 点击定位、方向键移动、粘贴、IME 提交和程序切换路径后，光标应先保持短暂常亮再进入闪烁。
+    /// - 与主窗口通用输入框保持同一节奏，避免同一组件在不同窗口里看起来像两套控件。
+    fn touch_path_input_cursor_activity(&mut self) {
+        self.path_cursor_last_activity = Instant::now();
+    }
+
+    /// 判断窗口坐标是否位于地址栏输入区域。
+    fn path_input_contains_position(&self, position: Point<Pixels>) -> bool {
+        self.path_layout
+            .as_ref()
+            .is_some_and(|layout| layout.bounds.contains(&position))
+    }
+
+    /// 点击地址栏以外位置时取消地址栏焦点。
+    ///
+    /// 业务意图：
+    /// - GPUI 的焦点不会因为点击普通列表行自动清空；如果文件行没有自己的焦点句柄，地址栏会继续显示蓝色焦点边框。
+    /// - 在窗口根节点统一处理“输入框外点击失焦”，可以让文件列表、工具栏和状态栏的点击都恢复普通状态。
+    fn blur_path_input_if_click_outside(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left || !self.path_focus.is_focused(window) {
+            return;
+        }
+        if self.path_input_contains_position(event.position) {
+            return;
+        }
+        self.path_input.selection_drag = None;
+        self.path_input.marked_range = None;
+        window.blur();
+        context.notify();
     }
 
     /// 打开独立文件预览窗口。
@@ -286,9 +365,35 @@ impl ConnectionFileManagerWindowView {
             };
 
             match event {
+                ConnectionFileEvent::SmbConnected {
+                    profile_id,
+                    connected_at_ms,
+                } => {
+                    let main_view = self.main_view.clone();
+                    context.defer(move |app| {
+                        let _ = main_view.update(app, |view, context| {
+                            if let Some(path) = view.connections.database_path.clone() {
+                                let _ = update_smb_connection_last_connected_at(
+                                    &path,
+                                    &profile_id,
+                                    connected_at_ms,
+                                );
+                            }
+                            if let Some(profile) = view
+                                .connections
+                                .smb_profiles
+                                .iter_mut()
+                                .find(|profile| profile.id == profile_id)
+                            {
+                                profile.last_connected_at_ms = Some(connected_at_ms);
+                            }
+                            context.notify();
+                        });
+                    });
+                }
                 ConnectionFileEvent::Listed { path, entries } => {
                     self.current_path = path.clone();
-                    self.path_text = path;
+                    self.set_path_text(path);
                     self.entries = entries;
                     self.rebuild_sorted_entries();
                     // 切换目录或刷新完成后列表内容已经变化，旧滚动位置和拖动状态不能继续复用。
@@ -350,7 +455,7 @@ impl ConnectionFileManagerWindowView {
 
     /// 切换到路径栏中的目录。
     fn open_path_from_input(&mut self, context: &mut Context<Self>) {
-        let next = self.path_text.trim().to_string();
+        let next = self.path_input.text.trim().to_string();
         if next.is_empty() {
             self.error_message = Some("路径不能为空".to_string());
             context.notify();
@@ -368,7 +473,7 @@ impl ConnectionFileManagerWindowView {
         let Some(parent) = connection_file_parent_path(&self.current_path, self.remote) else {
             return;
         };
-        self.path_text = parent.clone();
+        self.set_path_text(parent.clone());
         self.status_message = Some("正在读取目录...".to_string());
         self.send_command(ConnectionFileCommand::List { path: parent });
         self.schedule_poll(context);
@@ -379,8 +484,12 @@ impl ConnectionFileManagerWindowView {
     fn handle_path_key_down(&mut self, event: &KeyDownEvent, context: &mut Context<Self>) {
         if MainView::is_paste_keystroke(&event.keystroke) {
             if let Some(text) = context.read_from_clipboard().and_then(|item| item.text()) {
-                self.path_text
-                    .push_str(&sanitize_file_manager_path_text(&text));
+                replace_text_input_selection(
+                    &mut self.path_input,
+                    &sanitize_file_manager_path_text(&text),
+                );
+                self.path_layout = None;
+                self.touch_path_input_cursor_activity();
             }
             context.stop_propagation();
             context.notify();
@@ -392,25 +501,59 @@ impl ConnectionFileManagerWindowView {
                 context.stop_propagation();
             }
             "escape" => {
-                self.path_text = self.current_path.clone();
-                context.stop_propagation();
-                context.notify();
-            }
-            "backspace" => {
-                self.path_text.pop();
+                self.set_path_text(self.current_path.clone());
                 context.stop_propagation();
                 context.notify();
             }
             _ => {
-                if event.keystroke.modifiers.control
-                    || event.keystroke.modifiers.platform
-                    || event.keystroke.modifiers.alt
-                {
+                if MainView::is_copy_keystroke(&event.keystroke) {
+                    if let Some(text) = text_input_selected_text(&self.path_input) {
+                        context.write_to_clipboard(ClipboardItem::new_string(text));
+                    }
+                    context.stop_propagation();
                     return;
                 }
-                if let Some(text) = event.keystroke.key_char.as_ref() {
-                    self.path_text
-                        .push_str(&sanitize_file_manager_path_text(text));
+                if MainView::is_cut_keystroke(&event.keystroke) {
+                    if let Some(text) = text_input_selected_text(&self.path_input) {
+                        context.write_to_clipboard(ClipboardItem::new_string(text));
+                        replace_text_input_selection(&mut self.path_input, "");
+                        self.path_layout = None;
+                        self.touch_path_input_cursor_activity();
+                    }
+                    context.stop_propagation();
+                    context.notify();
+                    return;
+                }
+                if MainView::is_select_all_keystroke(&event.keystroke) {
+                    select_all_text_input(&mut self.path_input);
+                    self.touch_path_input_cursor_activity();
+                    context.stop_propagation();
+                    context.notify();
+                    return;
+                }
+
+                let outcome = match event.keystroke.key.as_str() {
+                    "left" => {
+                        move_text_input_left(&mut self.path_input, event.keystroke.modifiers.shift)
+                    }
+                    "right" => {
+                        move_text_input_right(&mut self.path_input, event.keystroke.modifiers.shift)
+                    }
+                    "home" | "up" => {
+                        move_text_input_home(&mut self.path_input, event.keystroke.modifiers.shift)
+                    }
+                    "end" | "down" => {
+                        move_text_input_end(&mut self.path_input, event.keystroke.modifiers.shift)
+                    }
+                    "backspace" => backspace_text_input(&mut self.path_input),
+                    "delete" => delete_text_input(&mut self.path_input),
+                    _ => TextInputEditOutcome::default(),
+                };
+                if outcome.consumed {
+                    if outcome.changed {
+                        self.path_layout = None;
+                    }
+                    self.touch_path_input_cursor_activity();
                     context.stop_propagation();
                     context.notify();
                 }
@@ -427,7 +570,7 @@ impl ConnectionFileManagerWindowView {
     ) {
         if event.click_count >= 2 {
             if entry.kind.is_directory() {
-                self.path_text = entry.path.clone();
+                self.set_path_text(entry.path.clone());
                 self.status_message = Some("正在读取目录...".to_string());
                 self.file_context_menu = None;
                 self.send_command(ConnectionFileCommand::List { path: entry.path });
@@ -797,11 +940,6 @@ impl ConnectionFileManagerWindowView {
         context: &mut Context<Self>,
     ) -> impl IntoElement {
         let focused = self.path_focus.is_focused(window);
-        let text = if focused {
-            format!("{}|", self.path_text)
-        } else {
-            self.path_text.clone()
-        };
         div()
             .id("connection-file-path-input")
             .track_focus(&self.path_focus)
@@ -828,7 +966,6 @@ impl ConnectionFileManagerWindowView {
             .text_color(rgb(palette.text))
             .text_size(px(12.0))
             .overflow_hidden()
-            .whitespace_nowrap()
             .cursor_text()
             .on_mouse_down(
                 MouseButton::Left,
@@ -837,7 +974,13 @@ impl ConnectionFileManagerWindowView {
                     context.stop_propagation();
                 }),
             )
-            .child(text)
+            .child(TextInputElement {
+                view: context.entity(),
+                binding: TextInputBinding::FileManagerPath,
+                focus_handle: self.path_focus.clone(),
+                placeholder: "输入路径",
+                palette,
+            })
     }
 
     /// 渲染单个文件行。
@@ -1712,6 +1855,344 @@ impl Drop for ConnectionFileManagerWindowView {
     }
 }
 
+impl ConnectionFileManagerWindowView {
+    /// 将窗口坐标换算为路径栏真实文本的 UTF-8 字节下标。
+    ///
+    /// 边界条件：
+    /// - 地址栏第一次绘制前还没有字形布局，此时回退到文本末尾，保证点击不会 panic。
+    /// - 命中计算需要加入水平滚动偏移，否则长路径滚动后鼠标位置会映射到错误字符。
+    fn path_input_index_for_point(&self, position: Point<Pixels>) -> usize {
+        let text = &self.path_input.text;
+        let Some(layout) = self.path_layout.as_ref() else {
+            return text.len();
+        };
+        if position.y < layout.bounds.top() {
+            return 0;
+        }
+        if position.y > layout.bounds.bottom() {
+            return text.len();
+        }
+        let display_index = layout.line.closest_index_for_x(
+            position.x - layout.bounds.left() + px(layout.horizontal_scroll_px),
+        );
+        text_input_clamp_byte_index(text, display_index.min(text.len()))
+    }
+
+    /// 返回 UTF-16 范围对应的窗口坐标，用于平台 IME 候选窗口定位。
+    ///
+    /// 实现原因：
+    /// - GPUI 平台输入协议使用 UTF-16 范围，而地址栏内部保存 UTF-8 字符串。
+    /// - 候选窗口必须跟随水平滚动后的光标位置，否则中文输入时候选栏会偏离可见光标。
+    fn path_input_bounds_for_utf16_range(
+        &self,
+        range_utf16: Range<usize>,
+        fallback_bounds: Bounds<Pixels>,
+    ) -> Bounds<Pixels> {
+        let Some(layout) = self.path_layout.as_ref() else {
+            return fallback_bounds;
+        };
+        let range = text_input_range_from_utf16(&self.path_input.text, range_utf16);
+        let start_x = f32::from(
+            layout.bounds.left() - px(layout.horizontal_scroll_px)
+                + layout.line.x_for_index(range.start),
+        )
+        .clamp(
+            f32::from(layout.bounds.left()),
+            f32::from(layout.bounds.right()),
+        );
+        let end_x = f32::from(
+            layout.bounds.left() - px(layout.horizontal_scroll_px)
+                + layout.line.x_for_index(range.end),
+        )
+        .clamp(
+            f32::from(layout.bounds.left()),
+            f32::from(layout.bounds.right()),
+        );
+        Bounds::from_corners(
+            point(px(start_x.min(end_x)), layout.bounds.top()),
+            point(
+                px(start_x.max(end_x).max(start_x.min(end_x) + 1.0)),
+                layout.bounds.bottom(),
+            ),
+        )
+    }
+
+    /// 用平台提交文本替换地址栏选区。
+    fn replace_path_input_range(&mut self, range_utf16: Option<Range<usize>>, text: &str) {
+        let replacement = sanitize_file_manager_path_text(text);
+        let range = range_utf16
+            .map(|range| text_input_range_from_utf16(&self.path_input.text, range))
+            .or_else(|| self.path_input.marked_range.clone())
+            .unwrap_or_else(|| self.path_input.selection_range.clone());
+        let range = text_input_clamp_range(&self.path_input.text, range);
+        self.path_input
+            .text
+            .replace_range(range.clone(), &replacement);
+        let cursor = range.start + replacement.len();
+        self.path_input.selection_range = cursor..cursor;
+        self.path_input.marked_range = None;
+        self.path_input.selection_drag = None;
+        self.path_input.horizontal_scroll_px = 0.0;
+        self.path_layout = None;
+        self.touch_path_input_cursor_activity();
+    }
+
+    /// 用平台组合文本替换地址栏选区并保留 marked 范围。
+    fn replace_and_mark_path_input_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range_utf16: Option<Range<usize>>,
+    ) {
+        let replacement = sanitize_file_manager_path_text(new_text);
+        let range = range_utf16
+            .map(|range| text_input_range_from_utf16(&self.path_input.text, range))
+            .or_else(|| self.path_input.marked_range.clone())
+            .unwrap_or_else(|| self.path_input.selection_range.clone());
+        let range = text_input_clamp_range(&self.path_input.text, range);
+        self.path_input
+            .text
+            .replace_range(range.clone(), &replacement);
+        if replacement.is_empty() {
+            self.path_input.marked_range = None;
+        } else {
+            self.path_input.marked_range = Some(range.start..range.start + replacement.len());
+        }
+        self.path_input.selection_range = new_selected_range_utf16
+            .map(|utf16_range| text_input_range_from_utf16(&replacement, utf16_range))
+            .map(|relative_range| {
+                range.start + relative_range.start..range.start + relative_range.end
+            })
+            .unwrap_or_else(|| {
+                let cursor = range.start + replacement.len();
+                cursor..cursor
+            });
+        self.path_input.selection_drag = None;
+        self.path_input.horizontal_scroll_px = 0.0;
+        self.path_layout = None;
+        self.touch_path_input_cursor_activity();
+    }
+}
+
+impl EntityInputHandler for ConnectionFileManagerWindowView {
+    /// 返回地址栏指定 UTF-16 范围的文本。
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        window: &mut Window,
+        _context: &mut Context<Self>,
+    ) -> Option<String> {
+        if !self.path_focus.is_focused(window) {
+            return None;
+        }
+        let range = text_input_range_from_utf16(&self.path_input.text, range_utf16);
+        adjusted_range.replace(text_input_range_to_utf16(
+            &self.path_input.text,
+            range.clone(),
+        ));
+        Some(self.path_input.text[range].to_string())
+    }
+
+    /// 返回地址栏当前选区。
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        window: &mut Window,
+        _context: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        self.path_focus.is_focused(window).then(|| UTF16Selection {
+            range: text_input_range_to_utf16(
+                &self.path_input.text,
+                self.path_input.selection_range.clone(),
+            ),
+            reversed: false,
+        })
+    }
+
+    /// 返回地址栏当前 IME 组合范围。
+    fn marked_text_range(
+        &self,
+        window: &mut Window,
+        _context: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        if !self.path_focus.is_focused(window) {
+            return None;
+        }
+        self.path_input
+            .marked_range
+            .clone()
+            .map(|range| text_input_range_to_utf16(&self.path_input.text, range))
+    }
+
+    /// 清理地址栏 IME 组合范围。
+    fn unmark_text(&mut self, window: &mut Window, context: &mut Context<Self>) {
+        if !self.path_focus.is_focused(window) {
+            return;
+        }
+        self.path_input.marked_range = None;
+        self.path_input.selection_drag = None;
+        self.touch_path_input_cursor_activity();
+        context.notify();
+    }
+
+    /// 提交普通文本到地址栏。
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if !self.path_focus.is_focused(window) {
+            return;
+        }
+        self.replace_path_input_range(range_utf16, text);
+        context.notify();
+    }
+
+    /// 更新地址栏 IME 组合文本。
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range_utf16: Option<Range<usize>>,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if !self.path_focus.is_focused(window) {
+            return;
+        }
+        self.replace_and_mark_path_input_range(range_utf16, new_text, new_selected_range_utf16);
+        context.notify();
+    }
+
+    /// 返回地址栏指定范围的候选窗口锚点。
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _context: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(self.path_input_bounds_for_utf16_range(range_utf16, element_bounds))
+    }
+
+    /// 返回点击位置对应的 UTF-16 下标。
+    fn character_index_for_point(
+        &mut self,
+        point: Point<Pixels>,
+        _window: &mut Window,
+        _context: &mut Context<Self>,
+    ) -> Option<usize> {
+        let index = self.path_input_index_for_point(point);
+        Some(text_input_utf16_offset_from_byte(
+            &self.path_input.text,
+            index,
+        ))
+    }
+}
+
+impl TextInputElementHost for ConnectionFileManagerWindowView {
+    /// 读取文件管理地址栏的通用输入快照。
+    fn text_input_snapshot(&self, binding: TextInputBinding) -> Option<TextInputSnapshot> {
+        (binding == TextInputBinding::FileManagerPath).then(|| {
+            TextInputSnapshot::from_single_line(
+                SingleLineTextInputSnapshot {
+                    text: self.path_input.text.clone(),
+                    selection_range: self.path_input.selection_range.clone(),
+                    marked_range: self.path_input.marked_range.clone(),
+                    horizontal_scroll_px: self.path_input.horizontal_scroll_px,
+                },
+                TextInputDisplayMode::Plain,
+            )
+        })
+    }
+
+    /// 保存文件管理地址栏最近一次布局。
+    fn store_text_input_layout(
+        &mut self,
+        binding: TextInputBinding,
+        line: ShapedLine,
+        bounds: Bounds<Pixels>,
+        horizontal_scroll_px: f32,
+    ) {
+        if binding != TextInputBinding::FileManagerPath {
+            return;
+        }
+        self.path_input.horizontal_scroll_px = horizontal_scroll_px;
+        self.path_layout = Some(ConnectionFilePathInputLayout {
+            line,
+            bounds,
+            horizontal_scroll_px,
+        });
+    }
+
+    /// 地址栏鼠标按下时定位光标或开始拖拽选区。
+    fn begin_text_input_mouse_interaction(
+        &mut self,
+        binding: TextInputBinding,
+        event: &MouseDownEvent,
+        _was_focused: bool,
+        context: &mut Context<Self>,
+    ) -> bool {
+        if binding != TextInputBinding::FileManagerPath {
+            return false;
+        }
+        let index = self.path_input_index_for_point(event.position);
+        begin_text_input_mouse_selection(
+            &mut self.path_input,
+            index,
+            event.click_count,
+            event.modifiers.shift,
+        );
+        self.touch_path_input_cursor_activity();
+        context.notify();
+        true
+    }
+
+    /// 地址栏鼠标拖拽时扩展选区。
+    fn update_text_input_mouse_drag(
+        &mut self,
+        binding: TextInputBinding,
+        position: Point<Pixels>,
+        context: &mut Context<Self>,
+    ) -> bool {
+        if binding != TextInputBinding::FileManagerPath {
+            return false;
+        }
+        let Some(anchor) = self.path_input.selection_drag else {
+            return false;
+        };
+        let index = self.path_input_index_for_point(position);
+        update_text_input_mouse_selection(&mut self.path_input, anchor, index);
+        self.touch_path_input_cursor_activity();
+        context.notify();
+        true
+    }
+
+    /// 地址栏鼠标释放时结束拖拽生命周期。
+    fn finish_text_input_mouse_drag(
+        &mut self,
+        binding: TextInputBinding,
+        context: &mut Context<Self>,
+    ) -> bool {
+        if binding != TextInputBinding::FileManagerPath {
+            return false;
+        }
+        let handled = self.path_input.selection_drag.take().is_some();
+        if handled {
+            context.notify();
+        }
+        handled
+    }
+
+    /// 文件管理地址栏沿用主窗口通用输入框的闪烁节奏。
+    fn text_input_cursor_visible(&self) -> bool {
+        MainView::search_text_cursor_visible_for_elapsed(self.path_cursor_last_activity.elapsed())
+    }
+}
+
 impl Render for ConnectionFileManagerWindowView {
     /// 渲染文件管理窗口。
     fn render(&mut self, window: &mut Window, context: &mut Context<Self>) -> impl IntoElement {
@@ -1728,6 +2209,12 @@ impl Render for ConnectionFileManagerWindowView {
             .flex_col()
             .size_full()
             .bg(rgb(palette.background))
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|view, event: &MouseDownEvent, window, context| {
+                    view.blur_path_input_if_click_outside(event, window, context);
+                }),
+            )
             .on_mouse_move(
                 context.listener(|view, event: &MouseMoveEvent, _window, context| {
                     view.handle_window_mouse_move(event, context);

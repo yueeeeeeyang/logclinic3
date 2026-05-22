@@ -15,8 +15,8 @@ pub(crate) const CONNECTIONS_DATABASE_FILE_NAME: &str = "connections.db";
 /// 连接数据库 schema 版本。
 ///
 /// 业务意图：
-/// - SQLite `PRAGMA user_version` 用于检测未来版本和后续迁移；v2 在 SSH 连接表之外新增分类树。
-pub(crate) const CONNECTIONS_DATABASE_SCHEMA_VERSION: i64 = 2;
+/// - SQLite `PRAGMA user_version` 用于检测未来版本和后续迁移；v3 在 SSH 连接和分类树之外新增 SMB 连接表。
+pub(crate) const CONNECTIONS_DATABASE_SCHEMA_VERSION: i64 = 3;
 
 /// SSH 密码密文格式版本前缀。
 ///
@@ -41,6 +41,13 @@ pub(crate) const CONNECTION_KEYRING_MASTER_KEY_USER: &str = "logclinic3-connecti
 
 /// 默认 SSH 端口。
 pub(crate) const DEFAULT_SSH_PORT: u16 = 22;
+
+/// 默认 SMB TCP 端口。
+///
+/// 业务意图：
+/// - 第一版 SMB 连接固定使用直连 SMB2/3 over TCP，默认端口是 445；用户在地址里显式填写 `host:port/share`
+///   时才覆盖该值。
+pub(crate) const DEFAULT_SMB_PORT: u16 = 445;
 
 /// 新终端默认列数。
 ///

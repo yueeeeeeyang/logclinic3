@@ -53,6 +53,7 @@ impl MainView {
                 )
             })
             .child(self.render_connection_dialog(palette, context))
+            .child(self.render_smb_connection_dialog(palette, context))
             .child(self.render_connection_category_dialog(palette, context))
             .child(self.render_connection_delete_dialog(palette, context))
             .child(self.render_connection_category_delete_dialog(palette, context))
@@ -377,7 +378,10 @@ impl MainView {
         context: &mut Context<Self>,
     ) -> impl IntoElement {
         let search_query = self.connections.tree_search.query();
-        if self.connections.profiles.is_empty() && self.connections.categories.is_empty() {
+        if self.connections.profiles.is_empty()
+            && self.connections.smb_profiles.is_empty()
+            && self.connections.categories.is_empty()
+        {
             return div()
                 .id("connections-empty-list")
                 .flex()
@@ -403,6 +407,7 @@ impl MainView {
         let rows = build_connection_tree_rows(
             &self.connections.categories,
             &self.connections.profiles,
+            &self.connections.smb_profiles,
             &self.connections.expanded_category_ids,
             &search_query,
         );
@@ -439,7 +444,7 @@ impl MainView {
                             &category, depth, expanded, palette, context,
                         ),
                         ConnectionTreeRow::Profile { profile, depth } => {
-                            self.render_connection_profile_row(&profile, depth, palette, context)
+                            self.render_connection_profile_row(profile, depth, palette, context)
                         }
                     })
                     .collect::<Vec<_>>(),
@@ -529,18 +534,22 @@ impl MainView {
     /// 渲染单条连接。
     fn render_connection_profile_row(
         &self,
-        profile: &ConnectionProfile,
+        profile: ConnectionTreeProfile,
         depth: usize,
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let click_profile_id = profile.id.clone();
-        let context_profile_id = profile.id.clone();
-        let hover_profile_id = profile.id.clone();
-        let active = self.connections.selected_profile_id.as_deref() == Some(profile.id.as_str());
+        let profile_key = profile.key();
+        let click_profile_id = profile_key.clone();
+        let context_profile_id = profile_key.clone();
+        let hover_profile_id = profile_key.clone();
+        let row_id = profile.id().to_string();
+        let name = profile.name().to_string();
+        let icon = profile.icon();
+        let active = self.connections.selected_profile_id.as_deref() == Some(profile_key.as_str());
         let background = if active { palette.hover } else { palette.panel };
         div()
-            .id(SharedString::from(format!("connection-row-{}", profile.id)))
+            .id(SharedString::from(format!("connection-row-{}", row_id)))
             .flex()
             .items_center()
             .gap_2()
@@ -555,8 +564,8 @@ impl MainView {
             .hover(move |row| row.bg(rgb(palette.hover)))
             .on_click(
                 context.listener(move |view, _event: &ClickEvent, window, context| {
-                    // 连接行主动作是直接打开一个新的 SSH tab；编辑和删除统一放在右键菜单，避免卡片内按钮分散点击目标。
-                    view.open_connection_terminal(&click_profile_id, window, context);
+                    // 连接行主动作由协议类型决定：SSH 打开终端，SMB 打开文件管理；编辑和删除统一放在右键菜单。
+                    view.open_connection_entry(&click_profile_id, window, context);
                     context.stop_propagation();
                 }),
             )
@@ -582,7 +591,7 @@ impl MainView {
                 }),
             )
             .child(Self::render_lucide_icon(
-                Some(Icon::Terminal),
+                Some(icon),
                 18.0,
                 15.0,
                 palette.muted_text,
@@ -596,7 +605,7 @@ impl MainView {
                     .font_weight(FontWeight::NORMAL)
                     .overflow_hidden()
                     .whitespace_nowrap()
-                    .child(profile.name.clone()),
+                    .child(name),
             )
             .into_any_element()
     }
@@ -619,14 +628,16 @@ impl MainView {
         let Some(tooltip) = self.connections.profile_hover_tooltip.as_ref() else {
             return div().id("connection-profile-tooltip-empty").hidden();
         };
-        let Some(profile) = self.connections.profile_by_id(&tooltip.profile_id) else {
+        let Some((title_id, user_label, address_label)) =
+            connection_profile_tooltip_labels(&self.connections, &tooltip.profile_id)
+        else {
             return div().id("connection-profile-tooltip-empty").hidden();
         };
 
         div()
             .id(SharedString::from(format!(
                 "connection-profile-tooltip-{}",
-                profile.id
+                title_id
             )))
             .absolute()
             .left(px(tooltip.x))
@@ -641,18 +652,19 @@ impl MainView {
             .shadow_lg()
             .text_xs()
             .text_color(rgb(palette.text))
-            .child(div().overflow_hidden().whitespace_nowrap().child(
-                ConnectionsWorkspaceState::profile_tooltip_user_label(profile),
-            ))
+            .child(
+                div()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(user_label),
+            )
             .child(
                 div()
                     .mt_1()
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_color(rgb(palette.muted_text))
-                    .child(ConnectionsWorkspaceState::profile_tooltip_address_label(
-                        profile,
-                    )),
+                    .child(address_label),
             )
     }
 
@@ -1577,6 +1589,118 @@ impl MainView {
             .into_any_element()
     }
 
+    /// 渲染新增/编辑 SMB 连接弹窗。
+    fn render_smb_connection_dialog(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(dialog) = self.connections.smb_dialog.as_ref() else {
+            return div().hidden().into_any_element();
+        };
+        let is_edit = matches!(dialog.mode, ConnectionDialogMode::Edit { .. });
+        let title = if is_edit {
+            "编辑 SMB 连接"
+        } else {
+            "新增 SMB 连接"
+        };
+        self.render_connections_modal_shell("smb-connection-dialog-overlay", palette, context)
+            .when(dialog.category_select_open, |shell| {
+                shell.child(self.render_smb_connection_dialog_select_background_overlay(context))
+            })
+            .child(
+                div()
+                    .id("smb-connection-dialog")
+                    .flex()
+                    .flex_col()
+                    .w(px(440.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.background))
+                    .shadow_lg()
+                    .child(self.render_connection_dialog_header(title, palette, context))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .relative()
+                            .gap_3()
+                            .p_4()
+                            .when(dialog.category_select_open, |body| {
+                                body.child(
+                                    self.render_smb_connection_category_select_dismiss_overlay(
+                                        context,
+                                    ),
+                                )
+                            })
+                            .child(self.render_smb_connection_form_field(
+                                "名称",
+                                SmbConnectionFormField::Name,
+                                None,
+                                palette,
+                                context,
+                            ))
+                            .child(self.render_smb_connection_form_field(
+                                "地址",
+                                SmbConnectionFormField::Address,
+                                Some("server/share/path"),
+                                palette,
+                                context,
+                            ))
+                            .child(self.render_smb_connection_form_field(
+                                "用户名",
+                                SmbConnectionFormField::Username,
+                                None,
+                                palette,
+                                context,
+                            ))
+                            .child(
+                                self.render_smb_connection_category_select_field(palette, context),
+                            )
+                            .child(self.render_smb_connection_form_field(
+                                "密码",
+                                SmbConnectionFormField::Password,
+                                is_edit.then_some("留空表示不修改旧密码"),
+                                palette,
+                                context,
+                            ))
+                            .when_some(dialog.error.as_ref(), |body, error| {
+                                body.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0xb91c1c))
+                                        .child(error.clone()),
+                                )
+                            }),
+                    )
+                    .child(self.render_smb_connection_dialog_footer(palette, context)),
+            )
+            .into_any_element()
+    }
+
+    /// 渲染 SMB 连接弹窗背景层上的分类 Select 关闭区域。
+    fn render_smb_connection_dialog_select_background_overlay(
+        &self,
+        context: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id("smb-connection-dialog-select-background-overlay")
+            .absolute()
+            .left(px(0.0))
+            .right(px(0.0))
+            .top(px(0.0))
+            .bottom(px(0.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(Self::close_smb_connection_dialog_category_select_from_mouse_down),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(Self::close_smb_connection_dialog_category_select_from_mouse_down),
+            )
+    }
+
     /// 渲染连接弹窗背景层上的分类 Select 关闭区域。
     ///
     /// 业务意图：
@@ -1699,6 +1823,57 @@ impl MainView {
             )
     }
 
+    /// 渲染 SMB 连接表单字段。
+    fn render_smb_connection_form_field(
+        &self,
+        label: &'static str,
+        field: SmbConnectionFormField,
+        placeholder: Option<&'static str>,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let focus_handle = self
+            .connections
+            .smb_dialog
+            .as_ref()
+            .map(|dialog| dialog.field(field).focus.clone())
+            .unwrap_or_else(|| context.focus_handle());
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(palette.muted_text))
+                    .child(label),
+            )
+            .child(
+                div()
+                    .h(px(32.0))
+                    .flex()
+                    .items_center()
+                    .px_2()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.panel))
+                    .text_sm()
+                    .text_color(rgb(palette.text))
+                    .track_focus(&focus_handle)
+                    .key_context("smb-connection-form-input")
+                    .on_key_down(context.listener(Self::handle_smb_connection_form_key_down))
+                    .child(TextInputElement {
+                        view: context.entity(),
+                        binding: TextInputBinding::SmbConnectionForm(field),
+                        focus_handle,
+                        placeholder: placeholder.unwrap_or(""),
+                        palette,
+                    }),
+            )
+    }
+
     /// 渲染连接表单分类选择器。
     ///
     /// 业务意图：
@@ -1772,6 +1947,71 @@ impl MainView {
             })
     }
 
+    /// 渲染 SMB 连接表单分类选择器。
+    fn render_smb_connection_category_select_field(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (selected_category_id, open) = self
+            .connections
+            .smb_dialog
+            .as_ref()
+            .map(|dialog| (dialog.category_id.clone(), dialog.category_select_open))
+            .unwrap_or((None, false));
+        let options = self.connection_category_select_options();
+        let selected_label = options
+            .iter()
+            .find(|option| option.value == selected_category_id)
+            .map(|option| option.label.clone())
+            .unwrap_or_else(|| "无分类".to_string());
+        let metrics = SelectMetrics::new(408.0, 32.0, 408.0, 30.0, 180.0, 2.0);
+        let select = Select::new(
+            "smb-connection-category-select",
+            selected_label,
+            selected_category_id,
+            options,
+            metrics,
+            palette,
+        )
+        .open_anchor(open.then_some(SelectAnchor::new(
+            0.0,
+            metrics.button_height + metrics.menu_gap,
+        )));
+
+        div()
+            .id("smb-connection-category-select-field")
+            .relative()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(palette.muted_text))
+                    .child("分类"),
+            )
+            .child(select.render_trigger(
+                context.listener(Self::toggle_smb_connection_dialog_category_select),
+            ))
+            .child({
+                gpui::deferred(select.render_menu(|category_id| {
+                    Box::new(context.listener(
+                        move |view, event: &MouseDownEvent, window, context| {
+                            view.select_smb_connection_dialog_category(
+                                category_id.clone(),
+                                event,
+                                window,
+                                context,
+                            );
+                        },
+                    ))
+                }))
+                .with_priority(32)
+            })
+    }
+
     /// 渲染连接表单分类 Select 的弹窗内关闭层。
     ///
     /// 业务意图：
@@ -1796,6 +2036,28 @@ impl MainView {
             .on_mouse_down(
                 MouseButton::Right,
                 context.listener(Self::close_connection_dialog_category_select_from_mouse_down),
+            )
+    }
+
+    /// 渲染 SMB 表单分类 Select 的弹窗内关闭层。
+    fn render_smb_connection_category_select_dismiss_overlay(
+        &self,
+        context: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id("smb-connection-category-select-dismiss-overlay")
+            .absolute()
+            .left(px(0.0))
+            .right(px(0.0))
+            .top(px(0.0))
+            .bottom(px(0.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(Self::close_smb_connection_dialog_category_select_from_mouse_down),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                context.listener(Self::close_smb_connection_dialog_category_select_from_mouse_down),
             )
     }
 
@@ -1866,6 +2128,36 @@ impl MainView {
                         "保存",
                         palette,
                         context.listener(Self::save_connection_dialog_from_mouse_down),
+                    )),
+            )
+    }
+
+    /// 渲染 SMB 连接弹窗底部操作。
+    fn render_smb_connection_dialog_footer(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .justify_end()
+            .px_4()
+            .pb_4()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(self.render_modal_secondary_button(
+                        "取消",
+                        palette,
+                        context.listener(Self::close_connection_dialog_from_mouse_down),
+                    ))
+                    .child(self.render_modal_primary_button(
+                        "保存",
+                        palette,
+                        context.listener(Self::save_smb_connection_dialog_from_mouse_down),
                     )),
             )
     }
@@ -2490,5 +2782,34 @@ fn measure_connection_terminal_cell_width(window: &mut Window) -> f32 {
         measured
     } else {
         CONNECTION_TERMINAL_CELL_WIDTH
+    }
+}
+
+/// 生成连接 hover 气泡需要的稳定文案。
+///
+/// 业务意图：
+/// - 左侧连接树混合展示 SSH 和 SMB，但气泡布局保持一致；这里按连接 key 分发，避免渲染层再手写协议判断。
+fn connection_profile_tooltip_labels(
+    state: &ConnectionsWorkspaceState,
+    key: &str,
+) -> Option<(String, String, String)> {
+    match ConnectionProfileKey::parse(key) {
+        Some((ConnectionProfileKind::Ssh, profile_id)) => {
+            let profile = state.profile_by_id(profile_id)?;
+            Some((
+                profile.id.clone(),
+                ConnectionsWorkspaceState::profile_tooltip_user_label(profile),
+                ConnectionsWorkspaceState::profile_tooltip_address_label(profile),
+            ))
+        }
+        Some((ConnectionProfileKind::Smb, profile_id)) => {
+            let profile = state.smb_profile_by_id(profile_id)?;
+            Some((
+                profile.id.clone(),
+                ConnectionsWorkspaceState::smb_profile_tooltip_user_label(profile),
+                ConnectionsWorkspaceState::smb_profile_tooltip_address_label(profile),
+            ))
+        }
+        None => None,
     }
 }

@@ -26,6 +26,8 @@ portable-pty = "0.9.0"
 russh = { version = "0.61.0", default-features = false, features = ["ring", "rsa"] }
 # russh-sftp 复用 russh SSH channel 的 SFTP subsystem；用于连接页文件管理，不引入系统 OpenSSH/WinSCP 依赖，跨 macOS/Windows 保持纯 Rust。
 russh-sftp = "2.1.1"
+# smb2 提供纯 Rust SMB2/3 客户端能力；其内部使用 aes/aes-gcm 预发布版本，但这些类型被封装在 SMB 后端内，不和本地密码加密的 aes-gcm 0.10 混用。
+smb2 = "0.11.0"
 # alacritty_terminal 提供成熟 VT/ANSI 解析和终端 grid 状态，GPUI 只负责把 grid 映射为自绘界面。
 alacritty_terminal = "0.26.0"
 # tokio 只服务 russh 后台运行时；不把异步运行时暴露到 GPUI 主线程，避免 UI 生命周期和网络任务耦合。
@@ -81,6 +83,9 @@ walkdir = "2.5.0"
 zip = "8.6.0"
 
 [patch.crates-io]
+# smb2 0.11.0 的发布包精确锁定 aes 0.9.0-rc.4，会和 russh 0.61 选中的 aes 0.9.0 稳定版解析冲突；
+# 本地补丁只放宽 smb2 内部 aes 版本约束，SMB 后端仍把加密类型封装在文件管理后台，不影响本地密码加密。
+smb2 = { path = "vendor/smb2-0.11.0" }
 # GPUI 0.2.2 的 Windows release shader 生成逻辑依赖构建脚本宿主也是 Windows；
 # macOS 通过 cargo-xwin 交叉编译时不会生成 `shaders_bytes.rs`，因此本地补丁改为在 Windows 运行时从内嵌 HLSL 源码编译。
 gpui = { path = "vendor/gpui-0.2.2" }
