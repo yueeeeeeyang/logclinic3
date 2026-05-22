@@ -26,6 +26,47 @@ struct ConnectionFileEntryContextMenu {
     y: f32,
 }
 
+/// 文件列表排序列。
+///
+/// 业务意图：
+/// - 文件管理列表的表头需要像常规表格一样支持点击排序。
+/// - 枚举列定义比字符串判断更稳定，后续增加列宽或国际化文案时不影响排序逻辑。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectionFileSortColumn {
+    /// 按文件名排序。
+    Name,
+    /// 按文件类型排序。
+    Kind,
+    /// 按文件大小排序。
+    Size,
+    /// 按修改时间排序。
+    ModifiedAt,
+}
+
+/// 文件列表排序状态。
+///
+/// 边界条件：
+/// - 排序只影响当前文件管理窗口的展示顺序，不回写后端，也不改变目录实际内容。
+/// - 目录始终排在普通文件之前，避免按大小或时间排序后目录被埋到文件列表中。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ConnectionFileSortState {
+    /// 当前排序列。
+    column: ConnectionFileSortColumn,
+    /// 是否升序排列。
+    ascending: bool,
+}
+
+/// 文件列表滚动条拖动状态。
+///
+/// 业务意图：
+/// - 原生 overlay scrollbar 在 macOS 上经常不可见，文件列表需要自绘可见滚动条提示当前位置。
+/// - 保存鼠标在滑块内的按下偏移，可以避免拖动开始时滑块跳到鼠标中心。
+#[derive(Clone, Copy)]
+struct ConnectionFileListScrollbarDrag {
+    /// 鼠标按下点相对滑块顶部的偏移。
+    cursor_offset: Pixels,
+}
+
 /// 文件列表右键菜单动作。
 #[derive(Clone, Copy)]
 enum ConnectionFileEntryContextMenuAction {
@@ -69,6 +110,12 @@ const CONNECTION_FILE_CONTEXT_MENU_WIDTH: f32 = 132.0;
 const CONNECTION_FILE_CONTEXT_MENU_ITEM_HEIGHT: f32 = 32.0;
 /// 文件列表右键菜单纵向内边距。
 const CONNECTION_FILE_CONTEXT_MENU_VERTICAL_PADDING: f32 = 8.0;
+/// 文件列表自绘纵向滚动条宽度。
+const CONNECTION_FILE_LIST_SCROLLBAR_WIDTH: f32 = 6.0;
+/// 文件列表自绘纵向滚动条最小滑块高度。
+const CONNECTION_FILE_LIST_SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 36.0;
+/// 文件列表自绘纵向滚动条内边距。
+const CONNECTION_FILE_LIST_SCROLLBAR_PADDING: f32 = 3.0;
 
 /// 连接文件管理窗口状态。
 pub(in crate::app) struct ConnectionFileManagerWindowView {
@@ -86,8 +133,25 @@ pub(in crate::app) struct ConnectionFileManagerWindowView {
     path_focus: FocusHandle,
     /// 已加载的目录项。
     entries: Vec<ConnectionFileEntry>,
+    /// 已按当前表头状态排序后的目录项缓存。
+    ///
+    /// 业务意图：
+    /// - 文件列表使用虚拟滚动渲染，滚动时会频繁请求可见 range。
+    /// - 排序本身是全量 O(n log n) 操作，必须只在目录刷新或用户切换排序列时执行，避免滚动过程中反复克隆和排序大量目录项。
+    /// - 缓存保存完整 `ConnectionFileEntry` 克隆，是因为右键菜单、双击预览和选择逻辑都需要拿到完整条目，而不仅是索引。
+    sorted_entries: Vec<ConnectionFileEntry>,
+    /// 文件列表虚拟滚动句柄。
+    ///
+    /// 业务意图：
+    /// - 文件列表行高固定，使用 `UniformListScrollHandle` 可以让大量文件只渲染可见行。
+    /// - 同一个句柄同时驱动滚轮、触控板和自绘纵向滚动条，避免维护两套滚动位置。
+    list_scroll_handle: UniformListScrollHandle,
+    /// 文件列表当前排序状态。
+    sort: ConnectionFileSortState,
     /// 当前选中文件路径集合。
     selected_paths: HashSet<String>,
+    /// 文件列表自绘滚动条拖动状态。
+    list_scrollbar_drag: Option<ConnectionFileListScrollbarDrag>,
     /// 文件列表右键菜单。
     ///
     /// 业务意图：
@@ -133,7 +197,14 @@ impl ConnectionFileManagerWindowView {
             path_text: initial_path,
             path_focus: context.focus_handle(),
             entries: Vec::new(),
+            sorted_entries: Vec::new(),
+            list_scroll_handle: UniformListScrollHandle::new(),
+            sort: ConnectionFileSortState {
+                column: ConnectionFileSortColumn::Name,
+                ascending: true,
+            },
             selected_paths: HashSet::new(),
+            list_scrollbar_drag: None,
             file_context_menu: None,
             transfer_progress: None,
             status_message: Some("正在读取目录...".to_string()),
@@ -219,6 +290,10 @@ impl ConnectionFileManagerWindowView {
                     self.current_path = path.clone();
                     self.path_text = path;
                     self.entries = entries;
+                    self.rebuild_sorted_entries();
+                    // 切换目录或刷新完成后列表内容已经变化，旧滚动位置和拖动状态不能继续复用。
+                    self.list_scroll_handle = UniformListScrollHandle::new();
+                    self.list_scrollbar_drag = None;
                     self.selected_paths.clear();
                     self.file_context_menu = None;
                     self.error_message = None;
@@ -624,6 +699,47 @@ impl ConnectionFileManagerWindowView {
         context.notify();
     }
 
+    /// 重建文件列表排序缓存。
+    ///
+    /// 业务意图：
+    /// - 后端返回目录优先、名称升序的事实列表；UI 排序是当前窗口的展示状态。
+    /// - 该方法只在数据源或排序条件变化时调用，避免虚拟列表滚动期间重复排序。
+    fn rebuild_sorted_entries(&mut self) {
+        self.sorted_entries = sorted_connection_file_entries(&self.entries, self.sort);
+    }
+
+    /// 返回当前可见 range 对应的排序目录项。
+    ///
+    /// 边界条件：
+    /// - `uniform_list` 正常会传入合法 range；这里仍做边界夹紧，避免目录刷新与渲染批次交错时出现越界。
+    /// - 返回可见项克隆，事件回调可以安全持有条目，不借用窗口状态跨过 GPUI 元素构造过程。
+    fn sorted_entries_in_range(&self, range: std::ops::Range<usize>) -> Vec<ConnectionFileEntry> {
+        let start = range.start.min(self.sorted_entries.len());
+        let end = range.end.min(self.sorted_entries.len());
+        if start >= end {
+            return Vec::new();
+        }
+        self.sorted_entries[start..end].to_vec()
+    }
+
+    /// 点击表头后更新文件列表排序。
+    ///
+    /// 边界条件：
+    /// - 点击同一列在升序/降序之间切换。
+    /// - 切换列时默认升序，并重置滚动条，避免用户停留在排序后列表深处看不到顶部结果。
+    fn sort_by_column(&mut self, column: ConnectionFileSortColumn, context: &mut Context<Self>) {
+        let ascending = if self.sort.column == column {
+            !self.sort.ascending
+        } else {
+            true
+        };
+        self.sort = ConnectionFileSortState { column, ascending };
+        self.rebuild_sorted_entries();
+        self.list_scroll_handle = UniformListScrollHandle::new();
+        self.list_scrollbar_drag = None;
+        context.notify();
+    }
+
     /// 渲染工具栏按钮。
     fn render_toolbar_button(
         &self,
@@ -747,6 +863,7 @@ impl ConnectionFileManagerWindowView {
             .flex()
             .items_center()
             .flex_none()
+            .w_full()
             .h(px(CONNECTION_FILE_MANAGER_ROW_HEIGHT))
             .px_3()
             .gap_2()
@@ -786,7 +903,8 @@ impl ConnectionFileManagerWindowView {
             ))
             .child(
                 div()
-                    .w(px(260.0))
+                    // 名称是文件管理中最需要完整展示的字段，因此默认占用除固定信息列外的剩余宽度。
+                    .flex_1()
                     .min_w_0()
                     .overflow_hidden()
                     .whitespace_nowrap()
@@ -809,7 +927,8 @@ impl ConnectionFileManagerWindowView {
             )
             .child(
                 div()
-                    .flex_1()
+                    .w(px(180.0))
+                    .flex_none()
                     .min_w_0()
                     .overflow_hidden()
                     .whitespace_nowrap()
@@ -817,6 +936,109 @@ impl ConnectionFileManagerWindowView {
                     .text_color(rgb(palette.muted_text))
                     .child(format_file_time(entry.modified_at_ms)),
             )
+    }
+
+    /// 渲染文件列表表头。
+    ///
+    /// 业务意图：
+    /// - 表头与文件行使用相同列宽，点击列名即可改变当前窗口内的排序方式。
+    /// - 当前排序列显示方向图标，帮助用户判断正在使用升序还是降序。
+    fn render_file_table_header(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id("connection-file-list-header")
+            .flex()
+            .items_center()
+            .flex_none()
+            .w_full()
+            .h(px(CONNECTION_FILE_MANAGER_TABLE_HEADER_HEIGHT))
+            .px_3()
+            .gap_2()
+            .border_b_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.panel))
+            .text_size(px(12.0))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(palette.muted_text))
+            .child(div().w(px(18.0)))
+            .child(self.render_file_table_header_cell(
+                "名称",
+                ConnectionFileSortColumn::Name,
+                None,
+                palette,
+                context,
+            ))
+            .child(self.render_file_table_header_cell(
+                "类型",
+                ConnectionFileSortColumn::Kind,
+                Some(72.0),
+                palette,
+                context,
+            ))
+            .child(self.render_file_table_header_cell(
+                "大小",
+                ConnectionFileSortColumn::Size,
+                Some(92.0),
+                palette,
+                context,
+            ))
+            .child(self.render_file_table_header_cell(
+                "修改时间",
+                ConnectionFileSortColumn::ModifiedAt,
+                Some(180.0),
+                palette,
+                context,
+            ))
+    }
+
+    /// 渲染单个可排序表头单元格。
+    fn render_file_table_header_cell(
+        &self,
+        label: &'static str,
+        column: ConnectionFileSortColumn,
+        fixed_width: Option<f32>,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let active = self.sort.column == column;
+        let ascending = self.sort.ascending;
+        div()
+            .id(SharedString::from(format!(
+                "connection-file-header-{label}"
+            )))
+            .when_some(fixed_width, |cell, width| cell.w(px(width)).flex_none())
+            .when(fixed_width.is_none(), |cell| cell.flex_1().min_w_0())
+            .h_full()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_1()
+            .overflow_hidden()
+            .cursor_pointer()
+            .hover(move |cell| cell.bg(rgb(palette.hover)))
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(move |view, _event: &MouseDownEvent, _window, context| {
+                    view.sort_by_column(column, context);
+                    context.stop_propagation();
+                }),
+            )
+            .child(div().truncate().child(label))
+            .when(active, |cell| {
+                cell.child(MainView::render_lucide_icon(
+                    Some(if ascending {
+                        Icon::ChevronUp
+                    } else {
+                        Icon::ChevronDown
+                    }),
+                    12.0,
+                    12.0,
+                    palette.accent,
+                ))
+            })
     }
 
     /// 渲染传输进度条。
@@ -847,8 +1069,6 @@ impl ConnectionFileManagerWindowView {
             .gap_1()
             .px_3()
             .py_2()
-            .border_b_1()
-            .border_color(rgb(palette.border))
             .bg(rgb(palette.surface))
             .child(
                 div()
@@ -893,6 +1113,203 @@ impl ConnectionFileManagerWindowView {
                     .bg(rgb(palette.border))
                     .child(div().h_full().w(relative(ratio)).bg(rgb(palette.accent))),
             )
+    }
+
+    /// 渲染窗口底部状态栏。
+    ///
+    /// 业务意图：
+    /// - 文件列表需要尽量占据中间可视区域，目录刷新、错误和传输状态统一停靠在窗口底部。
+    /// - 上传/下载进度也属于状态反馈，放在底部可以避免列表高度在顶部反复跳动。
+    fn render_status_bar(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let message = self
+            .error_message
+            .as_ref()
+            .or(self.status_message.as_ref())
+            .cloned()
+            .unwrap_or_else(|| "就绪".to_string());
+        let is_error = self.error_message.is_some();
+
+        div()
+            .id("connection-file-status-bar")
+            .flex()
+            .flex_col()
+            .flex_none()
+            .border_t_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.panel))
+            .child(self.render_transfer_progress(palette, context))
+            .child(
+                div()
+                    .id("connection-file-status-line")
+                    .h(px(28.0))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .text_size(px(12.0))
+                    .text_color(rgb(if is_error {
+                        palette.error
+                    } else {
+                        palette.muted_text
+                    }))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(message),
+            )
+    }
+
+    /// 渲染文件列表自绘纵向滚动条。
+    ///
+    /// 业务意图：
+    /// - 原生滚动条在部分系统设置下只在滚动瞬间出现，文件很多时用户无法确认列表是否还能继续向下滚动。
+    /// - 自绘滑块与虚拟列表使用同一个 `UniformListScrollHandle`，滚轮、拖动和触控板位置保持一致。
+    fn render_file_list_scrollbar(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let Some(metrics) = self.file_list_scrollbar_metrics() else {
+            return div().id("connection-file-list-scrollbar-empty").hidden();
+        };
+
+        div()
+            .id("connection-file-list-scrollbar")
+            .absolute()
+            .top(metrics.thumb_start)
+            .right(px(CONNECTION_FILE_LIST_SCROLLBAR_PADDING))
+            .w(px(CONNECTION_FILE_LIST_SCROLLBAR_WIDTH))
+            .h(metrics.thumb_length)
+            .rounded(px(CONNECTION_FILE_LIST_SCROLLBAR_WIDTH / 2.0))
+            .bg(rgb(palette.scrollbar))
+            .cursor_pointer()
+            .hover(move |thumb| thumb.bg(rgb(palette.scrollbar_hover)))
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|view, event: &MouseDownEvent, _window, context| {
+                    view.start_file_list_scrollbar_drag(event, context);
+                    context.stop_propagation();
+                }),
+            )
+    }
+
+    /// 计算文件列表滚动条滑块位置。
+    fn file_list_scrollbar_metrics(&self) -> Option<LogScrollbarMetrics> {
+        let state = self.list_scroll_handle.0.borrow();
+        let size = state.last_item_size?;
+        let viewport_height = size.item.height;
+        let content_height = size.contents.height;
+        if viewport_height <= px(0.0) || content_height <= viewport_height {
+            return None;
+        }
+
+        let max_scroll = content_height - viewport_height;
+        let scroll_top = (-state.base_handle.offset().y).clamp(px(0.0), max_scroll);
+        let track_start = px(CONNECTION_FILE_LIST_SCROLLBAR_PADDING);
+        let track_length = (viewport_height - track_start * 2.0).max(px(1.0));
+        let min_thumb_length =
+            px(CONNECTION_FILE_LIST_SCROLLBAR_MIN_THUMB_HEIGHT).min(track_length);
+        let thumb_length = (viewport_height * (viewport_height / content_height))
+            .clamp(min_thumb_length, track_length);
+        let movable_length = (track_length - thumb_length).max(px(0.0));
+        let thumb_start = track_start + movable_length * (scroll_top / max_scroll);
+
+        Some(LogScrollbarMetrics {
+            thumb_start,
+            thumb_length,
+            track_start,
+            track_length,
+            max_scroll,
+            max_scroll_px: f64::from(max_scroll),
+        })
+    }
+
+    /// 开始拖动文件列表滚动条。
+    fn start_file_list_scrollbar_drag(
+        &mut self,
+        event: &MouseDownEvent,
+        context: &mut Context<Self>,
+    ) {
+        let Some(metrics) = self.file_list_scrollbar_metrics() else {
+            return;
+        };
+        if metrics.max_scroll <= px(0.0) {
+            return;
+        }
+        let bounds = self.list_scroll_handle.0.borrow().base_handle.bounds();
+        if bounds.size.height <= px(0.0) {
+            return;
+        }
+        self.list_scrollbar_drag = Some(ConnectionFileListScrollbarDrag {
+            cursor_offset: event.position.y - bounds.top() - metrics.thumb_start,
+        });
+        context.notify();
+    }
+
+    /// 根据鼠标移动更新文件列表滚动条拖动。
+    fn update_file_list_scrollbar_drag(
+        &mut self,
+        event: &MouseMoveEvent,
+        context: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.list_scrollbar_drag else {
+            return;
+        };
+        if !event.dragging() {
+            self.finish_file_list_scrollbar_drag(context);
+            return;
+        }
+        let Some(metrics) = self.file_list_scrollbar_metrics() else {
+            self.finish_file_list_scrollbar_drag(context);
+            return;
+        };
+        let base_scroll_handle = {
+            // 先克隆底层 ScrollHandle 再释放 RefCell 借用，避免 set_offset 时触发嵌套借用。
+            self.list_scroll_handle.0.borrow().base_handle.clone()
+        };
+        let bounds = base_scroll_handle.bounds();
+        let movable_length = (metrics.track_length - metrics.thumb_length).max(px(0.0));
+        if metrics.max_scroll <= px(0.0)
+            || movable_length <= px(0.0)
+            || bounds.size.height <= px(0.0)
+        {
+            return;
+        }
+
+        let requested_thumb_start = event.position.y - bounds.top() - drag.cursor_offset;
+        let thumb_start =
+            requested_thumb_start.clamp(metrics.track_start, metrics.track_start + movable_length);
+        let scroll_ratio = f64::from((thumb_start - metrics.track_start) / movable_length);
+        let scroll_offset = px((metrics.max_scroll_px * scroll_ratio) as f32);
+        let current_offset = base_scroll_handle.offset();
+        base_scroll_handle.set_offset(point(current_offset.x, -scroll_offset));
+        context.notify();
+    }
+
+    /// 结束文件列表滚动条拖动。
+    fn finish_file_list_scrollbar_drag(&mut self, context: &mut Context<Self>) {
+        if self.list_scrollbar_drag.is_some() {
+            self.list_scrollbar_drag = None;
+            context.notify();
+        }
+    }
+
+    /// 处理文件管理窗口鼠标移动。
+    fn handle_window_mouse_move(&mut self, event: &MouseMoveEvent, context: &mut Context<Self>) {
+        if self.list_scrollbar_drag.is_some() {
+            self.update_file_list_scrollbar_drag(event, context);
+            context.stop_propagation();
+        }
+    }
+
+    /// 处理文件管理窗口鼠标释放。
+    fn handle_window_mouse_up(&mut self, context: &mut Context<Self>) {
+        if self.list_scrollbar_drag.is_some() {
+            self.finish_file_list_scrollbar_drag(context);
+            context.stop_propagation();
+        }
     }
 
     /// 渲染文件列表右键菜单关闭层。
@@ -1301,14 +1718,8 @@ impl Render for ConnectionFileManagerWindowView {
         self.drain_events(context);
         let palette = self.main_view.read(context).palette();
         let selected_has_files = !self.selected_file_paths().is_empty();
-        let entries = self.entries.clone();
-        let file_rows = entries
-            .into_iter()
-            .map(|entry| {
-                self.render_file_entry_row(entry, palette, context)
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
+        let row_count = self.sorted_entries.len();
+        let scroll_handle = self.list_scroll_handle.clone();
 
         div()
             .id("connection-file-manager-window")
@@ -1317,6 +1728,23 @@ impl Render for ConnectionFileManagerWindowView {
             .flex_col()
             .size_full()
             .bg(rgb(palette.background))
+            .on_mouse_move(
+                context.listener(|view, event: &MouseMoveEvent, _window, context| {
+                    view.handle_window_mouse_move(event, context);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                context.listener(|view, _event: &MouseUpEvent, _window, context| {
+                    view.handle_window_mouse_up(context);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                context.listener(|view, _event: &MouseUpEvent, _window, context| {
+                    view.handle_window_mouse_up(context);
+                }),
+            )
             .child(
                 div()
                     .id("connection-file-toolbar")
@@ -1374,32 +1802,6 @@ impl Render for ConnectionFileManagerWindowView {
                         context,
                     )),
             )
-            .when_some(self.error_message.as_ref(), |root, message| {
-                root.child(
-                    div()
-                        .px_3()
-                        .py_2()
-                        .border_b_1()
-                        .border_color(rgb(palette.border))
-                        .bg(rgb(palette.surface))
-                        .text_color(rgb(palette.error))
-                        .text_size(px(12.0))
-                        .child(message.clone()),
-                )
-            })
-            .when_some(self.status_message.as_ref(), |root, message| {
-                root.child(
-                    div()
-                        .px_3()
-                        .py_1()
-                        .border_b_1()
-                        .border_color(rgb(palette.border))
-                        .text_color(rgb(palette.muted_text))
-                        .text_size(px(12.0))
-                        .child(message.clone()),
-                )
-            })
-            .child(self.render_transfer_progress(palette, context))
             .child(
                 div()
                     .id("connection-file-table")
@@ -1409,41 +1811,57 @@ impl Render for ConnectionFileManagerWindowView {
                     .min_h_0()
                     .min_w_0()
                     .overflow_hidden()
+                    .child(self.render_file_table_header(palette, context))
                     .child(
                         div()
-                            .id("connection-file-list-header")
+                            .id("connection-file-list-wrapper")
+                            .relative()
                             .flex()
-                            .items_center()
-                            .flex_none()
-                            .h(px(CONNECTION_FILE_MANAGER_TABLE_HEADER_HEIGHT))
-                            .px_3()
-                            .gap_2()
-                            .border_b_1()
-                            .border_color(rgb(palette.border))
-                            .bg(rgb(palette.panel))
-                            .text_size(px(12.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(palette.muted_text))
-                            .child(div().w(px(18.0)))
-                            .child(div().w(px(260.0)).child("名称"))
-                            .child(div().w(px(72.0)).child("类型"))
-                            .child(div().w(px(92.0)).child("大小"))
-                            .child(div().flex_1().child("修改时间")),
-                    )
-                    .child(
-                        div()
-                            .id("connection-file-list-scroll")
-                            .flex()
-                            .flex_col()
                             .flex_1()
                             .min_h_0()
                             .min_w_0()
                             .overflow_hidden()
-                            .overflow_y_scroll()
-                            .scrollbar_width(px(6.0))
-                            .children(file_rows),
+                            .child(if row_count == 0 {
+                                div()
+                                    .id("connection-file-list-empty")
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .size_full()
+                                    .text_size(px(13.0))
+                                    .text_color(rgb(palette.muted_text))
+                                    .child("当前目录为空")
+                                    .into_any_element()
+                            } else {
+                                uniform_list(
+                                    "connection-file-list",
+                                    row_count,
+                                    context.processor(
+                                        move |view,
+                                              range: std::ops::Range<usize>,
+                                              _window,
+                                              context| {
+                                            let palette = view.main_view.read(context).palette();
+                                            view.sorted_entries_in_range(range)
+                                                .into_iter()
+                                                .map(|entry| {
+                                                    view.render_file_entry_row(
+                                                        entry, palette, context,
+                                                    )
+                                                    .into_any_element()
+                                                })
+                                                .collect::<Vec<_>>()
+                                        },
+                                    ),
+                                )
+                                .size_full()
+                                .track_scroll(scroll_handle)
+                                .into_any_element()
+                            })
+                            .child(self.render_file_list_scrollbar(palette, context)),
                     ),
             )
+            .child(self.render_status_bar(palette, context))
             .child(self.render_file_context_menu_overlay(context))
             .child(self.render_file_context_menu(palette, context))
             .child(self.render_conflict_dialog(palette, context))
@@ -1621,6 +2039,68 @@ fn sanitize_file_manager_path_text(text: &str) -> String {
         .collect()
 }
 
+/// 按 UI 排序状态生成文件列表展示顺序。
+///
+/// 业务意图：
+/// - 文件管理后端只负责返回目录项事实，排序属于当前窗口的展示偏好。
+/// - 目录优先是文件管理器的基础可用性要求，即使用户按大小或时间排序，也不应把目录混入文件中间。
+fn sorted_connection_file_entries(
+    entries: &[ConnectionFileEntry],
+    sort: ConnectionFileSortState,
+) -> Vec<ConnectionFileEntry> {
+    let mut entries = entries.to_vec();
+    entries.sort_by(|left, right| {
+        let directory_order = right.kind.is_directory().cmp(&left.kind.is_directory());
+        if directory_order != std::cmp::Ordering::Equal {
+            return directory_order;
+        }
+
+        let column_order = match sort.column {
+            ConnectionFileSortColumn::Name => compare_file_names(&left.name, &right.name),
+            ConnectionFileSortColumn::Kind => file_kind_sort_key(left.kind)
+                .cmp(&file_kind_sort_key(right.kind))
+                .then_with(|| compare_file_names(&left.name, &right.name)),
+            ConnectionFileSortColumn::Size => left
+                .size
+                .unwrap_or(0)
+                .cmp(&right.size.unwrap_or(0))
+                .then_with(|| compare_file_names(&left.name, &right.name)),
+            ConnectionFileSortColumn::ModifiedAt => left
+                .modified_at_ms
+                .unwrap_or(i64::MIN)
+                .cmp(&right.modified_at_ms.unwrap_or(i64::MIN))
+                .then_with(|| compare_file_names(&left.name, &right.name)),
+        };
+
+        if sort.ascending {
+            column_order
+        } else {
+            column_order.reverse()
+        }
+    });
+    entries
+}
+
+/// 文件名排序使用大小写不敏感比较，并用原始名称作为稳定兜底。
+fn compare_file_names(left: &str, right: &str) -> std::cmp::Ordering {
+    left.to_lowercase()
+        .cmp(&right.to_lowercase())
+        .then_with(|| left.cmp(right))
+}
+
+/// 文件类型排序键。
+///
+/// 边界条件：
+/// - 目录优先已经在外层处理；这里仍给出目录键值，方便测试和未来取消目录优先时保持确定顺序。
+fn file_kind_sort_key(kind: ConnectionFileEntryKind) -> u8 {
+    match kind {
+        ConnectionFileEntryKind::Directory => 0,
+        ConnectionFileEntryKind::File => 1,
+        ConnectionFileEntryKind::Symlink => 2,
+        ConnectionFileEntryKind::Other => 3,
+    }
+}
+
 /// 格式化文件大小。
 fn format_file_size(size: Option<u64>) -> String {
     let Some(size) = size else {
@@ -1696,5 +2176,45 @@ mod tests {
     #[test]
     fn 文件修改时间缺失时显示占位符() {
         assert_eq!(format_file_time(None), "-");
+    }
+
+    /// 验证文件列表排序始终保持目录优先，并按所选列切换顺序。
+    #[test]
+    fn 文件列表排序保持目录优先并支持大小降序() {
+        let entries = vec![
+            ConnectionFileEntry {
+                name: "small.log".to_string(),
+                path: "/small.log".to_string(),
+                kind: ConnectionFileEntryKind::File,
+                size: Some(10),
+                modified_at_ms: Some(20),
+            },
+            ConnectionFileEntry {
+                name: "folder".to_string(),
+                path: "/folder".to_string(),
+                kind: ConnectionFileEntryKind::Directory,
+                size: None,
+                modified_at_ms: Some(1),
+            },
+            ConnectionFileEntry {
+                name: "large.log".to_string(),
+                path: "/large.log".to_string(),
+                kind: ConnectionFileEntryKind::File,
+                size: Some(100),
+                modified_at_ms: Some(10),
+            },
+        ];
+
+        let sorted = sorted_connection_file_entries(
+            &entries,
+            ConnectionFileSortState {
+                column: ConnectionFileSortColumn::Size,
+                ascending: false,
+            },
+        );
+
+        assert_eq!(sorted[0].name, "folder");
+        assert_eq!(sorted[1].name, "large.log");
+        assert_eq!(sorted[2].name, "small.log");
     }
 }
