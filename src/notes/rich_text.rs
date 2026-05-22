@@ -865,7 +865,12 @@ fn note_rich_text_document_from_markdown(markdown: &str) -> NoteRichTextDocument
                 );
             }
             Event::End(TagEnd::CodeBlock) => {
-                finish_markdown_block(&mut blocks, &mut runs, &mut block_kind, &mut code_language);
+                finish_markdown_code_block(
+                    &mut blocks,
+                    &mut runs,
+                    &mut block_kind,
+                    &mut code_language,
+                );
             }
             Event::Start(Tag::Strong) => style.bold = true,
             Event::End(TagEnd::Strong) => style.bold = false,
@@ -971,6 +976,37 @@ fn finish_markdown_block(
             .flatten(),
         runs: std::mem::take(runs),
     });
+}
+
+/// 结束当前 Markdown 代码块，并丢弃 fenced code 末尾协议性换行产生的空块。
+///
+/// 业务意图：
+/// - `pulldown-cmark` 会把围栏代码块闭合前的换行作为代码文本的一部分上报。
+/// - 编辑器内部用“多个代码块行”表示多行代码，如果把最后这个协议性空行也保存下来，笔记每次保存再读取都会多出一行空白。
+///
+/// 边界条件：
+/// - 用户真实输入的空白代码行必须保留；只有“当前块为空，并且前一个块已经是同语言代码块”时才丢弃末尾占位块。
+/// - 损坏或未闭合的 Markdown 在文件末尾仍走普通 `finish_markdown_block`，避免丢失实际输入内容。
+fn finish_markdown_code_block(
+    blocks: &mut Vec<NoteRichTextBlock>,
+    runs: &mut Vec<NoteRichTextRun>,
+    block_kind: &mut Option<NoteRichTextBlockKind>,
+    code_language: &mut Option<String>,
+) {
+    let language = code_language.clone();
+    if block_kind
+        .as_ref()
+        .is_some_and(|kind| *kind == NoteRichTextBlockKind::CodeBlock)
+        && runs.is_empty()
+        && blocks.last().is_some_and(|block| {
+            block.kind == NoteRichTextBlockKind::CodeBlock && block.code_language == language
+        })
+    {
+        *block_kind = None;
+        *code_language = None;
+        return;
+    }
+    finish_markdown_block(blocks, runs, block_kind, code_language);
 }
 
 /// 把 Markdown 文本追加到当前块；文本内换行会拆成多个富文本块。
@@ -1283,6 +1319,21 @@ mod tests {
         assert_eq!(restored.blocks[0].kind, NoteRichTextBlockKind::CodeBlock);
         assert_eq!(restored.blocks[0].code_language.as_deref(), Some("rust"));
         assert_eq!(restored.blocks[1].code_language.as_deref(), Some("rust"));
+    }
+
+    /// 验证 Markdown 代码块保存往返不会重复追加空白行。
+    ///
+    /// 业务意图：
+    /// - 用户保存笔记时 Markdown 会先解析成富文本再序列化；围栏代码块末尾的换行是 Markdown 语法边界，不应变成用户内容。
+    /// - 如果这里回归，代码块每保存一次都会多出一个空行，属于可见数据损坏。
+    #[test]
+    fn 富文本代码块_markdown_往返不追加空行() {
+        let markdown = "```rust\nlet a = 1;\n```";
+        let once = NoteRichTextDocument::from_markdown(markdown).to_markdown();
+        let twice = NoteRichTextDocument::from_markdown(&once).to_markdown();
+
+        assert_eq!(once, markdown);
+        assert_eq!(twice, markdown);
     }
 
     /// 验证旧富文本 JSON 缺少代码语言字段时仍可读取。

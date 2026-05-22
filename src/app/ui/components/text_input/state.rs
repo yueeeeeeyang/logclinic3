@@ -14,6 +14,8 @@ use super::*;
 pub(in crate::app) enum TextInputBinding {
     /// 搜索弹窗的关键字输入框。
     SearchQuery,
+    /// 笔记页左侧笔记树标题过滤输入框。
+    NotesTreeSearch,
     /// 连接页左侧连接名称过滤输入框。
     ConnectionTreeSearch,
     /// SSH 连接表单中的单行输入框。
@@ -151,6 +153,11 @@ impl MainView {
                 .map(|snapshot| {
                     TextInputSnapshot::from_single_line(snapshot, TextInputDisplayMode::Plain)
                 }),
+            TextInputBinding::NotesTreeSearch => {
+                self.notes_tree_search_text_snapshot().map(|snapshot| {
+                    TextInputSnapshot::from_single_line(snapshot, TextInputDisplayMode::Plain)
+                })
+            }
             TextInputBinding::ConnectionTreeSearch => {
                 self.connection_tree_search_text_snapshot().map(|snapshot| {
                     TextInputSnapshot::from_single_line(snapshot, TextInputDisplayMode::Plain)
@@ -198,6 +205,9 @@ impl MainView {
                 bounds,
                 horizontal_scroll_px,
             ),
+            TextInputBinding::NotesTreeSearch => {
+                self.store_notes_tree_search_text_layout(line, bounds, horizontal_scroll_px)
+            }
             TextInputBinding::ConnectionTreeSearch => {
                 self.store_connection_tree_search_text_layout(line, bounds, horizontal_scroll_px)
             }
@@ -231,6 +241,7 @@ impl MainView {
                 .search_dialog
                 .as_mut()
                 .map(|dialog| &mut dialog.query_input),
+            TextInputBinding::NotesTreeSearch => Some(&mut self.notes.tree_search.input),
             TextInputBinding::ConnectionTreeSearch => Some(&mut self.connections.tree_search.input),
             TextInputBinding::ConnectionForm(field) => self
                 .connections
@@ -262,6 +273,7 @@ impl MainView {
                 .search_dialog
                 .as_ref()
                 .map(|dialog| &dialog.query_input),
+            TextInputBinding::NotesTreeSearch => Some(&self.notes.tree_search.input),
             TextInputBinding::ConnectionTreeSearch => Some(&self.connections.tree_search.input),
             TextInputBinding::ConnectionForm(field) => self
                 .connections
@@ -295,6 +307,9 @@ impl MainView {
         match binding {
             TextInputBinding::SearchQuery => {
                 self.search_text_index_for_point(SearchTextInputKind::Query, position)
+            }
+            TextInputBinding::NotesTreeSearch => {
+                self.notes_tree_search_text_index_for_point(position)
             }
             TextInputBinding::ConnectionTreeSearch => {
                 self.connection_tree_search_text_index_for_point(position)
@@ -355,6 +370,12 @@ impl MainView {
                     context.notify();
                     return true;
                 }
+                TextInputBinding::NotesTreeSearch => {
+                    select_all_text_input(&mut self.notes.tree_search.input);
+                    self.touch_search_text_cursor_activity();
+                    context.notify();
+                    return true;
+                }
                 _ => {}
             }
         }
@@ -406,6 +427,7 @@ impl MainView {
             false
         };
         if handled {
+            self.sync_text_input_scroll_to_cursor(binding);
             self.touch_search_text_cursor_activity();
             context.notify();
         }
@@ -430,6 +452,150 @@ impl MainView {
         }
         handled
     }
+
+    /// 将指定输入框水平滚动同步到当前光标位置。
+    ///
+    /// 业务意图：
+    /// - 用户用鼠标拖拽选区并越过输入框可视区域时，选区焦点会持续移动；此时应像系统输入框一样横向滚动，
+    ///   不能只在键盘移动或下一次文本输入后才更新。
+    /// - 这里复用 `TextInputElement` 回写的最后一次字形布局，不把滚动计算散落到各具体表单。
+    ///
+    /// 边界条件：
+    /// - 如果输入框刚挂载尚未回写布局，直接跳过；下一帧 `prepaint` 仍会根据当前光标重新夹紧滚动。
+    /// - 密码字段使用掩码展示宽度计算滚动，避免真实中文密码和星号宽度不同导致光标可见性判断错误。
+    fn sync_text_input_scroll_to_cursor(&mut self, binding: TextInputBinding) {
+        match binding {
+            TextInputBinding::SearchQuery => {
+                // 搜索弹窗的历史布局和输入状态分属不同搜索状态字段，直接同步会引入额外借用拆分。
+                // 下一帧 `TextInputElement::prepaint` 仍会按光标位置夹紧滚动；这里主要服务连接、笔记和表单长文本拖拽。
+            }
+            TextInputBinding::NotesTreeSearch => {
+                let Some(layout) = self.notes.tree_search.last_layout.as_ref() else {
+                    return;
+                };
+                let Some(bounds) = self.notes.tree_search.last_bounds else {
+                    return;
+                };
+                self.notes.tree_search.input.horizontal_scroll_px =
+                    next_single_line_input_scroll_to_cursor(
+                        &self.notes.tree_search.input,
+                        layout,
+                        bounds,
+                        TextInputDisplayMode::Plain,
+                    );
+            }
+            TextInputBinding::ConnectionTreeSearch => {
+                let Some(layout) = self.connections.tree_search.last_layout.as_ref() else {
+                    return;
+                };
+                let Some(bounds) = self.connections.tree_search.last_bounds else {
+                    return;
+                };
+                self.connections.tree_search.input.horizontal_scroll_px =
+                    next_single_line_input_scroll_to_cursor(
+                        &self.connections.tree_search.input,
+                        layout,
+                        bounds,
+                        TextInputDisplayMode::Plain,
+                    );
+            }
+            TextInputBinding::ConnectionForm(field) => {
+                let Some(dialog) = self.connections.dialog.as_mut() else {
+                    return;
+                };
+                let state = dialog.field_mut(field);
+                let Some(layout) = state.last_layout.as_ref() else {
+                    return;
+                };
+                let Some(bounds) = state.last_bounds else {
+                    return;
+                };
+                let display_mode = if field == ConnectionFormField::Password {
+                    TextInputDisplayMode::Masked { mask_char: '*' }
+                } else {
+                    TextInputDisplayMode::Plain
+                };
+                state.input.horizontal_scroll_px = next_single_line_input_scroll_to_cursor(
+                    &state.input,
+                    layout,
+                    bounds,
+                    display_mode,
+                );
+            }
+            TextInputBinding::SmbConnectionForm(field) => {
+                let Some(dialog) = self.connections.smb_dialog.as_mut() else {
+                    return;
+                };
+                let state = dialog.field_mut(field);
+                let Some(layout) = state.last_layout.as_ref() else {
+                    return;
+                };
+                let Some(bounds) = state.last_bounds else {
+                    return;
+                };
+                let display_mode = if field == SmbConnectionFormField::Password {
+                    TextInputDisplayMode::Masked { mask_char: '*' }
+                } else {
+                    TextInputDisplayMode::Plain
+                };
+                state.input.horizontal_scroll_px = next_single_line_input_scroll_to_cursor(
+                    &state.input,
+                    layout,
+                    bounds,
+                    display_mode,
+                );
+            }
+            TextInputBinding::ConnectionCategoryName => {
+                let Some(dialog) = self.connections.category_dialog.as_mut() else {
+                    return;
+                };
+                let Some(layout) = dialog.name.last_layout.as_ref() else {
+                    return;
+                };
+                let Some(bounds) = dialog.name.last_bounds else {
+                    return;
+                };
+                dialog.name.input.horizontal_scroll_px = next_single_line_input_scroll_to_cursor(
+                    &dialog.name.input,
+                    layout,
+                    bounds,
+                    TextInputDisplayMode::Plain,
+                );
+            }
+            TextInputBinding::FileManagerPath => {}
+        }
+    }
+}
+
+/// 根据当前光标位置更新单行输入框水平滚动。
+///
+/// 业务意图：
+/// - 鼠标拖拽、键盘方向键和 IME 替换最终都以 `selection_range.end` 作为可见焦点；滚动计算统一使用该位置。
+/// - 展示模式由调用方传入，确保明文和掩码字段都按真实绘制宽度滚动。
+fn next_single_line_input_scroll_to_cursor(
+    input: &SingleLineTextInputState,
+    layout: &ShapedLine,
+    bounds: Bounds<Pixels>,
+    display_mode: TextInputDisplayMode,
+) -> f32 {
+    let display_text = display_mode.display_text(&input.text);
+    let display_len = display_text.len();
+    let cursor_index = display_mode.display_index_for_text_index(
+        &input.text,
+        text_input_clamp_range(&input.text, input.selection_range.clone()).end,
+    );
+    let content_width = if input.text.is_empty() {
+        px(0.0)
+    } else {
+        layout.x_for_index(display_len)
+    };
+    text_input_horizontal_scroll_offset(
+        input.horizontal_scroll_px,
+        layout.x_for_index(cursor_index),
+        content_width,
+        bounds.size.width,
+        true,
+    )
 }
 
 impl TextInputElementHost for MainView {

@@ -139,6 +139,90 @@ pub(in crate::app) struct NotesTreeResizeDrag {
     pub(in crate::app) start_width: f32,
 }
 
+/// 笔记树搜索输入状态。
+///
+/// 业务意图：
+/// - 左侧笔记树可能同时包含大量目录和 Markdown 文件，搜索框只影响当前树的可见行，不修改物理文件、
+///   展开状态或当前编辑草稿。
+/// - 状态复用通用单行输入框核心，保证中文 IME、复制粘贴、拖拽选区和长标题水平滚动与连接树搜索一致。
+///
+/// 边界条件：
+/// - 搜索关键字为空时恢复普通展开/收起逻辑；有关键字时临时展示匹配节点及其祖先目录，不持久化展开结果。
+/// - 最近一次布局只服务鼠标命中和 IME 候选窗口定位，刷新树或清空搜索时可以安全丢弃。
+pub(in crate::app) struct NotesTreeSearchState {
+    /// 单行输入框通用编辑状态。
+    pub(in crate::app) input: SingleLineTextInputState,
+    /// 搜索框焦点句柄。
+    pub(in crate::app) focus: FocusHandle,
+    /// 最近一次绘制的字形布局。
+    pub(in crate::app) last_layout: Option<ShapedLine>,
+    /// 最近一次绘制的输入框窗口坐标。
+    pub(in crate::app) last_bounds: Option<Bounds<Pixels>>,
+}
+
+/// 判断笔记树当前是否处于搜索模式。
+///
+/// 业务意图：
+/// - 搜索框只要存在非空白关键字，就进入临时过滤视图；该视图不应读写普通树展开状态。
+/// - 抽成纯函数后，渲染层、点击动作和单元测试使用同一套判定，避免空格搜索等边界行为不一致。
+pub(in crate::app) fn note_tree_search_is_active(search_text: &str) -> bool {
+    !search_text.trim().is_empty()
+}
+
+/// 判断目录行在当前笔记树视图中是否应渲染为展开。
+///
+/// 业务意图：
+/// - 普通模式使用用户持久展开集合；搜索模式直接展示命中笔记和祖先目录，祖先目录必须视觉上显示为展开。
+/// - 该函数只影响箭头和文件夹图标，不修改 `expanded_directory_ids`，确保清空搜索后恢复原展开状态。
+///
+/// 边界条件：
+/// - 普通笔记行和无子节点目录都不能显示为展开，避免搜索结果中出现没有下级内容的展开箭头。
+pub(in crate::app) fn note_tree_directory_expanded_for_view(
+    row: &NoteTreeRow,
+    expanded_directory_ids: &HashSet<String>,
+    search_text: &str,
+) -> bool {
+    row.kind == NoteTreeRowKind::Directory
+        && row.has_children
+        && (note_tree_search_is_active(search_text) || expanded_directory_ids.contains(&row.id))
+}
+
+impl NotesTreeSearchState {
+    /// 创建笔记树搜索输入状态。
+    pub(in crate::app) fn new(context: &mut Context<MainView>) -> Self {
+        Self {
+            input: SingleLineTextInputState::empty(),
+            focus: context.focus_handle(),
+            last_layout: None,
+            last_bounds: None,
+        }
+    }
+
+    /// 返回规范化后的搜索关键字。
+    pub(in crate::app) fn query(&self) -> String {
+        self.input.text.trim().to_lowercase()
+    }
+
+    /// 记录最近一次绘制布局。
+    pub(in crate::app) fn store_layout(
+        &mut self,
+        line: ShapedLine,
+        bounds: Bounds<Pixels>,
+        horizontal_scroll_px: f32,
+    ) {
+        self.last_layout = Some(line);
+        self.last_bounds = Some(bounds);
+        self.input.horizontal_scroll_px = horizontal_scroll_px;
+    }
+
+    /// 清理布局缓存和水平滚动。
+    pub(in crate::app) fn clear_layout(&mut self) {
+        self.last_layout = None;
+        self.last_bounds = None;
+        self.input.horizontal_scroll_px = 0.0;
+    }
+}
+
 /// 笔记 AI 临时消息角色。
 ///
 /// 业务意图：
@@ -382,6 +466,11 @@ pub(in crate::app) struct NotesWorkspaceState {
     pub(in crate::app) tree_rows: Vec<NoteTreeRow>,
     /// 当前按展开状态可见的笔记树行。
     pub(in crate::app) visible_rows: Vec<NoteTreeRow>,
+    /// 左侧笔记树搜索框状态。
+    ///
+    /// 业务意图：
+    /// - 搜索只过滤左侧树，不影响当前打开笔记，也不写入磁盘；清空后恢复用户原本的展开/收起状态。
+    pub(in crate::app) tree_search: NotesTreeSearchState,
     /// 展开的目录 ID 集合。
     pub(in crate::app) expanded_directory_ids: HashSet<String>,
     /// 当前选中节点。
@@ -466,6 +555,7 @@ impl NotesWorkspaceState {
         let mut state = Self {
             tree_rows,
             visible_rows: Vec::new(),
+            tree_search: NotesTreeSearchState::new(context),
             expanded_directory_ids: HashSet::new(),
             selected: None,
             active_note: None,
@@ -512,6 +602,11 @@ impl NotesWorkspaceState {
     /// 按展开状态重建可见行。
     pub(in crate::app) fn rebuild_visible_rows(&mut self) {
         self.visible_rows.clear();
+        let search_query = self.tree_search.query();
+        if !search_query.is_empty() {
+            self.rebuild_visible_rows_for_search(&search_query);
+            return;
+        }
         let mut collapsed_depth: Option<usize> = None;
         for row in &self.tree_rows {
             if let Some(depth) = collapsed_depth {
@@ -528,6 +623,69 @@ impl NotesWorkspaceState {
                 collapsed_depth = Some(row.depth);
             }
         }
+    }
+
+    /// 按搜索关键字重建可见行。
+    ///
+    /// 业务意图：
+    /// - 搜索状态下不读取 `expanded_directory_ids`，而是直接展示命中笔记和祖先目录，避免用户必须先手动展开深层目录才能看到结果。
+    /// - 匹配范围只包含笔记标题；目录名称不参与命中，避免“搜索笔记”时出现没有匹配笔记的空目录。
+    ///
+    /// 边界条件：
+    /// - 目录和笔记 ID 分属不同命名空间；目录祖先只按目录 ID 追溯，避免同名笔记误当成父目录。
+    /// - 如果关键字只命中目录名称，不会展示该目录；搜索结果始终以笔记为目标，祖先目录仅用于路径上下文。
+    fn rebuild_visible_rows_for_search(&mut self, search_query: &str) {
+        self.visible_rows.extend(Self::visible_rows_for_note_search(
+            &self.tree_rows,
+            search_query,
+        ));
+    }
+
+    /// 计算笔记名称搜索下应展示的扁平树行。
+    ///
+    /// 业务意图：
+    /// - 抽成纯函数便于单元测试锁定“只匹配笔记、保留祖先目录、保持原树顺序”的规则。
+    /// - 返回行仍沿用原始 `tree_rows` 顺序，避免搜索时同级排序和普通树展示不一致。
+    fn visible_rows_for_note_search(
+        tree_rows: &[NoteTreeRow],
+        search_query: &str,
+    ) -> Vec<NoteTreeRow> {
+        let directory_parent_by_id = tree_rows
+            .iter()
+            .filter(|row| row.kind == NoteTreeRowKind::Directory)
+            .map(|row| (row.id.clone(), row.parent_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut visible_note_ids = HashSet::new();
+        let mut visible_directory_ids = HashSet::new();
+
+        for row in tree_rows {
+            if row.kind != NoteTreeRowKind::Note {
+                continue;
+            }
+            if !row.title.to_lowercase().contains(search_query) {
+                continue;
+            }
+            visible_note_ids.insert(row.id.clone());
+
+            let mut parent_id = row.parent_id.clone();
+            while let Some(directory_id) = parent_id {
+                if !visible_directory_ids.insert(directory_id.clone()) {
+                    break;
+                }
+                parent_id = directory_parent_by_id
+                    .get(&directory_id)
+                    .and_then(|value| value.clone());
+            }
+        }
+
+        tree_rows
+            .iter()
+            .filter(|row| match row.kind {
+                NoteTreeRowKind::Directory => visible_directory_ids.contains(&row.id),
+                NoteTreeRowKind::Note => visible_note_ids.contains(&row.id),
+            })
+            .cloned()
+            .collect()
     }
 
     /// 判断当前编辑草稿是否存在未保存修改。
@@ -560,5 +718,129 @@ impl NotesWorkspaceState {
             && (serialized_markdown != note.content
                 || editor_title != note.title
                 || note.content_format != NoteContentFormat::Markdown)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造测试用笔记树行。
+    ///
+    /// 业务意图：
+    /// - 搜索规则只关心 ID、父级、标题、类型和展示顺序，测试 helper 用默认更新时间避免重复噪音。
+    fn test_note_tree_row(
+        id: &str,
+        parent_id: Option<&str>,
+        title: &str,
+        kind: NoteTreeRowKind,
+        depth: usize,
+        has_children: bool,
+    ) -> NoteTreeRow {
+        NoteTreeRow {
+            id: id.to_string(),
+            parent_id: parent_id.map(ToString::to_string),
+            title: title.to_string(),
+            kind,
+            depth,
+            has_children,
+            updated_at_ms: 0,
+        }
+    }
+
+    /// 验证笔记树搜索只命中笔记名称，并保留祖先目录路径。
+    ///
+    /// 业务意图：
+    /// - 用户搜索的是笔记而不是目录；目录仅作为路径上下文展示，避免搜索目录名时出现没有匹配笔记的空结果分组。
+    #[test]
+    fn 笔记树搜索只匹配笔记并保留祖先目录() {
+        let rows = vec![
+            test_note_tree_row("dir-a", None, "工作", NoteTreeRowKind::Directory, 0, true),
+            test_note_tree_row(
+                "dir-b",
+                Some("dir-a"),
+                "日报",
+                NoteTreeRowKind::Directory,
+                1,
+                true,
+            ),
+            test_note_tree_row(
+                "note-a",
+                Some("dir-b"),
+                "线上故障复盘",
+                NoteTreeRowKind::Note,
+                2,
+                false,
+            ),
+            test_note_tree_row(
+                "note-b",
+                Some("dir-a"),
+                "会议纪要",
+                NoteTreeRowKind::Note,
+                1,
+                false,
+            ),
+        ];
+
+        let visible = NotesWorkspaceState::visible_rows_for_note_search(&rows, "故障");
+        let visible_ids = visible
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(visible_ids, vec!["dir-a", "dir-b", "note-a"]);
+    }
+
+    /// 验证目录名称本身不会作为笔记搜索命中。
+    #[test]
+    fn 笔记树搜索不会按目录名称命中() {
+        let rows = vec![
+            test_note_tree_row(
+                "dir-a",
+                None,
+                "故障目录",
+                NoteTreeRowKind::Directory,
+                0,
+                true,
+            ),
+            test_note_tree_row(
+                "note-a",
+                Some("dir-a"),
+                "普通笔记",
+                NoteTreeRowKind::Note,
+                1,
+                false,
+            ),
+        ];
+
+        let visible = NotesWorkspaceState::visible_rows_for_note_search(&rows, "故障");
+
+        assert!(visible.is_empty());
+    }
+
+    /// 验证搜索模式下祖先目录视觉上保持展开，但不要求写入普通展开集合。
+    ///
+    /// 业务风险：
+    /// - 搜索结果会展示命中笔记的祖先目录；如果目录仍显示收起箭头，用户会看到“收起目录下面露出子节点”的矛盾状态。
+    #[test]
+    fn 笔记树搜索模式目录按临时展开渲染() {
+        let row = test_note_tree_row("dir-a", None, "工作", NoteTreeRowKind::Directory, 0, true);
+        let expanded = HashSet::new();
+
+        assert!(note_tree_directory_expanded_for_view(
+            &row, &expanded, "故障"
+        ));
+        assert!(!note_tree_directory_expanded_for_view(&row, &expanded, ""));
+    }
+
+    /// 验证空白搜索词不会进入搜索模式。
+    ///
+    /// 业务风险：
+    /// - 如果空格也被当作搜索模式，点击目录会停止切换展开状态，表现为左侧树突然点不动。
+    #[test]
+    fn 笔记树空白搜索词不进入搜索模式() {
+        assert!(!note_tree_search_is_active(""));
+        assert!(!note_tree_search_is_active("   "));
+        assert!(note_tree_search_is_active(" jvm "));
     }
 }

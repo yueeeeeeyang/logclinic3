@@ -41,6 +41,24 @@ pub(in crate::app) const NOTES_TREE_DEFAULT_EXPANDED_DEPTH: usize = 2;
 /// - 该值只影响笔记树行，不复用日志树字号，避免后续调整日志目录树时连带改变笔记页密度。
 pub(in crate::app) const NOTES_TREE_FONT_SIZE: f32 = 13.0;
 
+/// 笔记树节点文字行高。
+///
+/// UI 约束：
+/// - 和连接树保持一致，分类、笔记文件名在中文与英文混排时基线稳定，不依赖父容器默认行高。
+pub(in crate::app) const NOTES_TREE_NODE_LINE_HEIGHT: f32 = 18.0;
+
+/// 笔记树搜索框高度。
+///
+/// UI 约束：
+/// - 搜索框位于标题栏和虚拟列表之间，保持与连接树搜索同样的紧凑高度，避免压缩首屏目录数量。
+pub(in crate::app) const NOTES_TREE_SEARCH_HEIGHT: f32 = 32.0;
+
+/// 笔记树单层缩进。
+///
+/// UI 约束：
+/// - 和连接树一致使用 16px 层级缩进，让“连接”和“笔记”两个资源树切换时视觉结构一致。
+pub(in crate::app) const NOTES_TREE_DEPTH_INDENT: f32 = 16.0;
+
 /// 笔记源码阅读和编辑区行高。
 pub(in crate::app) const NOTES_TEXT_LINE_HEIGHT: f32 = 21.0;
 

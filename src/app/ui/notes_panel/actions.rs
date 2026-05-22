@@ -160,6 +160,164 @@ impl MainView {
         }
     }
 
+    /// 清空笔记树搜索框并恢复普通树展开状态。
+    ///
+    /// 业务意图：
+    /// - 清空搜索不应改变用户原先展开/收起的目录集合，只重新用当前展开状态派生可见行。
+    /// - 搜索框布局缓存包含旧文本的字形位置，清空后必须一起丢弃，避免下一次点击命中到旧宽度。
+    pub(in crate::app) fn clear_notes_tree_search(&mut self, context: &mut Context<Self>) {
+        self.notes.tree_search.input = SingleLineTextInputState::empty();
+        self.notes.tree_search.clear_layout();
+        self.notes.rebuild_visible_rows();
+        self.notes.tree_context_menu = None;
+        self.notes.tree_create_menu_open = false;
+        self.touch_search_text_cursor_activity();
+        context.notify();
+    }
+
+    /// 返回笔记树搜索框绘制快照。
+    pub(in crate::app) fn notes_tree_search_text_snapshot(
+        &self,
+    ) -> Option<SingleLineTextInputSnapshot> {
+        Some(SingleLineTextInputSnapshot {
+            text: self.notes.tree_search.input.text.clone(),
+            selection_range: self.notes.tree_search.input.selection_range.clone(),
+            marked_range: self.notes.tree_search.input.marked_range.clone(),
+            horizontal_scroll_px: self.notes.tree_search.input.horizontal_scroll_px,
+        })
+    }
+
+    /// 保存笔记树搜索框最近一次文本布局。
+    pub(in crate::app) fn store_notes_tree_search_text_layout(
+        &mut self,
+        line: ShapedLine,
+        bounds: Bounds<Pixels>,
+        horizontal_scroll_px: f32,
+    ) {
+        self.notes
+            .tree_search
+            .store_layout(line, bounds, horizontal_scroll_px);
+    }
+
+    /// 根据鼠标窗口坐标返回笔记树搜索框中的 UTF-8 字节下标。
+    pub(in crate::app) fn notes_tree_search_text_index_for_point(
+        &self,
+        position: gpui::Point<Pixels>,
+    ) -> usize {
+        let state = &self.notes.tree_search;
+        let text = &state.input.text;
+        let (Some(layout), Some(bounds)) = (state.last_layout.as_ref(), state.last_bounds.as_ref())
+        else {
+            return text.len();
+        };
+        if position.y < bounds.top() {
+            return 0;
+        }
+        if position.y > bounds.bottom() {
+            return text.len();
+        }
+        let display_index = layout
+            .closest_index_for_x(position.x - bounds.left() + px(state.input.horizontal_scroll_px));
+        text_input_clamp_byte_index(text, display_index.min(text.len()))
+    }
+
+    /// 处理笔记树搜索框按键。
+    ///
+    /// 业务意图：
+    /// - 普通字符和中文 IME 由 `EntityInputHandler` 提交；这里只处理复制粘贴、方向键、删除和 Escape 清空。
+    /// - 搜索框只过滤已加载的树标题，不触发文件扫描或保存。
+    pub(in crate::app) fn handle_notes_tree_search_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if self.handle_notes_tree_search_single_line_key_down(event, context) {
+            return;
+        }
+
+        if event.keystroke.key == "escape" && !self.notes.tree_search.input.text.is_empty() {
+            self.clear_notes_tree_search(context);
+            context.stop_propagation();
+        }
+    }
+
+    /// 处理笔记树搜索框的通用单行编辑按键。
+    fn handle_notes_tree_search_single_line_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        context: &mut Context<Self>,
+    ) -> bool {
+        if Self::is_paste_keystroke(&event.keystroke) {
+            if let Some(text) = context.read_from_clipboard().and_then(|item| item.text()) {
+                replace_text_input_selection(
+                    &mut self.notes.tree_search.input,
+                    &Self::sanitize_search_input_text(&text),
+                );
+                self.after_notes_tree_search_changed();
+            }
+            self.touch_search_text_cursor_activity();
+            context.stop_propagation();
+            context.notify();
+            return true;
+        }
+
+        let input = &mut self.notes.tree_search.input;
+        if Self::is_copy_keystroke(&event.keystroke) {
+            if let Some(text) = text_input_selected_text(input) {
+                context.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            context.stop_propagation();
+            return true;
+        }
+        if Self::is_cut_keystroke(&event.keystroke) {
+            if let Some(text) = text_input_selected_text(input) {
+                context.write_to_clipboard(ClipboardItem::new_string(text));
+                replace_text_input_selection(input, "");
+                self.after_notes_tree_search_changed();
+            }
+            self.touch_search_text_cursor_activity();
+            context.stop_propagation();
+            context.notify();
+            return true;
+        }
+        if Self::is_select_all_keystroke(&event.keystroke) {
+            select_all_text_input(input);
+            self.touch_search_text_cursor_activity();
+            context.stop_propagation();
+            context.notify();
+            return true;
+        }
+
+        let outcome = match event.keystroke.key.as_str() {
+            "left" => move_text_input_left(input, event.keystroke.modifiers.shift),
+            "right" => move_text_input_right(input, event.keystroke.modifiers.shift),
+            "home" | "up" => move_text_input_home(input, event.keystroke.modifiers.shift),
+            "end" | "down" => move_text_input_end(input, event.keystroke.modifiers.shift),
+            "backspace" => backspace_text_input(input),
+            "delete" => delete_text_input(input),
+            _ => TextInputEditOutcome::default(),
+        };
+        if outcome.consumed {
+            if outcome.changed {
+                self.after_notes_tree_search_changed();
+            }
+            self.touch_search_text_cursor_activity();
+            context.stop_propagation();
+            context.notify();
+            return true;
+        }
+        false
+    }
+
+    /// 笔记树搜索文本变化后的派生状态更新。
+    pub(in crate::app) fn after_notes_tree_search_changed(&mut self) {
+        self.notes.tree_search.clear_layout();
+        self.notes.rebuild_visible_rows();
+        self.notes.tree_context_menu = None;
+        self.notes.tree_create_menu_open = false;
+    }
+
     /// 请求手动刷新物理笔记目录。
     ///
     /// 业务意图：
@@ -296,7 +454,11 @@ impl MainView {
 
         match selection.kind {
             NoteTreeRowKind::Directory => {
-                self.toggle_note_directory(&selection.id);
+                // 搜索模式的目录只是命中笔记的路径上下文，点击时不能写入普通树展开集合；
+                // 否则清空搜索后会看到目录被搜索过程意外展开或收起。
+                if !note_tree_search_is_active(&self.notes.tree_search.input.text) {
+                    self.toggle_note_directory(&selection.id);
+                }
                 self.notes.active_note = None;
                 self.notes.is_editing = false;
                 self.notes

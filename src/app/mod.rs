@@ -89,11 +89,14 @@ use gpui::{
 };
 use lucide_icons::{Icon, LUCIDE_FONT_BYTES};
 use main_view::MainView;
+use native_appearance::apply_native_theme_preference;
 
 actions!(logclinic, [OpenSearchDialog]);
 
 /// 主窗口根实体和构造功能域。
 mod main_view;
+/// 原生窗口标题栏外观适配。
+mod native_appearance;
 /// 应用层纯状态测试。
 #[cfg(test)]
 mod tests;

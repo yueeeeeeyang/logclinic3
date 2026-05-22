@@ -372,6 +372,8 @@ fn create_main_window(
     runtime: &Rc<RefCell<MainWindowRuntime>>,
     app: &mut App,
 ) -> Result<WindowHandle<MainView>, String> {
+    // 主窗口创建前先同步原生 AppKit 外观，避免 macOS 标题栏在应用强制暗色/亮色时仍停留在系统默认外观。
+    apply_native_theme_preference(load_theme_preference());
     let window_options = build_main_window_options(app);
     let runtime_for_close = Rc::clone(runtime);
     let main_window = app

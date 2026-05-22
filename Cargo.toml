@@ -82,6 +82,12 @@ walkdir = "2.5.0"
 # zip 用于读取 ZIP 中央目录和条目元数据，不读取日志正文。
 zip = "8.6.0"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# cocoa 只用于在用户强制选择亮色/暗色主题时同步 macOS 原生标题栏外观；它已经是 GPUI 的传递依赖，这里显式依赖避免访问 AppKit 时依赖传递关系。
+cocoa = "0.26.0"
+# objc 只服务 macOS AppKit 的 setAppearance 消息发送，不参与业务逻辑；Windows 构建不会启用该依赖。
+objc = "0.2.7"
+
 [patch.crates-io]
 # smb2 0.11.0 的发布包精确锁定 aes 0.9.0-rc.4，会和 russh 0.61 选中的 aes 0.9.0 稳定版解析冲突；
 # 本地补丁只放宽 smb2 内部 aes 版本约束，SMB 后端仍把加密类型封装在文件管理后台，不影响本地密码加密。

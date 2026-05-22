@@ -355,11 +355,11 @@ fn render_select_trigger(
         .w(px(metrics.button_width))
         .h(px(metrics.button_height))
         .px_2()
-        .rounded(px(3.0))
+        .rounded(px(6.0))
         .border_1()
         .border_color(rgb(border_color))
-        .bg(rgb(palette.input))
-        .text_xs()
+        .bg(rgb(palette.panel))
+        .text_sm()
         .text_color(rgb(text_color))
         .when(enabled, |button| {
             button.cursor_pointer().hover(move |button| {

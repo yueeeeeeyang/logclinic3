@@ -1917,6 +1917,37 @@ impl ConnectionFileManagerWindowView {
         )
     }
 
+    /// 将文件管理地址栏水平滚动同步到当前选区焦点。
+    ///
+    /// 业务意图：
+    /// - 地址栏长路径常见于 SSH/SMB 深层目录，用户拖拽选中并越过可视边界时应自动横向滚动。
+    /// - 文件管理窗口是独立 `Entity`，不能依赖主窗口的输入框状态同步逻辑，因此在这里复用同一套滚动计算。
+    ///
+    /// 边界条件：
+    /// - 地址栏尚未完成一次布局时跳过；下一帧 `TextInputElement` 会根据光标位置重新夹紧滚动。
+    fn sync_path_input_scroll_to_cursor(&mut self) {
+        let Some(layout) = self.path_layout.as_ref() else {
+            return;
+        };
+        let cursor_index = text_input_clamp_range(
+            &self.path_input.text,
+            self.path_input.selection_range.clone(),
+        )
+        .end;
+        let content_width = if self.path_input.text.is_empty() {
+            px(0.0)
+        } else {
+            layout.line.x_for_index(self.path_input.text.len())
+        };
+        self.path_input.horizontal_scroll_px = text_input_horizontal_scroll_offset(
+            self.path_input.horizontal_scroll_px,
+            layout.line.x_for_index(cursor_index),
+            content_width,
+            layout.bounds.size.width,
+            true,
+        );
+    }
+
     /// 用平台提交文本替换地址栏选区。
     fn replace_path_input_range(&mut self, range_utf16: Option<Range<usize>>, text: &str) {
         let replacement = sanitize_file_manager_path_text(text);
@@ -2166,6 +2197,7 @@ impl TextInputElementHost for ConnectionFileManagerWindowView {
         };
         let index = self.path_input_index_for_point(position);
         update_text_input_mouse_selection(&mut self.path_input, anchor, index);
+        self.sync_path_input_scroll_to_cursor();
         self.touch_path_input_cursor_activity();
         context.notify();
         true

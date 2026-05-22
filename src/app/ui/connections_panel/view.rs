@@ -463,6 +463,7 @@ impl MainView {
     ) -> gpui::AnyElement {
         let click_category_id = category.id.clone();
         let context_category_id = category.id.clone();
+        let tree_hover = palette.resource_tree_hover();
         div()
             .id(SharedString::from(format!(
                 "connection-category-{}",
@@ -471,6 +472,7 @@ impl MainView {
             .flex()
             .items_center()
             .gap_2()
+            .w_full()
             .h(px(30.0))
             .mb_1()
             .pl(px(8.0 + depth as f32 * CONNECTIONS_TREE_DEPTH_INDENT))
@@ -479,7 +481,7 @@ impl MainView {
             .bg(rgb(palette.panel))
             .text_color(rgb(palette.text))
             .cursor_pointer()
-            .hover(move |row| row.bg(rgb(palette.hover)))
+            .hover(move |row| row.bg(rgb(tree_hover)))
             .on_click(
                 context.listener(move |view, _event: &ClickEvent, _window, context| {
                     view.toggle_connection_category(&click_category_id, context);
@@ -546,22 +548,23 @@ impl MainView {
         let row_id = profile.id().to_string();
         let name = profile.name().to_string();
         let icon = profile.icon();
-        let active = self.connections.selected_profile_id.as_deref() == Some(profile_key.as_str());
-        let background = if active { palette.hover } else { palette.panel };
+        let tree_hover = palette.resource_tree_hover();
         div()
             .id(SharedString::from(format!("connection-row-{}", row_id)))
             .flex()
             .items_center()
             .gap_2()
+            .w_full()
             .h(px(30.0))
             .pl(px(8.0 + depth as f32 * CONNECTIONS_TREE_DEPTH_INDENT))
             .pr_2()
             .mb_1()
             .rounded(px(6.0))
-            .bg(rgb(background))
+            // 连接树不保留点击后的选中背景；连接点击会立即打开终端或文件管理，列表只在鼠标悬浮时反馈命中行。
+            .bg(rgb(palette.panel))
             .text_color(rgb(palette.text))
             .cursor_pointer()
-            .hover(move |row| row.bg(rgb(palette.hover)))
+            .hover(move |row| row.bg(rgb(tree_hover)))
             .on_click(
                 context.listener(move |view, _event: &ClickEvent, window, context| {
                     // 连接行主动作由协议类型决定：SSH 打开终端，SMB 打开文件管理；编辑和删除统一放在右键菜单。
@@ -1539,6 +1542,7 @@ impl MainView {
                                     self.render_connection_category_select_dismiss_overlay(context),
                                 )
                             })
+                            .child(self.render_connection_category_select_field(palette, context))
                             .child(self.render_connection_form_field(
                                 "名称",
                                 ConnectionFormField::Name,
@@ -1567,7 +1571,6 @@ impl MainView {
                                 palette,
                                 context,
                             ))
-                            .child(self.render_connection_category_select_field(palette, context))
                             .child(self.render_connection_form_field(
                                 "密码",
                                 ConnectionFormField::Password,
@@ -1634,6 +1637,9 @@ impl MainView {
                                     ),
                                 )
                             })
+                            .child(
+                                self.render_smb_connection_category_select_field(palette, context),
+                            )
                             .child(self.render_smb_connection_form_field(
                                 "名称",
                                 SmbConnectionFormField::Name,
@@ -1655,9 +1661,6 @@ impl MainView {
                                 palette,
                                 context,
                             ))
-                            .child(
-                                self.render_smb_connection_category_select_field(palette, context),
-                            )
                             .child(self.render_smb_connection_form_field(
                                 "密码",
                                 SmbConnectionFormField::Password,

@@ -239,11 +239,6 @@ pub(in crate::app) struct ConnectionsWorkspaceState {
     pub(in crate::app) categories: Vec<ConnectionCategory>,
     /// 数据库初始化或读取错误，中文展示给用户。
     pub(in crate::app) database_error: Option<String>,
-    /// 左侧当前选中的连接 key；只影响高亮和编辑/删除默认目标。
-    ///
-    /// 业务意图：
-    /// - SSH 与 SMB 分别写入不同表，可能存在相同裸 ID；选中态使用 `ssh:<id>` / `smb:<id>` 避免协议类型丢失。
-    pub(in crate::app) selected_profile_id: Option<String>,
     /// 左侧连接树已展开分类 ID 集合；搜索模式会临时展开匹配祖先但不写入该集合。
     pub(in crate::app) expanded_category_ids: HashSet<String>,
     /// 左侧连接名称搜索框状态；只过滤连接名称，不匹配分类名称。
@@ -340,22 +335,12 @@ impl ConnectionsWorkspaceState {
                 Some("无法定位应用配置目录，连接配置不会被加载".to_string()),
             ),
         };
-        let selected_profile_id = profiles
-            .first()
-            .map(|profile| ConnectionProfileKey::ssh(&profile.id))
-            .or_else(|| {
-                smb_profiles
-                    .first()
-                    .map(|profile| ConnectionProfileKey::smb(&profile.id))
-            });
-
         Self {
             database_path,
             profiles,
             smb_profiles,
             categories,
             database_error,
-            selected_profile_id,
             expanded_category_ids: HashSet::new(),
             tree_search: ConnectionTreeSearchState::new(context),
             tree_width: CONNECTIONS_TREE_DEFAULT_WIDTH,
@@ -440,7 +425,6 @@ impl ConnectionsWorkspaceState {
             self.profiles.clear();
             self.smb_profiles.clear();
             self.categories.clear();
-            self.selected_profile_id = None;
             return;
         };
 
@@ -459,20 +443,6 @@ impl ConnectionsWorkspaceState {
                         .iter()
                         .any(|category| &category.id == category_id)
                 });
-                if let Some(selected) = self.selected_profile_id.as_ref()
-                    && connection_profile_key_exists(selected, &self.profiles, &self.smb_profiles)
-                {
-                    return;
-                }
-                self.selected_profile_id = self
-                    .profiles
-                    .first()
-                    .map(|profile| ConnectionProfileKey::ssh(&profile.id))
-                    .or_else(|| {
-                        self.smb_profiles
-                            .first()
-                            .map(|profile| ConnectionProfileKey::smb(&profile.id))
-                    });
             }
             (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
                 self.database_error = Some(error);

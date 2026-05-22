@@ -1074,7 +1074,6 @@ impl MainView {
         }
         let target_profile_id = profile_key.to_string();
 
-        self.connections.selected_profile_id = Some(target_profile_id.clone());
         self.connections.profile_context_menu = Some(ConnectionProfileContextMenu {
             profile_id: target_profile_id,
             x: Self::connection_profile_context_menu_x(
@@ -1138,7 +1137,6 @@ impl MainView {
             return;
         };
         let profile_id = menu.profile_id;
-        self.connections.selected_profile_id = Some(profile_id.clone());
         self.connections.create_menu_open = false;
         self.connections.category_context_menu = None;
 
@@ -1228,7 +1226,6 @@ impl MainView {
             context.notify();
             return;
         };
-        self.connections.selected_profile_id = Some(ConnectionProfileKey::smb(&profile.id));
         self.connections.create_menu_open = false;
         self.connections.profile_context_menu = None;
         self.connections.profile_hover_tooltip = None;
@@ -1289,7 +1286,6 @@ impl MainView {
             context.notify();
             return;
         };
-        self.connections.selected_profile_id = Some(ConnectionProfileKey::ssh(&profile.id));
         self.connections.create_menu_open = false;
         self.connections.profile_context_menu = None;
         self.connections.profile_hover_tooltip = None;

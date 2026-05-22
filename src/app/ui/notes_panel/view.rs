@@ -218,15 +218,102 @@ impl MainView {
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let visible_row_count = self.notes.visible_rows.len();
         div()
-            .id("notes-tree-list")
+            .id("notes-tree-body")
             .relative()
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
             .overflow_hidden()
+            .child(self.render_notes_tree_search_bar(palette, context))
+            .child(self.render_notes_tree_rows(palette, context))
+    }
+
+    /// 渲染笔记树搜索框。
+    ///
+    /// 业务意图：
+    /// - 搜索框只按左侧笔记名称过滤，不读取笔记正文，也不按目录名称命中；用户输入过程必须保持轻量。
+    /// - 复用通用 `TextInputElement`，让笔记和连接的搜索框在 IME、复制粘贴、拖拽选区和长文本滚动上保持一致。
+    fn render_notes_tree_search_bar(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let focus_handle = self.notes.tree_search.focus.clone();
+        div()
+            .id("notes-tree-search-bar")
+            .flex()
+            .items_center()
+            .gap_2()
+            .mx_2()
+            .my_2()
+            .h(px(NOTES_TREE_SEARCH_HEIGHT))
+            .px_2()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.input))
+            .text_sm()
+            .text_color(rgb(palette.text))
+            .track_focus(&focus_handle)
+            .key_context("notes-tree-search-input")
+            .on_key_down(context.listener(Self::handle_notes_tree_search_key_down))
+            .child(Self::render_lucide_icon(
+                Some(Icon::Search),
+                15.0,
+                14.0,
+                palette.muted_text,
+            ))
+            .child(TextInputElement {
+                view: context.entity(),
+                binding: TextInputBinding::NotesTreeSearch,
+                focus_handle,
+                placeholder: "搜索笔记",
+                palette,
+            })
+            .when(!self.notes.tree_search.input.text.is_empty(), |bar| {
+                bar.child(
+                    div()
+                        .id("notes-tree-search-clear")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(18.0))
+                        .rounded(px(4.0))
+                        .cursor_pointer()
+                        .hover(move |button| button.bg(rgb(palette.hover)))
+                        .child(Self::render_lucide_icon(
+                            Some(Icon::X),
+                            12.0,
+                            12.0,
+                            palette.muted_text,
+                        ))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            context.listener(|view, _event: &MouseDownEvent, _window, context| {
+                                view.clear_notes_tree_search(context);
+                                context.stop_propagation();
+                            }),
+                        ),
+                )
+            })
+    }
+
+    /// 渲染笔记树虚拟列表。
+    fn render_notes_tree_rows(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let visible_row_count = self.notes.visible_rows.len();
+        div()
+            .id("notes-tree-list")
+            .flex_1()
+            .min_h_0()
+            .overflow_hidden()
+            // 和连接树保持一致的列表内边距，确保 hover/选中背景不会贴住左侧面板边缘。
+            .p_2()
             .child(
                 uniform_list(
                     "notes-tree-virtual-list",
@@ -282,8 +369,13 @@ impl MainView {
             .as_ref()
             .is_some_and(|selection| selection.id == row.id && selection.kind == row.kind);
         let can_toggle = row.kind == NoteTreeRowKind::Directory && row.has_children;
+        let directory_expanded = note_tree_directory_expanded_for_view(
+            &row,
+            &self.notes.expanded_directory_ids,
+            &self.notes.tree_search.input.text,
+        );
         let expand_icon = if can_toggle {
-            Some(if self.notes.expanded_directory_ids.contains(&row.id) {
+            Some(if directory_expanded {
                 Icon::ChevronDown
             } else {
                 Icon::ChevronRight
@@ -292,9 +384,7 @@ impl MainView {
             None
         };
         let item_icon = match row.kind {
-            NoteTreeRowKind::Directory if self.notes.expanded_directory_ids.contains(&row.id) => {
-                Icon::FolderOpen
-            }
+            NoteTreeRowKind::Directory if directory_expanded => Icon::FolderOpen,
             NoteTreeRowKind::Directory => Icon::Folder,
             NoteTreeRowKind::Note => Icon::FileText,
         };
@@ -304,13 +394,8 @@ impl MainView {
         };
         let selection_for_left_click = selection.clone();
         let selection_for_right_click = selection.clone();
-        let background = if selected {
-            palette.selected
-        } else {
-            palette.panel
-        };
-        let hover_background =
-            Self::log_tree_row_hover_background(selected, self.effective_theme());
+        let tree_hover = palette.resource_tree_hover();
+        let background = if selected { tree_hover } else { palette.panel };
         div()
             .id(SharedString::from(format!(
                 "notes-tree-row-{}-{}-{visible_index}",
@@ -322,36 +407,40 @@ impl MainView {
             )))
             .flex()
             .items_center()
-            .gap_1()
-            .h(px(LOG_TREE_ROW_HEIGHT))
+            .gap_2()
             .w_full()
-            .min_w_0()
-            .pl(px(
-                LOG_TREE_ROW_HORIZONTAL_PADDING + row.depth as f32 * LOG_TREE_ROW_INDENT
-            ))
-            .pr(px(LOG_TREE_ROW_HORIZONTAL_PADDING))
+            .h(px(30.0))
+            .pl(px(8.0 + row.depth as f32 * NOTES_TREE_DEPTH_INDENT))
+            .pr_2()
+            .mb_1()
+            .rounded(px(6.0))
             .bg(rgb(background))
-            .text_size(px(NOTES_TREE_FONT_SIZE))
-            .text_color(rgb(if selected {
-                palette.accent
-            } else {
-                palette.text
-            }))
+            .text_color(rgb(palette.text))
             .cursor_pointer()
-            .hover(move |item| item.bg(rgb(hover_background)))
+            .hover(move |item| item.bg(rgb(tree_hover)))
             .child(Self::render_lucide_icon(
                 expand_icon,
-                LOG_TREE_CHEVRON_WIDTH,
-                LOG_TREE_CHEVRON_SIZE,
+                14.0,
+                13.0,
                 palette.muted_text,
             ))
             .child(Self::render_lucide_icon(
                 Some(item_icon),
-                LOG_TREE_ITEM_ICON_WIDTH,
-                LOG_TREE_ITEM_ICON_SIZE,
+                17.0,
+                15.0,
                 palette.muted_text,
             ))
-            .child(div().flex_1().min_w_0().truncate().child(row.title))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(NOTES_TREE_FONT_SIZE))
+                    .line_height(px(NOTES_TREE_NODE_LINE_HEIGHT))
+                    .font_weight(FontWeight::NORMAL)
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(row.title),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 context.listener(move |view, event: &MouseDownEvent, _window, context| {

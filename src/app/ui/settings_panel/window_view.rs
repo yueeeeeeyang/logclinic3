@@ -119,6 +119,8 @@ impl SettingsWindowView {
         self.main_view.update(context, |view, context| {
             view.settings.theme_preference = theme;
             save_theme_preference(theme);
+            // 内容区由 GPUI 调色板立即重绘；macOS 原生标题栏需要额外同步 AppKit appearance，才能跟随应用内主题偏好。
+            apply_native_theme_preference(theme);
             context.notify();
         });
         context.notify();

@@ -75,6 +75,17 @@ impl EntityInputHandler for MainView {
             ));
             return Some(self.log.log_tree_search.input.text[range].to_string());
         }
+        if self.notes.tree_search.focus.is_focused(window) {
+            let range = Self::search_input_range_from_utf16(
+                &self.notes.tree_search.input.text,
+                range_utf16,
+            );
+            adjusted_range.replace(Self::search_input_range_to_utf16(
+                &self.notes.tree_search.input.text,
+                range.clone(),
+            ));
+            return Some(self.notes.tree_search.input.text[range].to_string());
+        }
         if self.connections.tree_search.focus.is_focused(window) {
             let range = Self::search_input_range_from_utf16(
                 &self.connections.tree_search.input.text,
@@ -204,6 +215,15 @@ impl EntityInputHandler for MainView {
                 range: Self::search_input_range_to_utf16(
                     &self.log.log_tree_search.input.text,
                     self.log.log_tree_search.input.selection_range.clone(),
+                ),
+                reversed: false,
+            });
+        }
+        if self.notes.tree_search.focus.is_focused(window) {
+            return Some(UTF16Selection {
+                range: Self::search_input_range_to_utf16(
+                    &self.notes.tree_search.input.text,
+                    self.notes.tree_search.input.selection_range.clone(),
                 ),
                 reversed: false,
             });
@@ -340,6 +360,17 @@ impl EntityInputHandler for MainView {
                     Self::search_input_range_to_utf16(&self.log.log_tree_search.input.text, range)
                 });
         }
+        if self.notes.tree_search.focus.is_focused(window) {
+            return self
+                .notes
+                .tree_search
+                .input
+                .marked_range
+                .clone()
+                .map(|range| {
+                    Self::search_input_range_to_utf16(&self.notes.tree_search.input.text, range)
+                });
+        }
         if self.connections.tree_search.focus.is_focused(window) {
             return self
                 .connections
@@ -439,6 +470,12 @@ impl EntityInputHandler for MainView {
         }
         if self.log.log_tree_search.focus.is_focused(window) {
             self.log.log_tree_search.input.marked_range = None;
+            context.notify();
+            return;
+        }
+        if self.notes.tree_search.focus.is_focused(window) {
+            self.notes.tree_search.input.marked_range = None;
+            self.notes.tree_search.input.selection_drag = None;
             context.notify();
             return;
         }
@@ -620,6 +657,25 @@ impl EntityInputHandler for MainView {
             self.log.log_tree_search.clear_layout();
             self.touch_search_text_cursor_activity();
             self.refresh_log_tree_search_results(true, context);
+            return;
+        }
+        if self.notes.tree_search.focus.is_focused(window) {
+            let replacement = Self::sanitize_search_input_text(text);
+            let input = &mut self.notes.tree_search.input;
+            let range = range_utf16
+                .map(|range| Self::search_input_range_from_utf16(&input.text, range))
+                .or_else(|| input.marked_range.clone())
+                .unwrap_or_else(|| input.selection_range.clone());
+            let range = Self::clamp_search_text_range(&input.text, range);
+            input.text.replace_range(range.clone(), &replacement);
+            let cursor = range.start + replacement.len();
+            input.selection_range = cursor..cursor;
+            input.marked_range = None;
+            input.selection_drag = None;
+            input.horizontal_scroll_px = 0.0;
+            self.after_notes_tree_search_changed();
+            self.touch_search_text_cursor_activity();
+            context.notify();
             return;
         }
         if self.connections.tree_search.focus.is_focused(window) {
@@ -1079,6 +1135,39 @@ impl EntityInputHandler for MainView {
             self.refresh_log_tree_search_results(true, context);
             return;
         }
+        if self.notes.tree_search.focus.is_focused(window) {
+            let replacement = Self::sanitize_search_input_text(new_text);
+            let input = &mut self.notes.tree_search.input;
+            let range = range_utf16
+                .map(|range| Self::search_input_range_from_utf16(&input.text, range))
+                .or_else(|| input.marked_range.clone())
+                .unwrap_or_else(|| input.selection_range.clone());
+            let range = Self::clamp_search_text_range(&input.text, range);
+            input.text.replace_range(range.clone(), &replacement);
+
+            if replacement.is_empty() {
+                input.marked_range = None;
+            } else {
+                input.marked_range = Some(range.start..range.start + replacement.len());
+            }
+
+            let selected_range = new_selected_range_utf16
+                .map(|utf16_range| Self::search_input_range_from_utf16(&replacement, utf16_range))
+                .map(|relative_range| {
+                    range.start + relative_range.start..range.start + relative_range.end
+                })
+                .unwrap_or_else(|| {
+                    let cursor = range.start + replacement.len();
+                    cursor..cursor
+                });
+            input.selection_range = selected_range;
+            input.selection_drag = None;
+            input.horizontal_scroll_px = 0.0;
+            self.after_notes_tree_search_changed();
+            self.touch_search_text_cursor_activity();
+            context.notify();
+            return;
+        }
         if self.connections.tree_search.focus.is_focused(window) {
             let replacement = Self::sanitize_search_input_text(new_text);
             let input = &mut self.connections.tree_search.input;
@@ -1505,6 +1594,28 @@ impl EntityInputHandler for MainView {
                 ),
             ));
         }
+        if self.notes.tree_search.focus.is_focused(window) {
+            let range = Self::search_input_range_from_utf16(
+                &self.notes.tree_search.input.text,
+                range_utf16,
+            );
+            let Some(layout) = self.notes.tree_search.last_layout.as_ref() else {
+                return Some(element_bounds);
+            };
+            let horizontal_scroll_px = self.notes.tree_search.input.horizontal_scroll_px;
+            return Some(Bounds::from_corners(
+                point(
+                    element_bounds.left() + layout.x_for_index(range.start)
+                        - px(horizontal_scroll_px),
+                    element_bounds.top(),
+                ),
+                point(
+                    element_bounds.left() + layout.x_for_index(range.end)
+                        - px(horizontal_scroll_px),
+                    element_bounds.bottom(),
+                ),
+            ));
+        }
         if self.connections.tree_search.focus.is_focused(window) {
             let range = Self::search_input_range_from_utf16(
                 &self.connections.tree_search.input.text,
@@ -1705,6 +1816,13 @@ impl EntityInputHandler for MainView {
             let utf8_index = self.log_tree_search_index_for_point(point);
             return Some(Self::search_input_utf16_offset_from_byte(
                 &self.log.log_tree_search.input.text,
+                utf8_index,
+            ));
+        }
+        if self.notes.tree_search.focus.is_focused(window) {
+            let utf8_index = self.notes_tree_search_text_index_for_point(point);
+            return Some(Self::search_input_utf16_offset_from_byte(
+                &self.notes.tree_search.input.text,
                 utf8_index,
             ));
         }
