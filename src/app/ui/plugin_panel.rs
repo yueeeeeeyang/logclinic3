@@ -77,6 +77,16 @@ const PLUGIN_TABLE_APPROX_CHAR_WIDTH: f32 = 7.6;
 /// - 上限只限制单列首屏宽度；用户仍可复制可见文本范围，超长内容后续可通过插件详情页继续拆分展示。
 const PLUGIN_TABLE_MAX_CONTENT_COLUMN_WIDTH: f32 = 1800.0;
 
+/// 插件表格列宽估算最多采样的行数。
+///
+/// 业务意图：
+/// - 插件表格虽然使用虚拟列表渲染可见行，但页面初始化仍需要估算列宽；对几十万行逐行扫描会直接卡住窗口创建。
+/// - 采样前若干行可以稳定覆盖常见请求路径和 SQL 宽度，同时把初始化开销限制在固定上限内。
+///
+/// 边界条件：
+/// - 极端长文本如果只出现在采样窗口之后，列宽可能低估；单元格仍会被裁剪且可通过横向滚动/详情页查看，不影响数据正确性。
+const PLUGIN_TABLE_COLUMN_WIDTH_SAMPLE_ROWS: usize = 2048;
+
 /// 插件窗口默认尺寸。
 ///
 /// 业务意图：
@@ -101,6 +111,28 @@ const PLUGIN_WINDOW_OFFSET_STEP: f32 = 28.0;
 /// - 持续打开很多窗口时不能无限向右下漂移，循环错位可以兼顾可见性和屏幕边界风险。
 const PLUGIN_WINDOW_OFFSET_CYCLE: usize = 8;
 
+/// 插件步骤输出中日志截图片段的起始标记。
+///
+/// 业务意图：
+/// - E9 memory 分析会把异常行上下文作为文本流返回；宿主消费该内部标记后渲染成带行号的日志块。
+/// - 标记只属于宿主和插件之间的声明式协议，不应直接展示给用户。
+const PLUGIN_LOG_SNIPPET_BEGIN: &str = "@@LC_LOG_SNIPPET_BEGIN";
+
+/// 插件步骤输出中日志截图片段的结束标记。
+const PLUGIN_LOG_SNIPPET_END: &str = "@@LC_LOG_SNIPPET_END";
+
+/// 插件步骤输出中单行日志片段的标记前缀。
+const PLUGIN_LOG_SNIPPET_LINE_PREFIX: &str = "@@LC_LOG_LINE\t";
+
+/// 性能表格用户过滤字段。
+const PLUGIN_PERFORMANCE_FILTER_USERS_KEY: &str = "filter_users";
+
+/// 性能表格起始请求时间过滤字段。
+const PLUGIN_PERFORMANCE_FILTER_START_KEY: &str = "filter_start_time";
+
+/// 性能表格结束请求时间过滤字段。
+const PLUGIN_PERFORMANCE_FILTER_END_KEY: &str = "filter_end_time";
+
 /// 当前进程内插件窗口打开序号。
 ///
 /// 业务意图：
@@ -121,11 +153,41 @@ struct PluginContentLineWriter<'a> {
     /// 插件进程 stdin writer。
     writer: &'a mut dyn Write,
     /// 宿主侧进度通知通道；为空时表示测试或同步调用路径不需要刷新 UI。
-    progress_sender: Option<&'a mpsc::Sender<PluginCommandProgress>>,
+    event_sender: Option<&'a mpsc::Sender<PluginCommandRuntimeEvent>>,
     /// 当前尚未遇到换行符的一行原始字节。
     line_buffer: Vec<u8>,
     /// 已发送给插件的日志行数。
     done: u64,
+}
+
+/// 插件步骤输出正文的结构化块。
+///
+/// 业务意图：
+/// - 插件步骤仍通过单个字符串做流式追加，但其中可能混入 E9 memory 异常上下文日志片段。
+/// - 渲染前先解析为普通文本块和日志片段块，避免把内部协议标记暴露给用户。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PluginOutputStepTextBlock {
+    /// 普通诊断文本，按原换行顺序展示。
+    Text(Vec<String>),
+    /// 带行号和高亮的原始日志上下文片段。
+    LogSnippet(Vec<PluginOutputLogSnippetLine>),
+}
+
+/// 插件步骤输出中的单行原始日志上下文。
+///
+/// 边界条件：
+/// - `text` 保留插件传回的原始行内容，可能包含制表符和较长数值列，渲染时使用横向滚动而不是截断。
+/// - `highlight_terms` 是插件解析出的关键数字 token，宿主只按字面匹配高亮，不重新解释日志业务含义。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PluginOutputLogSnippetLine {
+    /// 原始文件行号，从 1 开始。
+    line_number: String,
+    /// 原始日志行。
+    text: String,
+    /// 是否为当前异常行。
+    is_issue: bool,
+    /// 当前行需要高亮的文本片段。
+    highlight_terms: Vec<String>,
 }
 
 /// 插件表格文本选择状态。
@@ -209,6 +271,23 @@ struct PluginTableFilterInputLayout {
     horizontal_scroll_px: f32,
 }
 
+/// 插件表格过滤栏中的单行输入框种类。
+///
+/// 业务意图：
+/// - 普通关键字过滤和性能业务过滤共享同一套自绘输入框、IME、选区和剪贴板处理。
+/// - 使用显式种类分发状态，避免为用户、开始时间、结束时间重复维护平台输入细节。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PluginTableInputKind {
+    /// 当前表格的本地关键字过滤。
+    QuickFilter,
+    /// 性能列表/详情的用户名过滤，多个用户使用英文逗号分隔。
+    PerformanceUsers,
+    /// 性能列表/详情的起始请求时间。
+    PerformanceStartTime,
+    /// 性能列表/详情的结束请求时间。
+    PerformanceEndTime,
+}
+
 /// 插件表格过滤输入元素。
 ///
 /// 业务意图：
@@ -217,8 +296,12 @@ struct PluginTableFilterInputLayout {
 struct PluginTableFilterInputElement {
     /// 插件窗口实体。
     view: Entity<PluginPageWindowView>,
+    /// 输入框种类。
+    input_kind: PluginTableInputKind,
     /// 输入框焦点。
     focus_handle: gpui::FocusHandle,
+    /// 空输入时的占位文案。
+    placeholder: &'static str,
     /// 当前主题调色板。
     palette: AppThemePalette,
 }
@@ -410,10 +493,13 @@ impl Element for PluginTableFilterInputElement {
         window: &mut Window,
         context: &mut App,
     ) -> Self::PrepaintState {
-        let snapshot = self.view.read(context).table_filter_snapshot();
+        let snapshot = self
+            .view
+            .read(context)
+            .table_input_snapshot(self.input_kind);
         let style = window.text_style();
         let display_text = if snapshot.text.is_empty() {
-            SharedString::from("过滤当前表格任意关键字")
+            SharedString::from(self.placeholder)
         } else {
             SharedString::from(snapshot.text.clone())
         };
@@ -559,11 +645,14 @@ impl Element for PluginTableFilterInputElement {
             window.paint_quad(cursor);
         }
         self.view.update(context, |view, _context| {
-            view.store_table_filter_layout(PluginTableFilterInputLayout {
-                line: prepaint.line,
-                bounds,
-                horizontal_scroll_px: prepaint.horizontal_scroll_px,
-            });
+            view.store_table_input_layout(
+                self.input_kind,
+                PluginTableFilterInputLayout {
+                    line: prepaint.line,
+                    bounds,
+                    horizontal_scroll_px: prepaint.horizontal_scroll_px,
+                },
+            );
         });
         if self.focus_handle.is_focused(window) {
             window.request_animation_frame();
@@ -575,24 +664,25 @@ impl<'a> PluginContentLineWriter<'a> {
     /// 创建按行转换 writer。
     fn new(
         writer: &'a mut dyn Write,
-        progress_sender: Option<&'a mpsc::Sender<PluginCommandProgress>>,
+        event_sender: Option<&'a mpsc::Sender<PluginCommandRuntimeEvent>>,
     ) -> Self {
         Self {
             writer,
-            progress_sender,
+            event_sender,
             line_buffer: Vec::new(),
             done: 0,
         }
     }
 
     /// 结束流式写入，并把没有换行结尾的最后一行发送给插件。
-    fn finish(mut self) -> Result<(), String> {
+    fn finish(mut self) -> Result<u64, String> {
         if !self.line_buffer.is_empty() {
             self.emit_current_line()?;
         }
         self.writer
             .flush()
-            .map_err(|error| format!("刷新插件日志正文流失败：{error}"))
+            .map_err(|error| format!("刷新插件日志正文流失败：{error}"))?;
+        Ok(self.done)
     }
 
     /// 将当前行缓冲写成一个插件内容事件。
@@ -602,7 +692,7 @@ impl<'a> PluginContentLineWriter<'a> {
         write_plugin_log_content_line(self.writer, line)?;
         self.line_buffer.clear();
         self.done = self.done.saturating_add(1);
-        PluginPageWindowView::report_content_stream_progress(self.done, self.progress_sender);
+        PluginPageWindowView::report_content_stream_progress(self.done, self.event_sender);
         Ok(())
     }
 }
@@ -676,6 +766,22 @@ pub(in crate::app) struct PluginPageWindowView {
     /// - 插件结果页中的延迟按钮只会回传 `source_key` 等 JSON 字段；宿主需要用这里保存的原始 `LogFileSource` 进行受控正文读取。
     /// - 该快照只来自用户触发插件时的选择，不跟随后续左侧树选择变化，避免按钮点击时搜索范围漂移。
     origin_log_sources: BTreeMap<String, LogFileSource>,
+    /// 当前插件页面关联的可序列化日志文件快照。
+    ///
+    /// 业务意图：
+    /// - 性能列表这类汇总页会把“详情”做成延迟命令，首个响应只携带请求地址，不携带所有明细行。
+    /// - 用户点击详情时，宿主用这里保存的原始候选文件补齐 `TableAction.files`，再启动插件生成明细页。
+    ///
+    /// 边界条件：
+    /// - 快照只来自用户当次右键或工具栏授权范围；后续左侧树选择变化不会影响已打开插件窗口。
+    /// - `host_source` 字段只在宿主进程内使用，最终发给插件前仍会按权限剥离 `read_path`。
+    origin_log_files: Vec<PluginLogFile>,
+    /// 当前插件窗口内后台命令代次。
+    ///
+    /// 业务意图：
+    /// - 性能业务过滤在当前窗口内直接替换页面，如果用户连续点击“应用”或“重置”，旧命令迟到时不能覆盖新条件结果。
+    /// - 该状态只保护当前窗口内命令，不影响主窗口工具栏、右键菜单和独立行内命令窗口的既有代次机制。
+    current_window_command_generations: PluginWindowCommandGenerationState,
     /// 插件表格当前排序状态。
     ///
     /// 边界条件：
@@ -697,6 +803,40 @@ pub(in crate::app) struct PluginPageWindowView {
     table_filter_selection_drag: Option<usize>,
     /// 插件表格过滤输入框最近一次文本布局。
     table_filter_layout: Option<PluginTableFilterInputLayout>,
+    /// 性能表格用户过滤输入状态。
+    ///
+    /// 业务意图：
+    /// - weaver-logext 性能汇总和请求详情需要按用户名重新生成结果；这里保存用户正在编辑的原始文本。
+    /// - 多用户使用英文逗号分隔，具体匹配和重新聚合仍由插件执行，宿主不复制插件业务规则。
+    performance_user_filter_input: SingleLineTextInputState,
+    /// 性能表格用户过滤输入焦点。
+    performance_user_filter_focus: gpui::FocusHandle,
+    /// 性能表格用户过滤输入鼠标拖选锚点。
+    performance_user_filter_selection_drag: Option<usize>,
+    /// 性能表格用户过滤输入最近一次文本布局。
+    performance_user_filter_layout: Option<PluginTableFilterInputLayout>,
+    /// 性能表格起始请求时间输入状态。
+    ///
+    /// 边界条件：
+    /// - 输入格式由插件校验为 `yyyy-MM-dd HH:mm:ss`；空文本表示不限制起始时间。
+    performance_start_time_filter_input: SingleLineTextInputState,
+    /// 性能表格起始请求时间输入焦点。
+    performance_start_time_filter_focus: gpui::FocusHandle,
+    /// 性能表格起始请求时间输入鼠标拖选锚点。
+    performance_start_time_filter_selection_drag: Option<usize>,
+    /// 性能表格起始请求时间输入最近一次文本布局。
+    performance_start_time_filter_layout: Option<PluginTableFilterInputLayout>,
+    /// 性能表格结束请求时间输入状态。
+    ///
+    /// 边界条件：
+    /// - 结束时间由插件按秒级闭区间处理；空文本表示不限制结束时间。
+    performance_end_time_filter_input: SingleLineTextInputState,
+    /// 性能表格结束请求时间输入焦点。
+    performance_end_time_filter_focus: gpui::FocusHandle,
+    /// 性能表格结束请求时间输入鼠标拖选锚点。
+    performance_end_time_filter_selection_drag: Option<usize>,
+    /// 性能表格结束请求时间输入最近一次文本布局。
+    performance_end_time_filter_layout: Option<PluginTableFilterInputLayout>,
     /// 插件表格当前可见行顺序。
     ///
     /// 业务意图：
@@ -732,6 +872,12 @@ pub(in crate::app) struct PluginPageWindowView {
     /// - 用户需要选择单元格内一段文本复制，而不是复制整个单元格；这里保存当前文本范围。
     /// - 选区和排序后的可见下标无关，统一使用原始行下标，避免滚动虚拟列表时选区错位。
     table_text_selection: Option<PluginTableTextSelection>,
+    /// 步骤式输出当前已经显示的字符数。
+    ///
+    /// 业务意图：
+    /// - E9 日志分析正文由插件按文本块追加，宿主负责逐字展示，避免插件为了动画频繁写 stdout。
+    /// - 这里按步骤 ID 保存已显字符数；最终页面覆盖时复用旧进度，防止已显示内容突然重置。
+    output_step_visible_chars: BTreeMap<String, usize>,
     /// 当前帧已绘制单元格的文本边界。
     ///
     /// 业务意图：
@@ -748,28 +894,52 @@ impl PluginPageWindowView {
         palette: AppThemePalette,
         origin_plugin: Option<PluginDefinition>,
         origin_log_sources: BTreeMap<String, LogFileSource>,
+        origin_log_files: Vec<PluginLogFile>,
         _context: &mut Context<Self>,
     ) -> Self {
         let table_row_order = Self::initial_table_row_order(&page);
         let table_column_widths = Self::initial_table_column_widths(&page);
+        let output_step_visible_chars = Self::initial_output_step_visible_chars(&page);
+        let performance_filter_texts = Self::initial_performance_filter_texts(&page);
         Self {
             focus_handle: _context.focus_handle(),
             table_filter_focus: _context.focus_handle(),
+            performance_user_filter_focus: _context.focus_handle(),
+            performance_start_time_filter_focus: _context.focus_handle(),
+            performance_end_time_filter_focus: _context.focus_handle(),
             title,
             page,
             palette,
             origin_plugin,
             origin_log_sources,
+            origin_log_files,
+            current_window_command_generations: PluginWindowCommandGenerationState::new(),
             table_sort: None,
             table_filter_input: SingleLineTextInputState::empty(),
             table_filter_selection_drag: None,
             table_filter_layout: None,
+            performance_user_filter_input: SingleLineTextInputState::from_text(
+                performance_filter_texts.0,
+            ),
+            performance_user_filter_selection_drag: None,
+            performance_user_filter_layout: None,
+            performance_start_time_filter_input: SingleLineTextInputState::from_text(
+                performance_filter_texts.1,
+            ),
+            performance_start_time_filter_selection_drag: None,
+            performance_start_time_filter_layout: None,
+            performance_end_time_filter_input: SingleLineTextInputState::from_text(
+                performance_filter_texts.2,
+            ),
+            performance_end_time_filter_selection_drag: None,
+            performance_end_time_filter_layout: None,
             table_row_order,
             table_column_widths,
             table_scroll_handle: UniformListScrollHandle::new(),
             table_x_scroll_handle: ScrollHandle::new(),
             table_scrollbar_drag: None,
             table_text_selection: None,
+            output_step_visible_chars,
             table_cell_bounds: BTreeMap::new(),
         }
     }
@@ -785,23 +955,41 @@ impl PluginPageWindowView {
         palette: AppThemePalette,
         origin_plugin: Option<PluginDefinition>,
         origin_log_sources: BTreeMap<String, LogFileSource>,
+        origin_log_files: Vec<PluginLogFile>,
         context: &mut Context<Self>,
     ) {
+        let previous_step_visible_chars = self.output_step_visible_chars.clone();
         self.title = title;
         self.page = page;
         self.palette = palette;
         self.origin_plugin = origin_plugin;
         self.origin_log_sources = origin_log_sources;
+        self.origin_log_files = origin_log_files;
+        self.current_window_command_generations.cancel();
         self.table_sort = None;
         self.table_filter_input = SingleLineTextInputState::empty();
         self.table_filter_selection_drag = None;
         self.table_filter_layout = None;
+        let performance_filter_texts = Self::initial_performance_filter_texts(&self.page);
+        self.performance_user_filter_input =
+            SingleLineTextInputState::from_text(performance_filter_texts.0);
+        self.performance_user_filter_selection_drag = None;
+        self.performance_user_filter_layout = None;
+        self.performance_start_time_filter_input =
+            SingleLineTextInputState::from_text(performance_filter_texts.1);
+        self.performance_start_time_filter_selection_drag = None;
+        self.performance_start_time_filter_layout = None;
+        self.performance_end_time_filter_input =
+            SingleLineTextInputState::from_text(performance_filter_texts.2);
+        self.performance_end_time_filter_selection_drag = None;
+        self.performance_end_time_filter_layout = None;
         self.table_row_order = Self::initial_table_row_order(&self.page);
         self.table_column_widths = Self::initial_table_column_widths(&self.page);
         self.table_scroll_handle = UniformListScrollHandle::new();
         self.table_x_scroll_handle = ScrollHandle::new();
         self.table_scrollbar_drag = None;
         self.table_text_selection = None;
+        self.reconcile_output_step_visible_chars(previous_step_visible_chars);
         self.table_cell_bounds.clear();
         context.notify();
     }
@@ -817,6 +1005,168 @@ impl PluginPageWindowView {
     ) {
         self.page.progress = Some(progress);
         context.notify();
+    }
+
+    /// 追加一行插件瀑布流输出。
+    ///
+    /// 业务意图：
+    /// - E9 日志分析窗口会在插件后台逐个读取日志时不断产出诊断内容；追加输出不能替换当前页面，否则用户会丢失之前文件的分析结果。
+    /// - 输出行保持插件返回顺序，宿主不排序、不过滤，保证“按顺序分析”的业务语义可见。
+    pub(in crate::app) fn append_output_line(
+        &mut self,
+        line: PluginOutputLine,
+        context: &mut Context<Self>,
+    ) {
+        self.page.output.push(line);
+        context.notify();
+    }
+
+    /// 开始一个步骤式输出块。
+    ///
+    /// 业务意图：
+    /// - 插件运行中可能比初始 manifest 更早或更完整地声明步骤；同 ID 步骤到达时更新标题和状态，不重复插入。
+    /// - 新步骤从 0 个可见字符开始，由渲染层逐帧推进打字机效果。
+    pub(in crate::app) fn start_output_step(
+        &mut self,
+        step: PluginOutputStep,
+        context: &mut Context<Self>,
+    ) {
+        if let Some(existing) = self
+            .page
+            .output_steps
+            .iter_mut()
+            .find(|existing| existing.id == step.id)
+        {
+            *existing = step;
+        } else {
+            self.output_step_visible_chars
+                .entry(step.id.clone())
+                .or_insert(0);
+            self.page.output_steps.push(step);
+        }
+        context.notify();
+    }
+
+    /// 向指定步骤追加正文文本块。
+    ///
+    /// 边界条件：
+    /// - 如果事件先于初始步骤到达，宿主创建一个兜底步骤，避免第三方插件事件乱序导致内容丢失。
+    /// - 追加时不直接增加可见字符数，确保新文本仍由 UI 打字机动画逐字显示。
+    pub(in crate::app) fn append_output_step_text(
+        &mut self,
+        step_id: String,
+        text: String,
+        context: &mut Context<Self>,
+    ) {
+        if let Some(step) = self
+            .page
+            .output_steps
+            .iter_mut()
+            .find(|step| step.id == step_id)
+        {
+            step.content.push_str(&text);
+        } else {
+            self.page.output_steps.push(PluginOutputStep {
+                id: step_id.clone(),
+                loading_text: "正在处理插件步骤".to_string(),
+                done_text: None,
+                status: PluginOutputStepStatus::Running,
+                content: text,
+            });
+        }
+        self.output_step_visible_chars.entry(step_id).or_insert(0);
+        context.notify();
+    }
+
+    /// 结束指定步骤式输出块。
+    ///
+    /// 业务意图：
+    /// - 步骤标题在完成后替换为插件给出的中文结果文案；正文仍继续按已追加内容展示。
+    /// - 读取失败不阻断窗口展示，状态标记为失败即可让用户看到完成但有问题。
+    pub(in crate::app) fn finish_output_step(
+        &mut self,
+        step_id: String,
+        done_text: String,
+        status: PluginOutputStepStatus,
+        context: &mut Context<Self>,
+    ) {
+        if let Some(step) = self
+            .page
+            .output_steps
+            .iter_mut()
+            .find(|step| step.id == step_id)
+        {
+            step.done_text = Some(done_text);
+            step.status = status;
+        } else {
+            self.page.output_steps.push(PluginOutputStep {
+                id: step_id.clone(),
+                loading_text: "正在处理插件步骤".to_string(),
+                done_text: Some(done_text),
+                status,
+                content: String::new(),
+            });
+            self.output_step_visible_chars.entry(step_id).or_insert(0);
+        }
+        context.notify();
+    }
+
+    /// 应用一个插件运行时事件到当前窗口。
+    ///
+    /// 业务意图：
+    /// - 主窗口插件命令和行内延迟命令都复用同一套窗口事件处理，保证瀑布流输出和步骤式输出行为一致。
+    /// - 进度事件在调用方可能会做状态栏文案合并，这里仍保留兜底处理，便于未来直接转发完整事件序列。
+    pub(in crate::app) fn apply_plugin_runtime_event(
+        &mut self,
+        event: PluginCommandRuntimeEvent,
+        context: &mut Context<Self>,
+    ) {
+        match event {
+            PluginCommandRuntimeEvent::Progress(progress) => self.set_progress(progress, context),
+            PluginCommandRuntimeEvent::OutputAppend(line) => self.append_output_line(line, context),
+            PluginCommandRuntimeEvent::OutputStepStart(step) => {
+                self.start_output_step(step, context)
+            }
+            PluginCommandRuntimeEvent::OutputStepAppend { step_id, text } => {
+                self.append_output_step_text(step_id, text, context)
+            }
+            PluginCommandRuntimeEvent::OutputStepFinish {
+                step_id,
+                done_text,
+                status,
+            } => self.finish_output_step(step_id, done_text, status, context),
+        }
+    }
+
+    /// 为新页面初始化步骤可见字符数。
+    fn initial_output_step_visible_chars(page: &PluginPage) -> BTreeMap<String, usize> {
+        page.output_steps
+            .iter()
+            .map(|step| (step.id.clone(), 0))
+            .collect()
+    }
+
+    /// 页面替换时保留已经展示过的步骤字符数。
+    ///
+    /// 边界条件：
+    /// - 最终响应可能携带更完整的正文快照；已显示字符数不能超过新正文长度。
+    /// - 如果是全新页面或步骤 ID 不同，则从 0 开始显示，避免串用旧窗口动画状态。
+    fn reconcile_output_step_visible_chars(&mut self, previous: BTreeMap<String, usize>) {
+        self.output_step_visible_chars = self
+            .page
+            .output_steps
+            .iter()
+            .map(|step| {
+                let max_chars = Self::output_step_content_char_count(step);
+                let visible = previous.get(&step.id).copied().unwrap_or(0).min(max_chars);
+                (step.id.clone(), visible)
+            })
+            .collect();
+    }
+
+    /// 返回步骤正文字符数，使用字符而不是字节以正确处理中文。
+    fn output_step_content_char_count(step: &PluginOutputStep) -> usize {
+        step.content.chars().count()
     }
 
     /// 初始化插件表格行顺序。
@@ -843,20 +1193,183 @@ impl PluginPageWindowView {
             .unwrap_or_default()
     }
 
-    /// 读取表格过滤输入框绘制快照。
-    fn table_filter_snapshot(&self) -> SingleLineTextInputSnapshot {
+    /// 初始化性能业务过滤输入文本。
+    ///
+    /// 业务意图：
+    /// - 插件重新生成页面后会把已生效的过滤条件写回表格定义，宿主用它恢复输入框显示。
+    /// - 普通插件表格没有性能过滤器时保持空输入，避免上一页条件串到下一页。
+    fn initial_performance_filter_texts(page: &PluginPage) -> (String, String, String) {
+        page.table
+            .as_ref()
+            .and_then(|table| table.performance_filter.as_ref())
+            .map(|filter| {
+                (
+                    filter.users.clone(),
+                    filter.start_time.clone(),
+                    filter.end_time.clone(),
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    /// 读取插件表格过滤输入框绘制快照。
+    fn table_input_snapshot(
+        &self,
+        input_kind: PluginTableInputKind,
+    ) -> SingleLineTextInputSnapshot {
+        let input = self.table_input_state(input_kind);
         SingleLineTextInputSnapshot {
-            text: self.table_filter_input.text.clone(),
-            selection_range: self.table_filter_input.selection_range.clone(),
-            marked_range: self.table_filter_input.marked_range.clone(),
-            horizontal_scroll_px: self.table_filter_input.horizontal_scroll_px,
+            text: input.text.clone(),
+            selection_range: input.selection_range.clone(),
+            marked_range: input.marked_range.clone(),
+            horizontal_scroll_px: input.horizontal_scroll_px,
         }
     }
 
-    /// 记录过滤输入框当前布局。
-    fn store_table_filter_layout(&mut self, layout: PluginTableFilterInputLayout) {
-        self.table_filter_input.horizontal_scroll_px = layout.horizontal_scroll_px;
-        self.table_filter_layout = Some(layout);
+    /// 记录插件表格输入框当前布局。
+    fn store_table_input_layout(
+        &mut self,
+        input_kind: PluginTableInputKind,
+        layout: PluginTableFilterInputLayout,
+    ) {
+        self.table_input_state_mut(input_kind).horizontal_scroll_px = layout.horizontal_scroll_px;
+        *self.table_input_layout_mut(input_kind) = Some(layout);
+    }
+
+    /// 返回指定插件表格输入框的只读状态。
+    fn table_input_state(&self, input_kind: PluginTableInputKind) -> &SingleLineTextInputState {
+        match input_kind {
+            PluginTableInputKind::QuickFilter => &self.table_filter_input,
+            PluginTableInputKind::PerformanceUsers => &self.performance_user_filter_input,
+            PluginTableInputKind::PerformanceStartTime => &self.performance_start_time_filter_input,
+            PluginTableInputKind::PerformanceEndTime => &self.performance_end_time_filter_input,
+        }
+    }
+
+    /// 返回指定插件表格输入框的可变状态。
+    fn table_input_state_mut(
+        &mut self,
+        input_kind: PluginTableInputKind,
+    ) -> &mut SingleLineTextInputState {
+        match input_kind {
+            PluginTableInputKind::QuickFilter => &mut self.table_filter_input,
+            PluginTableInputKind::PerformanceUsers => &mut self.performance_user_filter_input,
+            PluginTableInputKind::PerformanceStartTime => {
+                &mut self.performance_start_time_filter_input
+            }
+            PluginTableInputKind::PerformanceEndTime => &mut self.performance_end_time_filter_input,
+        }
+    }
+
+    /// 返回指定插件表格输入框的焦点句柄。
+    fn table_input_focus(&self, input_kind: PluginTableInputKind) -> &gpui::FocusHandle {
+        match input_kind {
+            PluginTableInputKind::QuickFilter => &self.table_filter_focus,
+            PluginTableInputKind::PerformanceUsers => &self.performance_user_filter_focus,
+            PluginTableInputKind::PerformanceStartTime => &self.performance_start_time_filter_focus,
+            PluginTableInputKind::PerformanceEndTime => &self.performance_end_time_filter_focus,
+        }
+    }
+
+    /// 返回指定插件表格输入框的鼠标拖选锚点。
+    fn table_input_selection_drag_mut(
+        &mut self,
+        input_kind: PluginTableInputKind,
+    ) -> &mut Option<usize> {
+        match input_kind {
+            PluginTableInputKind::QuickFilter => &mut self.table_filter_selection_drag,
+            PluginTableInputKind::PerformanceUsers => {
+                &mut self.performance_user_filter_selection_drag
+            }
+            PluginTableInputKind::PerformanceStartTime => {
+                &mut self.performance_start_time_filter_selection_drag
+            }
+            PluginTableInputKind::PerformanceEndTime => {
+                &mut self.performance_end_time_filter_selection_drag
+            }
+        }
+    }
+
+    /// 返回指定插件表格输入框最近一次布局。
+    fn table_input_layout(
+        &self,
+        input_kind: PluginTableInputKind,
+    ) -> Option<&PluginTableFilterInputLayout> {
+        match input_kind {
+            PluginTableInputKind::QuickFilter => self.table_filter_layout.as_ref(),
+            PluginTableInputKind::PerformanceUsers => self.performance_user_filter_layout.as_ref(),
+            PluginTableInputKind::PerformanceStartTime => {
+                self.performance_start_time_filter_layout.as_ref()
+            }
+            PluginTableInputKind::PerformanceEndTime => {
+                self.performance_end_time_filter_layout.as_ref()
+            }
+        }
+    }
+
+    /// 返回指定插件表格输入框布局的可变槽位。
+    fn table_input_layout_mut(
+        &mut self,
+        input_kind: PluginTableInputKind,
+    ) -> &mut Option<PluginTableFilterInputLayout> {
+        match input_kind {
+            PluginTableInputKind::QuickFilter => &mut self.table_filter_layout,
+            PluginTableInputKind::PerformanceUsers => &mut self.performance_user_filter_layout,
+            PluginTableInputKind::PerformanceStartTime => {
+                &mut self.performance_start_time_filter_layout
+            }
+            PluginTableInputKind::PerformanceEndTime => {
+                &mut self.performance_end_time_filter_layout
+            }
+        }
+    }
+
+    /// 返回当前获得平台输入焦点的插件表格输入框。
+    fn focused_table_input_kind(&self, window: &Window) -> Option<PluginTableInputKind> {
+        [
+            PluginTableInputKind::QuickFilter,
+            PluginTableInputKind::PerformanceUsers,
+            PluginTableInputKind::PerformanceStartTime,
+            PluginTableInputKind::PerformanceEndTime,
+        ]
+        .into_iter()
+        .find(|input_kind| self.table_input_focus(*input_kind).is_focused(window))
+    }
+
+    /// 返回当前正在鼠标拖选的插件表格输入框。
+    fn dragging_table_input_kind(&self) -> Option<PluginTableInputKind> {
+        [
+            (
+                PluginTableInputKind::QuickFilter,
+                self.table_filter_selection_drag,
+            ),
+            (
+                PluginTableInputKind::PerformanceUsers,
+                self.performance_user_filter_selection_drag,
+            ),
+            (
+                PluginTableInputKind::PerformanceStartTime,
+                self.performance_start_time_filter_selection_drag,
+            ),
+            (
+                PluginTableInputKind::PerformanceEndTime,
+                self.performance_end_time_filter_selection_drag,
+            ),
+        ]
+        .into_iter()
+        .find_map(|(input_kind, drag)| drag.is_some().then_some(input_kind))
+    }
+
+    /// 结束所有插件表格输入框拖选。
+    fn finish_all_table_input_mouse_selection(&mut self, context: &mut Context<Self>) {
+        for input_kind in [
+            PluginTableInputKind::QuickFilter,
+            PluginTableInputKind::PerformanceUsers,
+            PluginTableInputKind::PerformanceStartTime,
+            PluginTableInputKind::PerformanceEndTime,
+        ] {
+            self.finish_table_input_mouse_selection(input_kind, context);
+        }
     }
 
     /// 过滤关键字发生变化后刷新可见行。
@@ -905,13 +1418,14 @@ impl PluginPageWindowView {
         context.notify();
     }
 
-    /// 处理插件表格过滤输入框键盘事件。
+    /// 处理插件表格输入框键盘事件。
     ///
     /// 业务意图：
-    /// - 过滤框是插件窗口内部的本地输入控件，普通字符交给 `EntityInputHandler` 和平台 IME，删除、方向键、复制粘贴等编辑键在这里维护状态。
-    /// - 每次文本变化都只重建可见行索引，不重新执行插件命令，保证上万行表格过滤仍是可预期的本地操作。
-    fn handle_table_filter_key_down(
+    /// - 普通字符交给 `EntityInputHandler` 和平台 IME；删除、方向键、复制粘贴等编辑键在这里统一维护状态。
+    /// - 本地关键字过滤每次文本变化只重建可见行索引；性能业务过滤只更新输入文本，按“应用”或 Enter 后才重新执行插件命令。
+    fn handle_table_input_key_down(
         &mut self,
+        input_kind: PluginTableInputKind,
         event: &KeyDownEvent,
         _window: &mut Window,
         context: &mut Context<Self>,
@@ -924,30 +1438,29 @@ impl PluginPageWindowView {
             if let Some(text) = clipboard_text
                 && !text.is_empty()
             {
-                self.replace_table_filter_selection(&text);
-                self.rebuild_table_after_filter_change(context);
+                self.replace_table_input_selection(input_kind, &text);
+                self.after_table_input_text_changed(input_kind, context);
             }
             context.stop_propagation();
             return;
         }
 
         if MainView::is_copy_keystroke(&event.keystroke) {
-            let range = MainView::clamp_search_text_range(
-                &self.table_filter_input.text,
-                self.table_filter_input.selection_range.clone(),
-            );
+            let input = self.table_input_state(input_kind);
+            let range =
+                MainView::clamp_search_text_range(&input.text, input.selection_range.clone());
             if range.start < range.end {
-                context.write_to_clipboard(ClipboardItem::new_string(
-                    self.table_filter_input.text[range].to_string(),
-                ));
+                context
+                    .write_to_clipboard(ClipboardItem::new_string(input.text[range].to_string()));
             }
             context.stop_propagation();
             return;
         }
 
         if MainView::is_select_all_keystroke(&event.keystroke) {
-            self.table_filter_input.marked_range = None;
-            self.table_filter_input.selection_range = 0..self.table_filter_input.text.len();
+            let input = self.table_input_state_mut(input_kind);
+            input.marked_range = None;
+            input.selection_range = 0..input.text.len();
             context.stop_propagation();
             context.notify();
             return;
@@ -955,201 +1468,243 @@ impl PluginPageWindowView {
 
         match event.keystroke.key.as_str() {
             "left" => {
-                self.table_filter_input.marked_range = None;
-                if event.keystroke.modifiers.shift {
-                    self.table_filter_input.selection_range.end =
-                        MainView::previous_search_text_boundary(
-                            &self.table_filter_input.text,
-                            self.table_filter_input.selection_range.end,
-                        );
-                    self.table_filter_input.selection_range = MainView::clamp_search_text_range(
-                        &self.table_filter_input.text,
-                        self.table_filter_input.selection_range.clone(),
-                    );
-                } else if self.table_filter_input.selection_range.start
-                    != self.table_filter_input.selection_range.end
                 {
-                    let cursor = self.table_filter_input.selection_range.start;
-                    self.table_filter_input.selection_range = cursor..cursor;
-                } else {
-                    let cursor = MainView::previous_search_text_boundary(
-                        &self.table_filter_input.text,
-                        self.table_filter_input.selection_range.end,
-                    );
-                    self.table_filter_input.selection_range = cursor..cursor;
+                    let input = self.table_input_state_mut(input_kind);
+                    input.marked_range = None;
+                    if event.keystroke.modifiers.shift {
+                        input.selection_range.end = MainView::previous_search_text_boundary(
+                            &input.text,
+                            input.selection_range.end,
+                        );
+                        input.selection_range = MainView::clamp_search_text_range(
+                            &input.text,
+                            input.selection_range.clone(),
+                        );
+                    } else if input.selection_range.start != input.selection_range.end {
+                        let cursor = input.selection_range.start;
+                        input.selection_range = cursor..cursor;
+                    } else {
+                        let cursor = MainView::previous_search_text_boundary(
+                            &input.text,
+                            input.selection_range.end,
+                        );
+                        input.selection_range = cursor..cursor;
+                    }
                 }
                 context.stop_propagation();
                 context.notify();
             }
             "right" => {
-                self.table_filter_input.marked_range = None;
-                if event.keystroke.modifiers.shift {
-                    self.table_filter_input.selection_range.end =
-                        MainView::next_search_text_boundary(
-                            &self.table_filter_input.text,
-                            self.table_filter_input.selection_range.end,
-                        );
-                    self.table_filter_input.selection_range = MainView::clamp_search_text_range(
-                        &self.table_filter_input.text,
-                        self.table_filter_input.selection_range.clone(),
-                    );
-                } else if self.table_filter_input.selection_range.start
-                    != self.table_filter_input.selection_range.end
                 {
-                    let cursor = self.table_filter_input.selection_range.end;
-                    self.table_filter_input.selection_range = cursor..cursor;
-                } else {
-                    let cursor = MainView::next_search_text_boundary(
-                        &self.table_filter_input.text,
-                        self.table_filter_input.selection_range.end,
-                    );
-                    self.table_filter_input.selection_range = cursor..cursor;
+                    let input = self.table_input_state_mut(input_kind);
+                    input.marked_range = None;
+                    if event.keystroke.modifiers.shift {
+                        input.selection_range.end = MainView::next_search_text_boundary(
+                            &input.text,
+                            input.selection_range.end,
+                        );
+                        input.selection_range = MainView::clamp_search_text_range(
+                            &input.text,
+                            input.selection_range.clone(),
+                        );
+                    } else if input.selection_range.start != input.selection_range.end {
+                        let cursor = input.selection_range.end;
+                        input.selection_range = cursor..cursor;
+                    } else {
+                        let cursor = MainView::next_search_text_boundary(
+                            &input.text,
+                            input.selection_range.end,
+                        );
+                        input.selection_range = cursor..cursor;
+                    }
                 }
                 context.stop_propagation();
                 context.notify();
             }
             "up" => {
-                self.table_filter_input.marked_range = None;
-                self.table_filter_input.selection_range = 0..0;
+                let input = self.table_input_state_mut(input_kind);
+                input.marked_range = None;
+                input.selection_range = 0..0;
                 context.stop_propagation();
                 context.notify();
             }
             "down" => {
-                self.table_filter_input.marked_range = None;
-                let cursor = self.table_filter_input.text.len();
-                self.table_filter_input.selection_range = cursor..cursor;
+                let input = self.table_input_state_mut(input_kind);
+                input.marked_range = None;
+                let cursor = input.text.len();
+                input.selection_range = cursor..cursor;
                 context.stop_propagation();
                 context.notify();
             }
             "backspace" => {
-                if let Some(range) = self.table_filter_input.marked_range.take().or_else(|| {
-                    (self.table_filter_input.selection_range.start
-                        != self.table_filter_input.selection_range.end)
-                        .then(|| self.table_filter_input.selection_range.clone())
-                }) {
-                    self.table_filter_input
-                        .text
-                        .replace_range(range.clone(), "");
-                    self.table_filter_input.selection_range = range.start..range.start;
-                } else if let Some((previous_index, _)) = self.table_filter_input.text
-                    [..self.table_filter_input.selection_range.end]
-                    .char_indices()
-                    .next_back()
                 {
-                    self.table_filter_input.text.replace_range(
-                        previous_index..self.table_filter_input.selection_range.end,
-                        "",
-                    );
-                    self.table_filter_input.selection_range = previous_index..previous_index;
+                    let input = self.table_input_state_mut(input_kind);
+                    if let Some(range) = input.marked_range.take().or_else(|| {
+                        (input.selection_range.start != input.selection_range.end)
+                            .then(|| input.selection_range.clone())
+                    }) {
+                        input.text.replace_range(range.clone(), "");
+                        input.selection_range = range.start..range.start;
+                    } else if let Some((previous_index, _)) = input.text
+                        [..input.selection_range.end]
+                        .char_indices()
+                        .next_back()
+                    {
+                        input
+                            .text
+                            .replace_range(previous_index..input.selection_range.end, "");
+                        input.selection_range = previous_index..previous_index;
+                    }
                 }
-                self.rebuild_table_after_filter_change(context);
+                self.after_table_input_text_changed(input_kind, context);
                 context.stop_propagation();
             }
             "delete" => {
-                if let Some(range) = self.table_filter_input.marked_range.take().or_else(|| {
-                    (self.table_filter_input.selection_range.start
-                        != self.table_filter_input.selection_range.end)
-                        .then(|| self.table_filter_input.selection_range.clone())
-                }) {
-                    self.table_filter_input
-                        .text
-                        .replace_range(range.clone(), "");
-                    self.table_filter_input.selection_range = range.start..range.start;
-                } else if let Some((next_index, next_character)) = self.table_filter_input.text
-                    [self.table_filter_input.selection_range.end..]
-                    .char_indices()
-                    .next()
                 {
-                    let start = self.table_filter_input.selection_range.end + next_index;
-                    let end = start + next_character.len_utf8();
-                    self.table_filter_input.text.replace_range(start..end, "");
-                    self.table_filter_input.selection_range = start..start;
+                    let input = self.table_input_state_mut(input_kind);
+                    if let Some(range) = input.marked_range.take().or_else(|| {
+                        (input.selection_range.start != input.selection_range.end)
+                            .then(|| input.selection_range.clone())
+                    }) {
+                        input.text.replace_range(range.clone(), "");
+                        input.selection_range = range.start..range.start;
+                    } else if let Some((next_index, next_character)) = input.text
+                        [input.selection_range.end..]
+                        .char_indices()
+                        .next()
+                    {
+                        let start = input.selection_range.end + next_index;
+                        let end = start + next_character.len_utf8();
+                        input.text.replace_range(start..end, "");
+                        input.selection_range = start..start;
+                    }
                 }
-                self.rebuild_table_after_filter_change(context);
+                self.after_table_input_text_changed(input_kind, context);
                 context.stop_propagation();
             }
             "escape" => {
-                if !self.table_filter_input.text.is_empty() {
-                    self.table_filter_input.set_text(String::new());
-                    self.rebuild_table_after_filter_change(context);
+                let had_text = !self.table_input_state(input_kind).text.is_empty();
+                if had_text {
+                    self.table_input_state_mut(input_kind)
+                        .set_text(String::new());
+                    self.after_table_input_text_changed(input_kind, context);
                 }
                 context.stop_propagation();
             }
             "enter" => {
+                if input_kind != PluginTableInputKind::QuickFilter
+                    && let Some(command) = self.current_performance_filter_command()
+                {
+                    self.apply_performance_table_filter(command, context);
+                }
                 context.stop_propagation();
             }
             _ => {}
         }
     }
 
-    /// 替换过滤输入框当前选区。
-    fn replace_table_filter_selection(&mut self, replacement: &str) {
-        let replacement = MainView::sanitize_search_input_text(replacement);
-        let range = self
-            .table_filter_input
-            .marked_range
-            .take()
-            .unwrap_or_else(|| self.table_filter_input.selection_range.clone());
-        let range = MainView::clamp_search_text_range(&self.table_filter_input.text, range);
-        self.table_filter_input
-            .text
-            .replace_range(range.clone(), &replacement);
-        let cursor = range.start + replacement.len();
-        self.table_filter_input.selection_range = cursor..cursor;
-    }
-
-    /// 处理过滤输入框鼠标按下。
-    fn start_table_filter_mouse_selection(
+    /// 表格输入文本变化后的业务副作用。
+    fn after_table_input_text_changed(
         &mut self,
-        event: &MouseDownEvent,
-        window: &mut Window,
+        input_kind: PluginTableInputKind,
         context: &mut Context<Self>,
     ) {
-        let index = self.table_filter_index_at_position(event.position);
-        let range = match event.click_count {
-            0 | 1 => index..index,
-            2 => MainView::search_text_word_range_for_index(&self.table_filter_input.text, index),
-            _ => 0..self.table_filter_input.text.len(),
-        };
-        self.table_filter_input.selection_range =
-            MainView::clamp_search_text_range(&self.table_filter_input.text, range.clone());
-        self.table_filter_input.marked_range = None;
-        self.table_filter_selection_drag = (event.click_count <= 1).then_some(index);
-        window.focus(&self.table_filter_focus);
-        context.notify();
-    }
-
-    /// 根据鼠标位置更新过滤输入框拖选范围。
-    fn update_table_filter_mouse_selection(
-        &mut self,
-        position: Point<Pixels>,
-        context: &mut Context<Self>,
-    ) {
-        let Some(anchor) = self.table_filter_selection_drag else {
-            return;
-        };
-        let index = self.table_filter_index_at_position(position);
-        self.table_filter_input.selection_range =
-            MainView::clamp_search_text_range(&self.table_filter_input.text, anchor..index);
-        context.notify();
-    }
-
-    /// 结束过滤输入框拖选。
-    fn finish_table_filter_mouse_selection(&mut self, context: &mut Context<Self>) {
-        if self.table_filter_selection_drag.take().is_some() {
+        if input_kind == PluginTableInputKind::QuickFilter {
+            self.rebuild_table_after_filter_change(context);
+        } else {
             context.notify();
         }
     }
 
-    /// 将窗口坐标转换为过滤输入框 UTF-8 字节下标。
-    fn table_filter_index_at_position(&self, position: Point<Pixels>) -> usize {
-        let Some(layout) = self.table_filter_layout.as_ref() else {
-            return self.table_filter_input.text.len();
+    /// 替换插件表格输入框当前选区。
+    fn replace_table_input_selection(
+        &mut self,
+        input_kind: PluginTableInputKind,
+        replacement: &str,
+    ) {
+        let replacement = MainView::sanitize_search_input_text(replacement);
+        let input = self.table_input_state_mut(input_kind);
+        let range = input
+            .marked_range
+            .take()
+            .unwrap_or_else(|| input.selection_range.clone());
+        let range = MainView::clamp_search_text_range(&input.text, range);
+        input.text.replace_range(range.clone(), &replacement);
+        let cursor = range.start + replacement.len();
+        input.selection_range = cursor..cursor;
+    }
+
+    /// 处理插件表格输入框鼠标按下。
+    fn start_table_input_mouse_selection(
+        &mut self,
+        input_kind: PluginTableInputKind,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let index = self.table_input_index_at_position(input_kind, event.position);
+        let text = self.table_input_state(input_kind).text.clone();
+        let range = match event.click_count {
+            0 | 1 => index..index,
+            2 => MainView::search_text_word_range_for_index(&text, index),
+            _ => 0..text.len(),
+        };
+        {
+            let input = self.table_input_state_mut(input_kind);
+            input.selection_range = MainView::clamp_search_text_range(&input.text, range);
+            input.marked_range = None;
+        }
+        *self.table_input_selection_drag_mut(input_kind) =
+            (event.click_count <= 1).then_some(index);
+        window.focus(self.table_input_focus(input_kind));
+        context.notify();
+    }
+
+    /// 根据鼠标位置更新插件表格输入框拖选范围。
+    fn update_table_input_mouse_selection(
+        &mut self,
+        input_kind: PluginTableInputKind,
+        position: Point<Pixels>,
+        context: &mut Context<Self>,
+    ) {
+        let Some(anchor) = *self.table_input_selection_drag_mut(input_kind) else {
+            return;
+        };
+        let index = self.table_input_index_at_position(input_kind, position);
+        let input = self.table_input_state_mut(input_kind);
+        input.selection_range = MainView::clamp_search_text_range(&input.text, anchor..index);
+        context.notify();
+    }
+
+    /// 结束插件表格输入框拖选。
+    fn finish_table_input_mouse_selection(
+        &mut self,
+        input_kind: PluginTableInputKind,
+        context: &mut Context<Self>,
+    ) {
+        if self
+            .table_input_selection_drag_mut(input_kind)
+            .take()
+            .is_some()
+        {
+            context.notify();
+        }
+    }
+
+    /// 将窗口坐标转换为插件表格输入框 UTF-8 字节下标。
+    fn table_input_index_at_position(
+        &self,
+        input_kind: PluginTableInputKind,
+        position: Point<Pixels>,
+    ) -> usize {
+        let input = self.table_input_state(input_kind);
+        let Some(layout) = self.table_input_layout(input_kind) else {
+            return input.text.len();
         };
         let relative_x =
             position.x - layout.bounds.left() + px(layout.horizontal_scroll_px).max(px(0.0));
         let index = layout.line.closest_index_for_x(relative_x.max(px(0.0)));
-        MainView::clamp_search_text_range(&self.table_filter_input.text, index..index).start
+        MainView::clamp_search_text_range(&input.text, index..index).start
     }
 
     /// 开始选择插件表格单元格文本。
@@ -1476,6 +2031,7 @@ impl PluginPageWindowView {
         let preferred = table
             .rows
             .iter()
+            .take(PLUGIN_TABLE_COLUMN_WIDTH_SAMPLE_ROWS)
             .filter_map(|row| row.get(column_index))
             .map(|text| Self::plugin_table_text_estimated_width(text))
             .fold(base_width, f32::max);
@@ -1667,6 +2223,486 @@ impl PluginPageWindowView {
             }))
     }
 
+    /// 渲染插件瀑布流输出。
+    ///
+    /// 业务意图：
+    /// - E9 日志分析按文件顺序输出“开始、异常、完成”，需要保留连续阅读语义；这里使用单个滚动流而不是表格或卡片。
+    /// - 输出文本来自插件协议，只按纯文本展示，不解释 Markdown、HTML 或 ANSI 控制序列，避免第三方插件影响宿主界面。
+    ///
+    /// 边界条件：
+    /// - 单行可能包含很长路径或日志摘要，因此允许自动换行，并给容器 `min_h_0 + overflow_y_scroll`，防止挤压窗口其它区域。
+    fn render_output_flow(&self, palette: AppThemePalette) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("plugin-page-output-flow")
+            .flex()
+            .flex_col()
+            .gap_1()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .border_t_1()
+            .border_color(rgb(palette.border))
+            .pt_3()
+            .children(self.page.output.iter().map(|line| {
+                let (icon, color) = Self::plugin_output_line_visual(line.level, palette);
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .w_full()
+                    .py_1()
+                    .text_xs()
+                    .line_height(px(18.0))
+                    .text_color(rgb(color))
+                    .child(MainView::render_lucide_icon(Some(icon), 16.0, 13.0, color))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_normal()
+                            .child(line.text.clone()),
+                    )
+            }))
+    }
+
+    /// 渲染步骤式插件输出。
+    ///
+    /// 业务意图：
+    /// - E9 日志分析按“步骤标题 -> 输出正文 -> 步骤完成”的方式呈现，用户关注的是 memory、连接池等诊断步骤的顺序过程。
+    /// - 每个步骤只用一行状态标题和一个纯文本正文区域，不使用卡片嵌套，避免大量日志诊断时视觉负担过重。
+    fn render_output_steps(
+        &mut self,
+        palette: AppThemePalette,
+        window: &mut Window,
+    ) -> gpui::Stateful<gpui::Div> {
+        let should_keep_animating = self.advance_output_step_typewriter();
+        if should_keep_animating
+            || self
+                .page
+                .output_steps
+                .iter()
+                .any(|step| step.status == PluginOutputStepStatus::Running)
+        {
+            window.request_animation_frame();
+        }
+
+        let spinner = Self::output_step_spinner_frame();
+        let rendered_steps = self
+            .page
+            .output_steps
+            .iter()
+            .map(|step| {
+                let visible = self
+                    .output_step_visible_chars
+                    .get(&step.id)
+                    .copied()
+                    .unwrap_or_default();
+                let text = Self::visible_output_step_text(&step.content, visible);
+                let (status_glyph, use_lucide_icon, status_color, status_text) =
+                    Self::output_step_status_visual(step, spinner, palette);
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .pb_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_sm()
+                            .text_color(rgb(status_color))
+                            .child(
+                                div()
+                                    .w(px(16.0))
+                                    .h(px(16.0))
+                                    .flex_none()
+                                    .text_center()
+                                    .line_height(px(16.0))
+                                    .text_size(px(13.0))
+                                    .text_color(rgb(status_color))
+                                    .font_family(if use_lucide_icon {
+                                        LUCIDE_FONT_FAMILY
+                                    } else {
+                                        LOG_VIEWER_FONT_FAMILY
+                                    })
+                                    .child(status_glyph),
+                            )
+                            .child(status_text),
+                    )
+                    .when(!text.is_empty(), |body| {
+                        body.child(Self::render_output_step_text(text, palette))
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        div()
+            .id("plugin-page-output-steps")
+            .flex()
+            .flex_col()
+            .gap_4()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .children(rendered_steps)
+    }
+
+    /// 按固定字符步长推进步骤正文打字机动画。
+    ///
+    /// 边界条件：
+    /// - 使用字符数而不是字节数，保证中文路径和中文诊断不会被截成非法 UTF-8。
+    /// - 每帧最多推进少量字符，既能看出流式效果，又不会因为长日志摘要导致窗口动画过慢。
+    fn advance_output_step_typewriter(&mut self) -> bool {
+        const TYPEWRITER_CHARS_PER_FRAME: usize = 4;
+        let mut advanced = false;
+        for step in &self.page.output_steps {
+            let total = Self::output_step_content_char_count(step);
+            let visible = self
+                .output_step_visible_chars
+                .entry(step.id.clone())
+                .or_insert(0);
+            if *visible < total {
+                *visible = (*visible + TYPEWRITER_CHARS_PER_FRAME).min(total);
+                advanced = true;
+            }
+        }
+        advanced
+    }
+
+    /// 返回当前帧可见的步骤正文。
+    fn visible_output_step_text(text: &str, visible_chars: usize) -> String {
+        text.chars().take(visible_chars).collect()
+    }
+
+    /// 渲染步骤正文。
+    ///
+    /// 业务意图：
+    /// - 普通诊断仍按文本流逐行展示，memory 异常上下文则渲染成截图式日志块，便于用户直接定位原始 jstat 行。
+    /// - 内部标记必须在这里被消费，不能泄露到窗口正文。
+    fn render_output_step_text(text: String, palette: AppThemePalette) -> gpui::Div {
+        let blocks = Self::parse_output_step_text_blocks(&text);
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .pl_5()
+            .font_family(LOG_VIEWER_FONT_FAMILY)
+            .text_xs()
+            .line_height(px(19.0))
+            .text_color(rgb(palette.text))
+            .children(
+                blocks
+                    .into_iter()
+                    .enumerate()
+                    .map(|(block_index, block)| match block {
+                        PluginOutputStepTextBlock::Text(lines) => {
+                            Self::render_output_step_plain_text(lines, palette)
+                        }
+                        PluginOutputStepTextBlock::LogSnippet(lines) => {
+                            Self::render_output_log_snippet(block_index, lines, palette)
+                        }
+                    }),
+            )
+    }
+
+    /// 解析步骤正文中的普通文本和日志截图片段。
+    ///
+    /// 边界条件：
+    /// - 打字机动画可能只显示了半行内部标记；遇到不完整标记时直接隐藏，下一帧完整后再渲染。
+    /// - 插件输出异常或第三方插件误用了同名前缀时，宿主只忽略无法解析的标记行，不影响其它普通文本展示。
+    fn parse_output_step_text_blocks(text: &str) -> Vec<PluginOutputStepTextBlock> {
+        let mut blocks = Vec::new();
+        let mut plain_lines = Vec::<String>::new();
+        let mut snippet_lines: Option<Vec<PluginOutputLogSnippetLine>> = None;
+
+        for raw_line in text.split('\n') {
+            if raw_line == PLUGIN_LOG_SNIPPET_BEGIN {
+                Self::push_output_step_plain_text_block(&mut blocks, &mut plain_lines);
+                snippet_lines = Some(Vec::new());
+                continue;
+            }
+            if raw_line == PLUGIN_LOG_SNIPPET_END {
+                if let Some(lines) = snippet_lines.take() {
+                    if !lines.is_empty() {
+                        blocks.push(PluginOutputStepTextBlock::LogSnippet(lines));
+                    }
+                }
+                continue;
+            }
+
+            if let Some(lines) = snippet_lines.as_mut() {
+                if let Some(line) = Self::parse_output_log_snippet_line(raw_line) {
+                    lines.push(line);
+                }
+                continue;
+            }
+
+            if raw_line.starts_with("@@LC_") {
+                continue;
+            }
+            plain_lines.push(if raw_line.is_empty() {
+                " ".to_string()
+            } else {
+                raw_line.to_string()
+            });
+        }
+
+        if let Some(lines) = snippet_lines.take() {
+            if !lines.is_empty() {
+                blocks.push(PluginOutputStepTextBlock::LogSnippet(lines));
+            }
+        }
+        Self::push_output_step_plain_text_block(&mut blocks, &mut plain_lines);
+        blocks
+    }
+
+    /// 将累计的普通文本行压入步骤正文块列表。
+    fn push_output_step_plain_text_block(
+        blocks: &mut Vec<PluginOutputStepTextBlock>,
+        plain_lines: &mut Vec<String>,
+    ) {
+        if !plain_lines.is_empty() {
+            blocks.push(PluginOutputStepTextBlock::Text(std::mem::take(plain_lines)));
+        }
+    }
+
+    /// 解析一行日志截图内部协议。
+    fn parse_output_log_snippet_line(raw_line: &str) -> Option<PluginOutputLogSnippetLine> {
+        let payload = raw_line.strip_prefix(PLUGIN_LOG_SNIPPET_LINE_PREFIX)?;
+        let mut parts = payload.splitn(4, '\t');
+        let line_number = parts.next()?.to_string();
+        let level = parts.next()?;
+        let highlights = parts.next().unwrap_or_default();
+        let text = Self::expand_plugin_log_tabs_for_display(parts.next().unwrap_or_default());
+        Some(PluginOutputLogSnippetLine {
+            line_number,
+            text,
+            is_issue: level == "issue",
+            highlight_terms: highlights
+                .split(',')
+                .filter(|term| !term.is_empty())
+                .map(str::to_string)
+                .collect(),
+        })
+    }
+
+    /// 将插件日志片段中的制表符展开为 4 个空格。
+    ///
+    /// 业务意图：
+    /// - 第三方插件可能直接把 tab 分隔的原始日志放入截图式片段；宿主兜底展开，避免列在 GPUI 中黏连。
+    /// - weaver-logext 也会在插件侧展开，这里保留防线，兼容未来插件和半截流式输出。
+    fn expand_plugin_log_tabs_for_display(text: &str) -> String {
+        text.replace('\t', "    ")
+    }
+
+    /// 渲染普通步骤文本。
+    fn render_output_step_plain_text(lines: Vec<String>, palette: AppThemePalette) -> gpui::Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .children(lines.into_iter().map(|line| {
+                let is_log_path = Self::output_step_plain_text_line_is_log_path(&line);
+                div()
+                    .min_w_0()
+                    .whitespace_normal()
+                    .text_color(rgb(if is_log_path {
+                        palette.muted_text
+                    } else {
+                        palette.text
+                    }))
+                    .child(line)
+            }))
+    }
+
+    /// 判断普通步骤文本行是否是日志路径展示行。
+    ///
+    /// 业务意图：
+    /// - E9 分析正文里路径只是来源提示，弱化为灰色可以让异常原因和截图式上下文成为视觉重点。
+    /// - 当前插件按 `- <path>` 输出扫描到的 memory 和连接池日志列表，因此优先识别这类路径行，避免把普通诊断文本误染成灰色。
+    fn output_step_plain_text_line_is_log_path(line: &str) -> bool {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("- ") {
+            return false;
+        }
+        let candidate = trimmed.trim_start_matches("- ").trim();
+        candidate.contains('/')
+            || candidate.contains("!/")
+            || candidate.to_ascii_lowercase().contains("memory_")
+            || candidate.to_ascii_lowercase().contains("pool_")
+    }
+
+    /// 渲染截图式原始日志上下文。
+    ///
+    /// 业务意图：
+    /// - 异常行前后各 2 行需要像日志截图一样展示，行号、等宽字体和异常高亮是定位问题的关键。
+    /// - 原始 jstat 列可能很宽，因此整体允许横向滚动，不做截断，避免丢失用于后续分析的指标列。
+    fn render_output_log_snippet(
+        block_index: usize,
+        lines: Vec<PluginOutputLogSnippetLine>,
+        palette: AppThemePalette,
+    ) -> gpui::Div {
+        div()
+            .w_full()
+            .min_w_0()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.input))
+            .overflow_hidden()
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "plugin-output-log-snippet-scroll-{block_index}"
+                    )))
+                    .w_full()
+                    .min_w_0()
+                    .overflow_x_scroll()
+                    .py_1()
+                    .children(
+                        lines
+                            .into_iter()
+                            .map(|line| Self::render_output_log_snippet_line(line, palette)),
+                    ),
+            )
+    }
+
+    /// 渲染日志截图中的单行。
+    fn render_output_log_snippet_line(
+        line: PluginOutputLogSnippetLine,
+        palette: AppThemePalette,
+    ) -> gpui::Div {
+        let highlights =
+            Self::output_log_snippet_highlights(&line.text, &line.highlight_terms, palette);
+        div()
+            .flex()
+            .items_start()
+            .min_w(px(760.0))
+            .when(line.is_issue, |row| row.bg(rgb(palette.search_highlight)))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(64.0))
+                    .px_2()
+                    .text_right()
+                    .text_color(rgb(if line.is_issue {
+                        palette.error
+                    } else {
+                        palette.muted_text
+                    }))
+                    .child(line.line_number),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .px_2()
+                    .whitespace_nowrap()
+                    .text_color(rgb(palette.text))
+                    .child(StyledText::new(line.text).with_highlights(highlights)),
+            )
+    }
+
+    /// 计算日志截图行内高亮范围。
+    ///
+    /// 边界条件：
+    /// - 高亮词由插件解析出的 ASCII 数字组成，`find` 返回的字节位置天然位于 UTF-8 边界。
+    /// - 同一个数字可能在行内出现多次，全部高亮；重叠范围会被跳过，避免 GPUI 高亮列表互相覆盖。
+    fn output_log_snippet_highlights(
+        text: &str,
+        highlight_terms: &[String],
+        palette: AppThemePalette,
+    ) -> Vec<(Range<usize>, HighlightStyle)> {
+        let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+        let style = HighlightStyle {
+            color: Some(rgb(palette.error).into()),
+            background_color: Some(rgb(palette.search_highlight).into()),
+            font_weight: Some(FontWeight::SEMIBOLD),
+            ..Default::default()
+        };
+        let mut terms = highlight_terms
+            .iter()
+            .filter(|term| !term.is_empty())
+            .collect::<Vec<_>>();
+        terms.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+        terms.dedup();
+        for term in terms {
+            let mut search_start = 0usize;
+            while search_start < text.len() {
+                let Some(offset) = text[search_start..].find(term.as_str()) else {
+                    break;
+                };
+                let start = search_start + offset;
+                let end = start + term.len();
+                if !highlights
+                    .iter()
+                    .any(|(range, _)| start < range.end && end > range.start)
+                {
+                    highlights.push((start..end, style.clone()));
+                }
+                search_start = end;
+            }
+        }
+        highlights.sort_by(|left, right| left.0.start.cmp(&right.0.start));
+        highlights
+    }
+
+    /// 返回步骤状态对应的图标、颜色和标题。
+    fn output_step_status_visual(
+        step: &PluginOutputStep,
+        spinner: &'static str,
+        palette: AppThemePalette,
+    ) -> (String, bool, u32, String) {
+        match step.status {
+            PluginOutputStepStatus::Running => (
+                spinner.to_string(),
+                false,
+                palette.accent,
+                step.loading_text.clone(),
+            ),
+            PluginOutputStepStatus::Completed => (
+                char::from(Icon::Check).to_string(),
+                true,
+                palette.accent,
+                step.done_text
+                    .clone()
+                    .unwrap_or_else(|| step.loading_text.clone()),
+            ),
+            PluginOutputStepStatus::Failed => (
+                char::from(Icon::AlertCircle).to_string(),
+                true,
+                palette.error,
+                step.done_text
+                    .clone()
+                    .unwrap_or_else(|| step.loading_text.clone()),
+            ),
+        }
+    }
+
+    /// 返回加载动画的字符帧。
+    fn output_step_spinner_frame() -> &'static str {
+        const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        FRAMES[((millis / 120) % FRAMES.len() as u128) as usize]
+    }
+
+    /// 返回瀑布流输出等级对应的图标和颜色。
+    fn plugin_output_line_visual(
+        level: PluginOutputLevel,
+        palette: AppThemePalette,
+    ) -> (Icon, u32) {
+        match level {
+            PluginOutputLevel::Info => (Icon::Info, palette.text),
+            PluginOutputLevel::Success => (Icon::ChartNoAxesCombined, palette.accent),
+            PluginOutputLevel::Warning => (Icon::AlertCircle, 0xd97706),
+            PluginOutputLevel::Error => (Icon::AlertCircle, palette.error),
+            PluginOutputLevel::Muted => (Icon::Info, palette.muted_text),
+        }
+    }
+
     /// 渲染插件表格过滤栏。
     ///
     /// 业务意图：
@@ -1684,112 +2720,282 @@ impl PluginPageWindowView {
         div()
             .id("plugin-table-filter-bar")
             .flex()
-            .items_center()
+            .flex_col()
             .gap_2()
-            .h(px(PLUGIN_TABLE_FILTER_HEIGHT))
             .flex_none()
+            .when_some(table.performance_filter.as_ref(), |bar, filter| {
+                bar.child(self.render_performance_filter_row(filter, palette, context))
+            })
             .child(
                 div()
-                    .id("plugin-table-filter-input")
+                    .id("plugin-table-quick-filter-row")
                     .flex()
                     .items_center()
                     .gap_2()
-                    .h_full()
-                    .flex_1()
-                    .min_w_0()
-                    .px_2()
-                    .rounded(px(7.0))
-                    .border_1()
-                    .border_color(rgb(palette.border))
-                    .bg(rgb(palette.input))
-                    .track_focus(&self.table_filter_focus)
-                    .key_context("plugin-table-filter-input")
-                    .on_key_down(context.listener(Self::handle_table_filter_key_down))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        context.listener(|view, event: &MouseDownEvent, window, context| {
-                            view.start_table_filter_mouse_selection(event, window, context);
-                            context.stop_propagation();
-                        }),
-                    )
-                    .on_mouse_move(context.listener(
-                        |view, event: &MouseMoveEvent, _window, context| {
-                            if event.dragging() {
-                                view.update_table_filter_mouse_selection(event.position, context);
-                                context.stop_propagation();
-                            }
-                        },
-                    ))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        context.listener(|view, _event: &MouseUpEvent, _window, context| {
-                            view.finish_table_filter_mouse_selection(context);
-                            context.stop_propagation();
-                        }),
-                    )
-                    .child(MainView::render_lucide_icon(
+                    .h(px(PLUGIN_TABLE_FILTER_HEIGHT))
+                    .child(self.render_table_input_box(
+                        "plugin-table-filter-input",
+                        PluginTableInputKind::QuickFilter,
+                        "过滤当前表格任意关键字",
                         Some(Icon::Search),
-                        15.0,
-                        15.0,
-                        palette.muted_text,
+                        true,
+                        px(0.0),
+                        palette,
+                        context,
                     ))
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .line_height(px(20.0))
-                            .text_size(px(13.0))
-                            .text_color(rgb(palette.text))
-                            .child(PluginTableFilterInputElement {
-                                view: context.entity(),
-                                focus_handle: self.table_filter_focus.clone(),
-                                palette,
+                            .flex_none()
+                            .text_xs()
+                            .text_color(rgb(palette.muted_text))
+                            .child(if has_filter {
+                                format!("{filtered_count} / {total_count} 行")
+                            } else {
+                                format!("{total_count} 行")
                             }),
-                    )
-                    .when(has_filter, |input| {
-                        input.child(
-                            div()
-                                .id("plugin-table-filter-clear")
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .w(px(22.0))
-                                .h(px(22.0))
-                                .rounded(px(5.0))
-                                .text_color(rgb(palette.muted_text))
-                                .cursor_pointer()
-                                .hover(move |button| button.bg(rgb(palette.hover)))
-                                .child(MainView::render_lucide_icon(
-                                    Some(Icon::X),
-                                    14.0,
-                                    14.0,
-                                    palette.muted_text,
-                                ))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    context.listener(
-                                        |view, _event: &MouseDownEvent, _window, context| {
-                                            view.table_filter_input.set_text(String::new());
-                                            view.rebuild_table_after_filter_change(context);
-                                            context.stop_propagation();
-                                        },
-                                    ),
-                                ),
-                        )
-                    }),
+                    ),
             )
+    }
+
+    /// 渲染性能表格业务过滤行。
+    ///
+    /// 业务意图：
+    /// - 用户和请求时间区间过滤会回调插件重新计算汇总或详情，不能混在通用本地关键字过滤里。
+    /// - 输入控件保持紧凑并允许换行，避免较窄窗口下时间输入和按钮互相挤压遮挡。
+    fn render_performance_filter_row(
+        &self,
+        filter: &PluginPerformanceTableFilter,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let apply_command = filter.command.clone();
+        let reset_command = filter.command.clone();
+        div()
+            .id("plugin-performance-filter-row")
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .min_h(px(PLUGIN_TABLE_FILTER_HEIGHT))
             .child(
                 div()
                     .flex_none()
                     .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
                     .text_color(rgb(palette.muted_text))
-                    .child(if has_filter {
-                        format!("{filtered_count} / {total_count} 行")
-                    } else {
-                        format!("{total_count} 行")
+                    .child("业务过滤"),
+            )
+            .child(self.render_table_input_box(
+                "plugin-performance-user-filter",
+                PluginTableInputKind::PerformanceUsers,
+                "用户：alice,bob",
+                Some(Icon::User),
+                false,
+                px(180.0),
+                palette,
+                context,
+            ))
+            .child(self.render_table_input_box(
+                "plugin-performance-start-filter",
+                PluginTableInputKind::PerformanceStartTime,
+                "开始：yyyy-MM-dd HH:mm:ss",
+                None,
+                false,
+                px(220.0),
+                palette,
+                context,
+            ))
+            .child(self.render_table_input_box(
+                "plugin-performance-end-filter",
+                PluginTableInputKind::PerformanceEndTime,
+                "结束：yyyy-MM-dd HH:mm:ss",
+                None,
+                false,
+                px(220.0),
+                palette,
+                context,
+            ))
+            .child(
+                div()
+                    .id("plugin-performance-filter-apply")
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .h(px(PLUGIN_TABLE_FILTER_HEIGHT))
+                    .px_3()
+                    .rounded(px(7.0))
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.panel))
+                    .text_sm()
+                    .text_color(rgb(palette.text))
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(rgb(palette.hover)))
+                    .child(MainView::render_lucide_icon(
+                        Some(Icon::ListFilter),
+                        14.0,
+                        14.0,
+                        palette.text,
+                    ))
+                    .child("应用")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        context.listener(move |view, _event: &MouseDownEvent, _window, context| {
+                            view.apply_performance_table_filter(apply_command.clone(), context);
+                            context.stop_propagation();
+                        }),
+                    ),
+            )
+            .child(
+                div()
+                    .id("plugin-performance-filter-reset")
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .h(px(PLUGIN_TABLE_FILTER_HEIGHT))
+                    .px_3()
+                    .rounded(px(7.0))
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.background))
+                    .text_sm()
+                    .text_color(rgb(palette.muted_text))
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(rgb(palette.hover)))
+                    .child(MainView::render_lucide_icon(
+                        Some(Icon::RefreshCw),
+                        14.0,
+                        14.0,
+                        palette.muted_text,
+                    ))
+                    .child("重置")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        context.listener(move |view, _event: &MouseDownEvent, _window, context| {
+                            view.clear_performance_filter_inputs();
+                            view.apply_performance_table_filter(reset_command.clone(), context);
+                            context.stop_propagation();
+                        }),
+                    ),
+            )
+    }
+
+    /// 渲染插件表格过滤栏中的单行输入框。
+    fn render_table_input_box(
+        &self,
+        element_id: &'static str,
+        input_kind: PluginTableInputKind,
+        placeholder: &'static str,
+        icon: Option<Icon>,
+        fill_available_width: bool,
+        fixed_width: Pixels,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let has_text = !self.table_input_state(input_kind).text.trim().is_empty();
+        let focus_handle = self.table_input_focus(input_kind).clone();
+        div()
+            .id(element_id)
+            .flex()
+            .items_center()
+            .gap_2()
+            .h_full()
+            .min_w_0()
+            .px_2()
+            .rounded(px(7.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.input))
+            .track_focus(&focus_handle)
+            .key_context(element_id)
+            .when(fill_available_width, |input| input.flex_1())
+            .when(!fill_available_width, |input| {
+                input.flex_none().w(fixed_width)
+            })
+            .on_key_down(context.listener(move |view, event, window, context| {
+                view.handle_table_input_key_down(input_kind, event, window, context);
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(move |view, event: &MouseDownEvent, window, context| {
+                    view.start_table_input_mouse_selection(input_kind, event, window, context);
+                    context.stop_propagation();
+                }),
+            )
+            .on_mouse_move(context.listener(
+                move |view, event: &MouseMoveEvent, _window, context| {
+                    if event.dragging() {
+                        view.update_table_input_mouse_selection(
+                            input_kind,
+                            event.position,
+                            context,
+                        );
+                        context.stop_propagation();
+                    }
+                },
+            ))
+            .on_mouse_up(
+                MouseButton::Left,
+                context.listener(move |view, _event: &MouseUpEvent, _window, context| {
+                    view.finish_table_input_mouse_selection(input_kind, context);
+                    context.stop_propagation();
+                }),
+            )
+            .when_some(icon, |input, icon| {
+                input.child(MainView::render_lucide_icon(
+                    Some(icon),
+                    15.0,
+                    15.0,
+                    palette.muted_text,
+                ))
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .line_height(px(20.0))
+                    .text_size(px(13.0))
+                    .text_color(rgb(palette.text))
+                    .child(PluginTableFilterInputElement {
+                        view: context.entity(),
+                        input_kind,
+                        focus_handle,
+                        placeholder,
+                        palette,
                     }),
             )
+            .when(has_text, |input| {
+                input.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(22.0))
+                        .h(px(22.0))
+                        .rounded(px(5.0))
+                        .text_color(rgb(palette.muted_text))
+                        .cursor_pointer()
+                        .hover(move |button| button.bg(rgb(palette.hover)))
+                        .child(MainView::render_lucide_icon(
+                            Some(Icon::X),
+                            14.0,
+                            14.0,
+                            palette.muted_text,
+                        ))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            context.listener(
+                                move |view, _event: &MouseDownEvent, _window, context| {
+                                    view.table_input_state_mut(input_kind)
+                                        .set_text(String::new());
+                                    view.after_table_input_text_changed(input_kind, context);
+                                    context.stop_propagation();
+                                },
+                            ),
+                        ),
+                )
+            })
     }
 
     /// 渲染插件表格纵向滚动条。
@@ -2105,11 +3311,11 @@ impl PluginPageWindowView {
         context: &mut Context<Self>,
     ) {
         let mut handled = false;
-        if self.table_filter_selection_drag.is_some() {
+        if let Some(input_kind) = self.dragging_table_input_kind() {
             if event.dragging() {
-                self.update_table_filter_mouse_selection(event.position, context);
+                self.update_table_input_mouse_selection(input_kind, event.position, context);
             } else {
-                self.finish_table_filter_mouse_selection(context);
+                self.finish_table_input_mouse_selection(input_kind, context);
             }
             handled = true;
         }
@@ -2142,13 +3348,13 @@ impl PluginPageWindowView {
         context: &mut Context<Self>,
     ) {
         let had_drag = self.table_scrollbar_drag.is_some()
-            || self.table_filter_selection_drag.is_some()
+            || self.dragging_table_input_kind().is_some()
             || self
                 .table_text_selection
                 .as_ref()
                 .is_some_and(|selection| selection.dragging);
         self.finish_plugin_table_scrollbar_drag(context);
-        self.finish_table_filter_mouse_selection(context);
+        self.finish_all_table_input_mouse_selection(context);
         self.finish_table_cell_text_selection(context);
         if had_drag {
             context.stop_propagation();
@@ -2590,6 +3796,9 @@ impl PluginPageWindowView {
         let title = action.title.clone().unwrap_or_else(|| action.label.clone());
         let palette = self.palette;
         let window_title = title.clone();
+        let origin_plugin = self.origin_plugin.clone();
+        let origin_log_sources = self.origin_log_sources.clone();
+        let origin_log_files = self.origin_log_files.clone();
         let window_options = WindowOptions {
             titlebar: Some(TitlebarOptions {
                 title: Some(window_title.clone().into()),
@@ -2610,8 +3819,9 @@ impl PluginPageWindowView {
                     title,
                     page,
                     palette,
-                    self.origin_plugin.clone(),
-                    self.origin_log_sources.clone(),
+                    origin_plugin,
+                    origin_log_sources,
+                    origin_log_files,
                     context,
                 )
             })
@@ -2652,6 +3862,7 @@ impl PluginPageWindowView {
         let window_title = title.clone();
         let plugin_for_window = Some(plugin.clone());
         let origin_log_sources = self.origin_log_sources.clone();
+        let origin_log_files = self.origin_log_files.clone();
         let window_options = WindowOptions {
             titlebar: Some(TitlebarOptions {
                 title: Some(window_title.clone().into()),
@@ -2674,6 +3885,7 @@ impl PluginPageWindowView {
                     palette,
                     plugin_for_window,
                     origin_log_sources.clone(),
+                    origin_log_files.clone(),
                     context,
                 )
             })
@@ -2685,10 +3897,10 @@ impl PluginPageWindowView {
             window_view.set_progress(initial_progress, context);
         });
 
-        let (progress_sender, progress_receiver) = mpsc::channel();
-        Self::spawn_deferred_action_progress_poller(window_handle, progress_receiver, context);
+        let (event_sender, event_receiver) = mpsc::channel();
+        Self::spawn_deferred_action_event_poller(window_handle, event_receiver, context);
         let command_id = command.command_id;
-        let command_context = command.context;
+        let command_context = self.hydrate_table_action_context(command.context);
         let origin_log_sources = self.origin_log_sources.clone();
         context
             .spawn(async move |_view, app| {
@@ -2704,12 +3916,12 @@ impl PluginPageWindowView {
                                 &plugin,
                                 &command_id,
                                 command_context,
-                                Some(progress_sender),
-                                move |writer, progress_sender| {
+                                Some(event_sender),
+                                move |writer, event_sender| {
                                     Self::write_log_source_content_stream(
                                         &content_source,
                                         writer,
-                                        progress_sender,
+                                        event_sender,
                                     )
                                 },
                             )
@@ -2718,7 +3930,7 @@ impl PluginPageWindowView {
                                 &plugin,
                                 &command_id,
                                 command_context,
-                                Some(progress_sender),
+                                Some(event_sender),
                             )
                         }
                     })
@@ -2729,6 +3941,267 @@ impl PluginPageWindowView {
                 .ok();
             })
             .detach();
+    }
+
+    /// 补齐表格延迟动作需要的页面来源快照。
+    ///
+    /// 业务意图：
+    /// - 性能汇总页的“详情”按钮只在首次响应中保存请求地址，避免把每个请求的完整明细页提前序列化出来。
+    /// - 用户实际点击按钮时，宿主再把当前插件窗口保存的原始日志文件快照放入上下文，由插件在后台生成该行详情。
+    ///
+    /// 边界条件：
+    /// - 如果插件响应已经显式携带 `files`，保持插件提供的快照，兼容第三方插件自定义分页或局部下钻场景。
+    /// - 补齐后的上下文仍会在插件调用前经过权限清理，未声明 `logs.content` 的插件拿不到本地读取路径。
+    fn hydrate_table_action_context(&self, context: PluginCommandContext) -> PluginCommandContext {
+        match context {
+            PluginCommandContext::TableAction {
+                action_id,
+                files,
+                data,
+            } if files.is_empty() => PluginCommandContext::TableAction {
+                action_id,
+                files: self.origin_log_files.clone(),
+                data,
+            },
+            other => other,
+        }
+    }
+
+    /// 返回当前页面性能过滤器的插件命令。
+    fn current_performance_filter_command(&self) -> Option<PluginTableRowCommand> {
+        self.page
+            .table
+            .as_ref()
+            .and_then(|table| table.performance_filter.as_ref())
+            .map(|filter| filter.command.clone())
+    }
+
+    /// 清空性能业务过滤输入。
+    fn clear_performance_filter_inputs(&mut self) {
+        self.performance_user_filter_input.set_text(String::new());
+        self.performance_start_time_filter_input
+            .set_text(String::new());
+        self.performance_end_time_filter_input
+            .set_text(String::new());
+    }
+
+    /// 把当前性能过滤输入合并进插件命令上下文。
+    ///
+    /// 业务意图：
+    /// - 插件负责解析用户和时间区间并重新聚合表格；宿主只把输入框原始文本写回 `TableAction.data`。
+    /// - 详情页的命令上下文还包含请求地址，合并时必须保留已有字段，只覆盖过滤相关键。
+    fn with_current_performance_filter_data(
+        &self,
+        context: PluginCommandContext,
+    ) -> PluginCommandContext {
+        let users = self.performance_user_filter_input.text.trim().to_string();
+        let start_time = self
+            .performance_start_time_filter_input
+            .text
+            .trim()
+            .to_string();
+        let end_time = self
+            .performance_end_time_filter_input
+            .text
+            .trim()
+            .to_string();
+        match context {
+            PluginCommandContext::TableAction {
+                action_id,
+                files,
+                mut data,
+            } => {
+                data.insert(PLUGIN_PERFORMANCE_FILTER_USERS_KEY.to_string(), users);
+                data.insert(PLUGIN_PERFORMANCE_FILTER_START_KEY.to_string(), start_time);
+                data.insert(PLUGIN_PERFORMANCE_FILTER_END_KEY.to_string(), end_time);
+                PluginCommandContext::TableAction {
+                    action_id,
+                    files,
+                    data,
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// 应用性能业务过滤并在当前插件窗口内替换页面。
+    ///
+    /// 业务意图：
+    /// - 性能汇总过滤必须重新计算请求次数和平均耗时；请求详情过滤也必须从原始日志快照重新筛选。
+    /// - 命令在后台线程执行，当前窗口先展示进度，避免用户在大目录中过滤时误以为界面卡死。
+    ///
+    /// 边界条件：
+    /// - 如果当前窗口缺少来源插件，说明页面不是由可回调插件生成，直接展示中文错误而不是静默失效。
+    fn apply_performance_table_filter(
+        &mut self,
+        command: PluginTableRowCommand,
+        context: &mut Context<Self>,
+    ) {
+        let Some(plugin) = self.origin_plugin.clone() else {
+            self.page = MainView::plugin_error_page("无法确定性能过滤所属插件".to_string());
+            context.notify();
+            return;
+        };
+        let command_id = command.command_id;
+        let command_context = self.hydrate_table_action_context(
+            self.with_current_performance_filter_data(command.context),
+        );
+        let palette = self.palette;
+        let origin_plugin = self.origin_plugin.clone();
+        let origin_log_sources = self.origin_log_sources.clone();
+        let origin_log_files = self.origin_log_files.clone();
+        let initial_progress =
+            MainView::initial_plugin_progress(format!("正在过滤：{}", plugin.name), None, "文件");
+        let generation = self.current_window_command_generations.begin();
+        self.set_progress(initial_progress.clone(), context);
+
+        let (event_sender, event_receiver) = mpsc::channel();
+        Self::spawn_current_window_plugin_event_poller(
+            context.entity(),
+            generation,
+            event_receiver,
+            context,
+        );
+        context
+            .spawn(async move |view, app| {
+                let result = app
+                    .background_executor()
+                    .spawn(async move {
+                        invoke_plugin_command_with_progress(
+                            &plugin,
+                            &command_id,
+                            command_context,
+                            Some(event_sender),
+                        )
+                    })
+                    .await;
+                app.update(move |app| {
+                    let _ = view.update(app, |window_view, context| {
+                        window_view.apply_current_window_command_result(
+                            generation,
+                            result,
+                            palette,
+                            origin_plugin,
+                            origin_log_sources,
+                            origin_log_files,
+                            context,
+                        );
+                    });
+                })
+                .ok();
+            })
+            .detach();
+    }
+
+    /// 轮询当前插件窗口的后台命令事件。
+    fn spawn_current_window_plugin_event_poller(
+        window_view: Entity<PluginPageWindowView>,
+        generation: usize,
+        event_receiver: mpsc::Receiver<PluginCommandRuntimeEvent>,
+        context: &mut Context<Self>,
+    ) {
+        context
+            .spawn(async move |_view, app| {
+                loop {
+                    app.background_executor()
+                        .timer(Duration::from_millis(33))
+                        .await;
+                    let keep_polling = window_view
+                        .update(app, |window_view, context| {
+                            window_view.drain_current_window_plugin_runtime_events(
+                                generation,
+                                &event_receiver,
+                                context,
+                            )
+                        })
+                        .unwrap_or(false);
+                    if !keep_polling {
+                        break;
+                    }
+                }
+            })
+            .detach();
+    }
+
+    /// 取出当前窗口后台命令事件并刷新页面。
+    ///
+    /// 业务意图：
+    /// - 过滤命令可能被后续过滤命令取代，只有最新代次的事件才能更新当前页面。
+    /// - 事件在 UI 线程批量应用，避免后台线程直接修改 GPUI 状态。
+    fn drain_current_window_plugin_runtime_events(
+        &mut self,
+        generation: usize,
+        event_receiver: &mpsc::Receiver<PluginCommandRuntimeEvent>,
+        context: &mut Context<Self>,
+    ) -> bool {
+        if !self
+            .current_window_command_generations
+            .is_active(generation)
+        {
+            return false;
+        }
+        let mut disconnected = false;
+        let mut runtime_events = Vec::new();
+        loop {
+            match event_receiver.try_recv() {
+                Ok(event) => runtime_events.push(event),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        for event in runtime_events {
+            self.apply_plugin_runtime_event(event, context);
+        }
+        !disconnected
+    }
+
+    /// 把后台命令结果应用到当前插件窗口。
+    fn apply_current_window_command_result(
+        &mut self,
+        generation: usize,
+        result: Result<PluginCommandResponse, String>,
+        palette: AppThemePalette,
+        origin_plugin: Option<PluginDefinition>,
+        origin_log_sources: BTreeMap<String, LogFileSource>,
+        origin_log_files: Vec<PluginLogFile>,
+        context: &mut Context<Self>,
+    ) {
+        if !self
+            .current_window_command_generations
+            .finish_if_active(generation)
+        {
+            return;
+        }
+        let (title, page) = match result {
+            Ok(PluginCommandResponse::OpenWindow { title, page }) => (title, page),
+            Ok(PluginCommandResponse::ShowMessage { level, message }) => {
+                let prefix = match level {
+                    PluginMessageLevel::Info => "插件提示",
+                    PluginMessageLevel::Warning => "插件警告",
+                    PluginMessageLevel::Error => "插件错误",
+                };
+                (
+                    prefix.to_string(),
+                    MainView::plugin_message_page(prefix, message),
+                )
+            }
+            Ok(PluginCommandResponse::Error { message }) | Err(message) => (
+                "插件执行失败".to_string(),
+                MainView::plugin_error_page(message),
+            ),
+        };
+        self.set_page(
+            title,
+            page,
+            palette,
+            origin_plugin,
+            origin_log_sources,
+            origin_log_files,
+            context,
+        );
     }
 
     /// 返回延迟行命令需要由宿主流式传给插件的日志来源。
@@ -2770,45 +4243,89 @@ impl PluginPageWindowView {
     fn write_log_source_content_stream(
         source: &LogFileSource,
         writer: &mut dyn Write,
-        progress_sender: Option<&mpsc::Sender<PluginCommandProgress>>,
+        event_sender: Option<&mpsc::Sender<PluginCommandRuntimeEvent>>,
     ) -> Result<(), String> {
-        if let Some(sender) = progress_sender {
-            let _ = sender.send(PluginCommandProgress {
+        if let Some(sender) = event_sender {
+            let _ = sender.send(PluginCommandRuntimeEvent::Progress(PluginCommandProgress {
                 message: "正在流式读取日志正文".to_string(),
                 detail: Some(source.display_name()),
                 done: 0,
                 total: None,
                 unit: Some("行".to_string()),
-            });
+            }));
         }
-        let mut line_writer = PluginContentLineWriter::new(writer, progress_sender);
+        let mut line_writer = PluginContentLineWriter::new(writer, event_sender);
         stream_log_source_bytes_to_writer(source, &mut line_writer)
             .map_err(|error| format!("流式读取日志正文失败：{error}"))?;
-        line_writer.finish()
+        line_writer.finish().map(|_| ())
+    }
+
+    /// 按插件请求把指定日志来源写入交互式内容流。
+    ///
+    /// 业务意图：
+    /// - 工具栏插件先拿到完整树快照，再用 source_key 请求自己真正需要分析的文件正文；宿主只在这里根据保存的来源快照读取文件。
+    /// - 读取失败或 source_key 不存在时写入 `log_content_error` 事件，让插件能继续处理后续文件，而不是让整个 E9 分析中断。
+    ///
+    /// 边界条件：
+    /// - `path_label` 只作为 UI 回显，不能参与文件定位；真实读取必须来自 `origin_log_sources`。
+    /// - 普通文件、压缩包成员和嵌套压缩包成员都通过 `stream_log_source_bytes_to_writer` 统一读取，避免为压缩包正文另写一套路径权限逻辑。
+    fn write_requested_log_source_content_stream(
+        request: PluginContentRequest,
+        origin_log_sources: &BTreeMap<String, LogFileSource>,
+        writer: &mut dyn Write,
+        event_sender: Option<&mpsc::Sender<PluginCommandRuntimeEvent>>,
+    ) -> Result<(), String> {
+        let path_label = request
+            .path_label
+            .as_deref()
+            .filter(|label| !label.trim().is_empty())
+            .unwrap_or(&request.source_key);
+        let Some(source) = origin_log_sources.get(&request.source_key) else {
+            return write_plugin_log_content_error(
+                writer,
+                &request.source_key,
+                "宿主无法定位该日志来源，可能是快照已失效或来源不可读取",
+            );
+        };
+
+        write_plugin_log_content_begin(writer, &request.source_key, path_label)?;
+        let mut line_writer = PluginContentLineWriter::new(writer, event_sender);
+        let stream_result = stream_log_source_bytes_to_writer(source, &mut line_writer)
+            .map_err(|error| format!("流式读取日志正文失败：{error}"));
+        match stream_result {
+            Ok(()) => {
+                let lines = line_writer.finish()?;
+                write_plugin_log_content_end(writer, &request.source_key, lines)
+            }
+            Err(message) => {
+                drop(line_writer);
+                write_plugin_log_content_error(writer, &request.source_key, &message)
+            }
+        }
     }
 
     /// 按固定步长向 UI 汇报宿主侧内容流进度。
     fn report_content_stream_progress(
         done: u64,
-        progress_sender: Option<&mpsc::Sender<PluginCommandProgress>>,
+        event_sender: Option<&mpsc::Sender<PluginCommandRuntimeEvent>>,
     ) {
         if (done == 1 || done % 2048 == 0)
-            && let Some(sender) = progress_sender
+            && let Some(sender) = event_sender
         {
-            let _ = sender.send(PluginCommandProgress {
+            let _ = sender.send(PluginCommandRuntimeEvent::Progress(PluginCommandProgress {
                 message: "正在流式读取日志正文".to_string(),
                 detail: Some(format!("已发送 {done} 行")),
                 done,
                 total: None,
                 unit: Some("行".to_string()),
-            });
+            }));
         }
     }
 
-    /// 轮询延迟命令进度并更新独立插件窗口。
-    fn spawn_deferred_action_progress_poller(
+    /// 轮询延迟命令流式事件并更新独立插件窗口。
+    fn spawn_deferred_action_event_poller(
         window_handle: WindowHandle<PluginPageWindowView>,
-        receiver: mpsc::Receiver<PluginCommandProgress>,
+        receiver: mpsc::Receiver<PluginCommandRuntimeEvent>,
         context: &mut Context<Self>,
     ) {
         context
@@ -2819,9 +4336,13 @@ impl PluginPageWindowView {
                         .await;
                     let mut disconnected = false;
                     let mut latest_progress = None;
+                    let mut runtime_events = Vec::new();
                     loop {
                         match receiver.try_recv() {
-                            Ok(progress) => latest_progress = Some(progress),
+                            Ok(PluginCommandRuntimeEvent::Progress(progress)) => {
+                                latest_progress = Some(progress)
+                            }
+                            Ok(event) => runtime_events.push(event),
                             Err(mpsc::TryRecvError::Empty) => break,
                             Err(mpsc::TryRecvError::Disconnected) => {
                                 disconnected = true;
@@ -2832,6 +4353,13 @@ impl PluginPageWindowView {
                     if let Some(progress) = latest_progress {
                         let _ = window_handle.update(app, |window_view, _window, context| {
                             window_view.set_progress(progress, context);
+                        });
+                    }
+                    if !runtime_events.is_empty() {
+                        let _ = window_handle.update(app, |window_view, _window, context| {
+                            for event in runtime_events {
+                                window_view.apply_plugin_runtime_event(event, context);
+                            }
                         });
                     }
                     if disconnected {
@@ -2871,12 +4399,14 @@ impl PluginPageWindowView {
         let _ = window_handle.update(app, |window_view, window, context| {
             let origin_plugin = window_view.origin_plugin.clone();
             let origin_log_sources = window_view.origin_log_sources.clone();
+            let origin_log_files = window_view.origin_log_files.clone();
             window_view.set_page(
                 title,
                 page,
                 palette,
                 origin_plugin,
                 origin_log_sources,
+                origin_log_files,
                 context,
             );
             window.set_window_title(&window_title);
@@ -2887,7 +4417,7 @@ impl PluginPageWindowView {
 }
 
 impl EntityInputHandler for PluginPageWindowView {
-    /// 返回过滤输入框指定 UTF-16 范围内的文本。
+    /// 返回当前聚焦输入框指定 UTF-16 范围内的文本。
     ///
     /// 业务意图：
     /// - macOS 和 Windows 的平台输入协议按 UTF-16 位置回调，Rust 字符串按 UTF-8 存储；这里统一做安全边界转换。
@@ -2898,32 +4428,29 @@ impl EntityInputHandler for PluginPageWindowView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<String> {
-        if !self.table_filter_focus.is_focused(window) {
-            return None;
-        }
-        let range =
-            MainView::search_input_range_from_utf16(&self.table_filter_input.text, range_utf16);
+        let input_kind = self.focused_table_input_kind(window)?;
+        let input = self.table_input_state(input_kind);
+        let range = MainView::search_input_range_from_utf16(&input.text, range_utf16);
         adjusted_range.replace(MainView::search_input_range_to_utf16(
-            &self.table_filter_input.text,
+            &input.text,
             range.clone(),
         ));
-        Some(self.table_filter_input.text[range].to_string())
+        Some(input.text[range].to_string())
     }
 
-    /// 返回过滤输入框当前选区。
+    /// 返回当前聚焦输入框的选区。
     fn selected_text_range(
         &mut self,
         _ignore_disabled_input: bool,
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        if !self.table_filter_focus.is_focused(window) {
-            return None;
-        }
+        let input_kind = self.focused_table_input_kind(window)?;
+        let input = self.table_input_state(input_kind);
         Some(UTF16Selection {
             range: MainView::search_input_range_to_utf16(
-                &self.table_filter_input.text,
-                self.table_filter_input.selection_range.clone(),
+                &input.text,
+                input.selection_range.clone(),
             ),
             reversed: false,
         })
@@ -2935,24 +4462,23 @@ impl EntityInputHandler for PluginPageWindowView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<Range<usize>> {
-        if !self.table_filter_focus.is_focused(window) {
-            return None;
-        }
-        self.table_filter_input.marked_range.clone().map(|range| {
-            MainView::search_input_range_to_utf16(&self.table_filter_input.text, range)
-        })
+        let input_kind = self.focused_table_input_kind(window)?;
+        let input = self.table_input_state(input_kind);
+        input
+            .marked_range
+            .clone()
+            .map(|range| MainView::search_input_range_to_utf16(&input.text, range))
     }
 
     /// 清除输入法组合文本状态。
     fn unmark_text(&mut self, window: &mut Window, context: &mut Context<Self>) {
-        if !self.table_filter_focus.is_focused(window) {
-            return;
+        if let Some(input_kind) = self.focused_table_input_kind(window) {
+            self.table_input_state_mut(input_kind).marked_range = None;
+            context.notify();
         }
-        self.table_filter_input.marked_range = None;
-        context.notify();
     }
 
-    /// 用平台提交文本替换过滤输入框中的指定范围。
+    /// 用平台提交文本替换当前聚焦输入框中的指定范围。
     fn replace_text_in_range(
         &mut self,
         range_utf16: Option<Range<usize>>,
@@ -2960,27 +4486,26 @@ impl EntityInputHandler for PluginPageWindowView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
-        if !self.table_filter_focus.is_focused(window) {
+        let Some(input_kind) = self.focused_table_input_kind(window) else {
             return;
-        }
+        };
         let replacement = MainView::sanitize_search_input_text(text);
-        let range = range_utf16
-            .map(|range| {
-                MainView::search_input_range_from_utf16(&self.table_filter_input.text, range)
-            })
-            .or_else(|| self.table_filter_input.marked_range.clone())
-            .unwrap_or_else(|| self.table_filter_input.selection_range.clone());
-        let range = MainView::clamp_search_text_range(&self.table_filter_input.text, range);
-        self.table_filter_input
-            .text
-            .replace_range(range.clone(), &replacement);
-        let cursor = range.start + replacement.len();
-        self.table_filter_input.selection_range = cursor..cursor;
-        self.table_filter_input.marked_range = None;
-        self.rebuild_table_after_filter_change(context);
+        {
+            let input = self.table_input_state_mut(input_kind);
+            let range = range_utf16
+                .map(|range| MainView::search_input_range_from_utf16(&input.text, range))
+                .or_else(|| input.marked_range.clone())
+                .unwrap_or_else(|| input.selection_range.clone());
+            let range = MainView::clamp_search_text_range(&input.text, range);
+            input.text.replace_range(range.clone(), &replacement);
+            let cursor = range.start + replacement.len();
+            input.selection_range = cursor..cursor;
+            input.marked_range = None;
+        }
+        self.after_table_input_text_changed(input_kind, context);
     }
 
-    /// 用平台组合文本替换过滤输入框中的指定范围，并保留组合状态。
+    /// 用平台组合文本替换当前聚焦输入框中的指定范围，并保留组合状态。
     fn replace_and_mark_text_in_range(
         &mut self,
         range_utf16: Option<Range<usize>>,
@@ -2989,37 +4514,37 @@ impl EntityInputHandler for PluginPageWindowView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
-        if !self.table_filter_focus.is_focused(window) {
+        let Some(input_kind) = self.focused_table_input_kind(window) else {
             return;
-        }
-        let replacement = MainView::sanitize_search_input_text(new_text);
-        let range = range_utf16
-            .map(|range| {
-                MainView::search_input_range_from_utf16(&self.table_filter_input.text, range)
-            })
-            .or_else(|| self.table_filter_input.marked_range.clone())
-            .unwrap_or_else(|| self.table_filter_input.selection_range.clone());
-        let range = MainView::clamp_search_text_range(&self.table_filter_input.text, range);
-        self.table_filter_input
-            .text
-            .replace_range(range.clone(), &replacement);
-        self.table_filter_input.marked_range = if replacement.is_empty() {
-            None
-        } else {
-            Some(range.start..range.start + replacement.len())
         };
-        let selected_range = new_selected_range_utf16
-            .map(|utf16_range| MainView::search_input_range_from_utf16(&replacement, utf16_range))
-            .map(|relative_range| {
-                range.start + relative_range.start..range.start + relative_range.end
-            })
-            .unwrap_or_else(|| {
-                let cursor = range.start + replacement.len();
-                cursor..cursor
-            });
-        self.table_filter_input.selection_range =
-            MainView::clamp_search_text_range(&self.table_filter_input.text, selected_range);
-        self.rebuild_table_after_filter_change(context);
+        let replacement = MainView::sanitize_search_input_text(new_text);
+        {
+            let input = self.table_input_state_mut(input_kind);
+            let range = range_utf16
+                .map(|range| MainView::search_input_range_from_utf16(&input.text, range))
+                .or_else(|| input.marked_range.clone())
+                .unwrap_or_else(|| input.selection_range.clone());
+            let range = MainView::clamp_search_text_range(&input.text, range);
+            input.text.replace_range(range.clone(), &replacement);
+            input.marked_range = if replacement.is_empty() {
+                None
+            } else {
+                Some(range.start..range.start + replacement.len())
+            };
+            let selected_range = new_selected_range_utf16
+                .map(|utf16_range| {
+                    MainView::search_input_range_from_utf16(&replacement, utf16_range)
+                })
+                .map(|relative_range| {
+                    range.start + relative_range.start..range.start + relative_range.end
+                })
+                .unwrap_or_else(|| {
+                    let cursor = range.start + replacement.len();
+                    cursor..cursor
+                });
+            input.selection_range = MainView::clamp_search_text_range(&input.text, selected_range);
+        }
+        self.after_table_input_text_changed(input_kind, context);
     }
 
     /// 返回指定文本范围在窗口中的边界，用于 IME 候选框定位。
@@ -3030,14 +4555,12 @@ impl EntityInputHandler for PluginPageWindowView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        if !self.table_filter_focus.is_focused(window) {
-            return None;
-        }
-        let Some(layout) = self.table_filter_layout.as_ref() else {
+        let input_kind = self.focused_table_input_kind(window)?;
+        let input = self.table_input_state(input_kind);
+        let Some(layout) = self.table_input_layout(input_kind) else {
             return Some(element_bounds);
         };
-        let range =
-            MainView::search_input_range_from_utf16(&self.table_filter_input.text, range_utf16);
+        let range = MainView::search_input_range_from_utf16(&input.text, range_utf16);
         let cursor = range.start;
         let cursor_x = layout.bounds.left() - px(layout.horizontal_scroll_px)
             + layout.line.x_for_index(cursor);
@@ -3054,12 +4577,11 @@ impl EntityInputHandler for PluginPageWindowView {
         window: &mut Window,
         _context: &mut Context<Self>,
     ) -> Option<usize> {
-        if !self.table_filter_focus.is_focused(window) {
-            return None;
-        }
-        let utf8_index = self.table_filter_index_at_position(point);
+        let input_kind = self.focused_table_input_kind(window)?;
+        let input = self.table_input_state(input_kind);
+        let utf8_index = self.table_input_index_at_position(input_kind, point);
         Some(MainView::search_input_utf16_offset_from_byte(
-            &self.table_filter_input.text,
+            &input.text,
             utf8_index,
         ))
     }
@@ -3087,6 +4609,60 @@ fn compare_plugin_table_cells(left: &str, right: &str) -> Ordering {
     }
 }
 
+/// 插件窗口内部后台命令代次状态。
+///
+/// 业务意图：
+/// - 性能业务过滤会在同一个插件窗口内反复启动后台插件命令，旧命令可能比新命令更晚返回。
+/// - 该状态只服务当前窗口内部的竞争消解，防止旧进度和旧结果覆盖用户最新输入的过滤条件。
+///
+/// 边界条件：
+/// - 代次不写入磁盘，也不跨窗口复用；窗口页面被外部命令替换时应取消当前代次。
+/// - 溢出时沿用宿主插件命令的饱和加一策略，真实会话中不会达到 `usize::MAX`。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PluginWindowCommandGenerationState {
+    /// 当前仍允许更新窗口的后台命令代次。
+    active: Option<usize>,
+    /// 下一次后台命令使用的代次。
+    next: usize,
+}
+
+impl PluginWindowCommandGenerationState {
+    /// 创建空闲的窗口命令代次状态。
+    fn new() -> Self {
+        Self {
+            active: None,
+            next: 1,
+        }
+    }
+
+    /// 开始追踪新的窗口内后台命令。
+    fn begin(&mut self) -> usize {
+        let generation = self.next;
+        self.next = self.next.saturating_add(1);
+        self.active = Some(generation);
+        generation
+    }
+
+    /// 判断指定代次是否仍然是当前窗口最新命令。
+    fn is_active(&self, generation: usize) -> bool {
+        self.active == Some(generation)
+    }
+
+    /// 仅在指定代次仍然有效时结束追踪。
+    fn finish_if_active(&mut self, generation: usize) -> bool {
+        if !self.is_active(generation) {
+            return false;
+        }
+        self.active = None;
+        true
+    }
+
+    /// 取消当前窗口内后台命令的 UI 更新权限。
+    fn cancel(&mut self) {
+        self.active = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3098,6 +4674,23 @@ mod tests {
     #[test]
     fn 插件表格单元格数字按数值比较() {
         assert_eq!(compare_plugin_table_cells("20", "100"), Ordering::Less);
+    }
+
+    /// 覆盖插件窗口内部后台命令代次的竞争消解。
+    ///
+    /// 业务意图：
+    /// - 性能业务过滤会在同一个窗口内连续启动插件进程，旧进程的结果不能结束或覆盖新进程。
+    /// - 该测试只验证纯状态规则，避免依赖 GPUI 窗口和真实插件进程。
+    #[test]
+    fn 插件窗口命令代次只接受最新任务() {
+        let mut state = PluginWindowCommandGenerationState::new();
+        let first = state.begin();
+        let second = state.begin();
+
+        assert!(!state.finish_if_active(first));
+        assert!(state.is_active(second));
+        assert!(state.finish_if_active(second));
+        assert!(!state.is_active(second));
     }
 
     /// 覆盖 weaver-logext 核心列宽。
@@ -3127,6 +4720,7 @@ mod tests {
                 "操作".to_string(),
             ],
             rows: Vec::new(),
+            performance_filter: None,
             row_actions: vec![vec![PluginTableRowAction {
                 label: "显示SQL".to_string(),
                 title: None,
@@ -3155,6 +4749,7 @@ mod tests {
         let table = PluginPageTable {
             headers: vec!["请求地址".to_string(), "操作".to_string()],
             rows: vec![vec!["/api".to_string(), String::new()]],
+            performance_filter: None,
             row_actions: vec![vec![PluginTableRowAction {
                 label: "详情".to_string(),
                 title: None,
@@ -3204,6 +4799,7 @@ mod tests {
         let table = PluginPageTable {
             headers: vec!["SQL文本".to_string()],
             rows: vec![vec![long_sql]],
+            performance_filter: None,
             row_actions: Vec::new(),
         };
 
@@ -3223,11 +4819,74 @@ mod tests {
             1..5
         );
     }
+
+    /// 覆盖步骤式输出打字机按字符截取正文。
+    ///
+    /// 业务意图：
+    /// - E9 memory 分析结果包含中文路径、中文异常原因和原始日志摘要，打字机效果必须按字符推进。
+    /// - 如果按字节截取，多字节中文会在渲染前被切坏，导致窗口正文丢失或 panic。
+    #[test]
+    fn 插件步骤正文打字机按字符推进() {
+        assert_eq!(
+            PluginPageWindowView::visible_output_step_text("a中b", 2),
+            "a中"
+        );
+    }
+
+    /// 覆盖 E9 输出中的日志路径行识别。
+    ///
+    /// 业务意图：
+    /// - memory 扫描摘要中的日志路径需要用灰色弱化显示，但普通异常说明仍应使用正文颜色。
+    /// - 只识别插件约定的 `- <path>` 形态，避免误把诊断结论或完成摘要染成路径样式。
+    #[test]
+    fn 插件步骤普通文本能识别日志路径行() {
+        assert!(
+            PluginPageWindowView::output_step_plain_text_line_is_log_path(
+                "- 192.168.9.172downLog.zip!/2026-05-21/memory_2026-05-21.log"
+            )
+        );
+        assert!(
+            !PluginPageWindowView::output_step_plain_text_line_is_log_path(
+                "异常行 2177 [2026-05-21 03:01:45] 单次FGCT增长超过2秒"
+            )
+        );
+    }
+
+    /// 覆盖 E9 memory 异常上下文内部协议解析。
+    ///
+    /// 业务意图：
+    /// - 插件返回的日志片段标记必须被宿主转换成结构化块，避免用户在流式输出中看到内部协议文本。
+    /// - 高亮词和异常行标记会影响截图式日志块渲染，解析错误会直接降低问题定位效率。
+    #[test]
+    fn 插件步骤日志片段解析为结构化块() {
+        let blocks = PluginPageWindowView::parse_output_step_text_blocks(
+            "开始\n@@LC_LOG_SNIPPET_BEGIN\n@@LC_LOG_LINE\t42\tissue\t91.2\t2026-05-22 00:00:12\t100\t87.3\t91.2\n@@LC_LOG_SNIPPET_END\n完成\n",
+        );
+
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(
+            blocks[0],
+            PluginOutputStepTextBlock::Text(vec!["开始".to_string()])
+        );
+        let PluginOutputStepTextBlock::LogSnippet(lines) = &blocks[1] else {
+            panic!("第二个块应为日志片段");
+        };
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].line_number, "42");
+        assert!(lines[0].is_issue);
+        assert_eq!(lines[0].highlight_terms, vec!["91.2"]);
+        assert!(lines[0].text.contains("12    100    87.3"));
+        assert_eq!(
+            blocks[2],
+            PluginOutputStepTextBlock::Text(vec!["完成".to_string(), " ".to_string()])
+        );
+    }
 }
 
 impl Render for PluginPageWindowView {
-    fn render(&mut self, _window: &mut Window, context: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, context: &mut Context<Self>) -> impl IntoElement {
         let palette = self.palette;
+        let has_output_steps = !self.page.output_steps.is_empty();
         div()
             .size_full()
             .flex()
@@ -3251,24 +4910,35 @@ impl Render for PluginPageWindowView {
                     .min_h_0()
                     .overflow_hidden()
                     .p_5()
-                    .when_some(self.page.description.clone(), |body, description| {
-                        body.child(
-                            div()
-                                .text_sm()
-                                .line_height(px(20.0))
-                                .text_color(rgb(palette.muted_text))
-                                .child(description),
+                    .when(has_output_steps, |body| {
+                        body.child(self.render_output_steps(palette, window))
+                    })
+                    .when(!has_output_steps, |body| {
+                        body.when_some(self.page.description.clone(), |body, description| {
+                            body.child(
+                                div()
+                                    .text_sm()
+                                    .line_height(px(20.0))
+                                    .text_color(rgb(palette.muted_text))
+                                    .child(description),
+                            )
+                        })
+                        .when_some(self.page.progress.as_ref(), |body, progress| {
+                            body.child(self.render_progress_card(progress, palette))
+                        })
+                        .when(!self.page.stats.is_empty(), |body| {
+                            body.child(self.render_stat_grid(palette))
+                        })
+                        .when(!self.page.output.is_empty(), |body| {
+                            body.child(self.render_output_flow(palette))
+                        })
+                        .when_some(
+                            self.page.table.as_ref(),
+                            |body, table| {
+                                body.child(self.render_table_filter_bar(table, palette, context))
+                                    .child(self.render_table(table, palette, context))
+                            },
                         )
-                    })
-                    .when_some(self.page.progress.as_ref(), |body, progress| {
-                        body.child(self.render_progress_card(progress, palette))
-                    })
-                    .when(!self.page.stats.is_empty(), |body| {
-                        body.child(self.render_stat_grid(palette))
-                    })
-                    .when_some(self.page.table.as_ref(), |body, table| {
-                        body.child(self.render_table_filter_bar(table, palette, context))
-                            .child(self.render_table(table, palette, context))
                     }),
             )
     }
@@ -3301,6 +4971,7 @@ impl MainView {
         generation: usize,
         origin_plugin: Option<PluginDefinition>,
         origin_log_sources: BTreeMap<String, LogFileSource>,
+        origin_log_files: Vec<PluginLogFile>,
         result: Result<PluginCommandResponse, String>,
         app: &mut App,
     ) {
@@ -3324,6 +4995,7 @@ impl MainView {
                     page,
                     origin_plugin,
                     origin_log_sources,
+                    origin_log_files,
                     app,
                 );
             }
@@ -3343,6 +5015,7 @@ impl MainView {
                     Self::plugin_message_page(prefix, message),
                     origin_plugin,
                     origin_log_sources,
+                    origin_log_files,
                     app,
                 );
             }
@@ -3357,6 +5030,7 @@ impl MainView {
                     Self::plugin_error_page(message),
                     origin_plugin,
                     origin_log_sources,
+                    origin_log_files,
                     app,
                 );
             }
@@ -3373,6 +5047,7 @@ impl MainView {
         page: PluginPage,
         origin_plugin: Option<PluginDefinition>,
         origin_log_sources: BTreeMap<String, LogFileSource>,
+        origin_log_files: Vec<PluginLogFile>,
         app: &mut App,
     ) {
         let (existing_window, palette) =
@@ -3387,6 +5062,7 @@ impl MainView {
                         palette,
                         origin_plugin.clone(),
                         origin_log_sources.clone(),
+                        origin_log_files.clone(),
                         context,
                     );
                     window.set_window_title(&reused_title);
@@ -3431,6 +5107,7 @@ impl MainView {
                     palette,
                     origin_plugin,
                     origin_log_sources,
+                    origin_log_files,
                     context,
                 )
             })
@@ -3468,6 +5145,7 @@ impl MainView {
         page: PluginPage,
         origin_plugin: Option<PluginDefinition>,
         origin_log_sources: BTreeMap<String, LogFileSource>,
+        origin_log_files: Vec<PluginLogFile>,
         context: &mut Context<Self>,
     ) {
         context
@@ -3483,6 +5161,7 @@ impl MainView {
                             page,
                             origin_plugin,
                             origin_log_sources,
+                            origin_log_files,
                             app,
                         );
                     }
@@ -3501,8 +5180,36 @@ impl MainView {
             title,
             description: Some("插件正在后台处理数据，处理完成后会自动替换为结果页面。".to_string()),
             stats: Vec::new(),
+            output: Vec::new(),
+            output_steps: Vec::new(),
             table: None,
             progress: Some(progress),
+        }
+    }
+
+    /// 构造插件步骤式运行初始页面。
+    ///
+    /// 业务意图：
+    /// - E9 日志分析点击后需要立即显示具体步骤“正在分析memory日志”，不展示通用进度条。
+    /// - 页面只携带步骤模型，后续 stdout 事件追加正文；旧插件仍使用 `plugin_running_page`。
+    pub(in crate::app) fn plugin_step_running_page(
+        title: String,
+        initial_step: PluginInitialOutputStep,
+    ) -> PluginPage {
+        PluginPage {
+            title,
+            description: None,
+            stats: Vec::new(),
+            output: Vec::new(),
+            output_steps: vec![PluginOutputStep {
+                id: initial_step.id,
+                loading_text: initial_step.loading_text,
+                done_text: None,
+                status: PluginOutputStepStatus::Running,
+                content: String::new(),
+            }],
+            table: None,
+            progress: None,
         }
     }
 
@@ -3512,6 +5219,8 @@ impl MainView {
             title: prefix.to_string(),
             description: Some(message),
             stats: Vec::new(),
+            output: Vec::new(),
+            output_steps: Vec::new(),
             table: None,
             progress: None,
         }
@@ -3523,6 +5232,8 @@ impl MainView {
             title: "插件执行失败".to_string(),
             description: Some(message),
             stats: Vec::new(),
+            output: Vec::new(),
+            output_steps: Vec::new(),
             table: None,
             progress: None,
         }
@@ -3543,15 +5254,15 @@ impl MainView {
         }
     }
 
-    /// 启动插件进度轮询任务。
+    /// 启动插件流式事件轮询任务。
     ///
     /// 业务意图：
-    /// - 后台插件进程通过标准库通道传回进度；UI 线程定时批量取出，避免跨线程直接修改 GPUI 状态。
+    /// - 后台插件进程通过标准库通道传回进度和瀑布流输出；UI 线程定时批量取出，避免跨线程直接修改 GPUI 状态。
     /// - 代次不匹配时停止轮询，防止旧插件命令覆盖新命令窗口。
-    pub(in crate::app) fn spawn_plugin_progress_poller(
+    pub(in crate::app) fn spawn_plugin_event_poller(
         &self,
         generation: usize,
-        receiver: mpsc::Receiver<PluginCommandProgress>,
+        receiver: mpsc::Receiver<PluginCommandRuntimeEvent>,
         context: &mut Context<Self>,
     ) {
         context
@@ -3562,7 +5273,7 @@ impl MainView {
                         .await;
                     let keep_polling = view
                         .update(app, |view, context| {
-                            view.drain_plugin_progress_events(generation, &receiver, context)
+                            view.drain_plugin_runtime_events(generation, &receiver, context)
                         })
                         .unwrap_or(false);
                     if !keep_polling {
@@ -3573,11 +5284,11 @@ impl MainView {
             .detach();
     }
 
-    /// 从通道取出插件进度并刷新窗口。
-    fn drain_plugin_progress_events(
+    /// 从通道取出插件运行时事件并刷新窗口。
+    fn drain_plugin_runtime_events(
         &mut self,
         generation: usize,
-        receiver: &mpsc::Receiver<PluginCommandProgress>,
+        receiver: &mpsc::Receiver<PluginCommandRuntimeEvent>,
         context: &mut Context<Self>,
     ) -> bool {
         if self.plugins.active_command_generation != Some(generation) {
@@ -3585,9 +5296,13 @@ impl MainView {
         }
         let mut disconnected = false;
         let mut latest_progress = None;
+        let mut runtime_events = Vec::new();
         loop {
             match receiver.try_recv() {
-                Ok(progress) => latest_progress = Some(progress),
+                Ok(PluginCommandRuntimeEvent::Progress(progress)) => {
+                    latest_progress = Some(progress)
+                }
+                Ok(event) => runtime_events.push(event),
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     disconnected = true;
@@ -3601,6 +5316,16 @@ impl MainView {
             if let Some(window_handle) = self.plugins.page_window {
                 let _ = window_handle.update(context, |window_view, _window, context| {
                     window_view.set_progress(progress, context);
+                });
+            }
+            context.notify();
+        }
+        if !runtime_events.is_empty() {
+            if let Some(window_handle) = self.plugins.page_window {
+                let _ = window_handle.update(context, |window_view, _window, context| {
+                    for event in runtime_events {
+                        window_view.apply_plugin_runtime_event(event, context);
+                    }
                 });
             }
             context.notify();
@@ -3660,10 +5385,11 @@ impl MainView {
             Some(files.len() as u64),
             "文件",
         );
-        let (progress_sender, progress_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::channel();
         self.plugins.status_message = Some(initial_progress.message.clone());
         let origin_plugin = Some(plugin.clone());
         let origin_log_sources = Self::plugin_log_source_map(&files);
+        let origin_log_files = files.clone();
         self.schedule_open_plugin_page_window_from_context(
             context.entity(),
             generation,
@@ -3671,9 +5397,10 @@ impl MainView {
             Self::plugin_running_page(title, initial_progress),
             origin_plugin.clone(),
             origin_log_sources.clone(),
+            origin_log_files.clone(),
             context,
         );
-        self.spawn_plugin_progress_poller(generation, progress_receiver, context);
+        self.spawn_plugin_event_poller(generation, event_receiver, context);
         let command_context = PluginCommandContext::LogTreeMenu { menu_id, files };
         let main_view = context.entity();
         context
@@ -3685,7 +5412,7 @@ impl MainView {
                             &plugin,
                             &command_id,
                             command_context,
-                            Some(progress_sender),
+                            Some(event_sender),
                         )
                     })
                     .await;
@@ -3695,6 +5422,7 @@ impl MainView {
                         generation,
                         origin_plugin,
                         origin_log_sources,
+                        origin_log_files,
                         result,
                         app,
                     );
@@ -3735,16 +5463,49 @@ impl MainView {
             self.plugins.status_message = Some("插件 manifest 不可用，无法执行命令".to_string());
             return;
         };
-        let tree = match &self.log.load_state {
-            LogTreeLoadState::Loaded(tree_state) => tree_state.tree.clone(),
+        let toolbar_contribution = manifest
+            .contributes
+            .log_toolbar
+            .iter()
+            .find(|contribution| contribution.id == toolbar_id)
+            .cloned();
+        let settings = load_plugin_settings(manifest);
+        let toolbar_snapshot_filter = toolbar_contribution
+            .as_ref()
+            .and_then(|contribution| contribution.initial_step.as_ref())
+            .filter(|initial_step| initial_step.id == "memory")
+            .map(|_| {
+                // E9 当前已实现 memory 和连接池两个步骤，宿主快照只预收这两类候选路径，
+                // 避免把线程、stdout、配置文件等无关条目序列化给插件导致首轮扫描变慢。
+                ["memory", "pool"]
+                    .iter()
+                    .filter_map(|key| settings.get(*key))
+                    .map(String::as_str)
+                    .filter(|patterns| !patterns.trim().is_empty())
+                    .collect::<Vec<_>>()
+                    .join(";")
+            })
+            .filter(|patterns| !patterns.trim().is_empty());
+        let (tree, toolbar_snapshot_cache_key, cached_toolbar_snapshot) = match &self.log.load_state
+        {
+            LogTreeLoadState::Loaded(tree_state) => {
+                let cache_key = LoadedLogTreeState::plugin_toolbar_snapshot_cache_key(
+                    &tree_state.tree,
+                    toolbar_snapshot_filter.as_deref(),
+                );
+                let cached = self.plugins.toolbar_snapshot_cache.get(&cache_key).cloned();
+                (tree_state.tree.clone(), cache_key, cached)
+            }
             _ => {
                 self.plugins.status_message = Some("请先加载日志，再执行插件分析".to_string());
                 return;
             }
         };
-        let settings = load_plugin_settings(manifest);
         let generation = self.plugins.begin_command_generation();
-        let title = format!("{} 正在处理", plugin.name);
+        let title = toolbar_contribution
+            .as_ref()
+            .map(|contribution| contribution.title.clone())
+            .unwrap_or_else(|| format!("{} 正在处理", plugin.name));
         let initial_progress = PluginCommandProgress {
             message: format!("正在收集日志树快照：{}", plugin.name),
             detail: Some("正在后台遍历当前加载的日志树和压缩包目录".to_string()),
@@ -3752,71 +5513,144 @@ impl MainView {
             total: None,
             unit: Some("条目".to_string()),
         };
-        let (progress_sender, progress_receiver) = mpsc::channel();
+        let initial_page = toolbar_contribution
+            .as_ref()
+            .and_then(|contribution| contribution.initial_step.clone())
+            .map(|initial_step| Self::plugin_step_running_page(title.clone(), initial_step))
+            .unwrap_or_else(|| Self::plugin_running_page(title.clone(), initial_progress.clone()));
+        let (event_sender, event_receiver) = mpsc::channel();
         self.plugins.status_message = Some(initial_progress.message.clone());
         let origin_plugin = Some(plugin.clone());
+        let initial_origin_log_files = Vec::new();
         self.schedule_open_plugin_page_window_from_context(
             context.entity(),
             generation,
             title.clone(),
-            Self::plugin_running_page(title, initial_progress),
+            initial_page,
             origin_plugin.clone(),
             BTreeMap::new(),
+            initial_origin_log_files,
             context,
         );
-        self.spawn_plugin_progress_poller(generation, progress_receiver, context);
+        self.spawn_plugin_event_poller(generation, event_receiver, context);
         let main_view = context.entity();
-        let progress_sender_for_snapshot = progress_sender.clone();
+        let event_sender_for_snapshot = event_sender.clone();
         let plugin_name_for_worker = plugin.name.clone();
         context
             .spawn(async move |_view, app| {
-                let (origin_log_sources, result) = app
+                let (snapshot_for_cache, origin_log_sources, origin_log_files, result) = app
                     .background_executor()
                     .spawn(async move {
-                        let _ = progress_sender_for_snapshot.send(PluginCommandProgress {
-                            message: format!("正在收集日志树快照：{}", plugin_name_for_worker),
-                            detail: Some("正在后台遍历当前加载的日志树和压缩包目录".to_string()),
-                            done: 0,
-                            total: None,
-                            unit: Some("条目".to_string()),
-                        });
+                        let (files, snapshot_for_cache) =
+                            if let Some(cached_files) = cached_toolbar_snapshot {
+                                let _ = event_sender_for_snapshot.send(
+                                    PluginCommandRuntimeEvent::Progress(PluginCommandProgress {
+                                        message: format!(
+                                            "正在执行插件：{}",
+                                            plugin_name_for_worker
+                                        ),
+                                        detail: Some(format!(
+                                            "已复用日志树快照缓存，候选 E9 日志 {} 个",
+                                            cached_files.len()
+                                        )),
+                                        done: 0,
+                                        total: Some(cached_files.len() as u64),
+                                        unit: Some("条目".to_string()),
+                                    }),
+                                );
+                                (cached_files, None)
+                            } else {
+                                let _ = event_sender_for_snapshot.send(
+                                    PluginCommandRuntimeEvent::Progress(PluginCommandProgress {
+                                        message: format!(
+                                            "正在收集日志树快照：{}",
+                                            plugin_name_for_worker
+                                        ),
+                                        detail: Some(
+                                            "正在后台遍历当前加载的日志树和压缩包目录".to_string(),
+                                        ),
+                                        done: 0,
+                                        total: None,
+                                        unit: Some("条目".to_string()),
+                                    }),
+                                );
 
-                        // 日志树快照会读取压缩包目录元数据，尤其是线程日志目录下的大量
-                        // `thread_*.zip`；放在后台线程执行，避免点击工具栏按钮后阻塞主窗口。
-                        let files =
-                            LoadedLogTreeState::plugin_log_files_for_toolbar_tree_snapshot(&tree);
+                                // 日志树快照会读取压缩包目录元数据，尤其是线程日志目录下的大量
+                                // `thread_*.zip`；放在后台线程执行，避免点击工具栏按钮后阻塞主窗口。
+                                let files =
+                                    LoadedLogTreeState::plugin_log_files_for_toolbar_tree_snapshot_with_filter(
+                                        &tree,
+                                        toolbar_snapshot_filter.as_deref(),
+                                    );
+                                let snapshot_for_cache = Some(files.clone());
+                                (files, snapshot_for_cache)
+                            };
                         let origin_log_sources = Self::plugin_log_source_map(&files);
-                        let _ = progress_sender_for_snapshot.send(PluginCommandProgress {
-                            message: format!("正在执行插件：{}", plugin_name_for_worker),
-                            detail: Some(format!(
-                                "已收集 {} 个日志树条目，正在启动插件进程",
-                                files.len()
-                            )),
-                            done: 0,
-                            total: Some(files.len() as u64),
-                            unit: Some("条目".to_string()),
-                        });
+                        let origin_log_files = files.clone();
+                        let _ = event_sender_for_snapshot.send(
+                            PluginCommandRuntimeEvent::Progress(PluginCommandProgress {
+                                message: format!("正在执行插件：{}", plugin_name_for_worker),
+                                detail: Some(format!(
+                                    "已收集 {} 个日志树条目，正在启动插件进程",
+                                    files.len()
+                                )),
+                                done: 0,
+                                total: Some(files.len() as u64),
+                                unit: Some("条目".to_string()),
+                            }),
+                        );
 
                         let command_context = PluginCommandContext::LogToolbarAction {
                             toolbar_id,
                             files,
                             settings,
                         };
-                        let result = invoke_plugin_command_with_progress(
-                            &plugin,
-                            &command_id,
-                            command_context,
-                            Some(progress_sender),
-                        );
-                        (origin_log_sources, result)
+                        let allows_log_content = plugin.manifest.as_ref().is_some_and(|manifest| {
+                            manifest
+                                .permissions
+                                .iter()
+                                .any(|permission| permission == "logs.content")
+                        });
+                        let result = if allows_log_content {
+                            let origin_log_sources_for_content = origin_log_sources.clone();
+                            invoke_plugin_command_with_interactive_content_stream(
+                                &plugin,
+                                &command_id,
+                                command_context,
+                                Some(event_sender),
+                                move |request, writer, event_sender| {
+                                    PluginPageWindowView::write_requested_log_source_content_stream(
+                                        request,
+                                        &origin_log_sources_for_content,
+                                        writer,
+                                        event_sender,
+                                    )
+                                },
+                            )
+                        } else {
+                            invoke_plugin_command_with_progress(
+                                &plugin,
+                                &command_id,
+                                command_context,
+                                Some(event_sender),
+                            )
+                        };
+                        (snapshot_for_cache, origin_log_sources, origin_log_files, result)
                     })
                     .await;
                 app.update(move |app| {
+                    if let Some(files) = snapshot_for_cache {
+                        let _ = main_view.update(app, |view, _context| {
+                            view.plugins
+                                .store_toolbar_snapshot_cache(toolbar_snapshot_cache_key, files);
+                        });
+                    }
                     Self::handle_plugin_command_result_after_main_update(
                         main_view,
                         generation,
                         origin_plugin,
                         origin_log_sources,
+                        origin_log_files,
                         result,
                         app,
                     );
@@ -3852,7 +5686,7 @@ impl MainView {
         let title = format!("{} 正在处理", plugin.name);
         let initial_progress =
             Self::initial_plugin_progress(format!("正在执行插件：{}", plugin.name), None, "项");
-        let (progress_sender, progress_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::channel();
         self.plugins.status_message = Some(initial_progress.message.clone());
         let origin_plugin = Some(plugin.clone());
         self.schedule_open_plugin_page_window_from_context(
@@ -3862,9 +5696,10 @@ impl MainView {
             Self::plugin_running_page(title, initial_progress),
             origin_plugin.clone(),
             BTreeMap::new(),
+            Vec::new(),
             context,
         );
-        self.spawn_plugin_progress_poller(generation, progress_receiver, context);
+        self.spawn_plugin_event_poller(generation, event_receiver, context);
         let command_context = PluginCommandContext::NotesTreeMenu { menu_id, target };
         let main_view = context.entity();
         context
@@ -3876,7 +5711,7 @@ impl MainView {
                             &plugin,
                             &command_id,
                             command_context,
-                            Some(progress_sender),
+                            Some(event_sender),
                         )
                     })
                     .await;
@@ -3886,6 +5721,7 @@ impl MainView {
                         generation,
                         origin_plugin,
                         BTreeMap::new(),
+                        Vec::new(),
                         result,
                         app,
                     );

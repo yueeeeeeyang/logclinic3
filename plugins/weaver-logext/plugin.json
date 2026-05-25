@@ -20,7 +20,11 @@
         "title": "E9日志分析",
         "icon": "ChartNoAxesCombined",
         "command": "weaver_log_scan",
-        "when": "log_tree_loaded"
+        "when": "log_tree_loaded",
+        "initial_step": {
+          "id": "memory",
+          "loading_text": "正在分析memory日志"
+        }
       }
     ],
     "settings_tabs": [

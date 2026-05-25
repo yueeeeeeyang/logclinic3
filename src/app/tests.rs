@@ -558,6 +558,154 @@ mod state_tests {
         assert!(paths.contains(&"root/logs.zip!/inner/ecology_20260523.log"));
     }
 
+    /// 验证工具栏快照可按 E9 已实现规则预过滤无关日志。
+    ///
+    /// 业务意图：
+    /// - E9 当前只分析 memory 和连接池日志，如果仍把线程日志、stdout、web.xml 等大量条目传给插件，会在现场大压缩包中造成明显等待。
+    /// - 预过滤必须支持日期 token，确保默认 `memory_yyyy-MM-dd.log` 和 `pool_yyyyMMdd_ecology.log` 能命中真实日期文件名。
+    #[test]
+    fn 插件工具栏日志树快照可按e9已实现规则预过滤() {
+        let tree = LoadedLogTree {
+            summary: "测试树".to_string(),
+            error_count: 0,
+            temporary_paths: Vec::new(),
+            rows: vec![
+                LoadedLogTreeRow {
+                    id: 1,
+                    depth: 0,
+                    label: "root".to_string(),
+                    kind: LogTreeEntryKind::Directory,
+                    has_children: true,
+                    meta: None,
+                    error_message: None,
+                    source: None,
+                },
+                LoadedLogTreeRow {
+                    id: 2,
+                    depth: 1,
+                    label: "memory_2026-05-23.log".to_string(),
+                    kind: LogTreeEntryKind::File,
+                    has_children: false,
+                    meta: None,
+                    error_message: None,
+                    source: Some(LogFileSource::LocalFile {
+                        path: PathBuf::from("/tmp/root/memory_2026-05-23.log"),
+                    }),
+                },
+                LoadedLogTreeRow {
+                    id: 4,
+                    depth: 1,
+                    label: "pool_20260523_ecology.log".to_string(),
+                    kind: LogTreeEntryKind::File,
+                    has_children: false,
+                    meta: None,
+                    error_message: None,
+                    source: Some(LogFileSource::LocalFile {
+                        path: PathBuf::from("/tmp/root/pool_20260523_ecology.log"),
+                    }),
+                },
+                LoadedLogTreeRow {
+                    id: 3,
+                    depth: 1,
+                    label: "stdout.20260523.log".to_string(),
+                    kind: LogTreeEntryKind::File,
+                    has_children: false,
+                    meta: None,
+                    error_message: None,
+                    source: Some(LogFileSource::LocalFile {
+                        path: PathBuf::from("/tmp/root/stdout.20260523.log"),
+                    }),
+                },
+            ],
+        };
+
+        let snapshot = LoadedLogTreeState::plugin_log_files_for_toolbar_tree_snapshot_with_filter(
+            &tree,
+            Some("memory_yyyy-MM-dd.log;pool_yyyyMMdd_ecology.log"),
+        );
+        let paths = snapshot
+            .iter()
+            .map(|file| file.path_label.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            paths,
+            vec![
+                "root/memory_2026-05-23.log",
+                "root/pool_20260523_ecology.log"
+            ]
+        );
+    }
+
+    /// 验证 E9 工具栏快照缓存键会随规则和压缩包元数据变化。
+    ///
+    /// 业务意图：
+    /// - 重复点击 E9 分析应复用同一日志树的快照缓存，但用户调整已实现步骤规则或替换同名压缩包后必须重新收集候选路径。
+    /// - 这里用文件长度变化模拟压缩包替换，避免依赖不同平台文件系统的修改时间精度。
+    #[test]
+    fn 插件工具栏快照缓存键随规则和压缩包元数据变化() {
+        let temp_root = test_save_as_directory("plugin-toolbar-snapshot-cache-key");
+        let _ = fs::remove_dir_all(&temp_root);
+        fs::create_dir_all(&temp_root).expect("应能创建测试临时目录");
+        let archive_path = temp_root.join("logs.zip");
+        fs::write(&archive_path, b"old").expect("应能写入测试压缩包占位文件");
+
+        let tree = LoadedLogTree {
+            summary: "测试树".to_string(),
+            error_count: 0,
+            temporary_paths: Vec::new(),
+            rows: vec![
+                LoadedLogTreeRow {
+                    id: 1,
+                    depth: 0,
+                    label: "root".to_string(),
+                    kind: LogTreeEntryKind::Directory,
+                    has_children: true,
+                    meta: None,
+                    error_message: None,
+                    source: None,
+                },
+                LoadedLogTreeRow {
+                    id: 2,
+                    depth: 1,
+                    label: "logs.zip".to_string(),
+                    kind: LogTreeEntryKind::File,
+                    has_children: false,
+                    meta: None,
+                    error_message: None,
+                    source: Some(LogFileSource::LocalFile {
+                        path: archive_path.clone(),
+                    }),
+                },
+            ],
+        };
+
+        let memory_key = LoadedLogTreeState::plugin_toolbar_snapshot_cache_key(
+            &tree,
+            Some("memory_yyyy-MM-dd.log"),
+        );
+        let same_key = LoadedLogTreeState::plugin_toolbar_snapshot_cache_key(
+            &tree,
+            Some("memory_yyyy-MM-dd.log"),
+        );
+        let other_rule_key =
+            LoadedLogTreeState::plugin_toolbar_snapshot_cache_key(&tree, Some("stdout.*.log"));
+        fs::write(&archive_path, b"new archive bytes").expect("应能替换测试压缩包占位文件");
+        let changed_archive_key = LoadedLogTreeState::plugin_toolbar_snapshot_cache_key(
+            &tree,
+            Some("memory_yyyy-MM-dd.log"),
+        );
+
+        assert_eq!(memory_key, same_key, "同一日志树和规则应命中同一缓存键");
+        assert_ne!(memory_key, other_rule_key, "修改规则后必须重新收集快照");
+        assert_ne!(
+            memory_key, changed_archive_key,
+            "同名压缩包内容变化后必须让快照缓存失效"
+        );
+
+        fs::remove_dir_all(temp_root).expect("应能清理测试临时目录");
+    }
+
     /// 验证插件工具栏快照会继续展开单文件内层压缩包。
     ///
     /// 业务意图：
@@ -645,18 +793,27 @@ mod state_tests {
             .map(|file| file.path_label.as_str())
             .collect::<Vec<_>>();
 
-        assert!(paths.contains(&"root/outer.zip!/middle.zip!/inner.zip!/memory_2026-05-23.log"));
+        let nested_memory_path = "root/outer.zip!/middle.zip!/inner.zip!/memory_2026-05-23.log";
+        assert!(paths.contains(&nested_memory_path));
+        let nested_memory = snapshot
+            .iter()
+            .find(|file| file.path_label == nested_memory_path)
+            .expect("嵌套 memory 日志应存在于工具栏快照");
+        assert!(
+            nested_memory.host_source.is_some(),
+            "工具栏快照中的嵌套压缩包成员必须保留宿主可回读来源，供 E9 memory 分析读取正文"
+        );
 
         fs::remove_dir_all(temp_root).expect("应能清理测试临时目录");
     }
 
-    /// 验证顶层压缩包内部的标准线程 ZIP 会作为终端日志保留。
+    /// 验证顶层压缩包内部的标准线程 ZIP 会虚拟为同名线程日志。
     ///
     /// 业务意图：
     /// - 现场线程日志常见形态是 `downLog.zip!/monitorThread/yyyyMMdd/thread_HHmmss.zip`。
-    /// - 这种节点数量通常很大，路径本身已经能按泛微线程日志规则命中；工具栏快照不应再逐个解压内部 `.log`，否则会拖慢扫描。
+    /// - 这种节点数量通常很大；工具栏快照应直接把最终文件名当作 `.log` 参与匹配，不应再逐个解压内部 `.log`，否则会拖慢扫描。
     #[test]
-    fn 插件工具栏日志树快照保留线程_zip_但不逐个展开() {
+    fn 插件工具栏日志树快照将线程_zip_虚拟为_log_且不逐个展开() {
         use std::io::{Cursor, Write};
         use zip::write::SimpleFileOptions;
 
@@ -752,18 +909,36 @@ mod state_tests {
             ],
         };
 
-        let snapshot = LoadedLogTreeState::new(tree).plugin_log_files_for_toolbar_snapshot();
+        let snapshot = LoadedLogTreeState::plugin_log_files_for_toolbar_tree_snapshot_with_filter(
+            &tree,
+            Some("monitorThread/yyyyMMdd/thread_HHmmss.log"),
+        );
         let paths = snapshot
             .iter()
             .map(|file| file.path_label.as_str())
             .collect::<Vec<_>>();
 
         assert!(
-            paths.contains(&"downLog.zip!/2026-05-21/monitorThread/20260521/thread_000038.zip")
+            paths.contains(&"downLog.zip!/2026-05-21/monitorThread/20260521/thread_000038.log")
+        );
+        assert!(
+            !paths.contains(&"downLog.zip!/2026-05-21/monitorThread/20260521/thread_000038.zip")
         );
         assert!(!paths.contains(
             &"downLog.zip!/2026-05-21/monitorThread/20260521/thread_000038.zip!/thread_000038.log"
         ));
+        let thread_file = snapshot
+            .iter()
+            .find(|file| {
+                file.path_label
+                    == "downLog.zip!/2026-05-21/monitorThread/20260521/thread_000038.log"
+            })
+            .expect("标准线程 ZIP 应以虚拟 .log 路径进入工具栏快照");
+        assert_eq!(thread_file.display_name, "thread_000038.log");
+        assert!(
+            thread_file.host_source.is_some(),
+            "虚拟 .log 仍必须保留原始 ZIP 来源，后续按需读取正文时才能解压"
+        );
 
         fs::remove_dir_all(temp_root).expect("应能清理测试临时目录");
     }

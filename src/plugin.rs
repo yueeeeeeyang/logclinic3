@@ -126,6 +126,20 @@ impl PluginManifest {
             if !contribution_ids.insert(contribution.id.clone()) {
                 return Err(format!("插件贡献点 ID 重复：{}", contribution.id));
             }
+            if let Some(initial_step) = &contribution.initial_step {
+                if initial_step.id.trim().is_empty() {
+                    return Err(format!(
+                        "插件日志工具栏贡献点 {} 的初始步骤 ID 不能为空",
+                        contribution.id
+                    ));
+                }
+                if initial_step.loading_text.trim().is_empty() {
+                    return Err(format!(
+                        "插件日志工具栏贡献点 {} 的初始步骤加载文案不能为空",
+                        contribution.id
+                    ));
+                }
+            }
         }
         let mut setting_keys = HashSet::new();
         for contribution in &self.contributes.settings_tabs {
@@ -270,6 +284,13 @@ pub(crate) struct PluginToolbarContribution {
     pub(crate) command: Option<String>,
     /// 简单启用条件；第一版只保留给后续扩展，当前不在宿主侧解析表达式。
     pub(crate) when: Option<String>,
+    /// 可选的初始步骤声明。
+    ///
+    /// 业务意图：
+    /// - E9 日志分析这类插件希望点击后立即展示“正在分析 memory 日志”，而不是通用进度条。
+    /// - 初始步骤仍由宿主声明式渲染，插件进程启动后再通过步骤事件追加正文和结束状态。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) initial_step: Option<PluginInitialOutputStep>,
 }
 
 impl PluginToolbarContribution {
@@ -277,6 +298,19 @@ impl PluginToolbarContribution {
     pub(crate) fn command_id(&self) -> &str {
         self.command.as_deref().unwrap_or(&self.id)
     }
+}
+
+/// 插件工具栏入口的初始步骤声明。
+///
+/// 业务意图：
+/// - 工具栏按钮点击后，宿主需要在后台快照扫描和插件启动前先打开独立窗口。
+/// - 该结构只包含启动窗口所需的稳定步骤 ID 和运行中文案，避免把插件运行状态写死在主程序里。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PluginInitialOutputStep {
+    /// 步骤稳定 ID，后续 stdout 步骤事件通过该 ID 追加正文或结束步骤。
+    pub(crate) id: String,
+    /// 步骤运行中显示的中文加载文案。
+    pub(crate) loading_text: String,
 }
 
 /// 插件设置页签贡献。
@@ -475,6 +509,22 @@ pub(crate) enum PluginCommandContext {
         #[serde(default)]
         data: BTreeMap<String, String>,
     },
+    /// 插件表格行内动作针对当前页面来源快照发起的二次命令。
+    ///
+    /// 业务意图：
+    /// - 性能汇总这类页面不能在首次响应中内嵌每个汇总行的完整明细页，否则几万条日志会让 JSON、内存和窗口初始化都膨胀。
+    /// - 插件可以只把动作参数写入按钮；宿主点击时再把当前窗口保存的原始日志文件快照补回 `files` 后调用插件。
+    /// - 该上下文仍只携带用户触发插件时已经授权的日志元数据，不允许插件扩大读取范围。
+    TableAction {
+        /// 行动作 ID，由插件自行定义。
+        action_id: String,
+        /// 当前插件页面来源日志快照；插件首个响应中通常传空，由宿主在点击时补齐。
+        #[serde(default)]
+        files: Vec<PluginLogFile>,
+        /// 附加业务参数，例如汇总请求地址。
+        #[serde(default)]
+        data: BTreeMap<String, String>,
+    },
     /// 笔记树菜单上下文。
     NotesTreeMenu {
         /// 菜单贡献点 ID。
@@ -566,6 +616,71 @@ pub(crate) enum PluginCommandEvent {
         /// 进度快照。
         progress: PluginCommandProgress,
     },
+    /// 插件追加一行瀑布流输出。
+    OutputAppend {
+        /// 追加的输出行。
+        line: PluginOutputLine,
+    },
+    /// 插件开始一个步骤式输出块。
+    OutputStepStart {
+        /// 步骤快照。
+        step: PluginOutputStep,
+    },
+    /// 插件向指定步骤追加文本块。
+    OutputStepAppend {
+        /// 步骤稳定 ID。
+        step_id: String,
+        /// 本次追加的纯文本内容。
+        text: String,
+    },
+    /// 插件结束指定步骤。
+    OutputStepFinish {
+        /// 步骤稳定 ID。
+        step_id: String,
+        /// 步骤结束后显示的标题文案。
+        done_text: String,
+        /// 步骤最终状态。
+        status: PluginOutputStepStatus,
+    },
+    /// 插件请求宿主把指定日志来源正文写入 stdin 内容流。
+    LogContentRequest {
+        /// 要读取的日志来源稳定键，必须来自当前命令上下文中的 `PluginLogFile.source_key`。
+        source_key: String,
+        /// 插件侧用于诊断展示的路径标签；宿主只作回显，不用它定位真实文件。
+        #[serde(default)]
+        path_label: Option<String>,
+    },
+}
+
+/// 插件命令运行时转发给 UI 的流式事件。
+///
+/// 业务意图：
+/// - stdout 协议事件属于跨进程 JSON 模型，UI 层不应直接解析 JSON；等待循环把它转换为进程内枚举后再通过通道传递。
+/// - 进度和瀑布流输出共享同一个通道，保证同一插件命令内事件的相对顺序尽量接近插件输出顺序。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PluginCommandRuntimeEvent {
+    /// 处理进度更新。
+    Progress(PluginCommandProgress),
+    /// 追加瀑布流输出行。
+    OutputAppend(PluginOutputLine),
+    /// 开始步骤式输出块。
+    OutputStepStart(PluginOutputStep),
+    /// 向步骤式输出块追加文本。
+    OutputStepAppend {
+        /// 步骤稳定 ID。
+        step_id: String,
+        /// 本次追加的纯文本内容。
+        text: String,
+    },
+    /// 结束步骤式输出块。
+    OutputStepFinish {
+        /// 步骤稳定 ID。
+        step_id: String,
+        /// 步骤结束后显示的标题文案。
+        done_text: String,
+        /// 步骤最终状态。
+        status: PluginOutputStepStatus,
+    },
 }
 
 /// 插件处理进度快照。
@@ -585,6 +700,95 @@ pub(crate) struct PluginCommandProgress {
     pub(crate) total: Option<u64>,
     /// 工作量单位。
     pub(crate) unit: Option<String>,
+}
+
+/// 插件瀑布流输出等级。
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PluginOutputLevel {
+    /// 普通信息。
+    #[default]
+    Info,
+    /// 成功或完成信息。
+    Success,
+    /// 需要用户关注的异常或风险。
+    Warning,
+    /// 明确错误。
+    Error,
+    /// 次要说明。
+    Muted,
+}
+
+/// 插件瀑布流输出行。
+///
+/// 业务意图：
+/// - E9 日志分析需要按文件处理顺序实时追加结果，表格不适合表达“开始、异常、完成”的连续诊断过程。
+/// - 输出行只允许纯文本和有限等级，避免插件通过富文本或 HTML 影响宿主 UI。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PluginOutputLine {
+    /// 输出等级，用于宿主选择轻量颜色和图标。
+    #[serde(default)]
+    pub(crate) level: PluginOutputLevel,
+    /// 纯文本内容。
+    pub(crate) text: String,
+}
+
+/// 插件步骤式输出状态。
+///
+/// 业务意图：
+/// - E9 日志分析按“memory 日志分析”等步骤推进，每个步骤需要独立展示运行、完成或失败状态。
+/// - 状态使用稳定字符串序列化，便于第三方插件通过任意语言生成 JSON。
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PluginOutputStepStatus {
+    /// 步骤仍在运行，宿主显示加载动画和加载文案。
+    Running,
+    /// 步骤正常完成，宿主显示完成图标和完成文案。
+    Completed,
+    /// 步骤执行结束但存在读取失败或其它可继续处理的错误。
+    Failed,
+}
+
+impl Default for PluginOutputStepStatus {
+    fn default() -> Self {
+        Self::Running
+    }
+}
+
+/// 插件步骤式输出块。
+///
+/// 业务意图：
+/// - 与旧的按行瀑布流相比，步骤模型可以把“当前正在分析什么”和“该步骤正文”绑定展示。
+/// - 正文字段保存完整文本快照；运行中 stdout 事件只追加文本块，最终响应再携带完整快照用于窗口刷新兜底。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PluginOutputStep {
+    /// 步骤稳定 ID。
+    pub(crate) id: String,
+    /// 运行中文案。
+    pub(crate) loading_text: String,
+    /// 完成或失败后的标题文案。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) done_text: Option<String>,
+    /// 当前步骤状态。
+    #[serde(default)]
+    pub(crate) status: PluginOutputStepStatus,
+    /// 步骤正文完整快照。
+    #[serde(default)]
+    pub(crate) content: String,
+}
+
+/// 插件请求宿主读取正文的目标。
+///
+/// 业务意图：
+/// - 工具栏分析面对整棵日志树，插件先用元数据筛选目标文件，再按 source_key 请求单个正文，避免一次性读取所有日志。
+/// - 路径标签只用于用户可见诊断，真实定位必须由宿主保存的 `source_key -> LogFileSource` 快照完成。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PluginContentRequest {
+    /// 日志来源稳定键。
+    pub(crate) source_key: String,
+    /// 插件回显路径标签。
+    #[serde(default)]
+    pub(crate) path_label: Option<String>,
 }
 
 /// 插件提示等级。
@@ -609,6 +813,20 @@ pub(crate) struct PluginPage {
     /// 统计摘要。
     #[serde(default)]
     pub(crate) stats: Vec<PluginPageStat>,
+    /// 瀑布流输出行。
+    ///
+    /// 业务意图：
+    /// - 插件可在运行中通过 `output_append` 追加输出，最终响应仍携带完整快照，确保窗口刷新或覆盖后不丢失已经展示的诊断内容。
+    /// - 该字段默认空以兼容旧插件页面。
+    #[serde(default)]
+    pub(crate) output: Vec<PluginOutputLine>,
+    /// 步骤式输出块。
+    ///
+    /// 业务意图：
+    /// - E9 日志分析采用按步骤推进的流式输出，运行中通过 `output_step_*` 事件更新这里的快照。
+    /// - 字段默认空，旧插件只返回 `progress/table/stats/output` 时仍按原 UI 渲染。
+    #[serde(default)]
+    pub(crate) output_steps: Vec<PluginOutputStep>,
     /// 可选表格。
     pub(crate) table: Option<PluginPageTable>,
     /// 可选处理进度。
@@ -636,6 +854,17 @@ pub(crate) struct PluginPageTable {
     pub(crate) headers: Vec<String>,
     /// 行数据。
     pub(crate) rows: Vec<Vec<String>>,
+    /// 可选的性能日志业务过滤器。
+    ///
+    /// 业务意图：
+    /// - 通用表格关键字过滤只能隐藏已有行，不能让性能汇总重新计算请求次数和平均耗时。
+    /// - 插件显式提供该字段时，宿主渲染“用户/开始时间/结束时间”过滤栏，并通过 `command` 让插件按原始日志快照重新生成表格。
+    ///
+    /// 边界条件：
+    /// - 字段默认空以兼容旧插件；第三方普通表格仍只使用本地关键字过滤。
+    /// - 命令上下文仍按插件权限清理，本字段不会让插件获得新的文件读取范围。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) performance_filter: Option<PluginPerformanceTableFilter>,
     /// 每一行对应的可点击动作。
     ///
     /// 业务意图：
@@ -647,6 +876,25 @@ pub(crate) struct PluginPageTable {
     /// - 延迟命令仍走外部进程 JSON 协议和权限剥离，不允许插件借 UI 按钮绕过宿主隔离。
     #[serde(default)]
     pub(crate) row_actions: Vec<Vec<PluginTableRowAction>>,
+}
+
+/// 插件性能表格过滤器定义。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PluginPerformanceTableFilter {
+    /// 用户过滤原始文本，多个用户使用英文逗号分隔。
+    #[serde(default)]
+    pub(crate) users: String,
+    /// 起始请求时间，格式为 `yyyy-MM-dd HH:mm:ss`，为空表示不限制。
+    #[serde(default)]
+    pub(crate) start_time: String,
+    /// 结束请求时间，格式为 `yyyy-MM-dd HH:mm:ss`，为空表示不限制。
+    #[serde(default)]
+    pub(crate) end_time: String,
+    /// 应用过滤时执行的插件命令。
+    ///
+    /// 业务意图：
+    /// - 汇总页需要重新聚合，详情页需要按请求地址和过滤条件重新筛选；这些业务规则由插件持有，宿主只负责收集输入并回调命令。
+    pub(crate) command: PluginTableRowCommand,
 }
 
 /// 插件表格行内动作。
@@ -1010,11 +1258,11 @@ pub(crate) fn uninstall_plugin(
     Ok(())
 }
 
-/// 调用插件外部进程并接收流式进度。
+/// 调用插件外部进程并接收流式事件。
 ///
 /// 业务意图：
-/// - 菜单点击后宿主会立即打开插件窗口，后台进程通过 stdout JSON Lines 上报进度，最终再输出页面响应。
-/// - `progress_sender` 为空时仍支持设置页或测试路径的同步调用，保持旧插件调用语义。
+/// - 菜单点击后宿主会立即打开插件窗口，后台进程通过 stdout JSON Lines 上报进度或瀑布流输出，最终再输出页面响应。
+/// - `event_sender` 为空时仍支持设置页或测试路径的同步调用，保持旧插件调用语义。
 ///
 /// 边界条件：
 /// - stdout 只允许插件协议 JSON 行，普通日志应写到 stderr；否则宿主会把非法输出视为协议错误。
@@ -1023,7 +1271,7 @@ pub(crate) fn invoke_plugin_command_with_progress(
     plugin: &PluginDefinition,
     command_id: &str,
     context: PluginCommandContext,
-    progress_sender: Option<mpsc::Sender<PluginCommandProgress>>,
+    event_sender: Option<mpsc::Sender<PluginCommandRuntimeEvent>>,
 ) -> Result<PluginCommandResponse, String> {
     let manifest = plugin
         .manifest
@@ -1068,7 +1316,7 @@ pub(crate) fn invoke_plugin_command_with_progress(
             return Err(format!("写入插件请求失败：{error}"));
         }
     }
-    wait_for_plugin_response(child, PLUGIN_COMMAND_TIMEOUT, progress_sender)
+    wait_for_plugin_response(child, PLUGIN_COMMAND_TIMEOUT, event_sender)
 }
 
 /// 调用插件外部进程，并在请求 JSON 后继续向 stdin 写入受控日志内容流。
@@ -1084,11 +1332,14 @@ pub(crate) fn invoke_plugin_command_with_content_stream<F>(
     plugin: &PluginDefinition,
     command_id: &str,
     context: PluginCommandContext,
-    progress_sender: Option<mpsc::Sender<PluginCommandProgress>>,
+    event_sender: Option<mpsc::Sender<PluginCommandRuntimeEvent>>,
     write_content: F,
 ) -> Result<PluginCommandResponse, String>
 where
-    F: FnOnce(&mut dyn Write, Option<&mpsc::Sender<PluginCommandProgress>>) -> Result<(), String>
+    F: FnOnce(
+            &mut dyn Write,
+            Option<&mpsc::Sender<PluginCommandRuntimeEvent>>,
+        ) -> Result<(), String>
         + Send
         + 'static,
 {
@@ -1132,7 +1383,7 @@ where
         .stdin
         .take()
         .ok_or_else(|| "插件 stdin 管道不可用".to_string())?;
-    let writer_progress_sender = progress_sender.clone();
+    let writer_event_sender = event_sender.clone();
     let (stdin_sender, stdin_receiver) = mpsc::channel();
     thread::spawn(move || {
         let mut stdin = stdin;
@@ -1140,7 +1391,7 @@ where
             .write_all(&request_raw)
             .and_then(|_| stdin.write_all(b"\n"))
             .map_err(|error| format!("写入插件请求失败：{error}"))
-            .and_then(|_| write_content(&mut stdin, writer_progress_sender.as_ref()))
+            .and_then(|_| write_content(&mut stdin, writer_event_sender.as_ref()))
             .and_then(|_| {
                 stdin
                     .flush()
@@ -1151,8 +1402,108 @@ where
     wait_for_plugin_response_with_stdin_result(
         child,
         PLUGIN_COMMAND_TIMEOUT,
-        progress_sender,
+        event_sender,
         stdin_receiver,
+    )
+}
+
+/// 调用插件外部进程，并支持插件按需请求多个日志来源正文。
+///
+/// 业务意图：
+/// - E9 工具栏分析先接收整棵日志树元数据，再由插件筛选 memory 日志并逐个请求正文，避免宿主在启动命令时盲目读取大量文件。
+/// - stdin writer 独立线程按请求顺序写入内容流，stdout 等待循环继续读取进度和瀑布流输出，防止大文件读写造成管道互相等待。
+///
+/// 边界条件：
+/// - 插件必须声明 `logs.content` 权限；否则只能做元数据分析，不能读取日志正文。
+/// - `write_content` 必须只根据宿主保存的 source_key 快照定位文件，不能信任插件回传的路径标签。
+pub(crate) fn invoke_plugin_command_with_interactive_content_stream<F>(
+    plugin: &PluginDefinition,
+    command_id: &str,
+    context: PluginCommandContext,
+    event_sender: Option<mpsc::Sender<PluginCommandRuntimeEvent>>,
+    write_content: F,
+) -> Result<PluginCommandResponse, String>
+where
+    F: FnMut(
+            PluginContentRequest,
+            &mut dyn Write,
+            Option<&mpsc::Sender<PluginCommandRuntimeEvent>>,
+        ) -> Result<(), String>
+        + Send
+        + 'static,
+{
+    if !plugin_allows_log_content(plugin) {
+        return Err("插件未声明 logs.content 权限，无法读取日志正文".to_string());
+    }
+    let manifest = plugin
+        .manifest
+        .as_ref()
+        .ok_or_else(|| "插件未成功加载，无法执行命令".to_string())?;
+    let mut command_parts = manifest.entry.command.clone();
+    let executable = command_parts
+        .first_mut()
+        .ok_or_else(|| "插件入口命令为空".to_string())?;
+    *executable = resolve_plugin_command_path(executable, plugin.root_path.as_deref())?;
+
+    let mut command = Command::new(&command_parts[0]);
+    if command_parts.len() > 1 {
+        command.args(&command_parts[1..]);
+    }
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(root_path) = plugin.root_path.as_deref() {
+        command.current_dir(root_path);
+    }
+
+    let request = PluginCommandRequest {
+        api_version: PLUGIN_API_VERSION,
+        plugin_id: manifest.id.clone(),
+        command_id: command_id.to_string(),
+        context: sanitize_plugin_context_for_permissions(plugin, context),
+    };
+    let request_raw =
+        serde_json::to_vec(&request).map_err(|error| format!("序列化插件请求失败：{error}"))?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("启动插件进程失败：{error}"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "插件 stdin 管道不可用".to_string())?;
+    let writer_event_sender = event_sender.clone();
+    let (content_request_sender, content_request_receiver) = mpsc::channel();
+    let (stdin_sender, stdin_receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut stdin = stdin;
+        let mut write_content = write_content;
+        let mut result = stdin
+            .write_all(&request_raw)
+            .and_then(|_| stdin.write_all(b"\n"))
+            .map_err(|error| format!("写入插件请求失败：{error}"));
+        if result.is_ok() {
+            for request in content_request_receiver {
+                result = write_content(request, &mut stdin, writer_event_sender.as_ref()).and_then(
+                    |_| {
+                        stdin
+                            .flush()
+                            .map_err(|error| format!("刷新插件 stdin 失败：{error}"))
+                    },
+                );
+                if result.is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = stdin_sender.send(result);
+    });
+    wait_for_plugin_response_with_interactive_stdin(
+        child,
+        PLUGIN_COMMAND_TIMEOUT,
+        event_sender,
+        stdin_receiver,
+        content_request_sender,
     )
 }
 
@@ -1176,6 +1527,66 @@ pub(crate) fn write_plugin_log_content_line(
     writer
         .write_all(b"\n")
         .map_err(|error| format!("写入日志内容流失败：{error}"))
+}
+
+/// 写入日志正文开始事件。
+pub(crate) fn write_plugin_log_content_begin(
+    writer: &mut dyn Write,
+    source_key: &str,
+    path_label: &str,
+) -> Result<(), String> {
+    serde_json::to_writer(
+        &mut *writer,
+        &serde_json::json!({
+            "event": "log_content_begin",
+            "source_key": source_key,
+            "path_label": path_label,
+        }),
+    )
+    .map_err(|error| format!("序列化日志内容开始事件失败：{error}"))?;
+    writer
+        .write_all(b"\n")
+        .map_err(|error| format!("写入日志内容开始事件失败：{error}"))
+}
+
+/// 写入日志正文结束事件。
+pub(crate) fn write_plugin_log_content_end(
+    writer: &mut dyn Write,
+    source_key: &str,
+    lines: u64,
+) -> Result<(), String> {
+    serde_json::to_writer(
+        &mut *writer,
+        &serde_json::json!({
+            "event": "log_content_end",
+            "source_key": source_key,
+            "lines": lines,
+        }),
+    )
+    .map_err(|error| format!("序列化日志内容结束事件失败：{error}"))?;
+    writer
+        .write_all(b"\n")
+        .map_err(|error| format!("写入日志内容结束事件失败：{error}"))
+}
+
+/// 写入日志正文读取错误事件。
+pub(crate) fn write_plugin_log_content_error(
+    writer: &mut dyn Write,
+    source_key: &str,
+    message: &str,
+) -> Result<(), String> {
+    serde_json::to_writer(
+        &mut *writer,
+        &serde_json::json!({
+            "event": "log_content_error",
+            "source_key": source_key,
+            "message": message,
+        }),
+    )
+    .map_err(|error| format!("序列化日志内容错误事件失败：{error}"))?;
+    writer
+        .write_all(b"\n")
+        .map_err(|error| format!("写入日志内容错误事件失败：{error}"))
 }
 
 /// 按插件声明权限清理即将发送的命令上下文。
@@ -1222,6 +1633,18 @@ fn sanitize_plugin_context_for_permissions(
         } => PluginCommandContext::LogFileAction {
             action_id,
             file: plugin_log_file_without_read_path(file),
+            data,
+        },
+        PluginCommandContext::TableAction {
+            action_id,
+            files,
+            data,
+        } => PluginCommandContext::TableAction {
+            action_id,
+            files: files
+                .into_iter()
+                .map(plugin_log_file_without_read_path)
+                .collect(),
             data,
         },
         other => other,
@@ -1474,6 +1897,20 @@ enum PluginStdoutReadEvent {
 enum ParsedPluginStdoutLine {
     /// 进度事件。
     Progress(PluginCommandProgress),
+    /// 瀑布流输出事件。
+    OutputAppend(PluginOutputLine),
+    /// 步骤开始事件。
+    OutputStepStart(PluginOutputStep),
+    /// 步骤正文追加事件。
+    OutputStepAppend { step_id: String, text: String },
+    /// 步骤结束事件。
+    OutputStepFinish {
+        step_id: String,
+        done_text: String,
+        status: PluginOutputStepStatus,
+    },
+    /// 日志正文请求事件。
+    LogContentRequest(PluginContentRequest),
     /// 最终响应。
     Response(PluginCommandResponse),
 }
@@ -1490,9 +1927,9 @@ enum ParsedPluginStdoutLine {
 fn wait_for_plugin_response(
     mut child: std::process::Child,
     timeout: Duration,
-    progress_sender: Option<mpsc::Sender<PluginCommandProgress>>,
+    event_sender: Option<mpsc::Sender<PluginCommandRuntimeEvent>>,
 ) -> Result<PluginCommandResponse, String> {
-    wait_for_plugin_response_inner(&mut child, timeout, progress_sender, None)
+    wait_for_plugin_response_inner(&mut child, timeout, event_sender, None, None)
 }
 
 /// 等待插件响应，同时监听 stdin 写入线程结果。
@@ -1503,14 +1940,32 @@ fn wait_for_plugin_response(
 fn wait_for_plugin_response_with_stdin_result(
     mut child: std::process::Child,
     timeout: Duration,
-    progress_sender: Option<mpsc::Sender<PluginCommandProgress>>,
+    event_sender: Option<mpsc::Sender<PluginCommandRuntimeEvent>>,
     stdin_result_receiver: mpsc::Receiver<Result<(), String>>,
 ) -> Result<PluginCommandResponse, String> {
     wait_for_plugin_response_inner(
         &mut child,
         timeout,
-        progress_sender,
+        event_sender,
         Some(stdin_result_receiver),
+        None,
+    )
+}
+
+/// 等待支持交互式内容请求的插件响应。
+fn wait_for_plugin_response_with_interactive_stdin(
+    mut child: std::process::Child,
+    timeout: Duration,
+    event_sender: Option<mpsc::Sender<PluginCommandRuntimeEvent>>,
+    stdin_result_receiver: mpsc::Receiver<Result<(), String>>,
+    content_request_sender: mpsc::Sender<PluginContentRequest>,
+) -> Result<PluginCommandResponse, String> {
+    wait_for_plugin_response_inner(
+        &mut child,
+        timeout,
+        event_sender,
+        Some(stdin_result_receiver),
+        Some(content_request_sender),
     )
 }
 
@@ -1518,8 +1973,9 @@ fn wait_for_plugin_response_with_stdin_result(
 fn wait_for_plugin_response_inner(
     child: &mut std::process::Child,
     timeout: Duration,
-    progress_sender: Option<mpsc::Sender<PluginCommandProgress>>,
+    event_sender: Option<mpsc::Sender<PluginCommandRuntimeEvent>>,
     stdin_result_receiver: Option<mpsc::Receiver<Result<(), String>>>,
+    mut content_request_sender: Option<mpsc::Sender<PluginContentRequest>>,
 ) -> Result<PluginCommandResponse, String> {
     let stdout = child
         .stdout
@@ -1562,8 +2018,9 @@ fn wait_for_plugin_response_inner(
     loop {
         drain_plugin_stdout_events(
             &stdout_receiver,
-            progress_sender.as_ref(),
+            event_sender.as_ref(),
             &mut final_response,
+            content_request_sender.as_ref(),
         )?;
         if !stdin_finished && let Some(receiver) = stdin_result_receiver.as_ref() {
             match receiver.try_recv() {
@@ -1591,9 +2048,11 @@ fn wait_for_plugin_response_inner(
                 let _ = stderr_reader.join();
                 drain_plugin_stdout_events(
                     &stdout_receiver,
-                    progress_sender.as_ref(),
+                    event_sender.as_ref(),
                     &mut final_response,
+                    content_request_sender.as_ref(),
                 )?;
+                drop(content_request_sender.take());
                 if !stdin_finished && let Some(receiver) = stdin_result_receiver.as_ref() {
                     match receiver.recv_timeout(Duration::from_millis(200)) {
                         Ok(Ok(())) => {}
@@ -1615,6 +2074,7 @@ fn wait_for_plugin_response_inner(
             Ok(None) if start.elapsed() >= timeout => {
                 let _ = child.kill();
                 let _ = child.wait();
+                drop(content_request_sender.take());
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
                 return Err("插件执行超时，已终止插件进程".to_string());
@@ -1628,15 +2088,53 @@ fn wait_for_plugin_response_inner(
 /// 读取并应用所有已经到达的插件 stdout 协议行。
 fn drain_plugin_stdout_events(
     receiver: &mpsc::Receiver<PluginStdoutReadEvent>,
-    progress_sender: Option<&mpsc::Sender<PluginCommandProgress>>,
+    event_sender: Option<&mpsc::Sender<PluginCommandRuntimeEvent>>,
     final_response: &mut Option<PluginCommandResponse>,
+    content_request_sender: Option<&mpsc::Sender<PluginContentRequest>>,
 ) -> Result<(), String> {
     loop {
         match receiver.try_recv() {
             Ok(PluginStdoutReadEvent::Line(line)) => match parse_plugin_stdout_line(&line)? {
                 Some(ParsedPluginStdoutLine::Progress(progress)) => {
-                    if let Some(sender) = progress_sender {
-                        let _ = sender.send(progress);
+                    if let Some(sender) = event_sender {
+                        let _ = sender.send(PluginCommandRuntimeEvent::Progress(progress));
+                    }
+                }
+                Some(ParsedPluginStdoutLine::OutputAppend(line)) => {
+                    if let Some(sender) = event_sender {
+                        let _ = sender.send(PluginCommandRuntimeEvent::OutputAppend(line));
+                    }
+                }
+                Some(ParsedPluginStdoutLine::OutputStepStart(step)) => {
+                    if let Some(sender) = event_sender {
+                        let _ = sender.send(PluginCommandRuntimeEvent::OutputStepStart(step));
+                    }
+                }
+                Some(ParsedPluginStdoutLine::OutputStepAppend { step_id, text }) => {
+                    if let Some(sender) = event_sender {
+                        let _ = sender
+                            .send(PluginCommandRuntimeEvent::OutputStepAppend { step_id, text });
+                    }
+                }
+                Some(ParsedPluginStdoutLine::OutputStepFinish {
+                    step_id,
+                    done_text,
+                    status,
+                }) => {
+                    if let Some(sender) = event_sender {
+                        let _ = sender.send(PluginCommandRuntimeEvent::OutputStepFinish {
+                            step_id,
+                            done_text,
+                            status,
+                        });
+                    }
+                }
+                Some(ParsedPluginStdoutLine::LogContentRequest(request)) => {
+                    let Some(sender) = content_request_sender else {
+                        return Err("插件请求日志正文，但当前命令不支持内容流".to_string());
+                    };
+                    if sender.send(request).is_err() {
+                        return Err("插件日志正文写入线程已经结束".to_string());
                     }
                 }
                 Some(ParsedPluginStdoutLine::Response(response)) => {
@@ -1662,6 +2160,29 @@ fn parse_plugin_stdout_line(line: &str) -> Result<Option<ParsedPluginStdoutLine>
     if let Ok(event) = serde_json::from_str::<PluginCommandEvent>(line) {
         return Ok(Some(match event {
             PluginCommandEvent::Progress { progress } => ParsedPluginStdoutLine::Progress(progress),
+            PluginCommandEvent::OutputAppend { line } => ParsedPluginStdoutLine::OutputAppend(line),
+            PluginCommandEvent::OutputStepStart { step } => {
+                ParsedPluginStdoutLine::OutputStepStart(step)
+            }
+            PluginCommandEvent::OutputStepAppend { step_id, text } => {
+                ParsedPluginStdoutLine::OutputStepAppend { step_id, text }
+            }
+            PluginCommandEvent::OutputStepFinish {
+                step_id,
+                done_text,
+                status,
+            } => ParsedPluginStdoutLine::OutputStepFinish {
+                step_id,
+                done_text,
+                status,
+            },
+            PluginCommandEvent::LogContentRequest {
+                source_key,
+                path_label,
+            } => ParsedPluginStdoutLine::LogContentRequest(PluginContentRequest {
+                source_key,
+                path_label,
+            }),
         }));
     }
     serde_json::from_str::<PluginCommandResponse>(line)
@@ -1822,9 +2343,13 @@ mod tests {
     "log_toolbar": [
       {
         "id": "weaver.log_scan",
-        "title": "泛微日志分析",
+        "title": "E9日志分析",
         "icon": "Search",
-        "command": "weaver_log_scan"
+        "command": "weaver_log_scan",
+        "initial_step": {
+          "id": "memory",
+          "loading_text": "正在分析memory日志"
+        }
       }
     ],
     "settings_tabs": [
@@ -1849,6 +2374,13 @@ mod tests {
         assert_eq!(
             manifest.contributes.log_toolbar[0].command_id(),
             "weaver_log_scan"
+        );
+        assert_eq!(
+            manifest.contributes.log_toolbar[0]
+                .initial_step
+                .as_ref()
+                .map(|step| step.loading_text.as_str()),
+            Some("正在分析memory日志")
         );
         assert_eq!(manifest.contributes.settings_tabs[0].title, "泛微插件");
         assert_eq!(
@@ -2019,6 +2551,59 @@ mod tests {
             panic!("应解析为最终响应");
         };
         assert_eq!(message, "完成");
+    }
+
+    #[test]
+    fn 插件_stdout_协议行支持瀑布流输出和正文请求事件() {
+        let output_line =
+            r#"{"event":"output_append","line":{"level":"warning","text":"异常行 2"}}"#;
+        let parsed_output = parse_plugin_stdout_line(output_line).expect("输出事件应能解析");
+        let Some(ParsedPluginStdoutLine::OutputAppend(line)) = parsed_output else {
+            panic!("应解析为瀑布流输出事件");
+        };
+        assert_eq!(line.level, PluginOutputLevel::Warning);
+        assert_eq!(line.text, "异常行 2");
+
+        let request_line = r#"{"event":"log_content_request","source_key":"local:/tmp/memory.log","path_label":"memory.log"}"#;
+        let parsed_request = parse_plugin_stdout_line(request_line).expect("正文请求应能解析");
+        let Some(ParsedPluginStdoutLine::LogContentRequest(request)) = parsed_request else {
+            panic!("应解析为日志正文请求事件");
+        };
+        assert_eq!(request.source_key, "local:/tmp/memory.log");
+        assert_eq!(request.path_label.as_deref(), Some("memory.log"));
+    }
+
+    #[test]
+    fn 插件_stdout_协议行支持步骤式输出事件() {
+        let start_line = r#"{"event":"output_step_start","step":{"id":"memory","loading_text":"正在分析memory日志","status":"running","content":""}}"#;
+        let parsed_start = parse_plugin_stdout_line(start_line).expect("步骤开始事件应能解析");
+        let Some(ParsedPluginStdoutLine::OutputStepStart(step)) = parsed_start else {
+            panic!("应解析为步骤开始事件");
+        };
+        assert_eq!(step.id, "memory");
+        assert_eq!(step.status, PluginOutputStepStatus::Running);
+
+        let append_line = r#"{"event":"output_step_append","step_id":"memory","text":"扫描到 1 个 memory 日志\n"}"#;
+        let parsed_append = parse_plugin_stdout_line(append_line).expect("步骤追加事件应能解析");
+        let Some(ParsedPluginStdoutLine::OutputStepAppend { step_id, text }) = parsed_append else {
+            panic!("应解析为步骤追加事件");
+        };
+        assert_eq!(step_id, "memory");
+        assert!(text.contains("扫描到 1 个 memory 日志"));
+
+        let finish_line = r#"{"event":"output_step_finish","step_id":"memory","done_text":"memory日志已分析完毕","status":"completed"}"#;
+        let parsed_finish = parse_plugin_stdout_line(finish_line).expect("步骤结束事件应能解析");
+        let Some(ParsedPluginStdoutLine::OutputStepFinish {
+            step_id,
+            done_text,
+            status,
+        }) = parsed_finish
+        else {
+            panic!("应解析为步骤结束事件");
+        };
+        assert_eq!(step_id, "memory");
+        assert_eq!(done_text, "memory日志已分析完毕");
+        assert_eq!(status, PluginOutputStepStatus::Completed);
     }
 
     #[test]

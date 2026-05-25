@@ -322,7 +322,7 @@ impl MainView {
         let generation = self.plugins.begin_command_generation();
         let initial_progress =
             Self::initial_plugin_progress(format!("正在打开插件页面：{title}"), None, "项");
-        let (progress_sender, progress_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::channel();
         self.plugins.status_message = Some(initial_progress.message.clone());
         let origin_plugin = Some(plugin.clone());
         self.schedule_open_plugin_page_window_from_context(
@@ -332,9 +332,10 @@ impl MainView {
             Self::plugin_running_page(title, initial_progress),
             origin_plugin.clone(),
             std::collections::BTreeMap::new(),
+            Vec::new(),
             context,
         );
-        self.spawn_plugin_progress_poller(generation, progress_receiver, context);
+        self.spawn_plugin_event_poller(generation, event_receiver, context);
         let command_context = PluginCommandContext::NavigationPage;
         let main_view = context.entity();
         context
@@ -346,7 +347,7 @@ impl MainView {
                             &plugin,
                             &command_id,
                             command_context,
-                            Some(progress_sender),
+                            Some(event_sender),
                         )
                     })
                     .await;
@@ -356,6 +357,7 @@ impl MainView {
                         generation,
                         origin_plugin,
                         std::collections::BTreeMap::new(),
+                        Vec::new(),
                         result,
                         app,
                     );

@@ -524,6 +524,16 @@ pub(in crate::app) struct PluginWorkspaceState {
     /// 边界条件：
     /// - 代次只在当前会话内用于 UI 竞争消解，不写入配置；溢出时使用饱和加一即可，实际会话不会达到上限。
     pub(in crate::app) next_command_generation: usize,
+    /// E9 工具栏日志树快照缓存。
+    ///
+    /// 业务意图：
+    /// - E9 memory 分析重复执行时，若当前日志树和匹配规则没有变化，可以直接复用上次收集到的候选文件列表。
+    /// - 这里缓存的是插件可见的元数据快照，不包含日志正文；正文仍在插件按需请求时由宿主重新读取。
+    ///
+    /// 边界条件：
+    /// - key 由 `LoadedLogTreeState` 按日志树内容和规则生成；加载新日志或修改规则会自然生成不同 key。
+    /// - 缓存只保留少量条目，避免用户频繁加载不同大目录时长期占用内存。
+    pub(in crate::app) toolbar_snapshot_cache: HashMap<String, Vec<PluginLogFile>>,
 }
 
 impl PluginWorkspaceState {
@@ -541,6 +551,7 @@ impl PluginWorkspaceState {
             page_window: None,
             active_command_generation: None,
             next_command_generation: 1,
+            toolbar_snapshot_cache: HashMap::new(),
         }
     }
 
@@ -558,6 +569,22 @@ impl PluginWorkspaceState {
         self.next_command_generation = self.next_command_generation.saturating_add(1);
         self.active_command_generation = Some(generation);
         generation
+    }
+
+    /// 保存 E9 工具栏日志树快照缓存。
+    pub(in crate::app) fn store_toolbar_snapshot_cache(
+        &mut self,
+        key: String,
+        files: Vec<PluginLogFile>,
+    ) {
+        const MAX_TOOLBAR_SNAPSHOT_CACHE_ENTRIES: usize = 8;
+        if !self.toolbar_snapshot_cache.contains_key(&key)
+            && self.toolbar_snapshot_cache.len() >= MAX_TOOLBAR_SNAPSHOT_CACHE_ENTRIES
+            && let Some(old_key) = self.toolbar_snapshot_cache.keys().next().cloned()
+        {
+            self.toolbar_snapshot_cache.remove(&old_key);
+        }
+        self.toolbar_snapshot_cache.insert(key, files);
     }
 }
 
