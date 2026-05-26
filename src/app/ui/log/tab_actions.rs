@@ -168,6 +168,7 @@ impl MainView {
             snapshots: Vec::new(),
             thread_names: Vec::new(),
             matrix: Vec::new(),
+            concurrency_rows: Vec::new(),
         };
         // 先在当前事件循环结束后打开窗口，给用户即时反馈；后台读取和解析完成后再替换为真实结果。
         window.defer(context, move |_window, app| {
@@ -204,6 +205,7 @@ impl MainView {
                         snapshots: Vec::new(),
                         thread_names: Vec::new(),
                         matrix: Vec::new(),
+                        concurrency_rows: Vec::new(),
                     };
                     let main_view_for_update = main_view_for_progress.clone();
                     app.update(move |app| {
@@ -533,7 +535,10 @@ impl MainView {
             )),
             is_resizable: true,
             is_minimizable: true,
-            window_min_size: Some(size(px(720.0), px(420.0))),
+            window_min_size: Some(size(
+                px(THREAD_ANALYSIS_WINDOW_MIN_WIDTH),
+                px(THREAD_ANALYSIS_WINDOW_MIN_HEIGHT),
+            )),
             ..Default::default()
         };
 

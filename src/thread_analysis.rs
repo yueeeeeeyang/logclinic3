@@ -47,6 +47,12 @@ pub(crate) struct ThreadAnalysisData {
     /// - 单个色块既要展示状态，也要支持悬浮查看线程片段、单击回到主窗口定位原始日志行。
     /// - 因此矩阵保存可定位的单元详情，而不是只保存颜色所需的状态枚举。
     pub(crate) matrix: Vec<Vec<Option<Arc<ThreadTimelineCell>>>>,
+    /// 并发分析页按线程名聚合后的统计行。
+    ///
+    /// 业务意图：
+    /// - 频率时间线会默认隐藏只出现一次的线程，而并发分析需要回答“选中日志里每个线程名出现了多少次”。
+    /// - 因此该集合基于用户过滤规则后的全部线程样本构建，不受默认可见线程集合和状态图例影响。
+    pub(crate) concurrency_rows: Vec<ThreadConcurrencyRow>,
 }
 
 /// 线程日志分析后台解析进度。
@@ -199,6 +205,86 @@ pub(crate) struct ThreadTimelineCell {
     /// - 点击时间线色块会打开独立堆栈详情窗口，详情窗口必须展示完整原始片段，而不是悬浮气泡的 5 行预览。
     /// - 该字段在矩阵构建阶段从解析样本复制，点击时不再回读日志文件，避免压缩包和大文件随机读取影响交互。
     pub(crate) stack_lines: Vec<String>,
+}
+
+/// 线程并发分析中的单个线程名聚合行。
+///
+/// 业务意图：
+/// - 并发页不展示时间轴，而是把选中线程日志中的同名线程合并，帮助用户快速定位重复出现最多的业务线程。
+/// - 状态分布保留为独立计数，避免用户只能看到总数而无法区分运行、阻塞和等待样本。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ThreadConcurrencyRow {
+    /// Java 线程名。
+    pub(crate) thread_name: String,
+    /// 该线程名在过滤后全部快照中的出现次数。
+    pub(crate) total_count: usize,
+    /// RUNNABLE 状态数量。
+    pub(crate) runnable_count: usize,
+    /// BLOCKED 状态数量。
+    pub(crate) blocked_count: usize,
+    /// WAITING 状态数量。
+    pub(crate) waiting_count: usize,
+    /// TIMED_WAITING 状态数量。
+    pub(crate) timed_waiting_count: usize,
+    /// 其它状态数量。
+    ///
+    /// 业务意图：
+    /// - 并发页只保留五个高价值状态列；NEW、TERMINATED 和无法识别状态统一归入 OTHER，避免表格过宽。
+    pub(crate) other_count: usize,
+}
+
+impl ThreadConcurrencyRow {
+    /// 返回指定状态在并发聚合行中的数量。
+    ///
+    /// 业务意图：
+    /// - UI 表格按状态列渲染，测试也需要直接验证状态分布；集中映射可以避免 NEW/TERMINATED 归类逻辑散落。
+    pub(crate) fn count_for_state(&self, state: ThreadStateKind) -> usize {
+        match state {
+            ThreadStateKind::Runnable => self.runnable_count,
+            ThreadStateKind::Blocked => self.blocked_count,
+            ThreadStateKind::Waiting => self.waiting_count,
+            ThreadStateKind::TimedWaiting => self.timed_waiting_count,
+            ThreadStateKind::New | ThreadStateKind::Terminated | ThreadStateKind::Other => {
+                self.other_count
+            }
+        }
+    }
+
+    /// 累加一个线程样本状态。
+    ///
+    /// 边界条件：
+    /// - JVM 不同版本可能输出 NEW、TERMINATED 或未知状态；并发页不新增额外列，统一计入 OTHER。
+    fn push_state(&mut self, state: ThreadStateKind) {
+        self.total_count = self.total_count.saturating_add(1);
+        match state {
+            ThreadStateKind::Runnable => {
+                self.runnable_count = self.runnable_count.saturating_add(1);
+            }
+            ThreadStateKind::Blocked => {
+                self.blocked_count = self.blocked_count.saturating_add(1);
+            }
+            ThreadStateKind::Waiting => {
+                self.waiting_count = self.waiting_count.saturating_add(1);
+            }
+            ThreadStateKind::TimedWaiting => {
+                self.timed_waiting_count = self.timed_waiting_count.saturating_add(1);
+            }
+            ThreadStateKind::New | ThreadStateKind::Terminated | ThreadStateKind::Other => {
+                self.other_count = self.other_count.saturating_add(1);
+            }
+        }
+    }
+}
+
+/// 线程并发分析构建阶段的内部累加器。
+///
+/// 业务意图：
+/// - 展示行不需要暴露首次出现顺序，但排序必须用它稳定处理同次数线程；内部结构把排序元数据隔离在构建阶段。
+struct ThreadConcurrencyAccumulator {
+    /// 展示给用户的聚合行。
+    row: ThreadConcurrencyRow,
+    /// 当前线程名第一次出现在过滤后快照中的顺序。
+    first_seen_order: usize,
 }
 
 /// 线程头已识别但状态行尚未出现时的临时解析状态。
@@ -912,6 +998,55 @@ fn thread_sample_matches_filter_rules(
     })
 }
 
+/// 构建线程并发分析聚合行。
+///
+/// 业务意图：
+/// - 并发分析统计口径是“用户过滤规则之后的全部线程样本”，不能复用频率时间线的默认可见集合，
+///   否则只出现一次但对并发排查有价值的线程会被误隐藏。
+/// - 排序按总出现次数降序，次数相同时按首次出现顺序稳定排列，最后用线程名兜底，保证多次打开同一批日志顺序一致。
+fn build_thread_concurrency_rows(snapshots: &[ThreadSnapshot]) -> Vec<ThreadConcurrencyRow> {
+    let mut rows_by_thread = HashMap::<String, ThreadConcurrencyAccumulator>::new();
+    let mut next_first_seen_order = 0usize;
+
+    for snapshot in snapshots {
+        for sample in &snapshot.threads {
+            let accumulator = rows_by_thread
+                .entry(sample.name.clone())
+                .or_insert_with(|| {
+                    let first_seen_order = next_first_seen_order;
+                    next_first_seen_order = next_first_seen_order.saturating_add(1);
+                    ThreadConcurrencyAccumulator {
+                        row: ThreadConcurrencyRow {
+                            thread_name: sample.name.clone(),
+                            total_count: 0,
+                            runnable_count: 0,
+                            blocked_count: 0,
+                            waiting_count: 0,
+                            timed_waiting_count: 0,
+                            other_count: 0,
+                        },
+                        first_seen_order,
+                    }
+                });
+            accumulator.row.push_state(sample.state);
+        }
+    }
+
+    let mut rows = rows_by_thread.into_values().collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .row
+            .total_count
+            .cmp(&left.row.total_count)
+            .then_with(|| left.first_seen_order.cmp(&right.first_seen_order))
+            .then_with(|| left.row.thread_name.cmp(&right.row.thread_name))
+    });
+
+    rows.into_iter()
+        .map(|accumulator| accumulator.row)
+        .collect()
+}
+
 /// 构建线程分析窗口可直接渲染的数据矩阵。
 ///
 /// 业务意图：
@@ -940,6 +1075,7 @@ pub(crate) fn build_thread_analysis_data(
         }
     }
     let _has_snapshot_labels = snapshots.iter().any(|snapshot| !snapshot.label.is_empty());
+    let concurrency_rows = build_thread_concurrency_rows(&snapshots);
     let visible_thread_name_set = default_visible_thread_names(&snapshots, source_count);
     let all_thread_name_set = snapshots
         .iter()
@@ -1024,6 +1160,7 @@ pub(crate) fn build_thread_analysis_data(
         snapshots,
         thread_names,
         matrix,
+        concurrency_rows,
     }
 }
 

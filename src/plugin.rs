@@ -140,6 +140,26 @@ impl PluginManifest {
                     ));
                 }
             }
+            if contribution
+                .snapshot_filter_setting_keys
+                .iter()
+                .any(|key| key.trim().is_empty())
+            {
+                return Err(format!(
+                    "插件日志工具栏贡献点 {} 的快照过滤设置键不能为空",
+                    contribution.id
+                ));
+            }
+            if contribution
+                .snapshot_single_file_archive_setting_keys
+                .iter()
+                .any(|key| key.trim().is_empty())
+            {
+                return Err(format!(
+                    "插件日志工具栏贡献点 {} 的单文件压缩日志设置键不能为空",
+                    contribution.id
+                ));
+            }
         }
         let mut setting_keys = HashSet::new();
         for contribution in &self.contributes.settings_tabs {
@@ -212,7 +232,7 @@ pub(crate) struct PluginContributes {
     /// 日志分析页顶部工具栏贡献。
     ///
     /// 业务意图：
-    /// - 第三方插件可以在用户已经加载日志树后提供独立分析入口，例如泛微日志分析。
+    /// - 第三方插件可以在用户已经加载日志树后提供独立分析入口。
     /// - 宿主只暴露当前左侧树快照，不允许插件自行扩大扫描范围。
     #[serde(default)]
     pub(crate) log_toolbar: Vec<PluginToolbarContribution>,
@@ -287,10 +307,33 @@ pub(crate) struct PluginToolbarContribution {
     /// 可选的初始步骤声明。
     ///
     /// 业务意图：
-    /// - E9 日志分析这类插件希望点击后立即展示“正在分析 memory 日志”，而不是通用进度条。
+    /// - 步骤式插件希望点击后立即展示第一步的运行状态，而不是通用进度条。
     /// - 初始步骤仍由宿主声明式渲染，插件进程启动后再通过步骤事件追加正文和结束状态。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) initial_step: Option<PluginInitialOutputStep>,
+    /// 工具栏快照预过滤使用的设置键。
+    ///
+    /// 业务意图：
+    /// - 大型日志树快照可能包含大量与当前工具栏命令无关的文件；插件可以声明若干 `pattern_settings` 键，让宿主只用这些通配规则预收候选文件。
+    /// - 宿主只按键读取设置值并拼接通配规则，不理解这些键的业务含义，避免把插件特定日志类型写进主程序。
+    ///
+    /// 边界条件：
+    /// - 字段默认空表示不过滤，保持旧插件拿到完整日志树快照。
+    /// - 未命中的设置键会被忽略，避免 manifest 升级过程中旧配置缺失导致工具栏入口不可用。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) snapshot_filter_setting_keys: Vec<String>,
+    /// 工具栏快照中可按单文件压缩日志处理的设置键。
+    ///
+    /// 业务意图：
+    /// - 有些现场日志会把单个日志文件压成同名 ZIP/GZ/7Z；递归扫描这类大量压缩文件只会浪费 I/O。
+    /// - 插件可以声明哪些 `pattern_settings` 代表“单文件压缩日志”，宿主据此把 `xxx.zip` 暴露为 `xxx.log` 候选并跳过内部目录扫描。
+    /// - 宿主只按规则文本判断路径形态，不理解规则背后的业务日志类型，避免主程序包含插件专属逻辑。
+    ///
+    /// 边界条件：
+    /// - 字段默认空表示所有压缩包仍按目录递归扫描，保持旧插件行为。
+    /// - 只有同时命中这些声明规则的压缩文件才会跳过展开，普通诊断包仍能继续递归发现内部日志。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) snapshot_single_file_archive_setting_keys: Vec<String>,
 }
 
 impl PluginToolbarContribution {
@@ -335,7 +378,7 @@ pub(crate) struct PluginSettingsTabContribution {
 ///
 /// 边界条件：
 /// - `default` 保持原始字符串，宿主不解析语义；插件命令执行时再按自身规则解释。
-/// - 多个 glob 用分号分隔是 `weaver-logext` 的业务约定，宿主只负责保存和恢复。
+/// - 多个 glob 用分号分隔是插件可选择使用的约定，宿主只负责保存和恢复原始字符串。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct PluginPatternSettingContribution {
     /// 配置键。
@@ -498,21 +541,21 @@ pub(crate) enum PluginCommandContext {
     /// 插件表格行内动作针对单个日志文件发起的二次命令。
     ///
     /// 业务意图：
-    /// - 大结果集不能把所有下钻页面一次性塞进首次响应；例如 SQL 明细应在用户点击对应请求后再由插件读取并返回。
+    /// - 大结果集不能把所有下钻页面一次性塞进首次响应；重型明细应在用户点击对应行后再由插件读取并返回。
     /// - 宿主仍只传递快照化的日志元数据和字符串参数，不暴露 GPUI 内部状态，也不允许插件直接操作主窗口。
     LogFileAction {
         /// 行动作 ID，由插件自行定义，便于一个命令复用不同按钮语义。
         action_id: String,
         /// 当前行对应的日志文件快照。
         file: PluginLogFile,
-        /// 附加业务参数，例如请求地址、文件名解析字段等。
+        /// 附加业务参数，例如行标识、文件名解析字段等。
         #[serde(default)]
         data: BTreeMap<String, String>,
     },
     /// 插件表格行内动作针对当前页面来源快照发起的二次命令。
     ///
     /// 业务意图：
-    /// - 性能汇总这类页面不能在首次响应中内嵌每个汇总行的完整明细页，否则几万条日志会让 JSON、内存和窗口初始化都膨胀。
+    /// - 汇总类页面不能在首次响应中内嵌每个汇总行的完整明细页，否则几万条日志会让 JSON、内存和窗口初始化都膨胀。
     /// - 插件可以只把动作参数写入按钮；宿主点击时再把当前窗口保存的原始日志文件快照补回 `files` 后调用插件。
     /// - 该上下文仍只携带用户触发插件时已经授权的日志元数据，不允许插件扩大读取范围。
     TableAction {
@@ -521,7 +564,7 @@ pub(crate) enum PluginCommandContext {
         /// 当前插件页面来源日志快照；插件首个响应中通常传空，由宿主在点击时补齐。
         #[serde(default)]
         files: Vec<PluginLogFile>,
-        /// 附加业务参数，例如汇总请求地址。
+        /// 附加业务参数，例如汇总行标识。
         #[serde(default)]
         data: BTreeMap<String, String>,
     },
@@ -722,7 +765,7 @@ pub(crate) enum PluginOutputLevel {
 /// 插件瀑布流输出行。
 ///
 /// 业务意图：
-/// - E9 日志分析需要按文件处理顺序实时追加结果，表格不适合表达“开始、异常、完成”的连续诊断过程。
+/// - 流式日志分析需要按文件处理顺序实时追加结果，表格不适合表达“开始、异常、完成”的连续诊断过程。
 /// - 输出行只允许纯文本和有限等级，避免插件通过富文本或 HTML 影响宿主 UI。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct PluginOutputLine {
@@ -736,7 +779,7 @@ pub(crate) struct PluginOutputLine {
 /// 插件步骤式输出状态。
 ///
 /// 业务意图：
-/// - E9 日志分析按“memory 日志分析”等步骤推进，每个步骤需要独立展示运行、完成或失败状态。
+/// - 步骤式插件按多个阶段推进，每个步骤需要独立展示运行、完成或失败状态。
 /// - 状态使用稳定字符串序列化，便于第三方插件通过任意语言生成 JSON。
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -823,7 +866,7 @@ pub(crate) struct PluginPage {
     /// 步骤式输出块。
     ///
     /// 业务意图：
-    /// - E9 日志分析采用按步骤推进的流式输出，运行中通过 `output_step_*` 事件更新这里的快照。
+    /// - 步骤式插件采用按阶段推进的流式输出，运行中通过 `output_step_*` 事件更新这里的快照。
     /// - 字段默认空，旧插件只返回 `progress/table/stats/output` 时仍按原 UI 渲染。
     #[serde(default)]
     pub(crate) output_steps: Vec<PluginOutputStep>,
@@ -854,17 +897,17 @@ pub(crate) struct PluginPageTable {
     pub(crate) headers: Vec<String>,
     /// 行数据。
     pub(crate) rows: Vec<Vec<String>>,
-    /// 可选的性能日志业务过滤器。
+    /// 可选的插件命令过滤器。
     ///
     /// 业务意图：
-    /// - 通用表格关键字过滤只能隐藏已有行，不能让性能汇总重新计算请求次数和平均耗时。
-    /// - 插件显式提供该字段时，宿主渲染“用户/开始时间/结束时间”过滤栏，并通过 `command` 让插件按原始日志快照重新生成表格。
+    /// - 通用表格关键字过滤只能隐藏已有行，不能让插件基于原始日志重新计算业务统计。
+    /// - 插件显式提供该字段时，宿主只按声明渲染输入框，并通过 `command` 把原始输入值回传给插件重新生成表格。
     ///
     /// 边界条件：
     /// - 字段默认空以兼容旧插件；第三方普通表格仍只使用本地关键字过滤。
-    /// - 命令上下文仍按插件权限清理，本字段不会让插件获得新的文件读取范围。
+    /// - 宿主不理解控件业务含义，命令上下文仍按插件权限清理，本字段不会让插件获得新的文件读取范围。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) performance_filter: Option<PluginPerformanceTableFilter>,
+    pub(crate) command_filter: Option<PluginTableCommandFilter>,
     /// 每一行对应的可点击动作。
     ///
     /// 业务意图：
@@ -878,23 +921,45 @@ pub(crate) struct PluginPageTable {
     pub(crate) row_actions: Vec<Vec<PluginTableRowAction>>,
 }
 
-/// 插件性能表格过滤器定义。
+/// 插件声明式表格命令过滤器。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct PluginPerformanceTableFilter {
-    /// 用户过滤原始文本，多个用户使用英文逗号分隔。
+pub(crate) struct PluginTableCommandFilter {
+    /// 插件声明的输入控件列表。
+    ///
+    /// 业务意图：
+    /// - 控件数量、字段名、占位文案和初始值都由插件决定，宿主只提供通用单行输入能力。
     #[serde(default)]
-    pub(crate) users: String,
-    /// 起始请求时间，格式为 `yyyy-MM-dd HH:mm:ss`，为空表示不限制。
-    #[serde(default)]
-    pub(crate) start_time: String,
-    /// 结束请求时间，格式为 `yyyy-MM-dd HH:mm:ss`，为空表示不限制。
-    #[serde(default)]
-    pub(crate) end_time: String,
+    pub(crate) controls: Vec<PluginTableCommandFilterControl>,
     /// 应用过滤时执行的插件命令。
     ///
     /// 业务意图：
-    /// - 汇总页需要重新聚合，详情页需要按请求地址和过滤条件重新筛选；这些业务规则由插件持有，宿主只负责收集输入并回调命令。
+    /// - 重新聚合、筛选、校验等业务规则由插件持有，宿主只负责把控件原始文本写回命令上下文。
     pub(crate) command: PluginTableRowCommand,
+}
+
+/// 插件命令过滤器中的单个输入控件。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PluginTableCommandFilterControl {
+    /// 回写到 `TableAction.data` 的字段名。
+    ///
+    /// 边界条件：
+    /// - 空字段名会被宿主忽略，避免第三方插件错误声明导致覆盖其它上下文字段。
+    pub(crate) key: String,
+    /// 当前输入值。
+    #[serde(default)]
+    pub(crate) value: String,
+    /// 空输入时的占位文案。
+    #[serde(default)]
+    pub(crate) placeholder: String,
+    /// 可选通用图标名，例如 `user`、`search`、`calendar`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) icon: Option<String>,
+    /// 输入框建议宽度，单位为逻辑像素。
+    ///
+    /// 业务意图：
+    /// - 插件最清楚字段典型长度；宿主按建议宽度渲染，但仍会做下限保护，避免控件不可点击。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) width: Option<u32>,
 }
 
 /// 插件表格行内动作。
@@ -1410,7 +1475,7 @@ where
 /// 调用插件外部进程，并支持插件按需请求多个日志来源正文。
 ///
 /// 业务意图：
-/// - E9 工具栏分析先接收整棵日志树元数据，再由插件筛选 memory 日志并逐个请求正文，避免宿主在启动命令时盲目读取大量文件。
+/// - 工具栏插件可以先接收整棵日志树元数据，再由插件筛选需要的日志并逐个请求正文，避免宿主在启动命令时盲目读取大量文件。
 /// - stdin writer 独立线程按请求顺序写入内容流，stdout 等待循环继续读取进度和瀑布流输出，防止大文件读写造成管道互相等待。
 ///
 /// 边界条件：
@@ -2334,34 +2399,41 @@ mod tests {
     fn manifest_兼容日志工具栏和插件设置页签贡献() {
         let raw = r#"{
   "api_version": 1,
-  "id": "weaver-logext",
-  "name": "泛微日志插件",
+  "id": "sample-log-tool",
+  "name": "示例日志插件",
   "version": "0.3.0",
-  "entry": {"command": ["weaver-logext"]},
+  "entry": {"command": ["sample-log-tool"]},
   "permissions": ["ui.log_toolbar", "ui.settings_tabs"],
   "contributes": {
     "log_toolbar": [
       {
-        "id": "weaver.log_scan",
-        "title": "E9日志分析",
+        "id": "sample.log_scan",
+        "title": "日志扫描",
         "icon": "Search",
-        "command": "weaver_log_scan",
+        "command": "sample_log_scan",
+        "snapshot_filter_setting_keys": ["app"],
+        "snapshot_single_file_archive_setting_keys": ["thread"],
         "initial_step": {
-          "id": "memory",
-          "loading_text": "正在分析memory日志"
+          "id": "scan",
+          "loading_text": "正在分析日志"
         }
       }
     ],
     "settings_tabs": [
       {
-        "id": "weaver.settings",
-        "title": "泛微插件",
+        "id": "sample.settings",
+        "title": "示例插件",
         "icon": "Settings",
         "pattern_settings": [
           {
-            "key": "memory",
-            "label": "内存日志",
-            "default": "memory_yyyy-MM-dd.log"
+            "key": "app",
+            "label": "应用日志",
+            "default": "app_yyyy-MM-dd.log"
+          },
+          {
+            "key": "thread",
+            "label": "线程日志",
+            "default": "thread_HHmmss.zip"
           }
         ]
       }
@@ -2373,21 +2445,29 @@ mod tests {
 
         assert_eq!(
             manifest.contributes.log_toolbar[0].command_id(),
-            "weaver_log_scan"
+            "sample_log_scan"
+        );
+        assert_eq!(
+            manifest.contributes.log_toolbar[0].snapshot_filter_setting_keys,
+            vec!["app".to_string()]
+        );
+        assert_eq!(
+            manifest.contributes.log_toolbar[0].snapshot_single_file_archive_setting_keys,
+            vec!["thread".to_string()]
         );
         assert_eq!(
             manifest.contributes.log_toolbar[0]
                 .initial_step
                 .as_ref()
                 .map(|step| step.loading_text.as_str()),
-            Some("正在分析memory日志")
+            Some("正在分析日志")
         );
-        assert_eq!(manifest.contributes.settings_tabs[0].title, "泛微插件");
+        assert_eq!(manifest.contributes.settings_tabs[0].title, "示例插件");
         assert_eq!(
             plugin_settings_defaults(&manifest)
-                .get("memory")
+                .get("app")
                 .map(String::as_str),
-            Some("memory_yyyy-MM-dd.log")
+            Some("app_yyyy-MM-dd.log")
         );
     }
 
@@ -2405,14 +2485,14 @@ mod tests {
         "id": "settings-a",
         "title": "设置 A",
         "pattern_settings": [
-          {"key": "memory", "label": "内存日志", "default": "memory.log"}
+          {"key": "app", "label": "应用日志", "default": "app.log"}
         ]
       },
       {
         "id": "settings-b",
         "title": "设置 B",
         "pattern_settings": [
-          {"key": "memory", "label": "另一个内存日志", "default": "memory2.log"}
+          {"key": "app", "label": "另一个应用日志", "default": "app2.log"}
         ]
       }
     ]
@@ -2424,7 +2504,7 @@ mod tests {
             .expect_err("跨设置页签重复 key 应被拒绝");
 
         assert!(
-            error.contains("插件设置规则键重复：memory"),
+            error.contains("插件设置规则键重复：app"),
             "错误信息应指出重复的规则键，实际为：{error}"
         );
     }
@@ -2443,8 +2523,8 @@ mod tests {
         "id": "settings",
         "title": "插件设置",
         "pattern_settings": [
-          {"key": "memory", "label": "内存日志", "default": "memory_yyyy-MM-dd.log"},
-          {"key": "stdout", "label": "输出日志", "default": "stdout.log"}
+          {"key": "app", "label": "应用日志", "default": "app_yyyy-MM-dd.log"},
+          {"key": "other", "label": "其它日志", "default": "other.log"}
         ]
       }
     ]
@@ -2461,12 +2541,12 @@ mod tests {
         );
 
         let mut custom = BTreeMap::new();
-        custom.insert("memory".to_string(), "custom.log".to_string());
+        custom.insert("app".to_string(), "custom.log".to_string());
         custom.insert("unknown".to_string(), "ignored".to_string());
         save_plugin_settings_to_path(&path, &custom).expect("测试设置应能保存");
         let merged = load_plugin_settings_from_path(&path, defaults.clone());
-        assert_eq!(merged.get("memory").map(String::as_str), Some("custom.log"));
-        assert_eq!(merged.get("stdout").map(String::as_str), Some("stdout.log"));
+        assert_eq!(merged.get("app").map(String::as_str), Some("custom.log"));
+        assert_eq!(merged.get("other").map(String::as_str), Some("other.log"));
         assert!(!merged.contains_key("unknown"));
 
         save_plugin_settings_to_path(&path, &defaults).expect("默认设置应能写回");
@@ -2509,7 +2589,7 @@ mod tests {
         let raw = r#"{
   "entries": [
     {
-      "id": "weaver-logext",
+      "id": "sample-log-tool",
       "source": "LegacySource",
       "path": null,
       "enabled": false
@@ -2564,34 +2644,35 @@ mod tests {
         assert_eq!(line.level, PluginOutputLevel::Warning);
         assert_eq!(line.text, "异常行 2");
 
-        let request_line = r#"{"event":"log_content_request","source_key":"local:/tmp/memory.log","path_label":"memory.log"}"#;
+        let request_line = r#"{"event":"log_content_request","source_key":"local:/tmp/app.log","path_label":"app.log"}"#;
         let parsed_request = parse_plugin_stdout_line(request_line).expect("正文请求应能解析");
         let Some(ParsedPluginStdoutLine::LogContentRequest(request)) = parsed_request else {
             panic!("应解析为日志正文请求事件");
         };
-        assert_eq!(request.source_key, "local:/tmp/memory.log");
-        assert_eq!(request.path_label.as_deref(), Some("memory.log"));
+        assert_eq!(request.source_key, "local:/tmp/app.log");
+        assert_eq!(request.path_label.as_deref(), Some("app.log"));
     }
 
     #[test]
     fn 插件_stdout_协议行支持步骤式输出事件() {
-        let start_line = r#"{"event":"output_step_start","step":{"id":"memory","loading_text":"正在分析memory日志","status":"running","content":""}}"#;
+        let start_line = r#"{"event":"output_step_start","step":{"id":"scan","loading_text":"正在分析日志","status":"running","content":""}}"#;
         let parsed_start = parse_plugin_stdout_line(start_line).expect("步骤开始事件应能解析");
         let Some(ParsedPluginStdoutLine::OutputStepStart(step)) = parsed_start else {
             panic!("应解析为步骤开始事件");
         };
-        assert_eq!(step.id, "memory");
+        assert_eq!(step.id, "scan");
         assert_eq!(step.status, PluginOutputStepStatus::Running);
 
-        let append_line = r#"{"event":"output_step_append","step_id":"memory","text":"扫描到 1 个 memory 日志\n"}"#;
+        let append_line =
+            r#"{"event":"output_step_append","step_id":"scan","text":"扫描到 1 个日志\n"}"#;
         let parsed_append = parse_plugin_stdout_line(append_line).expect("步骤追加事件应能解析");
         let Some(ParsedPluginStdoutLine::OutputStepAppend { step_id, text }) = parsed_append else {
             panic!("应解析为步骤追加事件");
         };
-        assert_eq!(step_id, "memory");
-        assert!(text.contains("扫描到 1 个 memory 日志"));
+        assert_eq!(step_id, "scan");
+        assert!(text.contains("扫描到 1 个日志"));
 
-        let finish_line = r#"{"event":"output_step_finish","step_id":"memory","done_text":"memory日志已分析完毕","status":"completed"}"#;
+        let finish_line = r#"{"event":"output_step_finish","step_id":"scan","done_text":"日志已分析完毕","status":"completed"}"#;
         let parsed_finish = parse_plugin_stdout_line(finish_line).expect("步骤结束事件应能解析");
         let Some(ParsedPluginStdoutLine::OutputStepFinish {
             step_id,
@@ -2601,8 +2682,8 @@ mod tests {
         else {
             panic!("应解析为步骤结束事件");
         };
-        assert_eq!(step_id, "memory");
-        assert_eq!(done_text, "memory日志已分析完毕");
+        assert_eq!(step_id, "scan");
+        assert_eq!(done_text, "日志已分析完毕");
         assert_eq!(status, PluginOutputStepStatus::Completed);
     }
 
@@ -2616,8 +2697,8 @@ mod tests {
                 "description": null,
                 "stats": [],
                 "table": {
-                    "headers": ["请求地址", "操作"],
-                    "rows": [["/api", ""]],
+                    "headers": ["主字段", "操作"],
+                    "rows": [["alpha", ""]],
                     "row_actions": [[{
                         "label": "详情",
                         "title": "详情 - /api",
@@ -2626,7 +2707,7 @@ mod tests {
                             "description": null,
                             "stats": [],
                             "table": {
-                                "headers": ["耗时(ms)"],
+                                "headers": ["数值"],
                                 "rows": [["100"]]
                             }
                         }

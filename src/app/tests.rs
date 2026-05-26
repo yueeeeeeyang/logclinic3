@@ -503,13 +503,13 @@ mod state_tests {
                 LoadedLogTreeRow {
                     id: 2,
                     depth: 1,
-                    label: "memory_2026-05-23.log".to_string(),
+                    label: "app_2026-05-23.log".to_string(),
                     kind: LogTreeEntryKind::File,
                     has_children: false,
                     meta: None,
                     error_message: None,
                     source: Some(LogFileSource::LocalFile {
-                        path: PathBuf::from("/tmp/root/memory_2026-05-23.log"),
+                        path: PathBuf::from("/tmp/root/app_2026-05-23.log"),
                     }),
                 },
                 LoadedLogTreeRow {
@@ -554,17 +554,17 @@ mod state_tests {
             .map(|file| file.path_label.as_str())
             .collect::<Vec<_>>();
 
-        assert!(paths.contains(&"root/memory_2026-05-23.log"));
+        assert!(paths.contains(&"root/app_2026-05-23.log"));
         assert!(paths.contains(&"root/logs.zip!/inner/ecology_20260523.log"));
     }
 
-    /// 验证工具栏快照可按 E9 已实现规则预过滤无关日志。
+    /// 验证工具栏快照可按插件声明规则预过滤无关日志。
     ///
     /// 业务意图：
-    /// - E9 当前只分析 memory 和连接池日志，如果仍把线程日志、stdout、web.xml 等大量条目传给插件，会在现场大压缩包中造成明显等待。
-    /// - 预过滤必须支持日期 token，确保默认 `memory_yyyy-MM-dd.log` 和 `pool_yyyyMMdd_ecology.log` 能命中真实日期文件名。
+    /// - 插件 manifest 可以声明只需要部分日志，如果仍把大量无关条目传给插件，会在现场大压缩包中造成明显等待。
+    /// - 预过滤必须支持日期 token，确保 `app_yyyy-MM-dd.log` 和 `db_yyyyMMdd.log` 能命中真实日期文件名。
     #[test]
-    fn 插件工具栏日志树快照可按e9已实现规则预过滤() {
+    fn 插件工具栏日志树快照可按声明规则预过滤() {
         let tree = LoadedLogTree {
             summary: "测试树".to_string(),
             error_count: 0,
@@ -583,37 +583,37 @@ mod state_tests {
                 LoadedLogTreeRow {
                     id: 2,
                     depth: 1,
-                    label: "memory_2026-05-23.log".to_string(),
+                    label: "app_2026-05-23.log".to_string(),
                     kind: LogTreeEntryKind::File,
                     has_children: false,
                     meta: None,
                     error_message: None,
                     source: Some(LogFileSource::LocalFile {
-                        path: PathBuf::from("/tmp/root/memory_2026-05-23.log"),
+                        path: PathBuf::from("/tmp/root/app_2026-05-23.log"),
                     }),
                 },
                 LoadedLogTreeRow {
                     id: 4,
                     depth: 1,
-                    label: "pool_20260523_ecology.log".to_string(),
+                    label: "db_20260523.log".to_string(),
                     kind: LogTreeEntryKind::File,
                     has_children: false,
                     meta: None,
                     error_message: None,
                     source: Some(LogFileSource::LocalFile {
-                        path: PathBuf::from("/tmp/root/pool_20260523_ecology.log"),
+                        path: PathBuf::from("/tmp/root/db_20260523.log"),
                     }),
                 },
                 LoadedLogTreeRow {
                     id: 3,
                     depth: 1,
-                    label: "stdout.20260523.log".to_string(),
+                    label: "other.20260523.log".to_string(),
                     kind: LogTreeEntryKind::File,
                     has_children: false,
                     meta: None,
                     error_message: None,
                     source: Some(LogFileSource::LocalFile {
-                        path: PathBuf::from("/tmp/root/stdout.20260523.log"),
+                        path: PathBuf::from("/tmp/root/other.20260523.log"),
                     }),
                 },
             ],
@@ -621,7 +621,8 @@ mod state_tests {
 
         let snapshot = LoadedLogTreeState::plugin_log_files_for_toolbar_tree_snapshot_with_filter(
             &tree,
-            Some("memory_yyyy-MM-dd.log;pool_yyyyMMdd_ecology.log"),
+            Some("app_yyyy-MM-dd.log;db_yyyyMMdd.log"),
+            None,
         );
         let paths = snapshot
             .iter()
@@ -630,17 +631,14 @@ mod state_tests {
 
         assert_eq!(
             paths,
-            vec![
-                "root/memory_2026-05-23.log",
-                "root/pool_20260523_ecology.log"
-            ]
+            vec!["root/app_2026-05-23.log", "root/db_20260523.log"]
         );
     }
 
-    /// 验证 E9 工具栏快照缓存键会随规则和压缩包元数据变化。
+    /// 验证工具栏快照缓存键会随规则和压缩包元数据变化。
     ///
     /// 业务意图：
-    /// - 重复点击 E9 分析应复用同一日志树的快照缓存，但用户调整已实现步骤规则或替换同名压缩包后必须重新收集候选路径。
+    /// - 重复点击工具栏插件应复用同一日志树的快照缓存，但用户调整插件声明规则或替换同名压缩包后必须重新收集候选路径。
     /// - 这里用文件长度变化模拟压缩包替换，避免依赖不同平台文件系统的修改时间精度。
     #[test]
     fn 插件工具栏快照缓存键随规则和压缩包元数据变化() {
@@ -680,26 +678,38 @@ mod state_tests {
             ],
         };
 
-        let memory_key = LoadedLogTreeState::plugin_toolbar_snapshot_cache_key(
+        let app_key = LoadedLogTreeState::plugin_toolbar_snapshot_cache_key(
             &tree,
-            Some("memory_yyyy-MM-dd.log"),
+            Some("app_yyyy-MM-dd.log"),
+            None,
         );
         let same_key = LoadedLogTreeState::plugin_toolbar_snapshot_cache_key(
             &tree,
-            Some("memory_yyyy-MM-dd.log"),
+            Some("app_yyyy-MM-dd.log"),
+            None,
         );
         let other_rule_key =
-            LoadedLogTreeState::plugin_toolbar_snapshot_cache_key(&tree, Some("stdout.*.log"));
+            LoadedLogTreeState::plugin_toolbar_snapshot_cache_key(&tree, Some("other.*.log"), None);
+        let single_archive_rule_key = LoadedLogTreeState::plugin_toolbar_snapshot_cache_key(
+            &tree,
+            Some("app_yyyy-MM-dd.log"),
+            Some("thread_HHmmss.zip"),
+        );
         fs::write(&archive_path, b"new archive bytes").expect("应能替换测试压缩包占位文件");
         let changed_archive_key = LoadedLogTreeState::plugin_toolbar_snapshot_cache_key(
             &tree,
-            Some("memory_yyyy-MM-dd.log"),
+            Some("app_yyyy-MM-dd.log"),
+            None,
         );
 
-        assert_eq!(memory_key, same_key, "同一日志树和规则应命中同一缓存键");
-        assert_ne!(memory_key, other_rule_key, "修改规则后必须重新收集快照");
+        assert_eq!(app_key, same_key, "同一日志树和规则应命中同一缓存键");
+        assert_ne!(app_key, other_rule_key, "修改规则后必须重新收集快照");
         assert_ne!(
-            memory_key, changed_archive_key,
+            app_key, single_archive_rule_key,
+            "修改单文件压缩日志规则后必须重新收集快照"
+        );
+        assert_ne!(
+            app_key, changed_archive_key,
             "同名压缩包内容变化后必须让快照缓存失效"
         );
 
@@ -710,7 +720,7 @@ mod state_tests {
     ///
     /// 业务意图：
     /// - 左侧树为了单文件压缩包可直接打开，会把只包含一个文件的内层 ZIP 当成文件展示。
-    /// - 泛微日志分析需要遍历所有嵌套压缩包路径，因此工具栏快照必须额外展开这类 ZIP，直到看到真正的日志文件名。
+    /// - 工具栏插件可能需要遍历所有嵌套压缩包路径，因此工具栏快照必须额外展开这类 ZIP，直到看到真正的日志文件名。
     #[test]
     fn 插件工具栏日志树快照展开单文件嵌套压缩包() {
         use std::io::{Cursor, Write};
@@ -725,10 +735,10 @@ mod state_tests {
         {
             let mut inner_writer = zip::ZipWriter::new(&mut inner_bytes);
             inner_writer
-                .start_file("memory_2026-05-23.log", SimpleFileOptions::default())
+                .start_file("app_2026-05-23.log", SimpleFileOptions::default())
                 .expect("应能创建内层日志条目");
             inner_writer
-                .write_all(b"INFO memory")
+                .write_all(b"INFO app")
                 .expect("应能写入内层日志内容");
             inner_writer.finish().expect("应能结束最内层 ZIP");
         }
@@ -793,31 +803,31 @@ mod state_tests {
             .map(|file| file.path_label.as_str())
             .collect::<Vec<_>>();
 
-        let nested_memory_path = "root/outer.zip!/middle.zip!/inner.zip!/memory_2026-05-23.log";
-        assert!(paths.contains(&nested_memory_path));
-        let nested_memory = snapshot
+        let nested_app_path = "root/outer.zip!/middle.zip!/inner.zip!/app_2026-05-23.log";
+        assert!(paths.contains(&nested_app_path));
+        let nested_app = snapshot
             .iter()
-            .find(|file| file.path_label == nested_memory_path)
-            .expect("嵌套 memory 日志应存在于工具栏快照");
+            .find(|file| file.path_label == nested_app_path)
+            .expect("嵌套日志应存在于工具栏快照");
         assert!(
-            nested_memory.host_source.is_some(),
-            "工具栏快照中的嵌套压缩包成员必须保留宿主可回读来源，供 E9 memory 分析读取正文"
+            nested_app.host_source.is_some(),
+            "工具栏快照中的嵌套压缩包成员必须保留宿主可回读来源，供插件读取正文"
         );
 
         fs::remove_dir_all(temp_root).expect("应能清理测试临时目录");
     }
 
-    /// 验证顶层压缩包内部的标准线程 ZIP 会虚拟为同名线程日志。
+    /// 验证插件可用声明式规则把单文件压缩日志作为虚拟日志候选。
     ///
     /// 业务意图：
-    /// - 现场线程日志常见形态是 `downLog.zip!/monitorThread/yyyyMMdd/thread_HHmmss.zip`。
-    /// - 这种节点数量通常很大；工具栏快照应直接把最终文件名当作 `.log` 参与匹配，不应再逐个解压内部 `.log`，否则会拖慢扫描。
+    /// - 现场可能存在大量 `thread_HHmmss.zip` 这类一个日志压成一个包的文件；逐个展开会导致工具栏快照阶段卡顿。
+    /// - 宿主不应写入具体插件业务路径，而是只根据插件声明的通配规则把压缩路径映射成同名 `.log`，并跳过内部目录扫描。
     #[test]
-    fn 插件工具栏日志树快照将线程_zip_虚拟为_log_且不逐个展开() {
+    fn 插件工具栏快照按声明单文件压缩日志生成虚拟路径() {
         use std::io::{Cursor, Write};
         use zip::write::SimpleFileOptions;
 
-        let temp_root = test_save_as_directory("plugin-archive-member-thread-zip-snapshot");
+        let temp_root = test_save_as_directory("plugin-single-file-archive-snapshot");
         let _ = fs::remove_dir_all(&temp_root);
         fs::create_dir_all(&temp_root).expect("应能创建测试临时目录");
         let outer_path = temp_root.join("downLog.zip");
@@ -855,8 +865,8 @@ mod state_tests {
                 LoadedLogTreeRow {
                     id: 1,
                     depth: 0,
-                    label: "downLog.zip".to_string(),
-                    kind: LogTreeEntryKind::Archive,
+                    label: "root".to_string(),
+                    kind: LogTreeEntryKind::Directory,
                     has_children: true,
                     meta: None,
                     error_message: None,
@@ -865,45 +875,13 @@ mod state_tests {
                 LoadedLogTreeRow {
                     id: 2,
                     depth: 1,
-                    label: "2026-05-21".to_string(),
-                    kind: LogTreeEntryKind::Directory,
-                    has_children: true,
-                    meta: None,
-                    error_message: None,
-                    source: None,
-                },
-                LoadedLogTreeRow {
-                    id: 3,
-                    depth: 2,
-                    label: "monitorThread".to_string(),
-                    kind: LogTreeEntryKind::Directory,
-                    has_children: true,
-                    meta: None,
-                    error_message: None,
-                    source: None,
-                },
-                LoadedLogTreeRow {
-                    id: 4,
-                    depth: 3,
-                    label: "20260521".to_string(),
-                    kind: LogTreeEntryKind::Directory,
-                    has_children: true,
-                    meta: None,
-                    error_message: None,
-                    source: None,
-                },
-                LoadedLogTreeRow {
-                    id: 5,
-                    depth: 4,
-                    label: "thread_000038.zip".to_string(),
+                    label: "downLog.zip".to_string(),
                     kind: LogTreeEntryKind::File,
                     has_children: false,
-                    meta: Some("38 KB".to_string()),
+                    meta: None,
                     error_message: None,
-                    source: Some(LogFileSource::ArchiveMember {
-                        archive_path: outer_path.clone(),
-                        archive_format: ArchiveFormat::Zip,
-                        member_path: thread_zip_member.to_string(),
+                    source: Some(LogFileSource::LocalFile {
+                        path: outer_path.clone(),
                     }),
                 },
             ],
@@ -912,32 +890,33 @@ mod state_tests {
         let snapshot = LoadedLogTreeState::plugin_log_files_for_toolbar_tree_snapshot_with_filter(
             &tree,
             Some("monitorThread/yyyyMMdd/thread_HHmmss.log"),
+            Some(
+                "monitorThread/yyyyMMdd/thread_HHmmss.log;monitorThread/yyyyMMdd/thread_HHmmss.zip",
+            ),
         );
         let paths = snapshot
             .iter()
             .map(|file| file.path_label.as_str())
             .collect::<Vec<_>>();
+        let virtual_thread_path =
+            "root/downLog.zip!/2026-05-21/monitorThread/20260521/thread_000038.log";
 
+        assert!(paths.contains(&virtual_thread_path));
         assert!(
-            paths.contains(&"downLog.zip!/2026-05-21/monitorThread/20260521/thread_000038.log")
-        );
-        assert!(
-            !paths.contains(&"downLog.zip!/2026-05-21/monitorThread/20260521/thread_000038.zip")
+            !paths
+                .contains(&"root/downLog.zip!/2026-05-21/monitorThread/20260521/thread_000038.zip")
         );
         assert!(!paths.contains(
-            &"downLog.zip!/2026-05-21/monitorThread/20260521/thread_000038.zip!/thread_000038.log"
+            &"root/downLog.zip!/2026-05-21/monitorThread/20260521/thread_000038.zip!/thread_000038.log"
         ));
         let thread_file = snapshot
             .iter()
-            .find(|file| {
-                file.path_label
-                    == "downLog.zip!/2026-05-21/monitorThread/20260521/thread_000038.log"
-            })
-            .expect("标准线程 ZIP 应以虚拟 .log 路径进入工具栏快照");
+            .find(|file| file.path_label == virtual_thread_path)
+            .expect("声明的单文件压缩日志应以虚拟 .log 路径进入快照");
         assert_eq!(thread_file.display_name, "thread_000038.log");
         assert!(
             thread_file.host_source.is_some(),
-            "虚拟 .log 仍必须保留原始 ZIP 来源，后续按需读取正文时才能解压"
+            "虚拟日志候选仍必须保留原始压缩成员来源，供插件按需读取正文"
         );
 
         fs::remove_dir_all(temp_root).expect("应能清理测试临时目录");
@@ -3425,6 +3404,170 @@ mod state_tests {
             .collect::<Vec<_>>();
 
         assert_eq!(visible_thread_names, vec!["hot-runnable"]);
+    }
+
+    /// 验证线程并发分析统计过滤后的全部线程样本。
+    ///
+    /// 业务意图：
+    /// - 并发页要展示选中线程日志里每个线程名的出现次数，不能复用频率页“只显示重复线程”的默认隐藏规则。
+    /// - 用户配置的线程过滤规则仍然必须先生效，避免 JVM 噪声线程进入并发统计。
+    /// - 状态分布只展示五个列，NEW、TERMINATED 和未知状态应统一归入 OTHER。
+    #[test]
+    fn 线程并发分析统计过滤后全部样本并按次数排序() {
+        let sample = |name: &str, state: ThreadStateKind, line_index: usize| ThreadStateSample {
+            name: name.to_string(),
+            thread_id: Some(format!("#{line_index}")),
+            state,
+            line_index,
+            preview_lines: vec![format!("\"{name}\" #{line_index}")],
+            stack_lines: vec![format!("\"{name}\" #{line_index}")],
+        };
+        let source = LogFileSource::LocalFile {
+            path: PathBuf::from("thread.log"),
+        };
+        let snapshots = vec![
+            ThreadSnapshot {
+                label: "第一个快照".to_string(),
+                source_index: 0,
+                source: source.clone(),
+                threads: vec![
+                    sample("hot-thread", ThreadStateKind::Runnable, 1),
+                    sample("tie-a", ThreadStateKind::Waiting, 2),
+                    sample("once-thread", ThreadStateKind::TimedWaiting, 3),
+                    sample("noise-thread", ThreadStateKind::Runnable, 4),
+                    sample("other-state", ThreadStateKind::New, 5),
+                ],
+            },
+            ThreadSnapshot {
+                label: "第二个快照".to_string(),
+                source_index: 0,
+                source: source.clone(),
+                threads: vec![
+                    sample("hot-thread", ThreadStateKind::Blocked, 6),
+                    sample("tie-b", ThreadStateKind::Runnable, 7),
+                    sample("tie-a", ThreadStateKind::Waiting, 8),
+                    sample("noise-thread", ThreadStateKind::Blocked, 9),
+                ],
+            },
+            ThreadSnapshot {
+                label: "第三个快照".to_string(),
+                source_index: 0,
+                source,
+                threads: vec![
+                    sample("hot-thread", ThreadStateKind::TimedWaiting, 10),
+                    sample("tie-b", ThreadStateKind::Terminated, 11),
+                ],
+            },
+        ];
+        let rules = vec![ThreadAnalysisFilterRule {
+            kind: ThreadAnalysisFilterRuleKind::ThreadNamePattern,
+            lines: vec!["noise-*".to_string()],
+        }];
+
+        let analysis = build_thread_analysis_data(1, 0, snapshots, &rules);
+        let concurrency_thread_names = analysis
+            .concurrency_rows
+            .iter()
+            .map(|row| row.thread_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            concurrency_thread_names,
+            vec!["hot-thread", "tie-a", "tie-b", "once-thread", "other-state"]
+        );
+        assert!(
+            !analysis.thread_names.contains(&"once-thread".to_string()),
+            "频率页仍应默认隐藏单次线程，并发页才展示全部样本"
+        );
+
+        let hot_row = analysis
+            .concurrency_rows
+            .iter()
+            .find(|row| row.thread_name == "hot-thread")
+            .expect("高频线程应进入并发分析");
+        assert_eq!(hot_row.total_count, 3);
+        assert_eq!(hot_row.runnable_count, 1);
+        assert_eq!(hot_row.blocked_count, 1);
+        assert_eq!(hot_row.timed_waiting_count, 1);
+
+        let tie_b_row = analysis
+            .concurrency_rows
+            .iter()
+            .find(|row| row.thread_name == "tie-b")
+            .expect("同次数线程应进入并发分析");
+        assert_eq!(tie_b_row.total_count, 2);
+        assert_eq!(tie_b_row.runnable_count, 1);
+        assert_eq!(tie_b_row.other_count, 1);
+    }
+
+    /// 验证线程并发分析详情入口按线程名收集全部堆栈样本。
+    ///
+    /// 业务意图：
+    /// - 并发页行点击没有具体时间线色块作为上下文，必须直接按线程名从过滤后快照中收集样本。
+    /// - 单次线程虽然不在频率矩阵中显示，也应能打开详情窗口查看原始堆栈。
+    #[test]
+    fn 线程并发分析详情按线程名收集堆栈样本() {
+        let source = LogFileSource::LocalFile {
+            path: PathBuf::from("thread.log"),
+        };
+        let sample = |name: &str, line_index: usize| ThreadStateSample {
+            name: name.to_string(),
+            thread_id: Some(format!("#{line_index}")),
+            state: ThreadStateKind::Runnable,
+            line_index,
+            preview_lines: vec![format!("\"{name}\" #{line_index}")],
+            stack_lines: vec![
+                format!("\"{name}\" #{line_index}"),
+                format!("        at demo.Worker.run({line_index})"),
+            ],
+        };
+        let snapshots = vec![
+            ThreadSnapshot {
+                label: "第一个快照".to_string(),
+                source_index: 0,
+                source: source.clone(),
+                threads: vec![sample("repeat-thread", 10), sample("once-thread", 11)],
+            },
+            ThreadSnapshot {
+                label: "第二个快照".to_string(),
+                source_index: 0,
+                source,
+                threads: vec![sample("repeat-thread", 20)],
+            },
+        ];
+        let analysis = build_thread_analysis_data(1, 0, snapshots, &[]);
+
+        let repeat_stacks = ThreadAnalysisWindowView::thread_stack_cells_for_thread_name(
+            &analysis,
+            "repeat-thread",
+        );
+        let once_stacks =
+            ThreadAnalysisWindowView::thread_stack_cells_for_thread_name(&analysis, "once-thread");
+
+        assert_eq!(repeat_stacks.len(), 2);
+        assert_eq!(repeat_stacks[0].line_index, 10);
+        assert_eq!(repeat_stacks[1].line_index, 20);
+        assert_eq!(once_stacks.len(), 1);
+        assert_eq!(
+            ThreadStackWindowView::thread_stack_lines_for_cell(&once_stacks[0])[1],
+            "        at demo.Worker.run(11)"
+        );
+    }
+
+    /// 验证线程分析结果页签默认值和并发布局宽度稳定。
+    ///
+    /// 业务意图：
+    /// - 新增并发页后，窗口首次打开仍必须展示原频率分析。
+    /// - 并发表格宽度需要覆盖线程名列、总数列和五个状态列，避免表头与行内容列宽不一致。
+    #[test]
+    fn 线程分析结果页签默认显示频率分析() {
+        assert_eq!(
+            ThreadAnalysisWindowView::default_result_tab(),
+            ThreadAnalysisResultTab::Frequency
+        );
+        assert_eq!(ThreadAnalysisResultTab::Frequency.label(), "线程频率分析");
+        assert_eq!(ThreadAnalysisResultTab::Concurrency.label(), "线程并发分析");
+        assert!(ThreadAnalysisWindowView::thread_concurrency_table_min_width() > 800.0);
     }
 
     /// 验证线程分析进度比例和文案在边界条件下稳定。

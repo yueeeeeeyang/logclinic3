@@ -524,10 +524,10 @@ pub(in crate::app) struct PluginWorkspaceState {
     /// 边界条件：
     /// - 代次只在当前会话内用于 UI 竞争消解，不写入配置；溢出时使用饱和加一即可，实际会话不会达到上限。
     pub(in crate::app) next_command_generation: usize,
-    /// E9 工具栏日志树快照缓存。
+    /// 工具栏插件日志树快照缓存。
     ///
     /// 业务意图：
-    /// - E9 memory 分析重复执行时，若当前日志树和匹配规则没有变化，可以直接复用上次收集到的候选文件列表。
+    /// - 工具栏插件重复执行时，若当前日志树和匹配规则没有变化，可以直接复用上次收集到的候选文件列表。
     /// - 这里缓存的是插件可见的元数据快照，不包含日志正文；正文仍在插件按需请求时由宿主重新读取。
     ///
     /// 边界条件：
@@ -571,7 +571,7 @@ impl PluginWorkspaceState {
         generation
     }
 
-    /// 保存 E9 工具栏日志树快照缓存。
+    /// 保存工具栏插件日志树快照缓存。
     pub(in crate::app) fn store_toolbar_snapshot_cache(
         &mut self,
         key: String,

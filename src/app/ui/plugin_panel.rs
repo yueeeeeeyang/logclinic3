@@ -38,7 +38,7 @@ const PLUGIN_TABLE_HEADER_HEIGHT: f32 = 34.0;
 ///
 /// 业务意图：
 /// - 插件表格可能同时出现横向和纵向滚动；滚动条需要贴近内容但不能遮住边框。
-/// - 使用与日志正文一致的窄滑块，避免在性能列表这类密集表格中占用过多空间。
+/// - 使用与日志正文一致的窄滑块，避免在高密度插件表格中占用过多空间。
 const PLUGIN_TABLE_SCROLLBAR_PADDING: f32 = 4.0;
 
 /// 插件表格自绘滚动条宽度。
@@ -53,27 +53,27 @@ const PLUGIN_TABLE_SCROLLBAR_MIN_THUMB_LENGTH: f32 = 36.0;
 /// 插件表格兜底列宽。
 ///
 /// 业务意图：
-/// - 插件协议允许第三方返回任意表头；宿主只对已知业务列做宽度优化，未知列保持稳定兜底宽度。
+/// - 插件协议允许第三方返回任意表头；宿主不能理解业务列含义，只能用统一兜底宽度保证布局稳定。
 const PLUGIN_TABLE_FALLBACK_COLUMN_WIDTH: f32 = 160.0;
 
 /// 插件表格搜索栏高度。
 ///
 /// 业务意图：
-/// - 所有插件声明式表格都共用宿主渲染层，搜索栏放在表格上方即可覆盖 weaver-logext 和第三方插件。
-/// - 高度保持紧凑，避免性能列表这类数据页因过滤控件占用过多垂直空间。
+/// - 所有插件声明式表格都共用宿主渲染层，搜索栏放在表格上方即可覆盖内置和第三方插件。
+/// - 高度保持紧凑，避免大数据插件页因过滤控件占用过多垂直空间。
 const PLUGIN_TABLE_FILTER_HEIGHT: f32 = 34.0;
 
 /// 插件表格内容估算时单字符平均宽度。
 ///
 /// 业务意图：
 /// - GPUI 排版必须在窗口绘制阶段才能拿到真实字体宽度；表格列宽需要在状态重建时确定，不能为每个单元格同步排版。
-/// - 使用偏保守的平均宽度估算列内容，可以让长 SQL、长请求路径触发横向滚动，同时避免逐行测量造成大表格卡顿。
+/// - 使用偏保守的平均宽度估算列内容，可以让任意长文本触发横向滚动，同时避免逐行测量造成大表格卡顿。
 const PLUGIN_TABLE_APPROX_CHAR_WIDTH: f32 = 7.6;
 
 /// 插件表格内容列最大估算宽度。
 ///
 /// 边界条件：
-/// - SQL 文本可能非常长，列宽不做上限会生成几万像素宽的滚动内容，影响命中测试和滚动体验。
+/// - 插件单元格可能返回非常长的原文片段，列宽不做上限会生成几万像素宽的滚动内容，影响命中测试和滚动体验。
 /// - 上限只限制单列首屏宽度；用户仍可复制可见文本范围，超长内容后续可通过插件详情页继续拆分展示。
 const PLUGIN_TABLE_MAX_CONTENT_COLUMN_WIDTH: f32 = 1800.0;
 
@@ -81,7 +81,7 @@ const PLUGIN_TABLE_MAX_CONTENT_COLUMN_WIDTH: f32 = 1800.0;
 ///
 /// 业务意图：
 /// - 插件表格虽然使用虚拟列表渲染可见行，但页面初始化仍需要估算列宽；对几十万行逐行扫描会直接卡住窗口创建。
-/// - 采样前若干行可以稳定覆盖常见请求路径和 SQL 宽度，同时把初始化开销限制在固定上限内。
+/// - 采样前若干行可以覆盖大多数首屏字段长度，同时把初始化开销限制在固定上限内。
 ///
 /// 边界条件：
 /// - 极端长文本如果只出现在采样窗口之后，列宽可能低估；单元格仍会被裁剪且可通过横向滚动/详情页查看，不影响数据正确性。
@@ -90,7 +90,7 @@ const PLUGIN_TABLE_COLUMN_WIDTH_SAMPLE_ROWS: usize = 2048;
 /// 插件窗口默认尺寸。
 ///
 /// 业务意图：
-/// - 性能列表、请求详情和 SQL 列表都需要比普通弹窗更宽，避免表格主要列被过早截断。
+/// - 插件结果窗口通常承载多列表格或步骤输出，需要比普通确认弹窗更宽，避免主要列被过早截断。
 const PLUGIN_PAGE_WINDOW_SIZE: Size<Pixels> = size(px(1180.0), px(660.0));
 
 /// 插件窗口最小尺寸。
@@ -114,7 +114,7 @@ const PLUGIN_WINDOW_OFFSET_CYCLE: usize = 8;
 /// 插件步骤输出中日志截图片段的起始标记。
 ///
 /// 业务意图：
-/// - E9 memory 分析会把异常行上下文作为文本流返回；宿主消费该内部标记后渲染成带行号的日志块。
+/// - 插件可以把异常行上下文作为文本流返回；宿主消费该内部标记后渲染成带行号的日志块。
 /// - 标记只属于宿主和插件之间的声明式协议，不应直接展示给用户。
 const PLUGIN_LOG_SNIPPET_BEGIN: &str = "@@LC_LOG_SNIPPET_BEGIN";
 
@@ -123,15 +123,6 @@ const PLUGIN_LOG_SNIPPET_END: &str = "@@LC_LOG_SNIPPET_END";
 
 /// 插件步骤输出中单行日志片段的标记前缀。
 const PLUGIN_LOG_SNIPPET_LINE_PREFIX: &str = "@@LC_LOG_LINE\t";
-
-/// 性能表格用户过滤字段。
-const PLUGIN_PERFORMANCE_FILTER_USERS_KEY: &str = "filter_users";
-
-/// 性能表格起始请求时间过滤字段。
-const PLUGIN_PERFORMANCE_FILTER_START_KEY: &str = "filter_start_time";
-
-/// 性能表格结束请求时间过滤字段。
-const PLUGIN_PERFORMANCE_FILTER_END_KEY: &str = "filter_end_time";
 
 /// 当前进程内插件窗口打开序号。
 ///
@@ -147,7 +138,7 @@ static PLUGIN_WINDOW_OPEN_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 /// - 该适配器把两者隔离开：上游只负责流式写字节，下游只看到一行一个 `log_content_line` 事件。
 ///
 /// 边界条件：
-/// - 日志可能不是 UTF-8；这里使用有损转换，保持与既有插件读取路径一致，避免因单行乱码中断整个 SQL 解析。
+/// - 日志可能不是 UTF-8；这里使用有损转换，保持与既有插件读取路径一致，避免因单行乱码中断整个插件解析。
 /// - 超长单行仍会在 `line_buffer` 中暂存，这是按行协议不可避免的边界；普通多行大文件不会整体进入内存。
 struct PluginContentLineWriter<'a> {
     /// 插件进程 stdin writer。
@@ -163,7 +154,7 @@ struct PluginContentLineWriter<'a> {
 /// 插件步骤输出正文的结构化块。
 ///
 /// 业务意图：
-/// - 插件步骤仍通过单个字符串做流式追加，但其中可能混入 E9 memory 异常上下文日志片段。
+/// - 插件步骤仍通过单个字符串做流式追加，但其中可能混入需要截图式展示的上下文日志片段。
 /// - 渲染前先解析为普通文本块和日志片段块，避免把内部协议标记暴露给用户。
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PluginOutputStepTextBlock {
@@ -274,18 +265,38 @@ struct PluginTableFilterInputLayout {
 /// 插件表格过滤栏中的单行输入框种类。
 ///
 /// 业务意图：
-/// - 普通关键字过滤和性能业务过滤共享同一套自绘输入框、IME、选区和剪贴板处理。
-/// - 使用显式种类分发状态，避免为用户、开始时间、结束时间重复维护平台输入细节。
+/// - 普通关键字过滤和插件声明式命令过滤共享同一套自绘输入框、IME、选区和剪贴板处理。
+/// - 命令过滤控件数量由插件声明，宿主只用索引路由输入状态，不理解字段业务含义。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PluginTableInputKind {
     /// 当前表格的本地关键字过滤。
     QuickFilter,
-    /// 性能列表/详情的用户名过滤，多个用户使用英文逗号分隔。
-    PerformanceUsers,
-    /// 性能列表/详情的起始请求时间。
-    PerformanceStartTime,
-    /// 性能列表/详情的结束请求时间。
-    PerformanceEndTime,
+    /// 插件命令过滤器中的第 N 个控件。
+    CommandFilter(usize),
+}
+
+/// 插件声明式命令过滤输入框状态。
+///
+/// 业务意图：
+/// - 每个输入框的字段名、初始值和占位文案都来自插件协议；宿主只保存当前窗口内的编辑状态。
+/// - 焦点、拖选和布局缓存按控件独立保存，避免多个输入框之间的 IME 候选框和鼠标选择互相串扰。
+struct PluginTableCommandFilterInputState {
+    /// 回写到插件命令 `TableAction.data` 的字段名。
+    key: String,
+    /// 当前输入状态。
+    input: SingleLineTextInputState,
+    /// 输入框焦点。
+    focus: gpui::FocusHandle,
+    /// 鼠标拖选锚点。
+    selection_drag: Option<usize>,
+    /// 最近一次文本布局。
+    layout: Option<PluginTableFilterInputLayout>,
+    /// 空输入时的占位文案。
+    placeholder: String,
+    /// 可选通用图标名。
+    icon: Option<String>,
+    /// 输入框建议宽度。
+    width: Pixels,
 }
 
 /// 插件表格过滤输入元素。
@@ -301,7 +312,7 @@ struct PluginTableFilterInputElement {
     /// 输入框焦点。
     focus_handle: gpui::FocusHandle,
     /// 空输入时的占位文案。
-    placeholder: &'static str,
+    placeholder: String,
     /// 当前主题调色板。
     palette: AppThemePalette,
 }
@@ -499,7 +510,7 @@ impl Element for PluginTableFilterInputElement {
             .table_input_snapshot(self.input_kind);
         let style = window.text_style();
         let display_text = if snapshot.text.is_empty() {
-            SharedString::from(self.placeholder)
+            SharedString::from(self.placeholder.clone())
         } else {
             SharedString::from(snapshot.text.clone())
         };
@@ -757,7 +768,7 @@ pub(in crate::app) struct PluginPageWindowView {
     /// 当前页面来源插件。
     ///
     /// 业务意图：
-    /// - 行内“延迟命令”按钮需要在点击后再次启动同一个插件进程，例如从请求详情页打开 SQL 明细。
+    /// - 行内“延迟命令”按钮需要在点击后再次启动同一个插件进程，例如从汇总页打开明细页。
     /// - 该字段保存插件定义快照，只服务当前窗口生命周期；插件被禁用或卸载后，已有窗口按钮再次点击会按快照尝试执行并展示错误，不影响主程序稳定性。
     origin_plugin: Option<PluginDefinition>,
     /// 当前插件页面关联的日志来源快照。
@@ -769,7 +780,7 @@ pub(in crate::app) struct PluginPageWindowView {
     /// 当前插件页面关联的可序列化日志文件快照。
     ///
     /// 业务意图：
-    /// - 性能列表这类汇总页会把“详情”做成延迟命令，首个响应只携带请求地址，不携带所有明细行。
+    /// - 插件可以把重型详情页做成延迟命令，首个响应只携带行标识，不携带所有明细行。
     /// - 用户点击详情时，宿主用这里保存的原始候选文件补齐 `TableAction.files`，再启动插件生成明细页。
     ///
     /// 边界条件：
@@ -779,13 +790,13 @@ pub(in crate::app) struct PluginPageWindowView {
     /// 当前插件窗口内后台命令代次。
     ///
     /// 业务意图：
-    /// - 性能业务过滤在当前窗口内直接替换页面，如果用户连续点击“应用”或“重置”，旧命令迟到时不能覆盖新条件结果。
+    /// - 插件声明式命令过滤在当前窗口内直接替换页面，如果用户连续点击“应用”或“重置”，旧命令迟到时不能覆盖新条件结果。
     /// - 该状态只保护当前窗口内命令，不影响主窗口工具栏、右键菜单和独立行内命令窗口的既有代次机制。
     current_window_command_generations: PluginWindowCommandGenerationState,
     /// 插件表格当前排序状态。
     ///
     /// 边界条件：
-    /// - `None` 表示按插件返回顺序显示；这对 weaver-logext 的默认耗时降序仍然生效。
+    /// - `None` 表示按插件返回顺序显示；插件侧已经排序的结果不会被宿主自动改写。
     /// - 点击表头后才生成宿主侧排序，不要求插件重新执行，避免大数据结果重复解析。
     table_sort: Option<PluginTableSortState>,
     /// 插件表格过滤输入状态。
@@ -803,40 +814,12 @@ pub(in crate::app) struct PluginPageWindowView {
     table_filter_selection_drag: Option<usize>,
     /// 插件表格过滤输入框最近一次文本布局。
     table_filter_layout: Option<PluginTableFilterInputLayout>,
-    /// 性能表格用户过滤输入状态。
+    /// 插件声明式命令过滤输入状态。
     ///
     /// 业务意图：
-    /// - weaver-logext 性能汇总和请求详情需要按用户名重新生成结果；这里保存用户正在编辑的原始文本。
-    /// - 多用户使用英文逗号分隔，具体匹配和重新聚合仍由插件执行，宿主不复制插件业务规则。
-    performance_user_filter_input: SingleLineTextInputState,
-    /// 性能表格用户过滤输入焦点。
-    performance_user_filter_focus: gpui::FocusHandle,
-    /// 性能表格用户过滤输入鼠标拖选锚点。
-    performance_user_filter_selection_drag: Option<usize>,
-    /// 性能表格用户过滤输入最近一次文本布局。
-    performance_user_filter_layout: Option<PluginTableFilterInputLayout>,
-    /// 性能表格起始请求时间输入状态。
-    ///
-    /// 边界条件：
-    /// - 输入格式由插件校验为 `yyyy-MM-dd HH:mm:ss`；空文本表示不限制起始时间。
-    performance_start_time_filter_input: SingleLineTextInputState,
-    /// 性能表格起始请求时间输入焦点。
-    performance_start_time_filter_focus: gpui::FocusHandle,
-    /// 性能表格起始请求时间输入鼠标拖选锚点。
-    performance_start_time_filter_selection_drag: Option<usize>,
-    /// 性能表格起始请求时间输入最近一次文本布局。
-    performance_start_time_filter_layout: Option<PluginTableFilterInputLayout>,
-    /// 性能表格结束请求时间输入状态。
-    ///
-    /// 边界条件：
-    /// - 结束时间由插件按秒级闭区间处理；空文本表示不限制结束时间。
-    performance_end_time_filter_input: SingleLineTextInputState,
-    /// 性能表格结束请求时间输入焦点。
-    performance_end_time_filter_focus: gpui::FocusHandle,
-    /// 性能表格结束请求时间输入鼠标拖选锚点。
-    performance_end_time_filter_selection_drag: Option<usize>,
-    /// 性能表格结束请求时间输入最近一次文本布局。
-    performance_end_time_filter_layout: Option<PluginTableFilterInputLayout>,
+    /// - 插件表格可以声明需要回调插件重新生成页面的过滤控件；宿主只保存控件编辑状态和通用输入法状态。
+    /// - 字段名、占位文案、默认值、图标和宽度都来自插件，主程序不包含任何插件业务规则。
+    command_filter_inputs: Vec<PluginTableCommandFilterInputState>,
     /// 插件表格当前可见行顺序。
     ///
     /// 业务意图：
@@ -859,7 +842,7 @@ pub(in crate::app) struct PluginPageWindowView {
     ///
     /// 业务意图：
     /// - 表格列宽超过可视区域时，横向滚动由外层 `ScrollHandle` 维护；自绘横向滚动条和原生滚轮共享同一份偏移。
-    /// - 页面替换时重置，避免从旧 SQL 表格切换到性能汇总时仍停在旧的横向位置。
+    /// - 页面替换时重置，避免从旧宽表切换到新窄表时仍停在旧的横向位置。
     table_x_scroll_handle: ScrollHandle,
     /// 当前正在拖动的插件表格滚动条。
     ///
@@ -875,7 +858,7 @@ pub(in crate::app) struct PluginPageWindowView {
     /// 步骤式输出当前已经显示的字符数。
     ///
     /// 业务意图：
-    /// - E9 日志分析正文由插件按文本块追加，宿主负责逐字展示，避免插件为了动画频繁写 stdout。
+    /// - 步骤式正文由插件按文本块追加，宿主负责逐字展示，避免插件为了动画频繁写 stdout。
     /// - 这里按步骤 ID 保存已显字符数；最终页面覆盖时复用旧进度，防止已显示内容突然重置。
     output_step_visible_chars: BTreeMap<String, usize>,
     /// 当前帧已绘制单元格的文本边界。
@@ -900,13 +883,10 @@ impl PluginPageWindowView {
         let table_row_order = Self::initial_table_row_order(&page);
         let table_column_widths = Self::initial_table_column_widths(&page);
         let output_step_visible_chars = Self::initial_output_step_visible_chars(&page);
-        let performance_filter_texts = Self::initial_performance_filter_texts(&page);
+        let command_filter_inputs = Self::initial_command_filter_inputs(&page, _context);
         Self {
             focus_handle: _context.focus_handle(),
             table_filter_focus: _context.focus_handle(),
-            performance_user_filter_focus: _context.focus_handle(),
-            performance_start_time_filter_focus: _context.focus_handle(),
-            performance_end_time_filter_focus: _context.focus_handle(),
             title,
             page,
             palette,
@@ -918,21 +898,7 @@ impl PluginPageWindowView {
             table_filter_input: SingleLineTextInputState::empty(),
             table_filter_selection_drag: None,
             table_filter_layout: None,
-            performance_user_filter_input: SingleLineTextInputState::from_text(
-                performance_filter_texts.0,
-            ),
-            performance_user_filter_selection_drag: None,
-            performance_user_filter_layout: None,
-            performance_start_time_filter_input: SingleLineTextInputState::from_text(
-                performance_filter_texts.1,
-            ),
-            performance_start_time_filter_selection_drag: None,
-            performance_start_time_filter_layout: None,
-            performance_end_time_filter_input: SingleLineTextInputState::from_text(
-                performance_filter_texts.2,
-            ),
-            performance_end_time_filter_selection_drag: None,
-            performance_end_time_filter_layout: None,
+            command_filter_inputs,
             table_row_order,
             table_column_widths,
             table_scroll_handle: UniformListScrollHandle::new(),
@@ -970,19 +936,7 @@ impl PluginPageWindowView {
         self.table_filter_input = SingleLineTextInputState::empty();
         self.table_filter_selection_drag = None;
         self.table_filter_layout = None;
-        let performance_filter_texts = Self::initial_performance_filter_texts(&self.page);
-        self.performance_user_filter_input =
-            SingleLineTextInputState::from_text(performance_filter_texts.0);
-        self.performance_user_filter_selection_drag = None;
-        self.performance_user_filter_layout = None;
-        self.performance_start_time_filter_input =
-            SingleLineTextInputState::from_text(performance_filter_texts.1);
-        self.performance_start_time_filter_selection_drag = None;
-        self.performance_start_time_filter_layout = None;
-        self.performance_end_time_filter_input =
-            SingleLineTextInputState::from_text(performance_filter_texts.2);
-        self.performance_end_time_filter_selection_drag = None;
-        self.performance_end_time_filter_layout = None;
+        self.command_filter_inputs = Self::initial_command_filter_inputs(&self.page, context);
         self.table_row_order = Self::initial_table_row_order(&self.page);
         self.table_column_widths = Self::initial_table_column_widths(&self.page);
         self.table_scroll_handle = UniformListScrollHandle::new();
@@ -1010,7 +964,7 @@ impl PluginPageWindowView {
     /// 追加一行插件瀑布流输出。
     ///
     /// 业务意图：
-    /// - E9 日志分析窗口会在插件后台逐个读取日志时不断产出诊断内容；追加输出不能替换当前页面，否则用户会丢失之前文件的分析结果。
+    /// - 流式插件窗口会在后台处理时不断产出诊断内容；追加输出不能替换当前页面，否则用户会丢失之前文件的分析结果。
     /// - 输出行保持插件返回顺序，宿主不排序、不过滤，保证“按顺序分析”的业务语义可见。
     pub(in crate::app) fn append_output_line(
         &mut self,
@@ -1172,7 +1126,7 @@ impl PluginPageWindowView {
     /// 初始化插件表格行顺序。
     ///
     /// 业务意图：
-    /// - 插件返回的表格顺序本身可能已经有业务含义，例如性能列表默认按耗时降序。
+    /// - 插件返回的表格顺序本身可能已经有业务含义，宿主初始状态必须保持插件声明的顺序。
     /// - 宿主只保存索引映射，避免为了排序能力复制大批量单元格字符串。
     fn initial_table_row_order(page: &PluginPage) -> Vec<usize> {
         page.table
@@ -1185,7 +1139,7 @@ impl PluginPageWindowView {
     ///
     /// 业务意图：
     /// - 横向滚动是否出现取决于整张表的最小内容宽度；页面加载时一次性估算列宽，可以避免滚动虚拟列表时反复扫描所有行。
-    /// - 估算保守覆盖长请求路径和 SQL 文本，保证内容放不下时生成横向滚动条，而不是只在固定小列内截断。
+    /// - 估算保守覆盖任意长文本，保证内容放不下时生成横向滚动条，而不是只在固定小列内截断。
     fn initial_table_column_widths(page: &PluginPage) -> Vec<f32> {
         page.table
             .as_ref()
@@ -1193,21 +1147,33 @@ impl PluginPageWindowView {
             .unwrap_or_default()
     }
 
-    /// 初始化性能业务过滤输入文本。
+    /// 初始化插件声明式命令过滤输入状态。
     ///
     /// 业务意图：
-    /// - 插件重新生成页面后会把已生效的过滤条件写回表格定义，宿主用它恢复输入框显示。
-    /// - 普通插件表格没有性能过滤器时保持空输入，避免上一页条件串到下一页。
-    fn initial_performance_filter_texts(page: &PluginPage) -> (String, String, String) {
+    /// - 插件重新生成页面后会把已生效的过滤条件写回控件声明，宿主用它恢复输入框显示。
+    /// - 普通插件表格没有命令过滤器时保持空集合，避免上一页条件串到下一页。
+    fn initial_command_filter_inputs(
+        page: &PluginPage,
+        context: &mut Context<Self>,
+    ) -> Vec<PluginTableCommandFilterInputState> {
         page.table
             .as_ref()
-            .and_then(|table| table.performance_filter.as_ref())
+            .and_then(|table| table.command_filter.as_ref())
             .map(|filter| {
-                (
-                    filter.users.clone(),
-                    filter.start_time.clone(),
-                    filter.end_time.clone(),
-                )
+                filter
+                    .controls
+                    .iter()
+                    .map(|control| PluginTableCommandFilterInputState {
+                        key: control.key.clone(),
+                        input: SingleLineTextInputState::from_text(control.value.clone()),
+                        focus: context.focus_handle(),
+                        selection_drag: None,
+                        layout: None,
+                        placeholder: control.placeholder.clone(),
+                        icon: control.icon.clone(),
+                        width: px(control.width.unwrap_or(180).max(96) as f32),
+                    })
+                    .collect::<Vec<_>>()
             })
             .unwrap_or_default()
     }
@@ -1217,13 +1183,19 @@ impl PluginPageWindowView {
         &self,
         input_kind: PluginTableInputKind,
     ) -> SingleLineTextInputSnapshot {
-        let input = self.table_input_state(input_kind);
-        SingleLineTextInputSnapshot {
-            text: input.text.clone(),
-            selection_range: input.selection_range.clone(),
-            marked_range: input.marked_range.clone(),
-            horizontal_scroll_px: input.horizontal_scroll_px,
-        }
+        self.table_input_state(input_kind)
+            .map(|input| SingleLineTextInputSnapshot {
+                text: input.text.clone(),
+                selection_range: input.selection_range.clone(),
+                marked_range: input.marked_range.clone(),
+                horizontal_scroll_px: input.horizontal_scroll_px,
+            })
+            .unwrap_or_else(|| SingleLineTextInputSnapshot {
+                text: String::new(),
+                selection_range: 0..0,
+                marked_range: None,
+                horizontal_scroll_px: 0.0,
+            })
     }
 
     /// 记录插件表格输入框当前布局。
@@ -1232,17 +1204,25 @@ impl PluginPageWindowView {
         input_kind: PluginTableInputKind,
         layout: PluginTableFilterInputLayout,
     ) {
-        self.table_input_state_mut(input_kind).horizontal_scroll_px = layout.horizontal_scroll_px;
-        *self.table_input_layout_mut(input_kind) = Some(layout);
+        if let Some(input) = self.table_input_state_mut(input_kind) {
+            input.horizontal_scroll_px = layout.horizontal_scroll_px;
+        }
+        if let Some(layout_slot) = self.table_input_layout_mut(input_kind) {
+            *layout_slot = Some(layout);
+        }
     }
 
     /// 返回指定插件表格输入框的只读状态。
-    fn table_input_state(&self, input_kind: PluginTableInputKind) -> &SingleLineTextInputState {
+    fn table_input_state(
+        &self,
+        input_kind: PluginTableInputKind,
+    ) -> Option<&SingleLineTextInputState> {
         match input_kind {
-            PluginTableInputKind::QuickFilter => &self.table_filter_input,
-            PluginTableInputKind::PerformanceUsers => &self.performance_user_filter_input,
-            PluginTableInputKind::PerformanceStartTime => &self.performance_start_time_filter_input,
-            PluginTableInputKind::PerformanceEndTime => &self.performance_end_time_filter_input,
+            PluginTableInputKind::QuickFilter => Some(&self.table_filter_input),
+            PluginTableInputKind::CommandFilter(index) => self
+                .command_filter_inputs
+                .get(index)
+                .map(|state| &state.input),
         }
     }
 
@@ -1250,24 +1230,24 @@ impl PluginPageWindowView {
     fn table_input_state_mut(
         &mut self,
         input_kind: PluginTableInputKind,
-    ) -> &mut SingleLineTextInputState {
+    ) -> Option<&mut SingleLineTextInputState> {
         match input_kind {
-            PluginTableInputKind::QuickFilter => &mut self.table_filter_input,
-            PluginTableInputKind::PerformanceUsers => &mut self.performance_user_filter_input,
-            PluginTableInputKind::PerformanceStartTime => {
-                &mut self.performance_start_time_filter_input
-            }
-            PluginTableInputKind::PerformanceEndTime => &mut self.performance_end_time_filter_input,
+            PluginTableInputKind::QuickFilter => Some(&mut self.table_filter_input),
+            PluginTableInputKind::CommandFilter(index) => self
+                .command_filter_inputs
+                .get_mut(index)
+                .map(|state| &mut state.input),
         }
     }
 
     /// 返回指定插件表格输入框的焦点句柄。
-    fn table_input_focus(&self, input_kind: PluginTableInputKind) -> &gpui::FocusHandle {
+    fn table_input_focus(&self, input_kind: PluginTableInputKind) -> Option<&gpui::FocusHandle> {
         match input_kind {
-            PluginTableInputKind::QuickFilter => &self.table_filter_focus,
-            PluginTableInputKind::PerformanceUsers => &self.performance_user_filter_focus,
-            PluginTableInputKind::PerformanceStartTime => &self.performance_start_time_filter_focus,
-            PluginTableInputKind::PerformanceEndTime => &self.performance_end_time_filter_focus,
+            PluginTableInputKind::QuickFilter => Some(&self.table_filter_focus),
+            PluginTableInputKind::CommandFilter(index) => self
+                .command_filter_inputs
+                .get(index)
+                .map(|state| &state.focus),
         }
     }
 
@@ -1275,18 +1255,13 @@ impl PluginPageWindowView {
     fn table_input_selection_drag_mut(
         &mut self,
         input_kind: PluginTableInputKind,
-    ) -> &mut Option<usize> {
+    ) -> Option<&mut Option<usize>> {
         match input_kind {
-            PluginTableInputKind::QuickFilter => &mut self.table_filter_selection_drag,
-            PluginTableInputKind::PerformanceUsers => {
-                &mut self.performance_user_filter_selection_drag
-            }
-            PluginTableInputKind::PerformanceStartTime => {
-                &mut self.performance_start_time_filter_selection_drag
-            }
-            PluginTableInputKind::PerformanceEndTime => {
-                &mut self.performance_end_time_filter_selection_drag
-            }
+            PluginTableInputKind::QuickFilter => Some(&mut self.table_filter_selection_drag),
+            PluginTableInputKind::CommandFilter(index) => self
+                .command_filter_inputs
+                .get_mut(index)
+                .map(|state| &mut state.selection_drag),
         }
     }
 
@@ -1297,13 +1272,10 @@ impl PluginPageWindowView {
     ) -> Option<&PluginTableFilterInputLayout> {
         match input_kind {
             PluginTableInputKind::QuickFilter => self.table_filter_layout.as_ref(),
-            PluginTableInputKind::PerformanceUsers => self.performance_user_filter_layout.as_ref(),
-            PluginTableInputKind::PerformanceStartTime => {
-                self.performance_start_time_filter_layout.as_ref()
-            }
-            PluginTableInputKind::PerformanceEndTime => {
-                self.performance_end_time_filter_layout.as_ref()
-            }
+            PluginTableInputKind::CommandFilter(index) => self
+                .command_filter_inputs
+                .get(index)
+                .and_then(|state| state.layout.as_ref()),
         }
     }
 
@@ -1311,63 +1283,47 @@ impl PluginPageWindowView {
     fn table_input_layout_mut(
         &mut self,
         input_kind: PluginTableInputKind,
-    ) -> &mut Option<PluginTableFilterInputLayout> {
+    ) -> Option<&mut Option<PluginTableFilterInputLayout>> {
         match input_kind {
-            PluginTableInputKind::QuickFilter => &mut self.table_filter_layout,
-            PluginTableInputKind::PerformanceUsers => &mut self.performance_user_filter_layout,
-            PluginTableInputKind::PerformanceStartTime => {
-                &mut self.performance_start_time_filter_layout
-            }
-            PluginTableInputKind::PerformanceEndTime => {
-                &mut self.performance_end_time_filter_layout
-            }
+            PluginTableInputKind::QuickFilter => Some(&mut self.table_filter_layout),
+            PluginTableInputKind::CommandFilter(index) => self
+                .command_filter_inputs
+                .get_mut(index)
+                .map(|state| &mut state.layout),
         }
     }
 
     /// 返回当前获得平台输入焦点的插件表格输入框。
     fn focused_table_input_kind(&self, window: &Window) -> Option<PluginTableInputKind> {
-        [
-            PluginTableInputKind::QuickFilter,
-            PluginTableInputKind::PerformanceUsers,
-            PluginTableInputKind::PerformanceStartTime,
-            PluginTableInputKind::PerformanceEndTime,
-        ]
-        .into_iter()
-        .find(|input_kind| self.table_input_focus(*input_kind).is_focused(window))
+        std::iter::once(PluginTableInputKind::QuickFilter)
+            .chain((0..self.command_filter_inputs.len()).map(PluginTableInputKind::CommandFilter))
+            .find(|input_kind| {
+                self.table_input_focus(*input_kind)
+                    .is_some_and(|focus| focus.is_focused(window))
+            })
     }
 
     /// 返回当前正在鼠标拖选的插件表格输入框。
     fn dragging_table_input_kind(&self) -> Option<PluginTableInputKind> {
-        [
-            (
-                PluginTableInputKind::QuickFilter,
-                self.table_filter_selection_drag,
-            ),
-            (
-                PluginTableInputKind::PerformanceUsers,
-                self.performance_user_filter_selection_drag,
-            ),
-            (
-                PluginTableInputKind::PerformanceStartTime,
-                self.performance_start_time_filter_selection_drag,
-            ),
-            (
-                PluginTableInputKind::PerformanceEndTime,
-                self.performance_end_time_filter_selection_drag,
-            ),
-        ]
-        .into_iter()
-        .find_map(|(input_kind, drag)| drag.is_some().then_some(input_kind))
+        if self.table_filter_selection_drag.is_some() {
+            return Some(PluginTableInputKind::QuickFilter);
+        }
+        self.command_filter_inputs
+            .iter()
+            .enumerate()
+            .find_map(|(index, state)| {
+                state
+                    .selection_drag
+                    .is_some()
+                    .then_some(PluginTableInputKind::CommandFilter(index))
+            })
     }
 
     /// 结束所有插件表格输入框拖选。
     fn finish_all_table_input_mouse_selection(&mut self, context: &mut Context<Self>) {
-        for input_kind in [
-            PluginTableInputKind::QuickFilter,
-            PluginTableInputKind::PerformanceUsers,
-            PluginTableInputKind::PerformanceStartTime,
-            PluginTableInputKind::PerformanceEndTime,
-        ] {
+        for input_kind in std::iter::once(PluginTableInputKind::QuickFilter)
+            .chain((0..self.command_filter_inputs.len()).map(PluginTableInputKind::CommandFilter))
+        {
             self.finish_table_input_mouse_selection(input_kind, context);
         }
     }
@@ -1375,7 +1331,7 @@ impl PluginPageWindowView {
     /// 过滤关键字发生变化后刷新可见行。
     ///
     /// 业务意图：
-    /// - 插件表格过滤只改变本地行索引顺序，不修改插件返回数据和行内动作，确保“详情/显示 SQL”等按钮仍指向原始行。
+    /// - 插件表格过滤只改变本地行索引顺序，不修改插件返回数据和行内动作，确保行内按钮仍指向原始行。
     /// - 过滤后重置滚动和文本选区，避免旧可见行的滚动位置或选中文本落到新结果上造成错位。
     fn rebuild_table_after_filter_change(&mut self, context: &mut Context<Self>) {
         self.rebuild_table_row_order();
@@ -1422,7 +1378,7 @@ impl PluginPageWindowView {
     ///
     /// 业务意图：
     /// - 普通字符交给 `EntityInputHandler` 和平台 IME；删除、方向键、复制粘贴等编辑键在这里统一维护状态。
-    /// - 本地关键字过滤每次文本变化只重建可见行索引；性能业务过滤只更新输入文本，按“应用”或 Enter 后才重新执行插件命令。
+    /// - 本地关键字过滤每次文本变化只重建可见行索引；插件命令过滤只更新输入文本，按“应用”或 Enter 后才重新执行插件命令。
     fn handle_table_input_key_down(
         &mut self,
         input_kind: PluginTableInputKind,
@@ -1446,7 +1402,9 @@ impl PluginPageWindowView {
         }
 
         if MainView::is_copy_keystroke(&event.keystroke) {
-            let input = self.table_input_state(input_kind);
+            let Some(input) = self.table_input_state(input_kind) else {
+                return;
+            };
             let range =
                 MainView::clamp_search_text_range(&input.text, input.selection_range.clone());
             if range.start < range.end {
@@ -1458,7 +1416,9 @@ impl PluginPageWindowView {
         }
 
         if MainView::is_select_all_keystroke(&event.keystroke) {
-            let input = self.table_input_state_mut(input_kind);
+            let Some(input) = self.table_input_state_mut(input_kind) else {
+                return;
+            };
             input.marked_range = None;
             input.selection_range = 0..input.text.len();
             context.stop_propagation();
@@ -1469,7 +1429,9 @@ impl PluginPageWindowView {
         match event.keystroke.key.as_str() {
             "left" => {
                 {
-                    let input = self.table_input_state_mut(input_kind);
+                    let Some(input) = self.table_input_state_mut(input_kind) else {
+                        return;
+                    };
                     input.marked_range = None;
                     if event.keystroke.modifiers.shift {
                         input.selection_range.end = MainView::previous_search_text_boundary(
@@ -1496,7 +1458,9 @@ impl PluginPageWindowView {
             }
             "right" => {
                 {
-                    let input = self.table_input_state_mut(input_kind);
+                    let Some(input) = self.table_input_state_mut(input_kind) else {
+                        return;
+                    };
                     input.marked_range = None;
                     if event.keystroke.modifiers.shift {
                         input.selection_range.end = MainView::next_search_text_boundary(
@@ -1522,14 +1486,18 @@ impl PluginPageWindowView {
                 context.notify();
             }
             "up" => {
-                let input = self.table_input_state_mut(input_kind);
+                let Some(input) = self.table_input_state_mut(input_kind) else {
+                    return;
+                };
                 input.marked_range = None;
                 input.selection_range = 0..0;
                 context.stop_propagation();
                 context.notify();
             }
             "down" => {
-                let input = self.table_input_state_mut(input_kind);
+                let Some(input) = self.table_input_state_mut(input_kind) else {
+                    return;
+                };
                 input.marked_range = None;
                 let cursor = input.text.len();
                 input.selection_range = cursor..cursor;
@@ -1538,7 +1506,9 @@ impl PluginPageWindowView {
             }
             "backspace" => {
                 {
-                    let input = self.table_input_state_mut(input_kind);
+                    let Some(input) = self.table_input_state_mut(input_kind) else {
+                        return;
+                    };
                     if let Some(range) = input.marked_range.take().or_else(|| {
                         (input.selection_range.start != input.selection_range.end)
                             .then(|| input.selection_range.clone())
@@ -1561,7 +1531,9 @@ impl PluginPageWindowView {
             }
             "delete" => {
                 {
-                    let input = self.table_input_state_mut(input_kind);
+                    let Some(input) = self.table_input_state_mut(input_kind) else {
+                        return;
+                    };
                     if let Some(range) = input.marked_range.take().or_else(|| {
                         (input.selection_range.start != input.selection_range.end)
                             .then(|| input.selection_range.clone())
@@ -1583,19 +1555,22 @@ impl PluginPageWindowView {
                 context.stop_propagation();
             }
             "escape" => {
-                let had_text = !self.table_input_state(input_kind).text.is_empty();
+                let had_text = self
+                    .table_input_state(input_kind)
+                    .is_some_and(|input| !input.text.is_empty());
                 if had_text {
-                    self.table_input_state_mut(input_kind)
-                        .set_text(String::new());
+                    if let Some(input) = self.table_input_state_mut(input_kind) {
+                        input.set_text(String::new());
+                    }
                     self.after_table_input_text_changed(input_kind, context);
                 }
                 context.stop_propagation();
             }
             "enter" => {
                 if input_kind != PluginTableInputKind::QuickFilter
-                    && let Some(command) = self.current_performance_filter_command()
+                    && let Some(command) = self.current_command_filter_command()
                 {
-                    self.apply_performance_table_filter(command, context);
+                    self.apply_plugin_table_command_filter(command, context);
                 }
                 context.stop_propagation();
             }
@@ -1623,7 +1598,9 @@ impl PluginPageWindowView {
         replacement: &str,
     ) {
         let replacement = MainView::sanitize_search_input_text(replacement);
-        let input = self.table_input_state_mut(input_kind);
+        let Some(input) = self.table_input_state_mut(input_kind) else {
+            return;
+        };
         let range = input
             .marked_range
             .take()
@@ -1643,20 +1620,30 @@ impl PluginPageWindowView {
         context: &mut Context<Self>,
     ) {
         let index = self.table_input_index_at_position(input_kind, event.position);
-        let text = self.table_input_state(input_kind).text.clone();
+        let Some(text) = self
+            .table_input_state(input_kind)
+            .map(|input| input.text.clone())
+        else {
+            return;
+        };
         let range = match event.click_count {
             0 | 1 => index..index,
             2 => MainView::search_text_word_range_for_index(&text, index),
             _ => 0..text.len(),
         };
         {
-            let input = self.table_input_state_mut(input_kind);
+            let Some(input) = self.table_input_state_mut(input_kind) else {
+                return;
+            };
             input.selection_range = MainView::clamp_search_text_range(&input.text, range);
             input.marked_range = None;
         }
-        *self.table_input_selection_drag_mut(input_kind) =
-            (event.click_count <= 1).then_some(index);
-        window.focus(self.table_input_focus(input_kind));
+        if let Some(selection_drag) = self.table_input_selection_drag_mut(input_kind) {
+            *selection_drag = (event.click_count <= 1).then_some(index);
+        }
+        if let Some(focus) = self.table_input_focus(input_kind) {
+            window.focus(focus);
+        }
         context.notify();
     }
 
@@ -1667,11 +1654,16 @@ impl PluginPageWindowView {
         position: Point<Pixels>,
         context: &mut Context<Self>,
     ) {
-        let Some(anchor) = *self.table_input_selection_drag_mut(input_kind) else {
+        let Some(anchor) = self
+            .table_input_selection_drag_mut(input_kind)
+            .and_then(|drag| *drag)
+        else {
             return;
         };
         let index = self.table_input_index_at_position(input_kind, position);
-        let input = self.table_input_state_mut(input_kind);
+        let Some(input) = self.table_input_state_mut(input_kind) else {
+            return;
+        };
         input.selection_range = MainView::clamp_search_text_range(&input.text, anchor..index);
         context.notify();
     }
@@ -1684,8 +1676,7 @@ impl PluginPageWindowView {
     ) {
         if self
             .table_input_selection_drag_mut(input_kind)
-            .take()
-            .is_some()
+            .is_some_and(|drag| drag.take().is_some())
         {
             context.notify();
         }
@@ -1697,7 +1688,9 @@ impl PluginPageWindowView {
         input_kind: PluginTableInputKind,
         position: Point<Pixels>,
     ) -> usize {
-        let input = self.table_input_state(input_kind);
+        let Some(input) = self.table_input_state(input_kind) else {
+            return 0;
+        };
         let Some(layout) = self.table_input_layout(input_kind) else {
             return input.text.len();
         };
@@ -1778,7 +1771,7 @@ impl PluginPageWindowView {
     ///
     /// 边界条件：
     /// - 如果单元格尚未绘制或已经滚出可视区，则回退到文本末尾，避免拖选过程中出现崩溃。
-    /// - `ShapedLine` 返回的下标仍需要夹到 UTF-8 边界，保证中文路径和 SQL 文本可安全切片。
+    /// - `ShapedLine` 返回的下标仍需要夹到 UTF-8 边界，保证中文和其它多字节文本可安全切片。
     fn table_cell_text_index_at_position(
         &self,
         row_index: usize,
@@ -1915,7 +1908,7 @@ impl PluginPageWindowView {
     ///
     /// 业务意图：
     /// - “模糊搜索”面向插件表格的快速定位，不改变插件业务搜索语义；用户输入的每个空白分隔关键字都在整行任意列中做忽略大小写包含匹配。
-    /// - 多关键字采用全部命中规则，方便在 SQL、用户、请求路径等多列之间逐步收窄结果。
+    /// - 多关键字采用全部命中规则，方便用户在任意插件列之间逐步收窄结果。
     fn plugin_table_row_matches_filter(row: &[String], query: &str) -> bool {
         let tokens = Self::plugin_table_filter_tokens(query);
         if tokens.is_empty() {
@@ -1938,32 +1931,18 @@ impl PluginPageWindowView {
     /// 计算插件表格列宽。
     ///
     /// 业务意图：
-    /// - weaver-logext 的“请求地址”是核心字段，需要比普通列更宽，避免在去掉路径列后仍然显得拥挤。
-    /// - 未知插件列使用兜底宽度，保证第三方插件输出不会破坏窗口布局。
+    /// - 宿主不理解插件业务列含义，因此只按表头文本长度估算最小宽度，避免把某个插件的字段名固化到主程序。
+    /// - 操作列由 `row_actions` 协议承载，固定宽度可以保证按钮区域稳定，其它列会继续参考内容采样扩宽。
     fn plugin_table_column_width(header: &str) -> f32 {
-        match header {
-            "耗时(ms)" | "耗时" => 112.0,
-            "平均耗时(ms)" => 134.0,
-            "请求次数" => 112.0,
-            "用户" | "用户名" => 140.0,
-            "请求地址" | "请求路径" => 240.0,
-            "请求时间" | "请求时间戳" => 190.0,
-            "SQL文本" => 280.0,
-            "SQL总耗时(ms)"
-            | "解析结果集(ms)"
-            | "获取连接(ms)"
-            | "事务提交(ms)"
-            | "释放连接(ms)" => 112.0,
-            "操作" => 96.0,
-            _ => PLUGIN_TABLE_FALLBACK_COLUMN_WIDTH,
-        }
+        Self::plugin_table_text_estimated_width(header)
+            .clamp(96.0, PLUGIN_TABLE_FALLBACK_COLUMN_WIDTH)
     }
 
     /// 计算插件表格最小宽度。
     ///
     /// 业务意图：
     /// - 表格应优先撑满容器并让主文本列动态吸收剩余宽度；只有所有列的最小宽度确实超过视口时才出现横向滚动。
-    /// - 请求地址、请求路径和 SQL 文本列的实际宽度由 flex 布局动态决定，这里的宽度只是最小可读宽度。
+    /// - 宿主只基于通用列宽估算和插件声明的动作列计算最小宽度，不依赖任何插件业务表头。
     #[cfg(test)]
     fn plugin_table_min_width(table: &PluginPageTable, column_count: usize) -> f32 {
         Self::plugin_table_min_width_from_widths(&Self::plugin_table_column_widths(
@@ -2009,7 +1988,7 @@ impl PluginPageWindowView {
     /// 按表格内容估算指定列宽。
     ///
     /// 业务意图：
-    /// - weaver-logext 的 SQL 文本和请求路径可能远长于表头固定宽度；如果不参考内容，横向滚动永远不会出现，用户只能看到截断文本。
+    /// - 插件的任意文本列都可能远长于表头固定宽度；如果不参考内容，横向滚动永远不会出现，用户只能看到截断文本。
     /// - 估算只在页面切换或测试中调用，不在虚拟列表每行渲染时调用，避免大表格滚动卡顿。
     fn plugin_table_content_column_width(
         table: &PluginPageTable,
@@ -2019,15 +1998,6 @@ impl PluginPageWindowView {
         if Self::plugin_table_action_column_index(table) == Some(column_index) {
             return base_width;
         }
-        let header = table
-            .headers
-            .get(column_index)
-            .map(String::as_str)
-            .unwrap_or_default();
-        let max_width = match header {
-            "请求地址" | "请求路径" | "SQL文本" => PLUGIN_TABLE_MAX_CONTENT_COLUMN_WIDTH,
-            _ => 620.0,
-        };
         let preferred = table
             .rows
             .iter()
@@ -2035,7 +2005,7 @@ impl PluginPageWindowView {
             .filter_map(|row| row.get(column_index))
             .map(|text| Self::plugin_table_text_estimated_width(text))
             .fold(base_width, f32::max);
-        preferred.clamp(base_width, max_width)
+        preferred.clamp(base_width, PLUGIN_TABLE_MAX_CONTENT_COLUMN_WIDTH)
     }
 
     /// 估算单元格文本宽度。
@@ -2068,7 +2038,7 @@ impl PluginPageWindowView {
     ///
     /// 业务意图：
     /// - 插件表格需要在窗口宽度充足时撑满容器，不能只按最小列宽渲染后在右侧留下空白。
-    /// - 默认让第一个非操作列伸展；如果存在 SQL 文本列，则优先让 SQL 文本吸收剩余宽度，避免耗时列被无意义拉宽。
+    /// - 默认让第一个非操作列伸展；插件如果需要重点展示某列，应把它放在动作列之外的靠前位置。
     ///
     /// 边界条件：
     /// - 操作列承载按钮，保持固定宽度更稳定，不能被拉宽后造成按钮远离数据主体。
@@ -2078,19 +2048,6 @@ impl PluginPageWindowView {
             return None;
         }
         let action_column_index = Self::plugin_table_action_column_index(table);
-        if let Some(route_column_index) = table
-            .headers
-            .iter()
-            .position(|header| matches!(header.as_str(), "请求地址" | "请求路径"))
-            && Some(route_column_index) != action_column_index
-        {
-            return Some(route_column_index);
-        }
-        if let Some(sql_column_index) = table.headers.iter().position(|header| header == "SQL文本")
-            && Some(sql_column_index) != action_column_index
-        {
-            return Some(sql_column_index);
-        }
         (0..column_count)
             .find(|column_index| Some(*column_index) != action_column_index)
             .or(Some(0))
@@ -2099,7 +2056,7 @@ impl PluginPageWindowView {
     /// 返回带错位的新插件窗口边界。
     ///
     /// 业务意图：
-    /// - 连续打开性能详情、请求明细、SQL 列表时，新窗口不能完全覆盖旧窗口，否则用户会误以为点击没有响应。
+    /// - 连续打开插件明细窗口时，新窗口不能完全覆盖旧窗口，否则用户会误以为点击没有响应。
     /// - 使用小步长右下偏移既能看出新窗口已打开，又不会明显偏离屏幕中心。
     fn next_plugin_window_bounds(app: &App) -> WindowBounds {
         let sequence = PLUGIN_WINDOW_OPEN_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed)
@@ -2226,7 +2183,7 @@ impl PluginPageWindowView {
     /// 渲染插件瀑布流输出。
     ///
     /// 业务意图：
-    /// - E9 日志分析按文件顺序输出“开始、异常、完成”，需要保留连续阅读语义；这里使用单个滚动流而不是表格或卡片。
+    /// - 流式插件可按文件顺序输出“开始、异常、完成”，需要保留连续阅读语义；这里使用单个滚动流而不是表格或卡片。
     /// - 输出文本来自插件协议，只按纯文本展示，不解释 Markdown、HTML 或 ANSI 控制序列，避免第三方插件影响宿主界面。
     ///
     /// 边界条件：
@@ -2268,7 +2225,7 @@ impl PluginPageWindowView {
     /// 渲染步骤式插件输出。
     ///
     /// 业务意图：
-    /// - E9 日志分析按“步骤标题 -> 输出正文 -> 步骤完成”的方式呈现，用户关注的是 memory、连接池等诊断步骤的顺序过程。
+    /// - 步骤式插件按“步骤标题 -> 输出正文 -> 步骤完成”的方式呈现，用户关注的是各诊断步骤的顺序过程。
     /// - 每个步骤只用一行状态标题和一个纯文本正文区域，不使用卡片嵌套，避免大量日志诊断时视觉负担过重。
     fn render_output_steps(
         &mut self,
@@ -2377,7 +2334,7 @@ impl PluginPageWindowView {
     /// 渲染步骤正文。
     ///
     /// 业务意图：
-    /// - 普通诊断仍按文本流逐行展示，memory 异常上下文则渲染成截图式日志块，便于用户直接定位原始 jstat 行。
+    /// - 普通诊断仍按文本流逐行展示，带内部标记的异常上下文则渲染成截图式日志块，便于用户直接定位原始日志行。
     /// - 内部标记必须在这里被消费，不能泄露到窗口正文。
     fn render_output_step_text(text: String, palette: AppThemePalette) -> gpui::Div {
         let blocks = Self::parse_output_step_text_blocks(&text);
@@ -2490,7 +2447,7 @@ impl PluginPageWindowView {
     ///
     /// 业务意图：
     /// - 第三方插件可能直接把 tab 分隔的原始日志放入截图式片段；宿主兜底展开，避免列在 GPUI 中黏连。
-    /// - weaver-logext 也会在插件侧展开，这里保留防线，兼容未来插件和半截流式输出。
+    /// - 插件侧也可能自行展开制表符；这里保留宿主防线，兼容未来插件和半截流式输出。
     fn expand_plugin_log_tabs_for_display(text: &str) -> String {
         text.replace('\t', "    ")
     }
@@ -2518,18 +2475,22 @@ impl PluginPageWindowView {
     /// 判断普通步骤文本行是否是日志路径展示行。
     ///
     /// 业务意图：
-    /// - E9 分析正文里路径只是来源提示，弱化为灰色可以让异常原因和截图式上下文成为视觉重点。
-    /// - 当前插件按 `- <path>` 输出扫描到的 memory 和连接池日志列表，因此优先识别这类路径行，避免把普通诊断文本误染成灰色。
+    /// - 诊断正文里的路径通常只是来源提示，弱化为灰色可以让异常原因和截图式上下文成为视觉重点。
+    /// - 插件可按 `- <path>` 输出扫描到的候选日志列表，因此优先识别这类路径行，避免把普通诊断文本误染成灰色。
     fn output_step_plain_text_line_is_log_path(line: &str) -> bool {
         let trimmed = line.trim_start();
         if !trimmed.starts_with("- ") {
             return false;
         }
         let candidate = trimmed.trim_start_matches("- ").trim();
+        let lower = candidate.to_ascii_lowercase();
         candidate.contains('/')
-            || candidate.contains("!/")
-            || candidate.to_ascii_lowercase().contains("memory_")
-            || candidate.to_ascii_lowercase().contains("pool_")
+            || candidate.contains('\\')
+            || candidate.contains('!')
+            || matches!(
+                lower.rsplit('.').next(),
+                Some("log" | "txt" | "out" | "err" | "zip" | "gz")
+            )
     }
 
     /// 渲染截图式原始日志上下文。
@@ -2706,7 +2667,7 @@ impl PluginPageWindowView {
     /// 渲染插件表格过滤栏。
     ///
     /// 业务意图：
-    /// - 插件协议只提供最终表格数据；宿主过滤栏在本地对任意插件表格做快速收窄，避免用户为了找一条 SQL 或路径重新执行插件。
+    /// - 插件协议只提供最终表格数据；宿主过滤栏在本地对任意插件表格做快速收窄，避免用户为了找一条记录重新执行插件。
     /// - 过滤栏必须消费鼠标和键盘事件，防止输入、拖选或清空按钮点击穿透到表格行按钮。
     fn render_table_filter_bar(
         &self,
@@ -2723,8 +2684,8 @@ impl PluginPageWindowView {
             .flex_col()
             .gap_2()
             .flex_none()
-            .when_some(table.performance_filter.as_ref(), |bar, filter| {
-                bar.child(self.render_performance_filter_row(filter, palette, context))
+            .when_some(table.command_filter.as_ref(), |bar, filter| {
+                bar.child(self.render_command_filter_row(filter, palette, context))
             })
             .child(
                 div()
@@ -2734,9 +2695,9 @@ impl PluginPageWindowView {
                     .gap_2()
                     .h(px(PLUGIN_TABLE_FILTER_HEIGHT))
                     .child(self.render_table_input_box(
-                        "plugin-table-filter-input",
+                        SharedString::from("plugin-table-filter-input"),
                         PluginTableInputKind::QuickFilter,
-                        "过滤当前表格任意关键字",
+                        "过滤当前表格任意关键字".to_string(),
                         Some(Icon::Search),
                         true,
                         px(0.0),
@@ -2757,67 +2718,46 @@ impl PluginPageWindowView {
             )
     }
 
-    /// 渲染性能表格业务过滤行。
+    /// 渲染插件声明式命令过滤行。
     ///
     /// 业务意图：
-    /// - 用户和请求时间区间过滤会回调插件重新计算汇总或详情，不能混在通用本地关键字过滤里。
+    /// - 插件声明的过滤控件会回调插件重新生成表格，不能混在通用本地关键字过滤里。
     /// - 输入控件保持紧凑并允许换行，避免较窄窗口下时间输入和按钮互相挤压遮挡。
-    fn render_performance_filter_row(
+    fn render_command_filter_row(
         &self,
-        filter: &PluginPerformanceTableFilter,
+        filter: &PluginTableCommandFilter,
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let apply_command = filter.command.clone();
         let reset_command = filter.command.clone();
         div()
-            .id("plugin-performance-filter-row")
+            .id("plugin-command-filter-row")
             .flex()
             .flex_wrap()
             .items_center()
             .gap_2()
             .min_h(px(PLUGIN_TABLE_FILTER_HEIGHT))
-            .child(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(rgb(palette.muted_text))
-                    .child("业务过滤"),
+            .children(
+                self.command_filter_inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, input_state)| {
+                        self.render_table_input_box(
+                            SharedString::from(format!("plugin-command-filter-input-{index}")),
+                            PluginTableInputKind::CommandFilter(index),
+                            input_state.placeholder.clone(),
+                            Self::plugin_command_filter_icon(input_state.icon.as_deref()),
+                            false,
+                            input_state.width,
+                            palette,
+                            context,
+                        )
+                    }),
             )
-            .child(self.render_table_input_box(
-                "plugin-performance-user-filter",
-                PluginTableInputKind::PerformanceUsers,
-                "用户：alice,bob",
-                Some(Icon::User),
-                false,
-                px(180.0),
-                palette,
-                context,
-            ))
-            .child(self.render_table_input_box(
-                "plugin-performance-start-filter",
-                PluginTableInputKind::PerformanceStartTime,
-                "开始：yyyy-MM-dd HH:mm:ss",
-                None,
-                false,
-                px(220.0),
-                palette,
-                context,
-            ))
-            .child(self.render_table_input_box(
-                "plugin-performance-end-filter",
-                PluginTableInputKind::PerformanceEndTime,
-                "结束：yyyy-MM-dd HH:mm:ss",
-                None,
-                false,
-                px(220.0),
-                palette,
-                context,
-            ))
             .child(
                 div()
-                    .id("plugin-performance-filter-apply")
+                    .id("plugin-command-filter-apply")
                     .flex()
                     .items_center()
                     .gap_1()
@@ -2841,14 +2781,14 @@ impl PluginPageWindowView {
                     .on_mouse_down(
                         MouseButton::Left,
                         context.listener(move |view, _event: &MouseDownEvent, _window, context| {
-                            view.apply_performance_table_filter(apply_command.clone(), context);
+                            view.apply_plugin_table_command_filter(apply_command.clone(), context);
                             context.stop_propagation();
                         }),
                     ),
             )
             .child(
                 div()
-                    .id("plugin-performance-filter-reset")
+                    .id("plugin-command-filter-reset")
                     .flex()
                     .items_center()
                     .gap_1()
@@ -2872,30 +2812,54 @@ impl PluginPageWindowView {
                     .on_mouse_down(
                         MouseButton::Left,
                         context.listener(move |view, _event: &MouseDownEvent, _window, context| {
-                            view.clear_performance_filter_inputs();
-                            view.apply_performance_table_filter(reset_command.clone(), context);
+                            view.clear_command_filter_inputs();
+                            view.apply_plugin_table_command_filter(reset_command.clone(), context);
                             context.stop_propagation();
                         }),
                     ),
             )
     }
 
+    /// 将插件声明的通用图标名映射到宿主图标。
+    ///
+    /// 业务意图：
+    /// - 插件只能传递字符串协议，宿主统一提供有限的通用图标集合；未知图标名忽略，不影响控件可用性。
+    fn plugin_command_filter_icon(icon: Option<&str>) -> Option<Icon> {
+        match icon
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "user" => Some(Icon::User),
+            "search" => Some(Icon::Search),
+            "filter" => Some(Icon::ListFilter),
+            "calendar" | "time" => Some(Icon::Calendar),
+            _ => None,
+        }
+    }
+
     /// 渲染插件表格过滤栏中的单行输入框。
     fn render_table_input_box(
         &self,
-        element_id: &'static str,
+        element_id: SharedString,
         input_kind: PluginTableInputKind,
-        placeholder: &'static str,
+        placeholder: String,
         icon: Option<Icon>,
         fill_available_width: bool,
         fixed_width: Pixels,
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let has_text = !self.table_input_state(input_kind).text.trim().is_empty();
-        let focus_handle = self.table_input_focus(input_kind).clone();
+        let has_text = self
+            .table_input_state(input_kind)
+            .is_some_and(|input| !input.text.trim().is_empty());
+        let focus_handle = self
+            .table_input_focus(input_kind)
+            .cloned()
+            .unwrap_or_else(|| context.focus_handle());
         div()
-            .id(element_id)
+            .id(element_id.clone())
             .flex()
             .items_center()
             .gap_2()
@@ -2907,7 +2871,7 @@ impl PluginPageWindowView {
             .border_color(rgb(palette.border))
             .bg(rgb(palette.input))
             .track_focus(&focus_handle)
-            .key_context(element_id)
+            .key_context("plugin-table-filter-input")
             .when(fill_available_width, |input| input.flex_1())
             .when(!fill_available_width, |input| {
                 input.flex_none().w(fixed_width)
@@ -2987,8 +2951,9 @@ impl PluginPageWindowView {
                             MouseButton::Left,
                             context.listener(
                                 move |view, _event: &MouseDownEvent, _window, context| {
-                                    view.table_input_state_mut(input_kind)
-                                        .set_text(String::new());
+                                    if let Some(input) = view.table_input_state_mut(input_kind) {
+                                        input.set_text(String::new());
+                                    }
                                     view.after_table_input_text_changed(input_kind, context);
                                     context.stop_propagation();
                                 },
@@ -3043,8 +3008,8 @@ impl PluginPageWindowView {
     /// 渲染插件表格横向滚动条。
     ///
     /// 业务意图：
-    /// - SQL 文本、请求路径和第三方插件未知列可能超过窗口宽度；横向滑块让用户不用依赖触控板即可查看完整内容。
-    /// - 只有真实产生横向溢出时才显示，避免普通性能汇总表右下角出现无效控件。
+    /// - 插件任意文本列都可能超过窗口宽度；横向滑块让用户不用依赖触控板即可查看完整内容。
+    /// - 只有真实产生横向溢出时才显示，避免普通短表右下角出现无效控件。
     fn render_plugin_table_horizontal_scrollbar(
         &self,
         scroll_handle: &ScrollHandle,
@@ -3763,7 +3728,7 @@ impl PluginPageWindowView {
     ///
     /// 业务意图：
     /// - 旧插件返回的静态页面直接打开；新插件可返回延迟命令，点击后先打开进度窗口，再等待插件生成结果。
-    /// - 这样避免首次页面响应携带所有深层明细数据，尤其适合 SQL 列表这类只在用户下钻时才需要读取的内容。
+    /// - 这样避免首次页面响应携带所有深层明细数据，尤其适合只在用户下钻时才需要读取的内容。
     fn open_table_row_action(&self, action: PluginTableRowAction, context: &mut Context<Self>) {
         if let Some(page) = action.page.clone() {
             self.open_table_row_action_page(action, *page, context);
@@ -3838,7 +3803,7 @@ impl PluginPageWindowView {
     /// 执行插件行内延迟命令并打开独立进度窗口。
     ///
     /// 业务意图：
-    /// - SQL 明细等数据可能需要读取单个大日志文件，必须在点击后后台执行，不能阻塞当前插件结果窗口。
+    /// - 行内明细可能需要读取单个大日志文件，必须在点击后后台执行，不能阻塞当前插件结果窗口。
     /// - 新窗口先展示进度，插件最终返回页面后再原地替换，用户可以继续查看原汇总/详情窗口。
     fn open_table_row_action_command(
         &self,
@@ -3946,7 +3911,7 @@ impl PluginPageWindowView {
     /// 补齐表格延迟动作需要的页面来源快照。
     ///
     /// 业务意图：
-    /// - 性能汇总页的“详情”按钮只在首次响应中保存请求地址，避免把每个请求的完整明细页提前序列化出来。
+    /// - 插件汇总页的行内按钮可以只在首次响应中保存行标识，避免把每行完整明细页提前序列化出来。
     /// - 用户实际点击按钮时，宿主再把当前插件窗口保存的原始日志文件快照放入上下文，由插件在后台生成该行详情。
     ///
     /// 边界条件：
@@ -3967,53 +3932,43 @@ impl PluginPageWindowView {
         }
     }
 
-    /// 返回当前页面性能过滤器的插件命令。
-    fn current_performance_filter_command(&self) -> Option<PluginTableRowCommand> {
+    /// 返回当前页面命令过滤器的插件命令。
+    fn current_command_filter_command(&self) -> Option<PluginTableRowCommand> {
         self.page
             .table
             .as_ref()
-            .and_then(|table| table.performance_filter.as_ref())
+            .and_then(|table| table.command_filter.as_ref())
             .map(|filter| filter.command.clone())
     }
 
-    /// 清空性能业务过滤输入。
-    fn clear_performance_filter_inputs(&mut self) {
-        self.performance_user_filter_input.set_text(String::new());
-        self.performance_start_time_filter_input
-            .set_text(String::new());
-        self.performance_end_time_filter_input
-            .set_text(String::new());
+    /// 清空插件命令过滤输入。
+    fn clear_command_filter_inputs(&mut self) {
+        for input_state in &mut self.command_filter_inputs {
+            input_state.input.set_text(String::new());
+        }
     }
 
-    /// 把当前性能过滤输入合并进插件命令上下文。
+    /// 把当前命令过滤输入合并进插件命令上下文。
     ///
     /// 业务意图：
-    /// - 插件负责解析用户和时间区间并重新聚合表格；宿主只把输入框原始文本写回 `TableAction.data`。
-    /// - 详情页的命令上下文还包含请求地址，合并时必须保留已有字段，只覆盖过滤相关键。
-    fn with_current_performance_filter_data(
+    /// - 插件负责解析字段值并重新生成表格；宿主只把输入框原始文本按插件声明的 `key` 写回 `TableAction.data`。
+    /// - 命令上下文还可能包含下钻参数，合并时必须保留已有字段，只覆盖插件声明的过滤键。
+    fn with_current_command_filter_data(
         &self,
         context: PluginCommandContext,
     ) -> PluginCommandContext {
-        let users = self.performance_user_filter_input.text.trim().to_string();
-        let start_time = self
-            .performance_start_time_filter_input
-            .text
-            .trim()
-            .to_string();
-        let end_time = self
-            .performance_end_time_filter_input
-            .text
-            .trim()
-            .to_string();
         match context {
             PluginCommandContext::TableAction {
                 action_id,
                 files,
                 mut data,
             } => {
-                data.insert(PLUGIN_PERFORMANCE_FILTER_USERS_KEY.to_string(), users);
-                data.insert(PLUGIN_PERFORMANCE_FILTER_START_KEY.to_string(), start_time);
-                data.insert(PLUGIN_PERFORMANCE_FILTER_END_KEY.to_string(), end_time);
+                for input_state in &self.command_filter_inputs {
+                    let key = input_state.key.trim();
+                    if !key.is_empty() {
+                        data.insert(key.to_string(), input_state.input.text.trim().to_string());
+                    }
+                }
                 PluginCommandContext::TableAction {
                     action_id,
                     files,
@@ -4024,28 +3979,27 @@ impl PluginPageWindowView {
         }
     }
 
-    /// 应用性能业务过滤并在当前插件窗口内替换页面。
+    /// 应用插件命令过滤并在当前插件窗口内替换页面。
     ///
     /// 业务意图：
-    /// - 性能汇总过滤必须重新计算请求次数和平均耗时；请求详情过滤也必须从原始日志快照重新筛选。
+    /// - 命令过滤由插件重新计算页面；宿主只负责启动同一插件命令并替换当前窗口页面。
     /// - 命令在后台线程执行，当前窗口先展示进度，避免用户在大目录中过滤时误以为界面卡死。
     ///
     /// 边界条件：
     /// - 如果当前窗口缺少来源插件，说明页面不是由可回调插件生成，直接展示中文错误而不是静默失效。
-    fn apply_performance_table_filter(
+    fn apply_plugin_table_command_filter(
         &mut self,
         command: PluginTableRowCommand,
         context: &mut Context<Self>,
     ) {
         let Some(plugin) = self.origin_plugin.clone() else {
-            self.page = MainView::plugin_error_page("无法确定性能过滤所属插件".to_string());
+            self.page = MainView::plugin_error_page("无法确定过滤命令所属插件".to_string());
             context.notify();
             return;
         };
         let command_id = command.command_id;
-        let command_context = self.hydrate_table_action_context(
-            self.with_current_performance_filter_data(command.context),
-        );
+        let command_context = self
+            .hydrate_table_action_context(self.with_current_command_filter_data(command.context));
         let palette = self.palette;
         let origin_plugin = self.origin_plugin.clone();
         let origin_log_sources = self.origin_log_sources.clone();
@@ -4207,8 +4161,8 @@ impl PluginPageWindowView {
     /// 返回延迟行命令需要由宿主流式传给插件的日志来源。
     ///
     /// 业务意图：
-    /// - 初始性能列表解析只读取文件名，不能为了后续 SQL 下钻预先读取或解压上万份日志。
-    /// - 用户真正点击“显示SQL”时，宿主用触发插件时保存的 `source_key -> LogFileSource` 快照定位单个文件，并把正文按行写入插件 stdin。
+    /// - 初始汇总解析可以只读取文件名，不能为了后续下钻预先读取或解压上万份日志。
+    /// - 用户真正点击延迟按钮时，宿主用触发插件时保存的 `source_key -> LogFileSource` 快照定位单个文件，并把正文按行写入插件 stdin。
     ///
     /// 边界条件：
     /// - 如果插件已经带回 `read_path`，说明它可以直接读取本地文件，不需要宿主内容流。
@@ -4235,7 +4189,7 @@ impl PluginPageWindowView {
     ///
     /// 业务意图：
     /// - 宿主直接读取用户触发下钻的单个日志来源，并把字节流按行转换成插件协议 JSON Lines。
-    /// - 普通文件、压缩包成员和已物化成员都通过同一个流式 writer 消费，避免为了插件 SQL 解析生成临时日志文件或整块日志内存。
+    /// - 普通文件、压缩包成员和已物化成员都通过同一个流式 writer 消费，避免为了插件解析生成临时日志文件或整块日志内存。
     ///
     /// 关键约束：
     /// - 该函数只在后台任务中调用，避免大文件顺序读取阻塞 GPUI 主线程。
@@ -4264,7 +4218,7 @@ impl PluginPageWindowView {
     ///
     /// 业务意图：
     /// - 工具栏插件先拿到完整树快照，再用 source_key 请求自己真正需要分析的文件正文；宿主只在这里根据保存的来源快照读取文件。
-    /// - 读取失败或 source_key 不存在时写入 `log_content_error` 事件，让插件能继续处理后续文件，而不是让整个 E9 分析中断。
+    /// - 读取失败或 source_key 不存在时写入 `log_content_error` 事件，让插件能继续处理后续文件，而不是让整个分析中断。
     ///
     /// 边界条件：
     /// - `path_label` 只作为 UI 回显，不能参与文件定位；真实读取必须来自 `origin_log_sources`。
@@ -4429,7 +4383,7 @@ impl EntityInputHandler for PluginPageWindowView {
         _context: &mut Context<Self>,
     ) -> Option<String> {
         let input_kind = self.focused_table_input_kind(window)?;
-        let input = self.table_input_state(input_kind);
+        let input = self.table_input_state(input_kind)?;
         let range = MainView::search_input_range_from_utf16(&input.text, range_utf16);
         adjusted_range.replace(MainView::search_input_range_to_utf16(
             &input.text,
@@ -4446,7 +4400,7 @@ impl EntityInputHandler for PluginPageWindowView {
         _context: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         let input_kind = self.focused_table_input_kind(window)?;
-        let input = self.table_input_state(input_kind);
+        let input = self.table_input_state(input_kind)?;
         Some(UTF16Selection {
             range: MainView::search_input_range_to_utf16(
                 &input.text,
@@ -4463,7 +4417,7 @@ impl EntityInputHandler for PluginPageWindowView {
         _context: &mut Context<Self>,
     ) -> Option<Range<usize>> {
         let input_kind = self.focused_table_input_kind(window)?;
-        let input = self.table_input_state(input_kind);
+        let input = self.table_input_state(input_kind)?;
         input
             .marked_range
             .clone()
@@ -4473,7 +4427,10 @@ impl EntityInputHandler for PluginPageWindowView {
     /// 清除输入法组合文本状态。
     fn unmark_text(&mut self, window: &mut Window, context: &mut Context<Self>) {
         if let Some(input_kind) = self.focused_table_input_kind(window) {
-            self.table_input_state_mut(input_kind).marked_range = None;
+            let Some(input) = self.table_input_state_mut(input_kind) else {
+                return;
+            };
+            input.marked_range = None;
             context.notify();
         }
     }
@@ -4491,7 +4448,9 @@ impl EntityInputHandler for PluginPageWindowView {
         };
         let replacement = MainView::sanitize_search_input_text(text);
         {
-            let input = self.table_input_state_mut(input_kind);
+            let Some(input) = self.table_input_state_mut(input_kind) else {
+                return;
+            };
             let range = range_utf16
                 .map(|range| MainView::search_input_range_from_utf16(&input.text, range))
                 .or_else(|| input.marked_range.clone())
@@ -4519,7 +4478,9 @@ impl EntityInputHandler for PluginPageWindowView {
         };
         let replacement = MainView::sanitize_search_input_text(new_text);
         {
-            let input = self.table_input_state_mut(input_kind);
+            let Some(input) = self.table_input_state_mut(input_kind) else {
+                return;
+            };
             let range = range_utf16
                 .map(|range| MainView::search_input_range_from_utf16(&input.text, range))
                 .or_else(|| input.marked_range.clone())
@@ -4556,7 +4517,7 @@ impl EntityInputHandler for PluginPageWindowView {
         _context: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let input_kind = self.focused_table_input_kind(window)?;
-        let input = self.table_input_state(input_kind);
+        let input = self.table_input_state(input_kind)?;
         let Some(layout) = self.table_input_layout(input_kind) else {
             return Some(element_bounds);
         };
@@ -4578,7 +4539,7 @@ impl EntityInputHandler for PluginPageWindowView {
         _context: &mut Context<Self>,
     ) -> Option<usize> {
         let input_kind = self.focused_table_input_kind(window)?;
-        let input = self.table_input_state(input_kind);
+        let input = self.table_input_state(input_kind)?;
         let utf8_index = self.table_input_index_at_position(input_kind, point);
         Some(MainView::search_input_utf16_offset_from_byte(
             &input.text,
@@ -4612,7 +4573,7 @@ fn compare_plugin_table_cells(left: &str, right: &str) -> Ordering {
 /// 插件窗口内部后台命令代次状态。
 ///
 /// 业务意图：
-/// - 性能业务过滤会在同一个插件窗口内反复启动后台插件命令，旧命令可能比新命令更晚返回。
+/// - 插件声明式命令过滤会在同一个插件窗口内反复启动后台插件命令，旧命令可能比新命令更晚返回。
 /// - 该状态只服务当前窗口内部的竞争消解，防止旧进度和旧结果覆盖用户最新输入的过滤条件。
 ///
 /// 边界条件：
@@ -4670,7 +4631,7 @@ mod tests {
     /// 覆盖插件表格数值列排序规则。
     ///
     /// 业务意图：
-    /// - 性能列表的耗时列必须按数值比较，避免字符串排序把 `100` 排在 `20` 前面。
+    /// - 插件返回的数值列必须按数值比较，避免字符串排序把 `100` 排在 `20` 前面。
     #[test]
     fn 插件表格单元格数字按数值比较() {
         assert_eq!(compare_plugin_table_cells("20", "100"), Ordering::Less);
@@ -4679,7 +4640,7 @@ mod tests {
     /// 覆盖插件窗口内部后台命令代次的竞争消解。
     ///
     /// 业务意图：
-    /// - 性能业务过滤会在同一个窗口内连续启动插件进程，旧进程的结果不能结束或覆盖新进程。
+    /// - 插件声明式命令过滤会在同一个窗口内连续启动插件进程，旧进程的结果不能结束或覆盖新进程。
     /// - 该测试只验证纯状态规则，避免依赖 GPUI 窗口和真实插件进程。
     #[test]
     fn 插件窗口命令代次只接受最新任务() {
@@ -4693,36 +4654,36 @@ mod tests {
         assert!(!state.is_active(second));
     }
 
-    /// 覆盖 weaver-logext 核心列宽。
+    /// 覆盖插件表头宽度只按通用文本长度估算。
     ///
     /// 业务意图：
-    /// - 请求地址是性能列表的主要诊断字段，必须明显宽于普通兜底列。
+    /// - 宿主不能按插件业务列名做特殊宽度优化；短表头不应超过通用兜底宽度。
     #[test]
-    fn 插件表格请求地址列宽大于普通列() {
+    fn 插件表格短表头宽度不超过兜底列宽() {
         assert!(
-            PluginPageWindowView::plugin_table_column_width("请求地址")
-                > PLUGIN_TABLE_FALLBACK_COLUMN_WIDTH
+            PluginPageWindowView::plugin_table_column_width("主要字段")
+                <= PLUGIN_TABLE_FALLBACK_COLUMN_WIDTH
         );
     }
 
-    /// 覆盖请求详情表格不会因为请求地址列固定过宽而触发横向滚动。
+    /// 覆盖带动作列的表格不会因为固定列宽过大而触发横向滚动。
     ///
     /// 业务意图：
-    /// - 请求地址/路径列应作为弹性列吸收剩余空间，而不是用超大固定宽度把操作列挤到横向滚动区域。
+    /// - 主文本列应作为弹性列吸收剩余空间，而不是用超大固定宽度把操作列挤到横向滚动区域。
     #[test]
-    fn 请求详情表格最小宽度适配插件窗口() {
+    fn 动作表格最小宽度适配插件窗口() {
         let table = PluginPageTable {
             headers: vec![
-                "请求路径".to_string(),
-                "耗时(ms)".to_string(),
-                "用户".to_string(),
-                "请求时间".to_string(),
+                "主文本".to_string(),
+                "数值".to_string(),
+                "来源".to_string(),
+                "时间".to_string(),
                 "操作".to_string(),
             ],
             rows: Vec::new(),
-            performance_filter: None,
+            command_filter: None,
             row_actions: vec![vec![PluginTableRowAction {
-                label: "显示SQL".to_string(),
+                label: "详情".to_string(),
                 title: None,
                 page: None,
                 command: None,
@@ -4747,9 +4708,9 @@ mod tests {
     #[test]
     fn 插件表格弹性列避开操作列() {
         let table = PluginPageTable {
-            headers: vec!["请求地址".to_string(), "操作".to_string()],
-            rows: vec![vec!["/api".to_string(), String::new()]],
-            performance_filter: None,
+            headers: vec!["主文本".to_string(), "操作".to_string()],
+            rows: vec![vec!["alpha".to_string(), String::new()]],
+            command_filter: None,
             row_actions: vec![vec![PluginTableRowAction {
                 label: "详情".to_string(),
                 title: None,
@@ -4767,50 +4728,50 @@ mod tests {
     /// 覆盖插件表格过滤按任意列关键字收窄结果。
     ///
     /// 业务意图：
-    /// - 第三方插件表格列语义不固定，过滤必须扫描整行所有单元格，而不是只看 weaver-logext 的请求地址列。
-    /// - 多关键字同时命中才能保留，方便用户用路径、用户或 SQL 片段逐步缩小范围。
+    /// - 第三方插件表格列语义不固定，过滤必须扫描整行所有单元格，而不是只看某个固定业务列。
+    /// - 多关键字同时命中才能保留，方便用户用不同列片段逐步缩小范围。
     #[test]
     fn 插件表格过滤支持任意列多关键字() {
         let row = vec![
-            "/api/workflow/request".to_string(),
-            "alice".to_string(),
-            "select table_a".to_string(),
+            "alpha/workflow".to_string(),
+            "owner-a".to_string(),
+            "payload-fragment".to_string(),
         ];
         assert!(PluginPageWindowView::plugin_table_row_matches_filter(
             &row,
-            "WORKFLOW alice"
+            "WORKFLOW owner"
         ));
         assert!(PluginPageWindowView::plugin_table_row_matches_filter(
-            &row, "table_a"
+            &row, "payload"
         ));
         assert!(!PluginPageWindowView::plugin_table_row_matches_filter(
             &row,
-            "workflow bob"
+            "workflow missing"
         ));
     }
 
-    /// 覆盖长 SQL 内容会扩大列宽以触发横向滚动。
+    /// 覆盖长文本内容会扩大列宽以触发横向滚动。
     ///
     /// 业务意图：
-    /// - weaver-logext 的 SQL 明细通常无法在默认列宽内完整展示，宿主需要根据内容估算列宽，让表格在必要时出现横向滚动条。
+    /// - 任意插件长文本通常无法在默认列宽内完整展示，宿主需要根据内容估算列宽，让表格在必要时出现横向滚动条。
     #[test]
     fn 插件表格长内容会扩大列宽() {
-        let long_sql = format!("select {} from very_long_table", "x".repeat(180));
+        let long_text = format!("prefix-{}", "x".repeat(180));
         let table = PluginPageTable {
-            headers: vec!["SQL文本".to_string()],
-            rows: vec![vec![long_sql]],
-            performance_filter: None,
+            headers: vec!["长文本".to_string()],
+            rows: vec![vec![long_text]],
+            command_filter: None,
             row_actions: Vec::new(),
         };
 
         let widths = PluginPageWindowView::plugin_table_column_widths(&table, 1);
-        assert!(widths[0] > PluginPageWindowView::plugin_table_column_width("SQL文本"));
+        assert!(widths[0] > PluginPageWindowView::plugin_table_column_width("长文本"));
     }
 
     /// 覆盖插件表格文本选区不会切断 UTF-8 字符。
     ///
     /// 业务意图：
-    /// - 表格单元格现在支持拖动选择文本片段；中文路径和 SQL 注释都可能包含多字节字符。
+    /// - 表格单元格现在支持拖动选择文本片段；中文路径和其它多字节字符都必须安全处理。
     /// - 复制前必须把鼠标命中范围夹到字符边界，避免生成非法字符串或复制失败。
     #[test]
     fn 插件表格文本选区按字符边界裁剪() {
@@ -4823,7 +4784,7 @@ mod tests {
     /// 覆盖步骤式输出打字机按字符截取正文。
     ///
     /// 业务意图：
-    /// - E9 memory 分析结果包含中文路径、中文异常原因和原始日志摘要，打字机效果必须按字符推进。
+    /// - 插件步骤输出可能包含中文路径、中文异常原因和原始日志摘要，打字机效果必须按字符推进。
     /// - 如果按字节截取，多字节中文会在渲染前被切坏，导致窗口正文丢失或 panic。
     #[test]
     fn 插件步骤正文打字机按字符推进() {
@@ -4833,16 +4794,16 @@ mod tests {
         );
     }
 
-    /// 覆盖 E9 输出中的日志路径行识别。
+    /// 覆盖步骤输出中的日志路径行识别。
     ///
     /// 业务意图：
-    /// - memory 扫描摘要中的日志路径需要用灰色弱化显示，但普通异常说明仍应使用正文颜色。
+    /// - 扫描摘要中的日志路径需要用灰色弱化显示，但普通异常说明仍应使用正文颜色。
     /// - 只识别插件约定的 `- <path>` 形态，避免误把诊断结论或完成摘要染成路径样式。
     #[test]
     fn 插件步骤普通文本能识别日志路径行() {
         assert!(
             PluginPageWindowView::output_step_plain_text_line_is_log_path(
-                "- 192.168.9.172downLog.zip!/2026-05-21/memory_2026-05-21.log"
+                "- 192.168.9.172downLog.zip!/2026-05-21/server_2026-05-21.log"
             )
         );
         assert!(
@@ -4852,7 +4813,7 @@ mod tests {
         );
     }
 
-    /// 覆盖 E9 memory 异常上下文内部协议解析。
+    /// 覆盖插件异常上下文内部协议解析。
     ///
     /// 业务意图：
     /// - 插件返回的日志片段标记必须被宿主转换成结构化块，避免用户在流式输出中看到内部协议文本。
@@ -5190,7 +5151,7 @@ impl MainView {
     /// 构造插件步骤式运行初始页面。
     ///
     /// 业务意图：
-    /// - E9 日志分析点击后需要立即显示具体步骤“正在分析memory日志”，不展示通用进度条。
+    /// - 步骤式插件点击后需要立即显示首个具体步骤，不展示通用进度条。
     /// - 页面只携带步骤模型，后续 stdout 事件追加正文；旧插件仍使用 `plugin_running_page`。
     pub(in crate::app) fn plugin_step_running_page(
         title: String,
@@ -5435,7 +5396,7 @@ impl MainView {
     /// 从日志分析页工具栏调用插件命令。
     ///
     /// 业务意图：
-    /// - 工具栏插件面向当前整棵日志树，例如泛微日志分析需要扫描所有已加载路径，而不是右键选中项。
+    /// - 工具栏插件面向当前整棵日志树，需要扫描所有已加载路径，而不是右键选中项。
     /// - 宿主负责把日志树快照和插件设置合并后传入，插件不能自行访问未加载目录或读取全局配置。
     ///
     /// 边界条件：
@@ -5472,14 +5433,28 @@ impl MainView {
         let settings = load_plugin_settings(manifest);
         let toolbar_snapshot_filter = toolbar_contribution
             .as_ref()
-            .and_then(|contribution| contribution.initial_step.as_ref())
-            .filter(|initial_step| initial_step.id == "memory")
-            .map(|_| {
-                // E9 当前已实现 memory 和连接池两个步骤，宿主快照只预收这两类候选路径，
-                // 避免把线程、stdout、配置文件等无关条目序列化给插件导致首轮扫描变慢。
-                ["memory", "pool"]
+            .map(|contribution| {
+                // 插件 manifest 声明哪些设置键可用于工具栏快照预过滤；宿主只读取对应通配规则，
+                // 不解析设置键的业务含义，避免主程序固化某个插件的日志类型。
+                contribution
+                    .snapshot_filter_setting_keys
                     .iter()
-                    .filter_map(|key| settings.get(*key))
+                    .filter_map(|key| settings.get(key))
+                    .map(String::as_str)
+                    .filter(|patterns| !patterns.trim().is_empty())
+                    .collect::<Vec<_>>()
+                    .join(";")
+            })
+            .filter(|patterns| !patterns.trim().is_empty());
+        let toolbar_single_file_archive_filter = toolbar_contribution
+            .as_ref()
+            .map(|contribution| {
+                // 插件可额外声明哪些规则代表单文件压缩日志；宿主只使用这些通配规则决定是否跳过
+                // 对应压缩包的目录展开，不关心该压缩包属于线程、业务还是其它日志类型。
+                contribution
+                    .snapshot_single_file_archive_setting_keys
+                    .iter()
+                    .filter_map(|key| settings.get(key))
                     .map(String::as_str)
                     .filter(|patterns| !patterns.trim().is_empty())
                     .collect::<Vec<_>>()
@@ -5492,6 +5467,7 @@ impl MainView {
                 let cache_key = LoadedLogTreeState::plugin_toolbar_snapshot_cache_key(
                     &tree_state.tree,
                     toolbar_snapshot_filter.as_deref(),
+                    toolbar_single_file_archive_filter.as_deref(),
                 );
                 let cached = self.plugins.toolbar_snapshot_cache.get(&cache_key).cloned();
                 (tree_state.tree.clone(), cache_key, cached)
@@ -5550,7 +5526,7 @@ impl MainView {
                                             plugin_name_for_worker
                                         ),
                                         detail: Some(format!(
-                                            "已复用日志树快照缓存，候选 E9 日志 {} 个",
+                                            "已复用日志树快照缓存，候选日志 {} 个",
                                             cached_files.len()
                                         )),
                                         done: 0,
@@ -5581,6 +5557,7 @@ impl MainView {
                                     LoadedLogTreeState::plugin_log_files_for_toolbar_tree_snapshot_with_filter(
                                         &tree,
                                         toolbar_snapshot_filter.as_deref(),
+                                        toolbar_single_file_archive_filter.as_deref(),
                                     );
                                 let snapshot_for_cache = Some(files.clone());
                                 (files, snapshot_for_cache)

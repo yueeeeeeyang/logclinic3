@@ -55,14 +55,14 @@ pub(in crate::app) const TOOLBAR_ACTIONS: &[ToolbarAction] = &[
     },
 ];
 
-/// E9 工具栏压缩包目录元数据缓存最大条目数。
+/// 工具栏插件压缩包目录元数据缓存最大条目数。
 ///
 /// 业务意图：
-/// - 第一次 E9 分析需要递归扫描压缩包目录，插件重载后如果重复分析同一批日志，不应再次付出完整解压/遍历成本。
+/// - 工具栏插件可能需要递归扫描压缩包目录，插件重载后如果重复分析同一批日志，不应再次付出完整解压/遍历成本。
 /// - 缓存只保存目录树元数据和成员定位信息，不保存日志正文，避免把大日志内容长期留在内存中。
 const TOOLBAR_ARCHIVE_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 32;
 
-/// E9 工具栏压缩包目录元数据缓存。
+/// 工具栏插件压缩包目录元数据缓存。
 ///
 /// 边界条件：
 /// - key 包含本地压缩包路径、文件大小、修改时间和格式；文件变化后会自然失效。
@@ -571,7 +571,7 @@ impl LoadedLogTreeState {
     ///
     /// 业务意图：
     /// - 工具栏分析入口面向“当前已经加载的左侧日志树”，因此必须遍历加载树中的全部可打开文件，而不是右键选中节点。
-    /// - 普通目录中出现的压缩包在加载树里只是普通文件；这里会继续扫描压缩包目录元数据，让泛微日志分析能看到压缩包内部候选路径。
+    /// - 普通目录中出现的压缩包在加载树里只是普通文件；这里会继续扫描压缩包目录元数据，让插件能看到压缩包内部候选路径。
     ///
     /// 边界条件：
     /// - 该函数只基于当前加载树和其中的本地压缩包文件扩展扫描，不访问用户未选择的其它路径。
@@ -595,13 +595,13 @@ impl LoadedLogTreeState {
     pub(in crate::app) fn plugin_log_files_for_toolbar_tree_snapshot(
         tree: &LoadedLogTree,
     ) -> Vec<PluginLogFile> {
-        Self::plugin_log_files_for_toolbar_tree_snapshot_with_filter(tree, None)
+        Self::plugin_log_files_for_toolbar_tree_snapshot_with_filter(tree, None, None)
     }
 
     /// 基于传入日志树和路径规则生成工具栏插件快照。
     ///
     /// 业务意图：
-    /// - E9 当前只分析 memory 和连接池日志，若仍把几万条线程日志、stdout、web.xml 等无关条目全部序列化给插件，会让窗口打开后长时间停留在扫描阶段。
+    /// - 插件 manifest 可以声明快照预过滤规则，避免把与当前命令无关的大量条目全部序列化给插件。
     /// - 这里允许调用方传入轻量 glob 规则，只把可能命中的文件加入插件上下文；压缩包目录仍会被遍历，以便发现压缩包内部的候选日志。
     ///
     /// 边界条件：
@@ -610,6 +610,7 @@ impl LoadedLogTreeState {
     pub(in crate::app) fn plugin_log_files_for_toolbar_tree_snapshot_with_filter(
         tree: &LoadedLogTree,
         path_filter_patterns: Option<&str>,
+        single_file_archive_patterns: Option<&str>,
     ) -> Vec<PluginLogFile> {
         const MAX_ARCHIVE_DEPTH: usize = 5;
 
@@ -617,6 +618,8 @@ impl LoadedLogTreeState {
         let mut seen_keys = HashSet::new();
         let mut files = Vec::new();
         let path_filter_patterns = path_filter_patterns
+            .filter(|patterns| Self::toolbar_snapshot_has_usable_patterns(patterns));
+        let single_file_archive_patterns = single_file_archive_patterns
             .filter(|patterns| Self::toolbar_snapshot_has_usable_patterns(patterns));
 
         for row in &tree.rows {
@@ -633,21 +636,43 @@ impl LoadedLogTreeState {
             }
 
             let relative_path = Self::plugin_relative_path_from_stack(&path_stack);
-            let snapshot_path =
-                Self::toolbar_thread_zip_virtual_log_path(&row.label, &relative_path)
-                    .unwrap_or_else(|| relative_path.clone());
             if let Some(source) = row.source.as_ref() {
+                if let Some(snapshot_path) =
+                    Self::toolbar_snapshot_declared_single_file_archive_path(
+                        single_file_archive_patterns,
+                        &relative_path,
+                    )
+                {
+                    if Self::toolbar_snapshot_path_allowed(path_filter_patterns, &snapshot_path)
+                        || Self::toolbar_snapshot_path_allowed(path_filter_patterns, &relative_path)
+                    {
+                        let source_key = source.stable_key();
+                        if seen_keys.insert(source_key.clone()) {
+                            files.push(Self::plugin_log_file_from_row_with_display_path(
+                                row,
+                                source,
+                                source_key,
+                                Self::toolbar_snapshot_display_name_for_path(
+                                    &snapshot_path,
+                                    &row.label,
+                                ),
+                                snapshot_path,
+                            ));
+                        }
+                    }
+                    continue;
+                }
+
                 let source_key = source.stable_key();
-                if (Self::toolbar_snapshot_path_allowed(path_filter_patterns, &snapshot_path)
-                    || Self::toolbar_snapshot_path_allowed(path_filter_patterns, &relative_path))
+                if Self::toolbar_snapshot_path_allowed(path_filter_patterns, &relative_path)
                     && seen_keys.insert(source_key.clone())
                 {
                     files.push(Self::plugin_log_file_from_row_with_display_path(
                         row,
                         source,
                         source_key,
-                        Self::toolbar_snapshot_display_name_for_path(&snapshot_path, &row.label),
-                        snapshot_path.clone(),
+                        Self::toolbar_snapshot_display_name_for_path(&relative_path, &row.label),
+                        relative_path.clone(),
                     ));
                 }
             }
@@ -659,6 +684,7 @@ impl LoadedLogTreeState {
                     &relative_path,
                     MAX_ARCHIVE_DEPTH,
                     path_filter_patterns,
+                    single_file_archive_patterns,
                     &mut seen_keys,
                     &mut files,
                 );
@@ -671,19 +697,24 @@ impl LoadedLogTreeState {
     /// 生成工具栏日志树快照缓存键。
     ///
     /// 业务意图：
-    /// - E9 分析重复点击时，完整日志树和已实现步骤匹配规则没有变化，就可以复用上一次递归压缩包扫描后的候选文件列表。
+    /// - 工具栏插件重复点击时，完整日志树和插件声明的匹配规则没有变化，就可以复用上一次递归压缩包扫描后的候选文件列表。
     /// - key 只包含来源定位、节点类型和展示路径，不包含展开状态；折叠/展开不改变授权日志范围，也不应导致缓存失效。
     ///
     /// 边界条件：
     /// - 对压缩包来源会额外读取外层压缩包大小和修改时间，避免同一路径压缩包被替换后复用旧快照。
-    /// - 规则文本归一化后参与 key，用户修改 memory 或连接池规则后会重新生成快照。
+    /// - 规则文本归一化后参与 key，用户修改插件声明的匹配规则后会重新生成快照。
     pub(in crate::app) fn plugin_toolbar_snapshot_cache_key(
         tree: &LoadedLogTree,
         path_filter_patterns: Option<&str>,
+        single_file_archive_patterns: Option<&str>,
     ) -> String {
         let mut hasher = DefaultHasher::new();
         tree.rows.len().hash(&mut hasher);
         path_filter_patterns
+            .map(Self::normalize_toolbar_snapshot_path)
+            .unwrap_or_default()
+            .hash(&mut hasher);
+        single_file_archive_patterns
             .map(Self::normalize_toolbar_snapshot_path)
             .unwrap_or_default()
             .hash(&mut hasher);
@@ -708,7 +739,7 @@ impl LoadedLogTreeState {
     /// 返回会影响工具栏快照内容的来源文件元数据指纹。
     ///
     /// 业务意图：
-    /// - 普通日志正文变化不影响“哪些路径可分析”，因此不应让 memory 日志追加内容导致快照缓存失效。
+    /// - 普通日志正文变化不影响“哪些路径可分析”，因此不应让普通日志追加内容导致快照缓存失效。
     /// - 压缩包目录会影响候选路径列表，必须把外层压缩包大小和修改时间写入 key，保证用户替换同名诊断包后不会看到旧成员列表。
     ///
     /// 边界条件：
@@ -738,7 +769,7 @@ impl LoadedLogTreeState {
     ///
     /// 业务意图：
     /// - 用户加载顶层压缩包后，左侧树中的 `thread_000038.zip` 会表现为 `ArchiveMember` 文件节点，而不是本地文件。
-    /// - 泛微日志分析要求遍历嵌套压缩包，因此工具栏快照必须对所有来源类型中的压缩包文件继续展开。
+    /// - 工具栏插件可能需要遍历嵌套压缩包，因此工具栏快照必须对所有来源类型中的压缩包文件继续展开。
     ///
     /// 边界条件：
     /// - 只读取当前树节点已经授权的来源字节，不根据路径文本访问其它本地文件。
@@ -749,13 +780,10 @@ impl LoadedLogTreeState {
         relative_path: &str,
         max_archive_depth: usize,
         path_filter_patterns: Option<&str>,
+        single_file_archive_patterns: Option<&str>,
         seen_keys: &mut HashSet<String>,
         files: &mut Vec<PluginLogFile>,
     ) {
-        if Self::should_skip_toolbar_archive_expansion(row_label, relative_path) {
-            return;
-        }
-
         let current_archive_depth = relative_path.matches("!/").count();
         if current_archive_depth >= max_archive_depth {
             return;
@@ -770,6 +798,7 @@ impl LoadedLogTreeState {
                 relative_path,
                 max_archive_depth,
                 path_filter_patterns,
+                single_file_archive_patterns,
                 seen_keys,
                 files,
             );
@@ -790,6 +819,7 @@ impl LoadedLogTreeState {
             max_archive_depth,
             current_archive_depth.saturating_add(1),
             path_filter_patterns,
+            single_file_archive_patterns,
             seen_keys,
             files,
         );
@@ -828,6 +858,7 @@ impl LoadedLogTreeState {
         relative_prefix: &str,
         max_archive_depth: usize,
         path_filter_patterns: Option<&str>,
+        single_file_archive_patterns: Option<&str>,
         seen_keys: &mut HashSet<String>,
         files: &mut Vec<PluginLogFile>,
     ) {
@@ -842,6 +873,7 @@ impl LoadedLogTreeState {
                 max_archive_depth,
                 1,
                 path_filter_patterns,
+                single_file_archive_patterns,
                 seen_keys,
                 files,
             );
@@ -858,7 +890,7 @@ impl LoadedLogTreeState {
     /// 读取本地压缩包目录扫描结果，并在会话内缓存元数据。
     ///
     /// 业务意图：
-    /// - E9 工具栏快照只需要压缩包目录和成员来源，不读取日志正文；同一压缩包重复扫描会明显拖慢首次分析后的再次点击。
+    /// - 工具栏快照只需要压缩包目录和成员来源，不读取日志正文；同一压缩包重复扫描会明显拖慢首次分析后的再次点击。
     /// - 使用文件大小和修改时间作为失效条件，兼顾正确性和实现成本，避免引入持久化索引。
     ///
     /// 边界条件：
@@ -920,6 +952,7 @@ impl LoadedLogTreeState {
         max_archive_depth: usize,
         current_archive_depth: usize,
         path_filter_patterns: Option<&str>,
+        single_file_archive_patterns: Option<&str>,
         seen_keys: &mut HashSet<String>,
         files: &mut Vec<PluginLogFile>,
     ) {
@@ -928,15 +961,20 @@ impl LoadedLogTreeState {
                 .unwrap_or_else(|| {
                     format!("{}!/{}/{}", relative_prefix, "", node.label).replace("!//", "!/")
                 });
-            let snapshot_path =
-                Self::toolbar_thread_zip_virtual_log_path(&node.label, &relative_path)
-                    .unwrap_or_else(|| relative_path.clone());
             let archive_depth = relative_path.matches("!/").count();
+            let declared_single_file_archive_path =
+                Self::toolbar_snapshot_declared_single_file_archive_path(
+                    single_file_archive_patterns,
+                    &relative_path,
+                );
+            let display_path = declared_single_file_archive_path
+                .as_deref()
+                .unwrap_or(relative_path.as_str());
             if archive_depth <= max_archive_depth
-                && (Self::toolbar_snapshot_path_allowed(path_filter_patterns, &snapshot_path)
+                && (Self::toolbar_snapshot_path_allowed(path_filter_patterns, display_path)
                     || Self::toolbar_snapshot_path_allowed(path_filter_patterns, &relative_path))
             {
-                let source_key = format!("archive-snapshot:{snapshot_path}");
+                let source_key = format!("archive-snapshot:{display_path}");
                 if seen_keys.insert(source_key.clone()) {
                     let host_source = node
                         .source
@@ -945,10 +983,10 @@ impl LoadedLogTreeState {
                     files.push(PluginLogFile {
                         source_key,
                         display_name: Self::toolbar_snapshot_display_name_for_path(
-                            &snapshot_path,
+                            display_path,
                             &node.label,
                         ),
-                        path_label: snapshot_path.clone(),
+                        path_label: display_path.to_string(),
                         source_kind: "archive_member".to_string(),
                         node_kind: "file".to_string(),
                         read_path: None,
@@ -957,11 +995,11 @@ impl LoadedLogTreeState {
                 }
             }
 
-            // 工具栏分析的业务语义是“遍历当前授权范围内所有压缩包”，不能沿用左侧树
-            // 对单文件内层压缩包的折叠展示规则；只要当前文件本身仍是压缩包，就继续展开其目录元数据。
+            // 工具栏快照面向插件可授权范围，不能沿用左侧树对单文件内层压缩包的折叠展示规则；
+            // 只要当前文件本身仍是压缩包，就继续展开其目录元数据。
             if archive_depth < max_archive_depth
                 && current_archive_depth < max_archive_depth
-                && !Self::should_skip_toolbar_archive_expansion(&node.label, &relative_path)
+                && declared_single_file_archive_path.is_none()
                 && let Some(nested_format) = ArchiveFormat::from_path(Path::new(&node.label))
             {
                 Self::append_nested_archive_snapshot_entries(
@@ -971,9 +1009,13 @@ impl LoadedLogTreeState {
                     max_archive_depth,
                     current_archive_depth.saturating_add(1),
                     path_filter_patterns,
+                    single_file_archive_patterns,
                     seen_keys,
                     files,
                 );
+            }
+            if declared_single_file_archive_path.is_some() {
+                return;
             }
         }
 
@@ -984,6 +1026,7 @@ impl LoadedLogTreeState {
                 max_archive_depth,
                 current_archive_depth,
                 path_filter_patterns,
+                single_file_archive_patterns,
                 seen_keys,
                 files,
             );
@@ -993,7 +1036,7 @@ impl LoadedLogTreeState {
     /// 将压缩包扫描来源转换成宿主日志来源。
     ///
     /// 业务意图：
-    /// - 工具栏插件快照中的压缩包成员过去只用于路径匹配；E9 memory 分析需要后续按 source_key 读取正文，因此必须保留可回读的内部来源。
+    /// - 工具栏插件快照中的压缩包成员可能会被后续 `source_key` 正文请求读取，因此必须保留可回读的内部来源。
     /// - 这里复制 `log_loader` 的转换语义，但不引入反向依赖，避免 UI 状态模块调用加载器私有函数。
     ///
     /// 边界条件：
@@ -1047,7 +1090,7 @@ impl LoadedLogTreeState {
     /// 判断工具栏快照路径是否允许加入插件上下文。
     ///
     /// 业务意图：
-    /// - E9 已实现步骤只需要 memory 和连接池文件，宿主先过滤无关路径可以显著减少 JSON 体积和插件侧匹配时间。
+    /// - 插件声明快照预过滤规则后，宿主先过滤无关路径可以显著减少 JSON 体积和插件侧匹配时间。
     /// - 过滤语义与插件设置页的分号分隔 glob 保持一致，避免用户修改规则后宿主预过滤和插件最终匹配不一致。
     ///
     /// 边界条件：
@@ -1085,6 +1128,48 @@ impl LoadedLogTreeState {
             .any(|candidate| Self::toolbar_snapshot_glob_matches(&pattern, candidate))
     }
 
+    /// 返回已由插件声明为单文件压缩日志的虚拟日志路径。
+    ///
+    /// 业务意图：
+    /// - 宿主需要避免递归展开成千上万个“一个日志压成一个包”的文件，但不能写入某个插件的目录命名规则。
+    /// - 插件通过 manifest 声明对应规则后，宿主只把 `xxx.zip`、`xxx.gz` 这类路径映射成 `xxx.log` 参与快照和匹配。
+    ///
+    /// 边界条件：
+    /// - 未声明规则时返回 `None`，普通压缩包仍递归扫描，保证旧插件和通用诊断包行为不变。
+    /// - 只在真实路径或虚拟 `.log` 路径命中声明规则时生效，避免宽泛跳过所有压缩包。
+    fn toolbar_snapshot_declared_single_file_archive_path(
+        single_file_archive_patterns: Option<&str>,
+        relative_path: &str,
+    ) -> Option<String> {
+        let patterns = single_file_archive_patterns?;
+        let virtual_path = Self::toolbar_snapshot_single_file_archive_virtual_path(relative_path)?;
+        (Self::toolbar_snapshot_path_allowed(Some(patterns), relative_path)
+            || Self::toolbar_snapshot_path_allowed(Some(patterns), &virtual_path))
+        .then_some(virtual_path)
+    }
+
+    /// 将单文件压缩日志路径转换成插件可见的解压后日志路径。
+    ///
+    /// 业务意图：
+    /// - 插件规则通常面向解压后的日志名书写，宿主把压缩后缀去掉后补 `.log`，可让同一规则同时覆盖明文和压缩日志。
+    /// - 这里是通用文件形态转换，不校验具体业务目录；是否启用由插件声明规则控制。
+    fn toolbar_snapshot_single_file_archive_virtual_path(relative_path: &str) -> Option<String> {
+        let lower_path = relative_path.to_ascii_lowercase();
+        for suffix in [
+            ".tar.gz", ".gzip", ".zip", ".rar", ".7z", ".tgz", ".gz", ".tar",
+        ] {
+            if lower_path.ends_with(suffix) {
+                let prefix = &relative_path[..relative_path.len().saturating_sub(suffix.len())];
+                return Some(if prefix.to_ascii_lowercase().ends_with(".log") {
+                    prefix.to_string()
+                } else {
+                    format!("{prefix}.log")
+                });
+            }
+        }
+        None
+    }
+
     /// 归一化工具栏快照路径，压缩包链路保留为路径片段参与匹配。
     fn normalize_toolbar_snapshot_path(path: &str) -> String {
         path.replace('\\', "/")
@@ -1098,7 +1183,7 @@ impl LoadedLogTreeState {
     ///
     /// 边界条件：
     /// - `*` 只匹配单级路径片段，`**` 可跨 `/`，`?` 匹配单个非 `/` 字符。
-    /// - 日期 token 只校验数字位数，保持与 weaver-logext 规则一致，不校验真实日历日期。
+    /// - 日期 token 只校验数字位数，保持通配规则轻量，不在宿主侧引入真实日历校验。
     fn toolbar_snapshot_glob_matches(pattern: &str, target: &str) -> bool {
         let pattern_chars = pattern.chars().collect::<Vec<_>>();
         let target_chars = target.chars().collect::<Vec<_>>();
@@ -1226,89 +1311,6 @@ impl LoadedLogTreeState {
             || matches!(previous, 'y' | 'Y' | 'M' | 'd' | 'D' | 'H' | 'm' | 's')
     }
 
-    /// 判断工具栏快照是否应跳过某个压缩包的递归展开。
-    ///
-    /// 业务意图：
-    /// - 泛微 `monitorThread/yyyyMMdd/thread_HHmmss.zip` 是大量出现的标准线程日志压缩文件，
-    ///   快照阶段会把它虚拟成同名 `.log` 路径，不需要再逐个解开内部 `.log`。
-    /// - 现场一个日期目录下可能有几千个这种 ZIP；跳过展开可以把“泛微日志分析”的等待时间从大量 I/O 降到路径匹配。
-    ///
-    /// 边界条件：
-    /// - 只跳过形态非常明确的线程日志 ZIP，普通业务压缩包、嵌套诊断包和其它日志压缩包仍继续按最多 5 层展开。
-    /// - 判断只基于当前授权树里的相对路径，不访问磁盘，也不影响用户在左侧树中手动打开该 ZIP。
-    fn should_skip_toolbar_archive_expansion(row_label: &str, relative_path: &str) -> bool {
-        Self::toolbar_thread_zip_virtual_log_path(row_label, relative_path).is_some()
-    }
-
-    /// 将标准线程日志 ZIP 映射为虚拟 `.log` 路径。
-    ///
-    /// 业务意图：
-    /// - 泛微线程日志常以 `thread_HHmmss.zip` 存放，但它在分析语义上就是同名线程日志。
-    /// - E9 工具栏快照只需要路径命中和后续按需读取定位，扫描阶段不应为了确认内部唯一 `.log` 而解开大量线程 ZIP。
-    ///
-    /// 边界条件：
-    /// - 只处理 `monitorThread/yyyyMMdd/thread_HHmmss.zip` 和 `yyyy-MM-dd/thread_HHmmss.zip` 两类已确认线程日志路径。
-    /// - 返回值只改变插件可见路径；`host_source` 仍保留原始 ZIP 来源，真正读取正文时再由日志读取层按单文件压缩包语义解压。
-    fn toolbar_thread_zip_virtual_log_path(row_label: &str, relative_path: &str) -> Option<String> {
-        if !row_label.to_ascii_lowercase().ends_with(".zip") {
-            return None;
-        }
-        let normalized_path = relative_path.replace('\\', "/").replace("!/", "/");
-        let segments = normalized_path
-            .split('/')
-            .filter(|segment| !segment.is_empty())
-            .collect::<Vec<_>>();
-        if segments.len() < 2 {
-            return None;
-        }
-        let file_name = segments.last().copied().unwrap_or_default();
-        if !Self::is_thread_log_zip_name(file_name) {
-            return None;
-        }
-        let date_segment = segments
-            .get(segments.len().saturating_sub(2))
-            .copied()
-            .unwrap_or_default();
-        let is_thread_zip = Self::is_yyyy_mm_dd_segment(date_segment)
-            || (segments.len() >= 3
-                && segments[segments.len() - 3].eq_ignore_ascii_case("monitorThread")
-                && Self::is_yyyymmdd_segment(date_segment));
-        if !is_thread_zip {
-            return None;
-        }
-
-        let log_name = Self::thread_log_name_for_zip_name(file_name)?;
-        Some(format!(
-            "{}{}",
-            relative_path
-                .rsplit_once('/')
-                .map(|(prefix, _)| format!("{prefix}/"))
-                .unwrap_or_default(),
-            log_name
-        ))
-    }
-
-    /// 判断文件名是否符合泛微线程日志压缩文件格式。
-    fn is_thread_log_zip_name(file_name: &str) -> bool {
-        Self::thread_log_name_for_zip_name(file_name).is_some()
-    }
-
-    /// 将 `thread_HHmmss.zip` 文件名转换为对应的 `thread_HHmmss.log`。
-    fn thread_log_name_for_zip_name(file_name: &str) -> Option<String> {
-        let lower = file_name.to_ascii_lowercase();
-        let Some(time_part) = lower
-            .strip_prefix("thread_")
-            .and_then(|name| name.strip_suffix(".zip"))
-        else {
-            return None;
-        };
-        if time_part.len() == 6 && time_part.chars().all(|ch| ch.is_ascii_digit()) {
-            Some(format!("thread_{time_part}.log"))
-        } else {
-            None
-        }
-    }
-
     /// 根据快照路径生成展示文件名。
     fn toolbar_snapshot_display_name_for_path(path_label: &str, fallback: &str) -> String {
         path_label
@@ -1319,28 +1321,11 @@ impl LoadedLogTreeState {
             .to_string()
     }
 
-    /// 判断路径片段是否是 `yyyyMMdd` 日期形状。
-    fn is_yyyymmdd_segment(segment: &str) -> bool {
-        segment.len() == 8 && segment.chars().all(|ch| ch.is_ascii_digit())
-    }
-
-    /// 判断路径片段是否是 `yyyy-MM-dd` 日期形状。
-    fn is_yyyy_mm_dd_segment(segment: &str) -> bool {
-        let bytes = segment.as_bytes();
-        bytes.len() == 10
-            && bytes[4] == b'-'
-            && bytes[7] == b'-'
-            && bytes
-                .iter()
-                .enumerate()
-                .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
-    }
-
     /// 继续展开压缩包成员本身。
     ///
     /// 业务意图：
     /// - `scan_archive_with_progress` 服务左侧树展示，会把单文件内层压缩包当成可打开文件保留。
-    /// - 泛微扫描只关心路径命中，需要把这类文件继续作为压缩包读取目录，否则 `inner.zip!/memory_...log` 这类路径永远不会进入插件。
+    /// - 工具栏快照需要完整候选路径，因此要把这类文件继续作为压缩包读取目录，否则内层成员路径永远不会进入插件上下文。
     ///
     /// 边界条件：
     /// - 只读取已经由用户加载树授权的压缩包成员，不扩大到任意本地路径。
@@ -1352,6 +1337,7 @@ impl LoadedLogTreeState {
         max_archive_depth: usize,
         current_archive_depth: usize,
         path_filter_patterns: Option<&str>,
+        single_file_archive_patterns: Option<&str>,
         seen_keys: &mut HashSet<String>,
         files: &mut Vec<PluginLogFile>,
     ) {
@@ -1369,6 +1355,7 @@ impl LoadedLogTreeState {
             max_archive_depth,
             current_archive_depth,
             path_filter_patterns,
+            single_file_archive_patterns,
             seen_keys,
             files,
         );
@@ -1387,6 +1374,7 @@ impl LoadedLogTreeState {
         max_archive_depth: usize,
         current_archive_depth: usize,
         path_filter_patterns: Option<&str>,
+        single_file_archive_patterns: Option<&str>,
         seen_keys: &mut HashSet<String>,
         files: &mut Vec<PluginLogFile>,
     ) {
@@ -1413,6 +1401,7 @@ impl LoadedLogTreeState {
             max_archive_depth,
             current_archive_depth,
             path_filter_patterns,
+            single_file_archive_patterns,
             seen_keys,
             files,
         );
@@ -1459,6 +1448,7 @@ impl LoadedLogTreeState {
         max_archive_depth: usize,
         current_archive_depth: usize,
         path_filter_patterns: Option<&str>,
+        single_file_archive_patterns: Option<&str>,
         seen_keys: &mut HashSet<String>,
         files: &mut Vec<PluginLogFile>,
     ) {
@@ -1472,6 +1462,7 @@ impl LoadedLogTreeState {
                 max_archive_depth,
                 current_archive_depth,
                 path_filter_patterns,
+                single_file_archive_patterns,
                 seen_keys,
                 files,
             );
@@ -1655,7 +1646,7 @@ impl LoadedLogTreeState {
     /// 把加载树文件节点转换为插件协议日志元数据，并指定展示名称和路径。
     ///
     /// 业务意图：
-    /// - E9 工具栏快照会把标准 `thread_HHmmss.zip` 虚拟成 `thread_HHmmss.log`，需要只在该入口覆盖展示名称。
+    /// - 工具栏快照可能使用相对路径或压缩包链路作为展示路径，需要只在该入口覆盖展示名称。
     /// - 右键插件菜单仍使用真实来源名称，避免改变已有插件菜单语义和测试期望。
     fn plugin_log_file_from_row_with_display_path(
         row: &LoadedLogTreeRow,
@@ -2894,7 +2885,7 @@ pub(in crate::app) enum SettingsTab {
     ///
     /// 业务意图：
     /// - 外部插件可以通过 manifest 声明轻量配置项；宿主集中渲染并保存到插件专属 JSON。
-    /// - 该枚举值只是内容路由，不在 `all()` 中作为固定页签出现，避免未加载插件时显示“泛微插件”。
+    /// - 该枚举值只是内容路由，不在 `all()` 中作为固定页签出现，避免未加载插件时显示空的插件设置页。
     PluginSettings,
     /// 存储页签，集中展示配置文件、数据库、插件目录和临时缓存位置。
     ///

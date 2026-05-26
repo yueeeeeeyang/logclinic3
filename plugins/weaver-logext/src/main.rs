@@ -235,29 +235,41 @@ struct PluginPageTable {
     headers: Vec<String>,
     /// 行。
     rows: Vec<Vec<String>>,
-    /// 性能列表和详情页的业务过滤器。
+    /// 表格命令过滤器。
     ///
     /// 业务意图：
-    /// - 用户过滤和时间区间过滤需要重新计算汇总统计，不能只依赖宿主通用关键字过滤隐藏行。
-    /// - 宿主渲染该过滤器后，会把输入条件放回 `command.context.data` 并重新调用插件生成页面。
+    /// - 用户过滤和时间区间过滤需要重新计算汇总统计，插件通过通用控件声明输入字段，宿主只负责渲染和回传原始文本。
     #[serde(skip_serializing_if = "Option::is_none")]
-    performance_filter: Option<PluginPerformanceTableFilter>,
+    command_filter: Option<PluginTableCommandFilter>,
     /// 每行对应的可点击动作；旧宿主忽略未知字段，新宿主会渲染为按钮。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     row_actions: Vec<Vec<PluginTableRowAction>>,
 }
 
-/// 性能表格业务过滤器。
+/// 表格命令过滤器。
 #[derive(Debug, Serialize)]
-struct PluginPerformanceTableFilter {
-    /// 用户过滤原始文本，多个用户使用英文逗号分隔。
-    users: String,
-    /// 起始请求时间，格式为 `yyyy-MM-dd HH:mm:ss`。
-    start_time: String,
-    /// 结束请求时间，格式为 `yyyy-MM-dd HH:mm:ss`。
-    end_time: String,
+struct PluginTableCommandFilter {
+    /// 插件声明的输入控件。
+    controls: Vec<PluginTableCommandFilterControl>,
     /// 应用过滤时执行的插件命令。
     command: PluginTableRowCommand,
+}
+
+/// 表格命令过滤器中的单个输入控件。
+#[derive(Debug, Serialize)]
+struct PluginTableCommandFilterControl {
+    /// 回写到命令上下文 data 的字段名。
+    key: String,
+    /// 当前输入值。
+    value: String,
+    /// 空输入时的占位文案。
+    placeholder: String,
+    /// 可选通用图标名。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    icon: Option<String>,
+    /// 输入框建议宽度。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    width: Option<u32>,
 }
 
 /// 页面表格行内动作。
@@ -2620,7 +2632,7 @@ where
                     "操作".to_string(),
                 ],
                 rows: table_rows,
-                performance_filter: Some(build_summary_performance_filter(&filter)),
+                command_filter: Some(build_summary_command_filter(&filter)),
                 row_actions,
             }),
         },
@@ -2786,16 +2798,12 @@ fn build_summary_table_rows(
     (table_rows, row_actions)
 }
 
-/// 构造性能汇总页过滤器定义。
-fn build_summary_performance_filter(
-    filter: &WeaverPerformanceFilter,
-) -> PluginPerformanceTableFilter {
+/// 构造性能汇总页的声明式过滤器定义。
+fn build_summary_command_filter(filter: &WeaverPerformanceFilter) -> PluginTableCommandFilter {
     let mut data = BTreeMap::new();
     filter.write_to_data(&mut data);
-    PluginPerformanceTableFilter {
-        users: filter.users_raw.clone(),
-        start_time: filter.start_time_raw.clone(),
-        end_time: filter.end_time_raw.clone(),
+    PluginTableCommandFilter {
+        controls: build_performance_filter_controls(filter),
         command: PluginTableRowCommand {
             command_id: "filter_performance_list".to_string(),
             context: PluginCommandContext::TableAction {
@@ -2807,18 +2815,16 @@ fn build_summary_performance_filter(
     }
 }
 
-/// 构造请求详情页过滤器定义。
+/// 构造请求详情页的声明式过滤器定义。
 fn build_detail_performance_filter(
     route: &str,
     filter: &WeaverPerformanceFilter,
-) -> PluginPerformanceTableFilter {
+) -> PluginTableCommandFilter {
     let mut data = BTreeMap::new();
     data.insert(PERFORMANCE_FILTER_ROUTE_KEY.to_string(), route.to_string());
     filter.write_to_data(&mut data);
-    PluginPerformanceTableFilter {
-        users: filter.users_raw.clone(),
-        start_time: filter.start_time_raw.clone(),
-        end_time: filter.end_time_raw.clone(),
+    PluginTableCommandFilter {
+        controls: build_performance_filter_controls(filter),
         command: PluginTableRowCommand {
             command_id: "show_performance_detail".to_string(),
             context: PluginCommandContext::TableAction {
@@ -2828,6 +2834,38 @@ fn build_detail_performance_filter(
             },
         },
     }
+}
+
+/// 构造性能过滤控件声明。
+///
+/// 业务意图：
+/// - 插件把字段名、占位符、图标和宽度完整声明给宿主，宿主无需了解这些字段属于泛微性能日志。
+fn build_performance_filter_controls(
+    filter: &WeaverPerformanceFilter,
+) -> Vec<PluginTableCommandFilterControl> {
+    vec![
+        PluginTableCommandFilterControl {
+            key: PERFORMANCE_FILTER_USERS_KEY.to_string(),
+            value: filter.users_raw.clone(),
+            placeholder: "用户：alice,bob".to_string(),
+            icon: Some("user".to_string()),
+            width: Some(180),
+        },
+        PluginTableCommandFilterControl {
+            key: PERFORMANCE_FILTER_START_KEY.to_string(),
+            value: filter.start_time_raw.clone(),
+            placeholder: "开始：yyyy-MM-dd HH:mm:ss".to_string(),
+            icon: None,
+            width: Some(220),
+        },
+        PluginTableCommandFilterControl {
+            key: PERFORMANCE_FILTER_END_KEY.to_string(),
+            value: filter.end_time_raw.clone(),
+            placeholder: "结束：yyyy-MM-dd HH:mm:ss".to_string(),
+            icon: None,
+            width: Some(220),
+        },
+    ]
 }
 
 /// 构建某个请求地址的详情页。
@@ -2890,7 +2928,7 @@ fn build_detail_page(summary: &WeaverRouteSummary, filter: &WeaverPerformanceFil
                 "操作".to_string(),
             ],
             rows: detail_rows,
-            performance_filter: Some(build_detail_performance_filter(&summary.route, filter)),
+            command_filter: Some(build_detail_performance_filter(&summary.route, filter)),
             row_actions,
         }),
     }
@@ -3165,7 +3203,7 @@ where
                     "SQL文本".to_string(),
                 ],
                 rows,
-                performance_filter: None,
+                command_filter: None,
                 row_actions: Vec::new(),
             }),
         },
@@ -3878,7 +3916,7 @@ mod tests {
         assert_eq!(action_id, "show_detail");
         assert!(files.is_empty());
         assert_eq!(data.get("route").map(String::as_str), Some("/a"));
-        assert!(table.performance_filter.is_some());
+        assert!(table.command_filter.is_some());
     }
 
     /// 覆盖性能汇总业务过滤会重新计算次数和平均耗时。
@@ -3915,8 +3953,9 @@ mod tests {
         assert_eq!(table.rows[0][0], "/a");
         assert_eq!(table.rows[0][1], "2");
         assert_eq!(table.rows[0][2], "300.0");
-        let filter = table.performance_filter.expect("汇总页应携带业务过滤器");
-        assert_eq!(filter.users, "ali,bob");
+        let filter = table.command_filter.expect("汇总页应携带业务过滤器");
+        assert_eq!(filter.controls[0].key, PERFORMANCE_FILTER_USERS_KEY);
+        assert_eq!(filter.controls[0].value, "ali,bob");
         let action_data = match &table.row_actions[0][0]
             .command
             .as_ref()
@@ -3971,7 +4010,7 @@ mod tests {
         assert_eq!(detail_table.rows[0][2], "bob");
         assert_eq!(detail_table.rows[1][1], "100");
         assert_eq!(detail_table.rows[1][2], "alice");
-        assert!(detail_table.performance_filter.is_some());
+        assert!(detail_table.command_filter.is_some());
     }
 
     /// 覆盖请求详情继承并应用汇总页过滤条件。
@@ -4008,9 +4047,10 @@ mod tests {
         assert_eq!(detail_table.rows[0][1], "500");
         assert_eq!(detail_table.rows[0][2], "bob");
         let filter = detail_table
-            .performance_filter
+            .command_filter
             .expect("详情页应携带业务过滤器");
-        assert_eq!(filter.users, "bob");
+        assert_eq!(filter.controls[0].key, PERFORMANCE_FILTER_USERS_KEY);
+        assert_eq!(filter.controls[0].value, "bob");
     }
 
     /// 覆盖非法时间过滤返回中文错误。

@@ -25,6 +25,27 @@ const THREAD_ANALYSIS_NAME_COLUMN_ESTIMATED_CHAR_WIDTH: f32 = 7.5;
 /// - 行内线程名元素带有右侧内边距，并且截断渲染需要少量余量；统一加入估算宽度，避免最长线程名末尾贴住时间线色块。
 const THREAD_ANALYSIS_NAME_COLUMN_TEXT_PADDING: f32 = 12.0;
 
+/// 线程并发分析表格行高。
+///
+/// 业务意图：
+/// - 并发分析可能包含大量线程名，行高必须固定才能使用 `uniform_list` 做虚拟渲染，避免大日志结果一次性创建全部行。
+const THREAD_ANALYSIS_CONCURRENCY_ROW_HEIGHT: f32 = 32.0;
+
+/// 线程并发分析总数列宽度。
+const THREAD_ANALYSIS_CONCURRENCY_TOTAL_COLUMN_WIDTH: f32 = 92.0;
+
+/// 线程并发分析状态数量列宽度。
+///
+/// 业务意图：
+/// - 状态列固定宽度能保证表头和虚拟列表行严格对齐，避免滚动时数字列抖动。
+const THREAD_ANALYSIS_CONCURRENCY_STATE_COLUMN_WIDTH: f32 = 104.0;
+
+/// 线程并发分析线程名列最小宽度。
+///
+/// 边界条件：
+/// - 线程名通常很长，最小宽度需要保留业务前缀；窗口变窄时仍允许表格整体横向溢出，由 GPUI 裁剪处理。
+const THREAD_ANALYSIS_CONCURRENCY_NAME_MIN_WIDTH: f32 = 320.0;
+
 /// 搜索结果面板高度拖动状态。
 ///
 /// 业务意图：
@@ -77,12 +98,23 @@ pub(in crate::app) struct ThreadAnalysisWindowView {
     pub(in crate::app) main_view: Entity<MainView>,
     /// 当前分析结果。
     pub(in crate::app) analysis: ThreadAnalysisData,
+    /// 当前线程分析结果页签。
+    ///
+    /// 业务意图：
+    /// - 频率分析和并发分析共享同一份解析数据，但展示模型不同；显式页签状态避免用滚动位置或图例状态推断当前视图。
+    /// - 新分析结果打开时默认回到频率分析，保持旧用户进入窗口后看到的内容不变。
+    pub(in crate::app) active_tab: ThreadAnalysisResultTab,
     /// 线程时间线虚拟列表滚动句柄。
     ///
     /// 业务意图：
     /// - Java thread dump 可能包含数千个线程，不能一次性把所有线程行都创建成 GPUI 元素。
     /// - 使用 `uniform_list` 只渲染可见行，并通过该句柄保存纵向和横向滚动位置。
     pub(in crate::app) scroll_handle: UniformListScrollHandle,
+    /// 线程并发分析虚拟列表滚动句柄。
+    ///
+    /// 业务意图：
+    /// - 并发页和频率页都可能有大量行，两者滚动位置互相独立，避免用户在一个页签滚动后切回另一个页签位置突变。
+    pub(in crate::app) concurrency_scroll_handle: UniformListScrollHandle,
     /// 当前线程名列的布局宽度。
     ///
     /// 业务意图：
@@ -126,6 +158,28 @@ pub(in crate::app) struct ThreadAnalysisWindowView {
     pub(in crate::app) _main_view_subscription: gpui::Subscription,
 }
 
+/// 线程分析结果窗口的页签类型。
+///
+/// 业务意图：
+/// - 页签名称进入用户界面和测试断言，集中定义可避免渲染处散落字符串。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::app) enum ThreadAnalysisResultTab {
+    /// 当前已有的线程状态时间线分析。
+    Frequency,
+    /// 新增的按线程名聚合统计分析。
+    Concurrency,
+}
+
+impl ThreadAnalysisResultTab {
+    /// 返回页签展示文案。
+    pub(in crate::app) fn label(self) -> &'static str {
+        match self {
+            Self::Frequency => "线程频率分析",
+            Self::Concurrency => "线程并发分析",
+        }
+    }
+}
+
 /// 线程分析滚动条拖动状态。
 ///
 /// 业务意图：
@@ -166,7 +220,9 @@ impl ThreadAnalysisWindowView {
         Self {
             main_view,
             analysis,
+            active_tab: Self::default_result_tab(),
             scroll_handle: UniformListScrollHandle::new(),
+            concurrency_scroll_handle: UniformListScrollHandle::new(),
             name_column_width: THREAD_ANALYSIS_NAME_COLUMN_WIDTH,
             scrollbar_drag: None,
             cell_popup: None,
@@ -190,7 +246,9 @@ impl ThreadAnalysisWindowView {
             self.analysis.progress.is_some() && analysis.progress.is_some();
         self.analysis = analysis;
         if !replacing_progress_with_progress {
+            self.active_tab = Self::default_result_tab();
             self.scroll_handle = UniformListScrollHandle::new();
+            self.concurrency_scroll_handle = UniformListScrollHandle::new();
             self.name_column_width = THREAD_ANALYSIS_NAME_COLUMN_WIDTH;
             self.scrollbar_drag = None;
             self.cell_popup = None;
@@ -209,6 +267,28 @@ impl ThreadAnalysisWindowView {
             }
             self.visible_state_kinds = Self::default_visible_state_kinds();
         }
+        context.notify();
+    }
+
+    /// 返回线程分析窗口默认页签。
+    ///
+    /// 业务意图：
+    /// - 用户新增并发分析后，旧入口仍应首先看到原有结果，降低行为变更风险。
+    pub(in crate::app) fn default_result_tab() -> ThreadAnalysisResultTab {
+        ThreadAnalysisResultTab::Frequency
+    }
+
+    /// 切换线程分析结果页签。
+    ///
+    /// 业务意图：
+    /// - 页签切换只影响展示形态，不重新解析日志；同时关闭悬浮气泡和滚动条拖动，避免频率页浮层残留到并发页。
+    fn set_active_tab(&mut self, active_tab: ThreadAnalysisResultTab, context: &mut Context<Self>) {
+        if self.active_tab == active_tab {
+            return;
+        }
+        self.active_tab = active_tab;
+        self.scrollbar_drag = None;
+        self.cell_popup = None;
         context.notify();
     }
 
@@ -331,6 +411,64 @@ impl ThreadAnalysisWindowView {
                         }),
                     )
             }))
+    }
+
+    /// 渲染线程分析结果页签。
+    ///
+    /// 业务意图：
+    /// - 频率分析保留原有时间线视图，并发分析提供按线程名聚合的新视图；页签让两类结果在同一分析窗口内切换。
+    /// - 页签按钮需要消费鼠标事件，避免点击页签时触发窗口根节点关闭气泡之外的其它下层交互。
+    fn render_result_tabs(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Div {
+        div().flex().items_center().gap_1().children(
+            [
+                ThreadAnalysisResultTab::Frequency,
+                ThreadAnalysisResultTab::Concurrency,
+            ]
+            .into_iter()
+            .map(|tab| {
+                let active = self.active_tab == tab;
+                div()
+                    .id(SharedString::from(format!(
+                        "thread-analysis-tab-{}",
+                        tab.label()
+                    )))
+                    .h(px(28.0))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .rounded(px(6.0))
+                    .text_xs()
+                    .font_weight(if active {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .text_color(rgb(if active {
+                        palette.text
+                    } else {
+                        palette.muted_text
+                    }))
+                    .bg(rgb(if active {
+                        palette.selected
+                    } else {
+                        palette.panel
+                    }))
+                    .cursor_pointer()
+                    .hover(move |tab_button| tab_button.bg(rgb(palette.hover)))
+                    .child(tab.label())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        context.listener(move |view, _event: &MouseDownEvent, _window, context| {
+                            view.set_active_tab(tab, context);
+                            context.stop_propagation();
+                        }),
+                    )
+            }),
+        )
     }
 
     /// 返回线程分析图例中展示的状态顺序。
@@ -463,6 +601,183 @@ impl ThreadAnalysisWindowView {
             }))
     }
 
+    /// 渲染线程并发分析表头。
+    ///
+    /// 业务意图：
+    /// - 表头和虚拟列表行使用相同列宽，保证大量线程滚动时列对齐稳定。
+    fn render_concurrency_table_header(&self, palette: AppThemePalette) -> gpui::Div {
+        div()
+            .flex()
+            .items_center()
+            .min_w(px(Self::thread_concurrency_table_min_width()))
+            .w_full()
+            .h(px(THREAD_ANALYSIS_CONCURRENCY_ROW_HEIGHT))
+            .px_4()
+            .border_b_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.panel))
+            .text_xs()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(palette.muted_text))
+            .child(Self::render_concurrency_name_cell(
+                "线程名称",
+                palette,
+                true,
+            ))
+            .child(Self::render_concurrency_count_cell(
+                "出现次数",
+                THREAD_ANALYSIS_CONCURRENCY_TOTAL_COLUMN_WIDTH,
+                palette,
+                true,
+            ))
+            .children(
+                Self::thread_concurrency_state_columns()
+                    .into_iter()
+                    .map(|state| {
+                        Self::render_concurrency_count_cell(
+                            state.label(),
+                            THREAD_ANALYSIS_CONCURRENCY_STATE_COLUMN_WIDTH,
+                            palette,
+                            true,
+                        )
+                    }),
+            )
+    }
+
+    /// 渲染线程并发分析单行。
+    ///
+    /// 业务意图：
+    /// - 行点击打开该线程名匹配到的全部堆栈样本详情；数字列只展示聚合结果，不改变过滤或排序语义。
+    fn render_concurrency_row(
+        &self,
+        row: ThreadConcurrencyRow,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let thread_name_for_click = row.thread_name.clone();
+        div()
+            .id(SharedString::from(format!(
+                "thread-analysis-concurrency-row-{}",
+                row.thread_name
+            )))
+            .flex()
+            .items_center()
+            .min_w(px(Self::thread_concurrency_table_min_width()))
+            .w_full()
+            .h(px(THREAD_ANALYSIS_CONCURRENCY_ROW_HEIGHT))
+            .px_4()
+            .border_b_1()
+            .border_color(rgb(palette.border))
+            .text_xs()
+            .text_color(rgb(palette.text))
+            .cursor_pointer()
+            .hover(move |row| row.bg(rgb(palette.hover)))
+            .child(Self::render_concurrency_name_cell(
+                row.thread_name.clone(),
+                palette,
+                false,
+            ))
+            .child(Self::render_concurrency_count_cell(
+                row.total_count.to_string(),
+                THREAD_ANALYSIS_CONCURRENCY_TOTAL_COLUMN_WIDTH,
+                palette,
+                false,
+            ))
+            .children(
+                Self::thread_concurrency_state_columns()
+                    .into_iter()
+                    .map(|state| {
+                        Self::render_concurrency_count_cell(
+                            row.count_for_state(state).to_string(),
+                            THREAD_ANALYSIS_CONCURRENCY_STATE_COLUMN_WIDTH,
+                            palette,
+                            false,
+                        )
+                    }),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(move |view, event: &MouseDownEvent, window, context| {
+                    view.handle_concurrency_row_mouse_down(
+                        thread_name_for_click.clone(),
+                        event,
+                        window,
+                        context,
+                    );
+                }),
+            )
+    }
+
+    /// 渲染线程并发分析线程名列。
+    ///
+    /// 边界条件：
+    /// - 线程名可能很长，只在单元格内截断，不允许挤压右侧统计列。
+    fn render_concurrency_name_cell(
+        text: impl Into<SharedString>,
+        palette: AppThemePalette,
+        is_header: bool,
+    ) -> gpui::Div {
+        div()
+            .flex_1()
+            .min_w(px(THREAD_ANALYSIS_CONCURRENCY_NAME_MIN_WIDTH))
+            .pr_3()
+            .truncate()
+            .text_color(rgb(if is_header {
+                palette.muted_text
+            } else {
+                palette.text
+            }))
+            .child(text.into())
+    }
+
+    /// 渲染线程并发分析数字列。
+    ///
+    /// 业务意图：
+    /// - 数字右对齐便于比较同列大小，固定宽度保证虚拟列表滚动时表格不会横向抖动。
+    fn render_concurrency_count_cell(
+        text: impl Into<SharedString>,
+        width: f32,
+        palette: AppThemePalette,
+        is_header: bool,
+    ) -> gpui::Div {
+        div()
+            .w(px(width))
+            .flex_none()
+            .text_right()
+            .font_family(LOG_VIEWER_FONT_FAMILY)
+            .text_color(rgb(if is_header {
+                palette.muted_text
+            } else {
+                palette.text
+            }))
+            .child(text.into())
+    }
+
+    /// 返回线程并发分析状态列顺序。
+    ///
+    /// 业务意图：
+    /// - 并发页状态列需要和频率页图例保持主要状态顺序一致；OTHER 承接 NEW、TERMINATED 和未知状态。
+    fn thread_concurrency_state_columns() -> [ThreadStateKind; 5] {
+        [
+            ThreadStateKind::Runnable,
+            ThreadStateKind::Blocked,
+            ThreadStateKind::Waiting,
+            ThreadStateKind::TimedWaiting,
+            ThreadStateKind::Other,
+        ]
+    }
+
+    /// 返回线程并发分析表格最小宽度。
+    ///
+    /// 业务意图：
+    /// - 表格宽度由固定状态列和线程名最小宽度组成，测试用该纯函数锁定表头和数据行的布局约束。
+    pub(in crate::app) fn thread_concurrency_table_min_width() -> f32 {
+        THREAD_ANALYSIS_CONCURRENCY_NAME_MIN_WIDTH
+            + THREAD_ANALYSIS_CONCURRENCY_TOTAL_COLUMN_WIDTH
+            + THREAD_ANALYSIS_CONCURRENCY_STATE_COLUMN_WIDTH
+                * Self::thread_concurrency_state_columns().len() as f32
+    }
+
     /// 返回线程时间线色块的填充色。
     ///
     /// 业务意图：
@@ -551,6 +866,30 @@ impl ThreadAnalysisWindowView {
         context.stop_propagation();
     }
 
+    /// 处理线程并发分析行点击。
+    ///
+    /// 业务意图：
+    /// - 并发页按线程名聚合，用户点击一行后应查看该线程名匹配到的全部堆栈样本，并用详情窗口左右按钮切换。
+    /// - 并发页不对应某一个时间线色块，因此点击后清空时间线高亮，避免把旧频率页色块误认为当前详情目标。
+    fn handle_concurrency_row_mouse_down(
+        &mut self,
+        thread_name: String,
+        event: &MouseDownEvent,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        if Self::timeline_cell_click_should_open_stack_window(event.click_count) {
+            let stacks = Self::thread_stack_cells_for_thread_name(&self.analysis, &thread_name);
+            if !stacks.is_empty() {
+                self.jumped_cell = None;
+                self.cell_popup = None;
+                self.open_thread_stack_window_with_stacks(stacks, 0, context);
+                context.notify();
+            }
+        }
+        context.stop_propagation();
+    }
+
     /// 打开或复用线程堆栈详情窗口。
     ///
     /// 业务意图：
@@ -564,6 +903,26 @@ impl ThreadAnalysisWindowView {
     ) {
         let (stacks, active_index) =
             Self::thread_stack_cells_for_clicked_cell(&self.analysis, &cell);
+        self.open_thread_stack_window_with_stacks(stacks, active_index, context);
+    }
+
+    /// 使用给定堆栈样本打开或复用线程堆栈详情窗口。
+    ///
+    /// 业务意图：
+    /// - 频率页色块和并发页聚合行都需要打开同一个详情窗口；统一入口可以保证标题、窗口复用、焦点和前进后退能力一致。
+    ///
+    /// 边界条件：
+    /// - 空样本表示没有可展示详情，直接忽略，避免创建只显示空态的新窗口误导用户。
+    fn open_thread_stack_window_with_stacks(
+        &mut self,
+        stacks: Vec<Arc<ThreadTimelineCell>>,
+        active_index: usize,
+        context: &mut Context<Self>,
+    ) {
+        if stacks.is_empty() {
+            return;
+        }
+        let active_index = ThreadStackWindowView::clamped_active_index(&stacks, active_index);
         let window_title = ThreadStackWindowView::window_title_for_cell(stacks.get(active_index));
         if let Some(stack_window) = self.stack_window {
             if stack_window
@@ -664,6 +1023,39 @@ impl ThreadAnalysisWindowView {
                     .unwrap_or(0)
             });
         (cells, active_index)
+    }
+
+    /// 按线程名收集并发分析行对应的全部堆栈样本。
+    ///
+    /// 业务意图：
+    /// - 并发分析统计包含用户过滤后全部线程样本，包括频率页默认隐藏的单次线程；详情入口也必须使用同一口径。
+    /// - 遍历快照和线程样本的原始顺序，保证详情窗口前进/后退顺序和选中日志解析顺序一致。
+    pub(in crate::app) fn thread_stack_cells_for_thread_name(
+        analysis: &ThreadAnalysisData,
+        thread_name: &str,
+    ) -> Vec<Arc<ThreadTimelineCell>> {
+        analysis
+            .snapshots
+            .iter()
+            .flat_map(|snapshot| {
+                snapshot
+                    .threads
+                    .iter()
+                    .filter(move |sample| sample.name == thread_name)
+                    .map(|sample| {
+                        Arc::new(ThreadTimelineCell {
+                            state: sample.state,
+                            time_label: snapshot.label.clone(),
+                            thread_name: sample.name.clone(),
+                            thread_id: sample.thread_id.clone(),
+                            source: snapshot.source.clone(),
+                            line_index: sample.line_index,
+                            preview_lines: sample.preview_lines.clone(),
+                            stack_lines: sample.stack_lines.clone(),
+                        })
+                    })
+            })
+            .collect()
     }
 
     /// 判断线程分析色块的一次鼠标按下是否应打开堆栈详情窗口。
@@ -995,6 +1387,135 @@ impl ThreadAnalysisWindowView {
         }
     }
 
+    /// 渲染线程频率分析内容区。
+    ///
+    /// 业务意图：
+    /// - 该页签完全承载旧版分析结果：按线程名和快照组成时间线矩阵，并继续使用虚拟列表与自绘滚动条处理大结果集。
+    fn render_frequency_content(
+        &self,
+        visible_thread_indexes: Vec<usize>,
+        visible_state_kinds: HashSet<ThreadStateKind>,
+        name_column_width: f32,
+        palette: AppThemePalette,
+        theme: EffectiveTheme,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let row_count = visible_thread_indexes.len();
+        let scroll_handle = self.scroll_handle.clone();
+        div()
+            .id("thread-analysis-frequency-scroll")
+            .relative()
+            .flex_1()
+            .p_4()
+            .child(
+                uniform_list(
+                    "thread-analysis-virtual-list",
+                    row_count,
+                    context.processor(
+                        move |view, range: std::ops::Range<usize>, _window, _context| {
+                            range
+                                .map(|row_index| {
+                                    let thread_name = view
+                                        .analysis
+                                        .thread_names
+                                        .get(
+                                            visible_thread_indexes
+                                                .get(row_index)
+                                                .copied()
+                                                .unwrap_or(usize::MAX),
+                                        )
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    let cells = view
+                                        .analysis
+                                        .matrix
+                                        .get(
+                                            visible_thread_indexes
+                                                .get(row_index)
+                                                .copied()
+                                                .unwrap_or(usize::MAX),
+                                        )
+                                        .map(Vec::as_slice)
+                                        .unwrap_or(&[]);
+                                    view.render_timeline_row(
+                                        thread_name,
+                                        cells,
+                                        &visible_state_kinds,
+                                        name_column_width,
+                                        palette,
+                                        theme,
+                                        _context,
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        },
+                    ),
+                )
+                .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+                .size_full()
+                .track_scroll(scroll_handle),
+            )
+            .child(self.render_vertical_scrollbar(palette, context))
+            .child(self.render_horizontal_scrollbar(name_column_width, palette, context))
+    }
+
+    /// 渲染线程并发分析内容区。
+    ///
+    /// 业务意图：
+    /// - 并发页按线程名聚合展示，不受频率页状态图例影响；行数可能很大，因此正文仍使用 `uniform_list` 虚拟渲染。
+    fn render_concurrency_content(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let row_count = self.analysis.concurrency_rows.len();
+        if row_count == 0 {
+            return div()
+                .id("thread-analysis-concurrency-empty")
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_4()
+                .text_sm()
+                .text_color(rgb(palette.muted_text))
+                .child("没有可展示的线程并发数据");
+        }
+
+        let scroll_handle = self.concurrency_scroll_handle.clone();
+        div()
+            .id("thread-analysis-concurrency-table")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .child(self.render_concurrency_table_header(palette))
+            .child(
+                div().relative().flex_1().min_h_0().child(
+                    uniform_list(
+                        "thread-analysis-concurrency-list",
+                        row_count,
+                        context.processor(
+                            move |view, range: std::ops::Range<usize>, _window, context| {
+                                range
+                                    .filter_map(|row_index| {
+                                        view.analysis.concurrency_rows.get(row_index).cloned().map(
+                                            |row| {
+                                                view.render_concurrency_row(row, palette, context)
+                                            },
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                            },
+                        ),
+                    )
+                    .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+                    .size_full()
+                    .track_scroll(scroll_handle),
+                ),
+            )
+    }
+
     /// 返回当前窗口中可见线程名列应使用的宽度。
     ///
     /// 业务意图：
@@ -1070,14 +1591,13 @@ impl Render for ThreadAnalysisWindowView {
             let main_view = self.main_view.read(context);
             (main_view.palette(), main_view.effective_theme())
         };
-        let _snapshot_count = self.analysis.snapshots.len();
         let visible_thread_indexes = self.visible_thread_indexes();
-        let row_count = visible_thread_indexes.len();
         let visible_state_kinds = self.visible_state_kinds.clone();
-        let scroll_handle = self.scroll_handle.clone();
         let name_column_width =
             self.thread_analysis_name_column_width_for_visible_threads(&visible_thread_indexes);
-        self.name_column_width = name_column_width;
+        if self.active_tab == ThreadAnalysisResultTab::Frequency {
+            self.name_column_width = name_column_width;
+        }
 
         div()
             .on_mouse_down(
@@ -1147,70 +1667,30 @@ impl Render for ThreadAnalysisWindowView {
                                             .child(self.analysis.summary.clone()),
                                     ),
                             )
-                            .child(self.render_legend(palette, theme, context)),
-                    ),
+                            .when(
+                                self.active_tab == ThreadAnalysisResultTab::Frequency,
+                                |row| row.child(self.render_legend(palette, theme, context)),
+                            ),
+                    )
+                    .child(self.render_result_tabs(palette, context)),
             )
             .child(
-                div()
-                    .id("thread-analysis-scroll")
-                    .relative()
-                    .flex_1()
-                    .p_4()
-                    .child(
-                        uniform_list(
-                            "thread-analysis-virtual-list",
-                            row_count,
-                            context.processor(
-                                move |view, range: std::ops::Range<usize>, _window, _context| {
-                                    range
-                                        .map(|row_index| {
-                                            let thread_name = view
-                                                .analysis
-                                                .thread_names
-                                                .get(
-                                                    visible_thread_indexes
-                                                        .get(row_index)
-                                                        .copied()
-                                                        .unwrap_or(usize::MAX),
-                                                )
-                                                .cloned()
-                                                .unwrap_or_default();
-                                            let cells = view
-                                                .analysis
-                                                .matrix
-                                                .get(
-                                                    visible_thread_indexes
-                                                        .get(row_index)
-                                                        .copied()
-                                                        .unwrap_or(usize::MAX),
-                                                )
-                                                .map(Vec::as_slice)
-                                                .unwrap_or(&[]);
-                                            view.render_timeline_row(
-                                                thread_name,
-                                                cells,
-                                                &visible_state_kinds,
-                                                name_column_width,
-                                                palette,
-                                                theme,
-                                                _context,
-                                            )
-                                        })
-                                        .collect::<Vec<_>>()
-                                },
-                            ),
-                        )
-                        .with_horizontal_sizing_behavior(
-                            ListHorizontalSizingBehavior::Unconstrained,
-                        )
-                        .size_full()
-                        .track_scroll(scroll_handle),
-                    )
-                    .child(self.render_vertical_scrollbar(palette, context))
-                    .child(self.render_horizontal_scrollbar(name_column_width, palette, context))
-                    .when_some(self.analysis.progress.as_ref(), |content, progress| {
-                        content.child(self.render_progress_bar(progress, palette))
-                    }),
+                match self.active_tab {
+                    ThreadAnalysisResultTab::Frequency => self.render_frequency_content(
+                        visible_thread_indexes,
+                        visible_state_kinds,
+                        name_column_width,
+                        palette,
+                        theme,
+                        context,
+                    ),
+                    ThreadAnalysisResultTab::Concurrency => {
+                        self.render_concurrency_content(palette, context)
+                    }
+                }
+                .when_some(self.analysis.progress.as_ref(), |content, progress| {
+                    content.child(self.render_progress_bar(progress, palette))
+                }),
             )
             .when(self.cell_popup.is_some(), |root| {
                 root.child(self.render_cell_popup(palette, context).unwrap_or_else(div))

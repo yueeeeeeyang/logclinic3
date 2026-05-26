@@ -94,6 +94,19 @@ pub(in crate::app) const THREAD_ANALYSIS_WINDOW_WIDTH: f32 = 1040.0;
 /// - Java thread dump 往往包含大量线程，较高窗口可以减少初次打开后的滚动成本。
 pub(in crate::app) const THREAD_ANALYSIS_WINDOW_HEIGHT: f32 = 720.0;
 
+/// 线程日志分析窗口最小宽度。
+///
+/// 业务意图：
+/// - 并发分析页需要同时展示线程名、出现次数和五个状态计数列；窗口过窄时右侧列会被裁剪且无法查看。
+/// - 这里把最小宽度约束到能容纳并发表格主体和少量窗口内边距，避免新增页签在窄窗口下出现不可达内容。
+pub(in crate::app) const THREAD_ANALYSIS_WINDOW_MIN_WIDTH: f32 = 980.0;
+
+/// 线程日志分析窗口最小高度。
+///
+/// 边界条件：
+/// - 高度仍保持旧窗口下限，避免在小屏设备上因为新增并发页而过度放大窗口。
+pub(in crate::app) const THREAD_ANALYSIS_WINDOW_MIN_HEIGHT: f32 = 420.0;
+
 /// 线程分析图中线程名列宽度。
 ///
 /// 业务意图：

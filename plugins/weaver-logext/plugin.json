@@ -21,6 +21,8 @@
         "icon": "ChartNoAxesCombined",
         "command": "weaver_log_scan",
         "when": "log_tree_loaded",
+        "snapshot_filter_setting_keys": ["memory", "pool"],
+        "snapshot_single_file_archive_setting_keys": ["monitor_thread_40s", "thread_3m"],
         "initial_step": {
           "id": "memory",
           "loading_text": "正在分析memory日志"

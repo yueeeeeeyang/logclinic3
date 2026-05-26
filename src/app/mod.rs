@@ -58,7 +58,7 @@ use crate::shell_integration::{
 };
 use crate::theme::{AppThemePalette, EffectiveTheme, ThemePreference};
 use crate::thread_analysis::{
-    ThreadAnalysisData, ThreadAnalysisFilterRule, ThreadAnalysisProgress,
+    ThreadAnalysisData, ThreadAnalysisFilterRule, ThreadAnalysisProgress, ThreadConcurrencyRow,
     ThreadDumpLineFilterSummary, ThreadStateKind, ThreadTimelineCell,
     analyze_thread_dump_sources_with_progress, filter_thread_dump_lines_with_analysis_rules,
     has_java_thread_dump_snapshots, parse_thread_analysis_filter_rules,
