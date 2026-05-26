@@ -2,7 +2,7 @@
 # 包名固定为用户确认的 logclinic3，后续发布、日志目录和进程名都应以这里为准。
 name = "logclinic3"
 # 主程序发布版本号；插件独立编译打包，不跟随该版本字段自动升级。
-version = "0.3.0"
+version = "0.6.0"
 # 使用稳定 Rust 2024 edition；如后续目标工具链不支持，需要在跨平台验收时统一降级。
 edition = "2024"
 [dependencies]
