@@ -534,6 +534,27 @@ impl MainView {
         dialog.message = "日志已重新加载，请重新打开文件后搜索".to_string();
     }
 
+    /// 重新加载日志时清空搜索历史状态。
+    ///
+    /// 业务意图：
+    /// - 搜索关键字历史和底部搜索结果历史都只对当前已加载日志树有意义；重新加载后继续保留会让用户误以为旧目录和旧结果仍属于新日志。
+    /// - 搜索结果历史记录中会保存“当前目录搜索”的目录目标，这里直接丢弃整个结果面板，确保旧目录不会在新工作区中残留。
+    ///
+    /// 边界条件：
+    /// - 该函数只清理内存态历史，不触碰设置、笔记、AI 对话等跨日志会话数据。
+    /// - 延迟打开搜索窗口的“选中文件”预设也可能保存旧来源快照，重载时一并恢复默认入口。
+    pub(in crate::app) fn clear_search_histories_for_log_reload(
+        query_history: &mut Vec<SearchQueryHistoryItem>,
+        results_panel: &mut Option<SearchResultsPanelState>,
+        results_context_menu: &mut Option<SearchResultsContextMenu>,
+        dialog_open_preset: &mut SearchDialogOpenPreset,
+    ) {
+        query_history.clear();
+        *results_panel = None;
+        *results_context_menu = None;
+        *dialog_open_preset = SearchDialogOpenPreset::Default;
+    }
+
     /// 把搜索结果定位状态写入日志 tab。
     ///
     /// 业务意图：

@@ -62,7 +62,8 @@ use crate::thread_analysis::{
     ThreadDumpLineFilterSummary, ThreadStateKind, ThreadTimelineCell,
     analyze_thread_dump_sources_with_progress, filter_thread_dump_lines_with_analysis_rules,
     has_java_thread_dump_snapshots, parse_thread_analysis_filter_rules,
-    parse_thread_analysis_name_filter_rules, visible_thread_indexes_for_state_kinds,
+    parse_thread_analysis_name_filter_rules, thread_stack_fingerprint_key,
+    visible_thread_indexes_for_state_kinds,
 };
 #[cfg(test)]
 use crate::thread_analysis::{

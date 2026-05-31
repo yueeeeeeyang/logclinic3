@@ -951,6 +951,16 @@ pub(crate) struct PluginTableCommandFilterControl {
     /// 空输入时的占位文案。
     #[serde(default)]
     pub(crate) placeholder: String,
+    /// 控件渲染类型。
+    ///
+    /// 业务意图：
+    /// - 插件可以声明“普通文本”“日期时间”等通用输入语义，宿主据此提供对应交互组件。
+    /// - 字段业务含义仍由插件解析，宿主不能根据 key 写死性能日志、用户或请求时间规则。
+    ///
+    /// 边界条件：
+    /// - 默认值为普通文本，保证旧插件没有该字段时仍按原有单行输入框渲染。
+    #[serde(default)]
+    pub(crate) kind: PluginTableCommandFilterControlKind,
     /// 可选通用图标名，例如 `user`、`search`、`calendar`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) icon: Option<String>,
@@ -960,6 +970,41 @@ pub(crate) struct PluginTableCommandFilterControl {
     /// - 插件最清楚字段典型长度；宿主按建议宽度渲染，但仍会做下限保护，避免控件不可点击。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) width: Option<u32>,
+}
+
+/// 插件命令过滤器控件类型。
+///
+/// 业务意图：
+/// - 插件协议只暴露与业务无关的通用输入组件类型，主程序按类型选择 UI 交互。
+/// - 新增控件类型时必须保持向后兼容，旧插件 JSON 缺省为 `text`。
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PluginTableCommandFilterControlKind {
+    /// 普通单行文本输入。
+    #[default]
+    Text,
+    /// 日期时间输入，展示和回传格式由插件占位文案/业务解析决定，宿主仅提供选择辅助。
+    DateTime,
+}
+
+impl<'de> Deserialize<'de> for PluginTableCommandFilterControlKind {
+    /// 解析插件声明的控件类型。
+    ///
+    /// 业务意图：
+    /// - 插件协议需要向前兼容：新版插件可能声明旧宿主尚不认识的通用控件类型。
+    /// - 未知类型降级为普通文本输入，保证页面主体和其它过滤控件仍可展示，业务校验继续交给插件自身。
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        let raw = raw.as_str().unwrap_or_default().trim();
+        Ok(match raw {
+            "date_time" => Self::DateTime,
+            "text" | "" => Self::Text,
+            _ => Self::Text,
+        })
+    }
 }
 
 /// 插件表格行内动作。
@@ -2797,6 +2842,76 @@ mod tests {
             panic!("应解析为打开窗口响应");
         };
         assert!(page.table.expect("旧响应应包含表格").row_actions.is_empty());
+    }
+
+    #[test]
+    fn 插件命令过滤控件类型默认文本并支持日期时间() {
+        let response_line = serde_json::json!({
+            "action": "open_window",
+            "title": "带过滤器表格",
+            "page": {
+                "title": "带过滤器表格",
+                "description": null,
+                "stats": [],
+                "table": {
+                    "headers": ["列"],
+                    "rows": [["值"]],
+                    "command_filter": {
+                        "controls": [
+                            {
+                                "key": "keyword",
+                                "value": "alice",
+                                "placeholder": "关键字"
+                            },
+                            {
+                                "key": "start_time",
+                                "kind": "date_time",
+                                "value": "2026-05-31 09:08:07",
+                                "placeholder": "开始：yyyy-MM-dd HH:mm:ss",
+                                "icon": "calendar"
+                            },
+                            {
+                                "key": "future_control",
+                                "kind": "future_picker",
+                                "value": "保留文本",
+                                "placeholder": "未来控件"
+                            }
+                        ],
+                        "command": {
+                            "command_id": "filter",
+                            "context": {
+                                "type": "table_action",
+                                "action_id": "apply_filter",
+                                "files": [],
+                                "data": {}
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let parsed_response = parse_plugin_stdout_line(&response_line).expect("过滤器响应应能解析");
+        let Some(ParsedPluginStdoutLine::Response(PluginCommandResponse::OpenWindow {
+            page, ..
+        })) = parsed_response
+        else {
+            panic!("应解析为打开窗口响应");
+        };
+        let controls = page
+            .table
+            .expect("响应应包含表格")
+            .command_filter
+            .expect("响应应包含命令过滤器")
+            .controls;
+        assert_eq!(controls[0].kind, PluginTableCommandFilterControlKind::Text);
+        assert_eq!(
+            controls[1].kind,
+            PluginTableCommandFilterControlKind::DateTime
+        );
+        assert_eq!(controls[2].kind, PluginTableCommandFilterControlKind::Text);
+        assert_eq!(controls[2].value, "保留文本");
     }
 
     #[test]

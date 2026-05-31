@@ -264,12 +264,40 @@ struct PluginTableCommandFilterControl {
     value: String,
     /// 空输入时的占位文案。
     placeholder: String,
+    /// 宿主应使用的通用控件类型。
+    ///
+    /// 业务意图：
+    /// - 性能日志插件只声明通用 UI 语义，例如用户字段用文本、时间字段用日期时间选择器。
+    /// - 宿主仍只负责渲染和回传字符串，具体过滤规则继续由插件解析，避免主程序夹带插件业务逻辑。
+    #[serde(skip_serializing_if = "PluginTableCommandFilterControlKind::is_text")]
+    kind: PluginTableCommandFilterControlKind,
     /// 可选通用图标名。
     #[serde(skip_serializing_if = "Option::is_none")]
     icon: Option<String>,
     /// 输入框建议宽度。
     #[serde(skip_serializing_if = "Option::is_none")]
     width: Option<u32>,
+}
+
+/// 插件命令过滤器控件类型。
+///
+/// 业务意图：
+/// - 该枚举复制宿主协议中的通用控件语义，但只用于插件侧序列化响应。
+/// - 旧宿主会忽略未知字段，新宿主可据此渲染日期时间选择器。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PluginTableCommandFilterControlKind {
+    /// 普通单行文本输入。
+    Text,
+    /// 日期时间输入。
+    DateTime,
+}
+
+impl PluginTableCommandFilterControlKind {
+    /// 判断是否为默认文本输入，用于让旧 JSON 保持简洁。
+    fn is_text(value: &Self) -> bool {
+        matches!(value, Self::Text)
+    }
 }
 
 /// 页面表格行内动作。
@@ -2848,6 +2876,7 @@ fn build_performance_filter_controls(
             key: PERFORMANCE_FILTER_USERS_KEY.to_string(),
             value: filter.users_raw.clone(),
             placeholder: "用户：alice,bob".to_string(),
+            kind: PluginTableCommandFilterControlKind::Text,
             icon: Some("user".to_string()),
             width: Some(180),
         },
@@ -2855,15 +2884,17 @@ fn build_performance_filter_controls(
             key: PERFORMANCE_FILTER_START_KEY.to_string(),
             value: filter.start_time_raw.clone(),
             placeholder: "开始：yyyy-MM-dd HH:mm:ss".to_string(),
-            icon: None,
-            width: Some(220),
+            kind: PluginTableCommandFilterControlKind::DateTime,
+            icon: Some("calendar".to_string()),
+            width: Some(236),
         },
         PluginTableCommandFilterControl {
             key: PERFORMANCE_FILTER_END_KEY.to_string(),
             value: filter.end_time_raw.clone(),
             placeholder: "结束：yyyy-MM-dd HH:mm:ss".to_string(),
-            icon: None,
-            width: Some(220),
+            kind: PluginTableCommandFilterControlKind::DateTime,
+            icon: Some("calendar".to_string()),
+            width: Some(236),
         },
     ]
 }
@@ -3916,7 +3947,21 @@ mod tests {
         assert_eq!(action_id, "show_detail");
         assert!(files.is_empty());
         assert_eq!(data.get("route").map(String::as_str), Some("/a"));
-        assert!(table.command_filter.is_some());
+        let command_filter = table.command_filter.expect("汇总页应携带业务过滤器");
+        assert_eq!(
+            command_filter.controls[0].kind,
+            PluginTableCommandFilterControlKind::Text
+        );
+        assert_eq!(
+            command_filter.controls[1].kind,
+            PluginTableCommandFilterControlKind::DateTime
+        );
+        assert_eq!(
+            command_filter.controls[2].kind,
+            PluginTableCommandFilterControlKind::DateTime
+        );
+        assert_eq!(command_filter.controls[1].icon.as_deref(), Some("calendar"));
+        assert_eq!(command_filter.controls[2].icon.as_deref(), Some("calendar"));
     }
 
     /// 覆盖性能汇总业务过滤会重新计算次数和平均耗时。
@@ -3956,6 +4001,14 @@ mod tests {
         let filter = table.command_filter.expect("汇总页应携带业务过滤器");
         assert_eq!(filter.controls[0].key, PERFORMANCE_FILTER_USERS_KEY);
         assert_eq!(filter.controls[0].value, "ali,bob");
+        assert_eq!(
+            filter.controls[1].kind,
+            PluginTableCommandFilterControlKind::DateTime
+        );
+        assert_eq!(
+            filter.controls[2].kind,
+            PluginTableCommandFilterControlKind::DateTime
+        );
         let action_data = match &table.row_actions[0][0]
             .command
             .as_ref()
@@ -4051,6 +4104,14 @@ mod tests {
             .expect("详情页应携带业务过滤器");
         assert_eq!(filter.controls[0].key, PERFORMANCE_FILTER_USERS_KEY);
         assert_eq!(filter.controls[0].value, "bob");
+        assert_eq!(
+            filter.controls[1].kind,
+            PluginTableCommandFilterControlKind::DateTime
+        );
+        assert_eq!(
+            filter.controls[2].kind,
+            PluginTableCommandFilterControlKind::DateTime
+        );
     }
 
     /// 覆盖非法时间过滤返回中文错误。

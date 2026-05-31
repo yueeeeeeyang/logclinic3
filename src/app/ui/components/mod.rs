@@ -6,10 +6,13 @@
 
 use super::*;
 
+/// 通用日期时间选择器组件辅助。
+pub(in crate::app) mod date_time_picker;
 /// 通用受控单选 Select 组件。
 pub(in crate::app) mod select;
 /// 通用文本输入框组件。
 pub(in crate::app) mod text_input;
 
+pub(in crate::app) use date_time_picker::*;
 pub(in crate::app) use select::*;
 pub(in crate::app) use text_input::*;

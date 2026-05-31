@@ -1843,6 +1843,63 @@ mod state_tests {
         assert_eq!(dialog.message, "日志已重新加载，请重新打开文件后搜索");
     }
 
+    /// 验证重新加载日志会清空搜索关键字历史和搜索结果历史。
+    ///
+    /// 业务意图：
+    /// - 搜索结果历史里会保存当前目录搜索的目录目标；重新加载日志后这些目录属于旧来源树，必须和命中记录一起丢弃。
+    /// - 搜索关键字历史也只服务当前日志会话，重载后不能再自动带入旧日志关键字。
+    /// - 延迟打开搜索窗口的选中文件预设保存旧来源快照，也必须回到默认入口。
+    #[test]
+    fn 重新加载日志会清空搜索历史和历史目录() {
+        let mut query_history = vec![
+            SearchQueryHistoryItem::new("Exception", SearchMatchMode::Literal)
+                .expect("测试关键字应能进入历史"),
+            SearchQueryHistoryItem::new("error.*", SearchMatchMode::Regex)
+                .expect("测试正则应能进入历史"),
+        ];
+        let mut results_panel = Some(SearchResultsPanelState {
+            records: vec![SearchHistoryRecord {
+                job_id: 9,
+                query: "Exception".to_string(),
+                scope: SearchScope::CurrentDirectory,
+                directory_target: Some("/old/logs".to_string()),
+                case_sensitive: false,
+                match_mode: SearchMatchMode::Literal,
+                progress: SearchProgress {
+                    searched_files: 1,
+                    total_files: 1,
+                    matched_lines: 3,
+                },
+                results: Vec::new(),
+                result_groups: Vec::new(),
+                result_group_indices: HashMap::new(),
+                errors: Vec::new(),
+                canceled: false,
+                expanded: true,
+                expanded_file_keys: HashSet::new(),
+            }],
+            rows: vec![SearchResultsPanelRow::RecordHeader { record_index: 0 }],
+            height: 260.0,
+            scroll_handle: UniformListScrollHandle::new(),
+        });
+        let mut results_context_menu = Some(SearchResultsContextMenu { x: 16.0, y: 24.0 });
+        let mut open_preset = SearchDialogOpenPreset::SelectedFiles {
+            sources: vec![test_local_file("/tmp/old.log")],
+        };
+
+        MainView::clear_search_histories_for_log_reload(
+            &mut query_history,
+            &mut results_panel,
+            &mut results_context_menu,
+            &mut open_preset,
+        );
+
+        assert!(query_history.is_empty());
+        assert!(results_panel.is_none());
+        assert!(results_context_menu.is_none());
+        assert!(matches!(open_preset, SearchDialogOpenPreset::Default));
+    }
+
     /// 验证“选中文件”范围禁用当前文件快捷按钮。
     ///
     /// 业务意图：
@@ -3406,21 +3463,28 @@ mod state_tests {
         assert_eq!(visible_thread_names, vec!["hot-runnable"]);
     }
 
-    /// 验证线程并发分析统计过滤后的全部线程样本。
+    /// 验证堆栈并发分析统计过滤后的全部线程样本。
     ///
     /// 业务意图：
-    /// - 并发页要展示选中线程日志里每个线程名的出现次数，不能复用频率页“只显示重复线程”的默认隐藏规则。
+    /// - 并发页要按规范化后的堆栈指纹归并样本，避免线程名唯一时失去排查价值。
+    /// - 同一快照中相同堆栈出现多次时，应体现最大并发数；跨快照总次数用于辅助判断持续性。
     /// - 用户配置的线程过滤规则仍然必须先生效，避免 JVM 噪声线程进入并发统计。
     /// - 状态分布只展示五个列，NEW、TERMINATED 和未知状态应统一归入 OTHER。
     #[test]
-    fn 线程并发分析统计过滤后全部样本并按次数排序() {
-        let sample = |name: &str, state: ThreadStateKind, line_index: usize| ThreadStateSample {
-            name: name.to_string(),
-            thread_id: Some(format!("#{line_index}")),
-            state,
-            line_index,
-            preview_lines: vec![format!("\"{name}\" #{line_index}")],
-            stack_lines: vec![format!("\"{name}\" #{line_index}")],
+    fn 堆栈并发分析统计过滤后全部样本并按并发排序() {
+        let sample = |name: &str, state: ThreadStateKind, line_index: usize, stack_frame: &str| {
+            ThreadStateSample {
+                name: name.to_string(),
+                thread_id: Some(format!("#{line_index}")),
+                state,
+                line_index,
+                preview_lines: vec![format!("\"{name}\" #{line_index}")],
+                stack_lines: vec![
+                    format!("\"{name}\" #{line_index}"),
+                    format!("   java.lang.Thread.State: {}", state.label()),
+                    format!("        at {stack_frame}"),
+                ],
+            }
         };
         let source = LogFileSource::LocalFile {
             path: PathBuf::from("thread.log"),
@@ -3431,11 +3495,36 @@ mod state_tests {
                 source_index: 0,
                 source: source.clone(),
                 threads: vec![
-                    sample("hot-thread", ThreadStateKind::Runnable, 1),
-                    sample("tie-a", ThreadStateKind::Waiting, 2),
-                    sample("once-thread", ThreadStateKind::TimedWaiting, 3),
-                    sample("noise-thread", ThreadStateKind::Runnable, 4),
-                    sample("other-state", ThreadStateKind::New, 5),
+                    sample(
+                        "worker-1",
+                        ThreadStateKind::Runnable,
+                        1,
+                        "demo.Worker.run(Worker.java:10)",
+                    ),
+                    sample(
+                        "worker-2",
+                        ThreadStateKind::Blocked,
+                        2,
+                        "demo.Worker.run(Worker.java:20)",
+                    ),
+                    sample(
+                        "once-thread",
+                        ThreadStateKind::Waiting,
+                        3,
+                        "demo.Once.run(Once.java:30)",
+                    ),
+                    sample(
+                        "noise-thread",
+                        ThreadStateKind::Runnable,
+                        4,
+                        "demo.Worker.run(Worker.java:40)",
+                    ),
+                    sample(
+                        "native-state",
+                        ThreadStateKind::New,
+                        5,
+                        "demo.Native.run(Native.java:50)",
+                    ),
                 ],
             },
             ThreadSnapshot {
@@ -3443,20 +3532,42 @@ mod state_tests {
                 source_index: 0,
                 source: source.clone(),
                 threads: vec![
-                    sample("hot-thread", ThreadStateKind::Blocked, 6),
-                    sample("tie-b", ThreadStateKind::Runnable, 7),
-                    sample("tie-a", ThreadStateKind::Waiting, 8),
-                    sample("noise-thread", ThreadStateKind::Blocked, 9),
+                    sample(
+                        "worker-3",
+                        ThreadStateKind::TimedWaiting,
+                        6,
+                        "demo.Worker.run(Worker.java:60)",
+                    ),
+                    sample(
+                        "other-a",
+                        ThreadStateKind::Runnable,
+                        7,
+                        "demo.Other.run(Other.java:70)",
+                    ),
+                    sample(
+                        "other-b",
+                        ThreadStateKind::Terminated,
+                        8,
+                        "demo.Other.run(Other.java:80)",
+                    ),
+                    sample(
+                        "noise-thread",
+                        ThreadStateKind::Blocked,
+                        9,
+                        "demo.Other.run(Other.java:90)",
+                    ),
                 ],
             },
             ThreadSnapshot {
                 label: "第三个快照".to_string(),
                 source_index: 0,
                 source,
-                threads: vec![
-                    sample("hot-thread", ThreadStateKind::TimedWaiting, 10),
-                    sample("tie-b", ThreadStateKind::Terminated, 11),
-                ],
+                threads: vec![sample(
+                    "other-c",
+                    ThreadStateKind::Runnable,
+                    10,
+                    "demo.Other.run(Other.java:100)",
+                )],
             },
         ];
         let rules = vec![ThreadAnalysisFilterRule {
@@ -3465,52 +3576,59 @@ mod state_tests {
         }];
 
         let analysis = build_thread_analysis_data(1, 0, snapshots, &rules);
-        let concurrency_thread_names = analysis
+        let concurrency_stack_titles = analysis
             .concurrency_rows
             .iter()
-            .map(|row| row.thread_name.as_str())
+            .map(|row| row.stack_title.as_str())
             .collect::<Vec<_>>();
 
         assert_eq!(
-            concurrency_thread_names,
-            vec!["hot-thread", "tie-a", "tie-b", "once-thread", "other-state"]
+            concurrency_stack_titles,
+            vec![
+                "at demo.Worker.run",
+                "at demo.Other.run",
+                "at demo.Once.run",
+                "at demo.Native.run"
+            ]
         );
         assert!(
             !analysis.thread_names.contains(&"once-thread".to_string()),
             "频率页仍应默认隐藏单次线程，并发页才展示全部样本"
         );
 
-        let hot_row = analysis
+        let worker_row = analysis
             .concurrency_rows
             .iter()
-            .find(|row| row.thread_name == "hot-thread")
-            .expect("高频线程应进入并发分析");
-        assert_eq!(hot_row.total_count, 3);
-        assert_eq!(hot_row.runnable_count, 1);
-        assert_eq!(hot_row.blocked_count, 1);
-        assert_eq!(hot_row.timed_waiting_count, 1);
+            .find(|row| row.stack_title == "at demo.Worker.run")
+            .expect("高频堆栈应进入并发分析");
+        assert_eq!(worker_row.total_count, 3);
+        assert_eq!(worker_row.max_snapshot_concurrency, 2);
+        assert_eq!(worker_row.runnable_count, 1);
+        assert_eq!(worker_row.blocked_count, 1);
+        assert_eq!(worker_row.timed_waiting_count, 1);
 
-        let tie_b_row = analysis
+        let other_row = analysis
             .concurrency_rows
             .iter()
-            .find(|row| row.thread_name == "tie-b")
-            .expect("同次数线程应进入并发分析");
-        assert_eq!(tie_b_row.total_count, 2);
-        assert_eq!(tie_b_row.runnable_count, 1);
-        assert_eq!(tie_b_row.other_count, 1);
+            .find(|row| row.stack_title == "at demo.Other.run")
+            .expect("同并发堆栈应进入并发分析");
+        assert_eq!(other_row.total_count, 3);
+        assert_eq!(other_row.max_snapshot_concurrency, 2);
+        assert_eq!(other_row.runnable_count, 2);
+        assert_eq!(other_row.other_count, 1);
     }
 
-    /// 验证线程并发分析详情入口按线程名收集全部堆栈样本。
+    /// 验证堆栈并发分析详情入口按堆栈指纹收集全部样本。
     ///
     /// 业务意图：
-    /// - 并发页行点击没有具体时间线色块作为上下文，必须直接按线程名从过滤后快照中收集样本。
-    /// - 单次线程虽然不在频率矩阵中显示，也应能打开详情窗口查看原始堆栈。
+    /// - 并发页行点击没有具体时间线色块作为上下文，必须按堆栈指纹从过滤后快照中收集样本。
+    /// - 线程名不同但业务堆栈相同的样本应进入同一个详情序列，并保留原始堆栈文本供用户查看。
     #[test]
-    fn 线程并发分析详情按线程名收集堆栈样本() {
+    fn 堆栈并发分析详情按堆栈指纹收集堆栈样本() {
         let source = LogFileSource::LocalFile {
             path: PathBuf::from("thread.log"),
         };
-        let sample = |name: &str, line_index: usize| ThreadStateSample {
+        let sample = |name: &str, line_index: usize, stack_frame: &str| ThreadStateSample {
             name: name.to_string(),
             thread_id: Some(format!("#{line_index}")),
             state: ThreadStateKind::Runnable,
@@ -3518,7 +3636,8 @@ mod state_tests {
             preview_lines: vec![format!("\"{name}\" #{line_index}")],
             stack_lines: vec![
                 format!("\"{name}\" #{line_index}"),
-                format!("        at demo.Worker.run({line_index})"),
+                "   java.lang.Thread.State: RUNNABLE".to_string(),
+                format!("        at {stack_frame}"),
             ],
         };
         let snapshots = vec![
@@ -3526,23 +3645,38 @@ mod state_tests {
                 label: "第一个快照".to_string(),
                 source_index: 0,
                 source: source.clone(),
-                threads: vec![sample("repeat-thread", 10), sample("once-thread", 11)],
+                threads: vec![
+                    sample("repeat-a", 10, "demo.Worker.run(Worker.java:10)"),
+                    sample("once-thread", 11, "demo.Once.run(Once.java:11)"),
+                ],
             },
             ThreadSnapshot {
                 label: "第二个快照".to_string(),
                 source_index: 0,
                 source,
-                threads: vec![sample("repeat-thread", 20)],
+                threads: vec![sample("repeat-b", 20, "demo.Worker.run(Worker.java:20)")],
             },
         ];
         let analysis = build_thread_analysis_data(1, 0, snapshots, &[]);
+        let repeat_row = analysis
+            .concurrency_rows
+            .iter()
+            .find(|row| row.stack_title == "at demo.Worker.run")
+            .expect("同业务堆栈应被归并为同一行");
+        let once_row = analysis
+            .concurrency_rows
+            .iter()
+            .find(|row| row.stack_title == "at demo.Once.run")
+            .expect("单次业务堆栈应保留在并发分析中");
 
-        let repeat_stacks = ThreadAnalysisWindowView::thread_stack_cells_for_thread_name(
+        let repeat_stacks = ThreadAnalysisWindowView::thread_stack_cells_for_stack_key(
             &analysis,
-            "repeat-thread",
+            &repeat_row.stack_key,
         );
-        let once_stacks =
-            ThreadAnalysisWindowView::thread_stack_cells_for_thread_name(&analysis, "once-thread");
+        let once_stacks = ThreadAnalysisWindowView::thread_stack_cells_for_stack_key(
+            &analysis,
+            &once_row.stack_key,
+        );
 
         assert_eq!(repeat_stacks.len(), 2);
         assert_eq!(repeat_stacks[0].line_index, 10);
@@ -3550,7 +3684,11 @@ mod state_tests {
         assert_eq!(once_stacks.len(), 1);
         assert_eq!(
             ThreadStackWindowView::thread_stack_lines_for_cell(&once_stacks[0])[1],
-            "        at demo.Worker.run(11)"
+            "   java.lang.Thread.State: RUNNABLE"
+        );
+        assert_eq!(
+            ThreadStackWindowView::thread_stack_lines_for_cell(&repeat_stacks[1])[2],
+            "        at demo.Worker.run(Worker.java:20)"
         );
     }
 
@@ -3566,7 +3704,7 @@ mod state_tests {
             ThreadAnalysisResultTab::Frequency
         );
         assert_eq!(ThreadAnalysisResultTab::Frequency.label(), "线程频率分析");
-        assert_eq!(ThreadAnalysisResultTab::Concurrency.label(), "线程并发分析");
+        assert_eq!(ThreadAnalysisResultTab::Concurrency.label(), "堆栈并发分析");
         assert!(ThreadAnalysisWindowView::thread_concurrency_table_min_width() > 800.0);
     }
 

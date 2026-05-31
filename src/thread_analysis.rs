@@ -10,6 +10,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
+    hash::{Hash, Hasher},
     sync::Arc,
 };
 
@@ -47,10 +48,10 @@ pub(crate) struct ThreadAnalysisData {
     /// - 单个色块既要展示状态，也要支持悬浮查看线程片段、单击回到主窗口定位原始日志行。
     /// - 因此矩阵保存可定位的单元详情，而不是只保存颜色所需的状态枚举。
     pub(crate) matrix: Vec<Vec<Option<Arc<ThreadTimelineCell>>>>,
-    /// 并发分析页按线程名聚合后的统计行。
+    /// 并发分析页按规范化堆栈聚合后的统计行。
     ///
     /// 业务意图：
-    /// - 频率时间线会默认隐藏只出现一次的线程，而并发分析需要回答“选中日志里每个线程名出现了多少次”。
+    /// - 频率时间线会默认隐藏只出现一次的线程，而堆栈并发分析需要回答“同一类堆栈在选中日志中同时出现多少”。
     /// - 因此该集合基于用户过滤规则后的全部线程样本构建，不受默认可见线程集合和状态图例影响。
     pub(crate) concurrency_rows: Vec<ThreadConcurrencyRow>,
 }
@@ -207,17 +208,31 @@ pub(crate) struct ThreadTimelineCell {
     pub(crate) stack_lines: Vec<String>,
 }
 
-/// 线程并发分析中的单个线程名聚合行。
+/// 堆栈并发分析中的单个堆栈聚合行。
 ///
 /// 业务意图：
-/// - 并发页不展示时间轴，而是把选中线程日志中的同名线程合并，帮助用户快速定位重复出现最多的业务线程。
+/// - 真实 Java 线程名经常带序号或请求标识，按线程名合并会把同一问题拆散；这里改用规范化堆栈指纹聚合。
+/// - 指纹忽略线程头、线程状态、栈帧源码行号和对象地址，保留方法调用序列作为“同类堆栈”的判断依据。
 /// - 状态分布保留为独立计数，避免用户只能看到总数而无法区分运行、阻塞和等待样本。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ThreadConcurrencyRow {
-    /// Java 线程名。
-    pub(crate) thread_name: String,
-    /// 该线程名在过滤后全部快照中的出现次数。
+    /// 规范化堆栈指纹键。
+    ///
+    /// 业务意图：
+    /// - 点击并发行时需要用同一指纹重新从过滤后快照收集完整原始堆栈样本；展示列只显示摘要，不足以精确匹配。
+    pub(crate) stack_key: String,
+    /// 用户可见的代表性栈帧。
+    ///
+    /// 业务意图：
+    /// - 表格首列不展示完整堆栈，只展示第一个有效方法帧或兜底行，让用户快速判断这一组线程在做什么。
+    pub(crate) stack_title: String,
+    /// 该堆栈指纹在过滤后全部快照中的样本出现次数。
     pub(crate) total_count: usize,
+    /// 单个 thread dump 快照内同一堆栈指纹同时出现的最大数量。
+    ///
+    /// 业务意图：
+    /// - “并发”更关注同一时刻有多少线程停在同一调用栈；总出现次数可能只是多次采样累计，不能单独代表并发规模。
+    pub(crate) max_snapshot_concurrency: usize,
     /// RUNNABLE 状态数量。
     pub(crate) runnable_count: usize,
     /// BLOCKED 状态数量。
@@ -234,6 +249,16 @@ pub(crate) struct ThreadConcurrencyRow {
 }
 
 impl ThreadConcurrencyRow {
+    /// 返回聚合行在 UI 虚拟列表中的稳定标识。
+    ///
+    /// 业务意图：
+    /// - 堆栈指纹可能包含换行和很长的类名，不能直接作为元素 ID 展示；用哈希压缩后只服务当前 UI 标识。
+    pub(crate) fn stable_id(&self) -> String {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.stack_key.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    }
+
     /// 返回指定状态在并发聚合行中的数量。
     ///
     /// 业务意图：
@@ -276,15 +301,21 @@ impl ThreadConcurrencyRow {
     }
 }
 
-/// 线程并发分析构建阶段的内部累加器。
+/// 堆栈并发分析构建阶段的内部累加器。
 ///
 /// 业务意图：
-/// - 展示行不需要暴露首次出现顺序，但排序必须用它稳定处理同次数线程；内部结构把排序元数据隔离在构建阶段。
+/// - 展示行不需要暴露首次出现顺序和每个快照内计数，但排序和最大并发都依赖这些元数据。
+/// - 内部结构把构建细节隔离，避免 UI 或序列化层误依赖临时状态。
 struct ThreadConcurrencyAccumulator {
     /// 展示给用户的聚合行。
     row: ThreadConcurrencyRow,
-    /// 当前线程名第一次出现在过滤后快照中的顺序。
+    /// 当前堆栈指纹第一次出现在过滤后快照中的顺序。
     first_seen_order: usize,
+    /// 每个快照内该堆栈指纹已经累计的样本数量。
+    ///
+    /// 边界条件：
+    /// - 同一快照内多个线程可能拥有完全相同堆栈；这里用于计算“最大单快照并发数”。
+    snapshot_counts: HashMap<usize, usize>,
 }
 
 /// 线程头已识别但状态行尚未出现时的临时解析状态。
@@ -998,48 +1029,182 @@ fn thread_sample_matches_filter_rules(
     })
 }
 
-/// 构建线程并发分析聚合行。
+/// 判断线程片段中的一行是否是线程头。
+///
+/// 业务意图：
+/// - Java thread dump 的线程头通常包含线程名、tid、nid、prio 等高度唯一的信息；堆栈聚类时必须排除，
+///   否则同一调用栈会被线程名或线程 ID 拆成多个组。
+fn is_thread_stack_header_line(trimmed: &str) -> bool {
+    trimmed.starts_with('"')
+}
+
+/// 判断线程片段中的一行是否是 JVM 状态行。
+///
+/// 业务意图：
+/// - 状态本身已经进入状态分布列，不参与堆栈指纹；否则同一调用栈在 RUNNABLE 和 WAITING 间切换时会被拆组。
+fn is_thread_stack_state_line(trimmed: &str) -> bool {
+    trimmed.starts_with("java.lang.Thread.State:")
+}
+
+/// 归一化日志行中的十六进制地址。
+///
+/// 业务意图：
+/// - 锁对象、native thread id 和对象地址每次 JVM 运行都可能不同；聚类关注调用栈形态，不应被这些地址打散。
+/// - 该函数只处理 ASCII 地址模式，不改写中文类名、线程名或其它非 ASCII 文本，避免破坏 UTF-8 边界。
+fn normalize_stack_hex_addresses(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut index = 0usize;
+    while index < text.len() {
+        let remaining = &text[index..];
+        if remaining.starts_with("<0x")
+            && let Some(end_offset) = remaining.find('>')
+        {
+            normalized.push_str("<addr>");
+            index = index.saturating_add(end_offset + 1);
+            continue;
+        }
+        if remaining.starts_with("0x") {
+            let mut end = index + 2;
+            while end < text.len() && text.as_bytes()[end].is_ascii_hexdigit() {
+                end += 1;
+            }
+            if end > index + 2 {
+                normalized.push_str("0x");
+                index = end;
+                continue;
+            }
+        }
+        let Some(character) = remaining.chars().next() else {
+            break;
+        };
+        normalized.push(character);
+        index += character.len_utf8();
+    }
+    normalized
+}
+
+/// 归一化单条堆栈行。
+///
+/// 业务意图：
+/// - Java 栈帧的源码行号会随版本变化或编译参数变化而不同；同一个方法调用应归为同一类堆栈。
+/// - 非 `at` 行（锁等待、ownable synchronizer 等）仍保留语义，只清理地址，避免把锁相关问题完全抹掉。
+fn normalize_thread_stack_line(trimmed: &str) -> String {
+    let normalized = normalize_stack_hex_addresses(trimmed);
+    if let Some(frame) = normalized.strip_prefix("at ") {
+        let method = frame
+            .split_once('(')
+            .map(|(method, _)| method)
+            .unwrap_or(frame)
+            .trim();
+        if !method.is_empty() {
+            return format!("at {method}");
+        }
+    }
+    normalized
+}
+
+/// 返回堆栈聚类使用的规范化行序列。
+///
+/// 边界条件：
+/// - 完全没有方法帧的线程仍要进入并发分析，因此使用固定空堆栈占位键，避免被丢弃。
+fn normalized_thread_stack_lines(stack_lines: &[String]) -> Vec<String> {
+    let mut normalized_lines = Vec::new();
+    for line in stack_lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if is_thread_stack_header_line(trimmed) {
+            continue;
+        }
+        if is_thread_stack_state_line(trimmed) {
+            continue;
+        }
+        normalized_lines.push(normalize_thread_stack_line(trimmed));
+    }
+    if normalized_lines.is_empty() {
+        normalized_lines.push("<empty-stack>".to_string());
+    }
+    normalized_lines
+}
+
+/// 返回堆栈并发分析聚合键。
+///
+/// 业务意图：
+/// - UI 点击聚合行时需要重新匹配完整样本；把聚合键做成领域层公共函数可以保证构建和点击使用同一套规范化规则。
+pub(crate) fn thread_stack_fingerprint_key(stack_lines: &[String]) -> String {
+    normalized_thread_stack_lines(stack_lines).join("\n")
+}
+
+/// 返回堆栈并发分析的代表性展示文本。
+///
+/// 业务意图：
+/// - 优先展示第一个方法帧；如果线程只包含锁信息或空栈，则展示第一条保留下来的规范化行。
+fn thread_stack_fingerprint_title(normalized_lines: &[String]) -> String {
+    normalized_lines
+        .iter()
+        .find(|line| line.starts_with("at "))
+        .or_else(|| normalized_lines.first())
+        .cloned()
+        .unwrap_or_else(|| "<empty-stack>".to_string())
+}
+
+/// 构建堆栈并发分析聚合行。
 ///
 /// 业务意图：
 /// - 并发分析统计口径是“用户过滤规则之后的全部线程样本”，不能复用频率时间线的默认可见集合，
 ///   否则只出现一次但对并发排查有价值的线程会被误隐藏。
-/// - 排序按总出现次数降序，次数相同时按首次出现顺序稳定排列，最后用线程名兜底，保证多次打开同一批日志顺序一致。
+/// - 排序按最大单快照并发数降序，其次按总出现次数降序；再按首次出现顺序和堆栈摘要兜底，保证多次打开同一批日志顺序一致。
 fn build_thread_concurrency_rows(snapshots: &[ThreadSnapshot]) -> Vec<ThreadConcurrencyRow> {
-    let mut rows_by_thread = HashMap::<String, ThreadConcurrencyAccumulator>::new();
+    let mut rows_by_stack = HashMap::<String, ThreadConcurrencyAccumulator>::new();
     let mut next_first_seen_order = 0usize;
 
-    for snapshot in snapshots {
+    for (snapshot_index, snapshot) in snapshots.iter().enumerate() {
         for sample in &snapshot.threads {
-            let accumulator = rows_by_thread
-                .entry(sample.name.clone())
-                .or_insert_with(|| {
-                    let first_seen_order = next_first_seen_order;
-                    next_first_seen_order = next_first_seen_order.saturating_add(1);
-                    ThreadConcurrencyAccumulator {
-                        row: ThreadConcurrencyRow {
-                            thread_name: sample.name.clone(),
-                            total_count: 0,
-                            runnable_count: 0,
-                            blocked_count: 0,
-                            waiting_count: 0,
-                            timed_waiting_count: 0,
-                            other_count: 0,
-                        },
-                        first_seen_order,
-                    }
-                });
+            let normalized_lines = normalized_thread_stack_lines(&sample.stack_lines);
+            let stack_key = normalized_lines.join("\n");
+            let stack_title = thread_stack_fingerprint_title(&normalized_lines);
+            let accumulator = rows_by_stack.entry(stack_key.clone()).or_insert_with(|| {
+                let first_seen_order = next_first_seen_order;
+                next_first_seen_order = next_first_seen_order.saturating_add(1);
+                ThreadConcurrencyAccumulator {
+                    row: ThreadConcurrencyRow {
+                        stack_key,
+                        stack_title,
+                        total_count: 0,
+                        max_snapshot_concurrency: 0,
+                        runnable_count: 0,
+                        blocked_count: 0,
+                        waiting_count: 0,
+                        timed_waiting_count: 0,
+                        other_count: 0,
+                    },
+                    first_seen_order,
+                    snapshot_counts: HashMap::new(),
+                }
+            });
             accumulator.row.push_state(sample.state);
+            let snapshot_count = accumulator
+                .snapshot_counts
+                .entry(snapshot_index)
+                .or_insert(0);
+            *snapshot_count = snapshot_count.saturating_add(1);
+            accumulator.row.max_snapshot_concurrency = accumulator
+                .row
+                .max_snapshot_concurrency
+                .max(*snapshot_count);
         }
     }
 
-    let mut rows = rows_by_thread.into_values().collect::<Vec<_>>();
+    let mut rows = rows_by_stack.into_values().collect::<Vec<_>>();
     rows.sort_by(|left, right| {
         right
             .row
-            .total_count
-            .cmp(&left.row.total_count)
+            .max_snapshot_concurrency
+            .cmp(&left.row.max_snapshot_concurrency)
+            .then_with(|| right.row.total_count.cmp(&left.row.total_count))
             .then_with(|| left.first_seen_order.cmp(&right.first_seen_order))
-            .then_with(|| left.row.thread_name.cmp(&right.row.thread_name))
+            .then_with(|| left.row.stack_title.cmp(&right.row.stack_title))
     });
 
     rows.into_iter()

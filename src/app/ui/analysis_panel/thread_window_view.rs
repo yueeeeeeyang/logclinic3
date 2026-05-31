@@ -25,25 +25,28 @@ const THREAD_ANALYSIS_NAME_COLUMN_ESTIMATED_CHAR_WIDTH: f32 = 7.5;
 /// - 行内线程名元素带有右侧内边距，并且截断渲染需要少量余量；统一加入估算宽度，避免最长线程名末尾贴住时间线色块。
 const THREAD_ANALYSIS_NAME_COLUMN_TEXT_PADDING: f32 = 12.0;
 
-/// 线程并发分析表格行高。
+/// 堆栈并发分析表格行高。
 ///
 /// 业务意图：
-/// - 并发分析可能包含大量线程名，行高必须固定才能使用 `uniform_list` 做虚拟渲染，避免大日志结果一次性创建全部行。
+/// - 并发分析可能包含大量堆栈指纹，行高必须固定才能使用 `uniform_list` 做虚拟渲染，避免大日志结果一次性创建全部行。
 const THREAD_ANALYSIS_CONCURRENCY_ROW_HEIGHT: f32 = 32.0;
 
-/// 线程并发分析总数列宽度。
+/// 堆栈并发分析总样本列宽度。
 const THREAD_ANALYSIS_CONCURRENCY_TOTAL_COLUMN_WIDTH: f32 = 92.0;
 
-/// 线程并发分析状态数量列宽度。
+/// 堆栈并发分析最大并发列宽度。
+const THREAD_ANALYSIS_CONCURRENCY_MAX_COLUMN_WIDTH: f32 = 92.0;
+
+/// 堆栈并发分析状态数量列宽度。
 ///
 /// 业务意图：
 /// - 状态列固定宽度能保证表头和虚拟列表行严格对齐，避免滚动时数字列抖动。
 const THREAD_ANALYSIS_CONCURRENCY_STATE_COLUMN_WIDTH: f32 = 104.0;
 
-/// 线程并发分析线程名列最小宽度。
+/// 堆栈并发分析代表栈帧列最小宽度。
 ///
 /// 边界条件：
-/// - 线程名通常很长，最小宽度需要保留业务前缀；窗口变窄时仍允许表格整体横向溢出，由 GPUI 裁剪处理。
+/// - 业务栈帧通常很长，最小宽度需要保留包名和方法名前缀；窗口变窄时仍允许表格整体横向溢出，由 GPUI 裁剪处理。
 const THREAD_ANALYSIS_CONCURRENCY_NAME_MIN_WIDTH: f32 = 320.0;
 
 /// 搜索结果面板高度拖动状态。
@@ -110,7 +113,7 @@ pub(in crate::app) struct ThreadAnalysisWindowView {
     /// - Java thread dump 可能包含数千个线程，不能一次性把所有线程行都创建成 GPUI 元素。
     /// - 使用 `uniform_list` 只渲染可见行，并通过该句柄保存纵向和横向滚动位置。
     pub(in crate::app) scroll_handle: UniformListScrollHandle,
-    /// 线程并发分析虚拟列表滚动句柄。
+    /// 堆栈并发分析虚拟列表滚动句柄。
     ///
     /// 业务意图：
     /// - 并发页和频率页都可能有大量行，两者滚动位置互相独立，避免用户在一个页签滚动后切回另一个页签位置突变。
@@ -166,7 +169,7 @@ pub(in crate::app) struct ThreadAnalysisWindowView {
 pub(in crate::app) enum ThreadAnalysisResultTab {
     /// 当前已有的线程状态时间线分析。
     Frequency,
-    /// 新增的按线程名聚合统计分析。
+    /// 按规范化堆栈指纹聚合的并发统计分析。
     Concurrency,
 }
 
@@ -175,7 +178,7 @@ impl ThreadAnalysisResultTab {
     pub(in crate::app) fn label(self) -> &'static str {
         match self {
             Self::Frequency => "线程频率分析",
-            Self::Concurrency => "线程并发分析",
+            Self::Concurrency => "堆栈并发分析",
         }
     }
 }
@@ -416,7 +419,7 @@ impl ThreadAnalysisWindowView {
     /// 渲染线程分析结果页签。
     ///
     /// 业务意图：
-    /// - 频率分析保留原有时间线视图，并发分析提供按线程名聚合的新视图；页签让两类结果在同一分析窗口内切换。
+    /// - 频率分析保留原有时间线视图，并发分析提供按堆栈指纹聚合的新视图；页签让两类结果在同一分析窗口内切换。
     /// - 页签按钮需要消费鼠标事件，避免点击页签时触发窗口根节点关闭气泡之外的其它下层交互。
     fn render_result_tabs(
         &self,
@@ -601,7 +604,7 @@ impl ThreadAnalysisWindowView {
             }))
     }
 
-    /// 渲染线程并发分析表头。
+    /// 渲染堆栈并发分析表头。
     ///
     /// 业务意图：
     /// - 表头和虚拟列表行使用相同列宽，保证大量线程滚动时列对齐稳定。
@@ -620,13 +623,19 @@ impl ThreadAnalysisWindowView {
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(rgb(palette.muted_text))
             .child(Self::render_concurrency_name_cell(
-                "线程名称",
+                "堆栈特征",
                 palette,
                 true,
             ))
             .child(Self::render_concurrency_count_cell(
-                "出现次数",
+                "样本数",
                 THREAD_ANALYSIS_CONCURRENCY_TOTAL_COLUMN_WIDTH,
+                palette,
+                true,
+            ))
+            .child(Self::render_concurrency_count_cell(
+                "最大并发",
+                THREAD_ANALYSIS_CONCURRENCY_MAX_COLUMN_WIDTH,
                 palette,
                 true,
             ))
@@ -644,21 +653,21 @@ impl ThreadAnalysisWindowView {
             )
     }
 
-    /// 渲染线程并发分析单行。
+    /// 渲染堆栈并发分析单行。
     ///
     /// 业务意图：
-    /// - 行点击打开该线程名匹配到的全部堆栈样本详情；数字列只展示聚合结果，不改变过滤或排序语义。
+    /// - 行点击打开该堆栈指纹匹配到的全部原始堆栈样本详情；数字列只展示聚合结果，不改变过滤或排序语义。
     fn render_concurrency_row(
         &self,
         row: ThreadConcurrencyRow,
         palette: AppThemePalette,
         context: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let thread_name_for_click = row.thread_name.clone();
+        let stack_key_for_click = row.stack_key.clone();
         div()
             .id(SharedString::from(format!(
                 "thread-analysis-concurrency-row-{}",
-                row.thread_name
+                row.stable_id()
             )))
             .flex()
             .items_center()
@@ -673,13 +682,19 @@ impl ThreadAnalysisWindowView {
             .cursor_pointer()
             .hover(move |row| row.bg(rgb(palette.hover)))
             .child(Self::render_concurrency_name_cell(
-                row.thread_name.clone(),
+                row.stack_title.clone(),
                 palette,
                 false,
             ))
             .child(Self::render_concurrency_count_cell(
                 row.total_count.to_string(),
                 THREAD_ANALYSIS_CONCURRENCY_TOTAL_COLUMN_WIDTH,
+                palette,
+                false,
+            ))
+            .child(Self::render_concurrency_count_cell(
+                row.max_snapshot_concurrency.to_string(),
+                THREAD_ANALYSIS_CONCURRENCY_MAX_COLUMN_WIDTH,
                 palette,
                 false,
             ))
@@ -699,7 +714,7 @@ impl ThreadAnalysisWindowView {
                 MouseButton::Left,
                 context.listener(move |view, event: &MouseDownEvent, window, context| {
                     view.handle_concurrency_row_mouse_down(
-                        thread_name_for_click.clone(),
+                        stack_key_for_click.clone(),
                         event,
                         window,
                         context,
@@ -708,10 +723,10 @@ impl ThreadAnalysisWindowView {
             )
     }
 
-    /// 渲染线程并发分析线程名列。
+    /// 渲染堆栈并发分析代表栈帧列。
     ///
     /// 边界条件：
-    /// - 线程名可能很长，只在单元格内截断，不允许挤压右侧统计列。
+    /// - 栈帧可能很长，只在单元格内截断，不允许挤压右侧统计列。
     fn render_concurrency_name_cell(
         text: impl Into<SharedString>,
         palette: AppThemePalette,
@@ -730,7 +745,7 @@ impl ThreadAnalysisWindowView {
             .child(text.into())
     }
 
-    /// 渲染线程并发分析数字列。
+    /// 渲染堆栈并发分析数字列。
     ///
     /// 业务意图：
     /// - 数字右对齐便于比较同列大小，固定宽度保证虚拟列表滚动时表格不会横向抖动。
@@ -753,7 +768,7 @@ impl ThreadAnalysisWindowView {
             .child(text.into())
     }
 
-    /// 返回线程并发分析状态列顺序。
+    /// 返回堆栈并发分析状态列顺序。
     ///
     /// 业务意图：
     /// - 并发页状态列需要和频率页图例保持主要状态顺序一致；OTHER 承接 NEW、TERMINATED 和未知状态。
@@ -767,13 +782,14 @@ impl ThreadAnalysisWindowView {
         ]
     }
 
-    /// 返回线程并发分析表格最小宽度。
+    /// 返回堆栈并发分析表格最小宽度。
     ///
     /// 业务意图：
-    /// - 表格宽度由固定状态列和线程名最小宽度组成，测试用该纯函数锁定表头和数据行的布局约束。
+    /// - 表格宽度由固定状态列和堆栈摘要最小宽度组成，测试用该纯函数锁定表头和数据行的布局约束。
     pub(in crate::app) fn thread_concurrency_table_min_width() -> f32 {
         THREAD_ANALYSIS_CONCURRENCY_NAME_MIN_WIDTH
             + THREAD_ANALYSIS_CONCURRENCY_TOTAL_COLUMN_WIDTH
+            + THREAD_ANALYSIS_CONCURRENCY_MAX_COLUMN_WIDTH
             + THREAD_ANALYSIS_CONCURRENCY_STATE_COLUMN_WIDTH
                 * Self::thread_concurrency_state_columns().len() as f32
     }
@@ -866,20 +882,20 @@ impl ThreadAnalysisWindowView {
         context.stop_propagation();
     }
 
-    /// 处理线程并发分析行点击。
+    /// 处理堆栈并发分析行点击。
     ///
     /// 业务意图：
-    /// - 并发页按线程名聚合，用户点击一行后应查看该线程名匹配到的全部堆栈样本，并用详情窗口左右按钮切换。
+    /// - 并发页按规范化后的堆栈指纹聚合，用户点击一行后应查看该堆栈匹配到的全部原始样本，并用详情窗口左右按钮切换。
     /// - 并发页不对应某一个时间线色块，因此点击后清空时间线高亮，避免把旧频率页色块误认为当前详情目标。
     fn handle_concurrency_row_mouse_down(
         &mut self,
-        thread_name: String,
+        stack_key: String,
         event: &MouseDownEvent,
         _window: &mut Window,
         context: &mut Context<Self>,
     ) {
         if Self::timeline_cell_click_should_open_stack_window(event.click_count) {
-            let stacks = Self::thread_stack_cells_for_thread_name(&self.analysis, &thread_name);
+            let stacks = Self::thread_stack_cells_for_stack_key(&self.analysis, &stack_key);
             if !stacks.is_empty() {
                 self.jumped_cell = None;
                 self.cell_popup = None;
@@ -1025,14 +1041,17 @@ impl ThreadAnalysisWindowView {
         (cells, active_index)
     }
 
-    /// 按线程名收集并发分析行对应的全部堆栈样本。
+    /// 按堆栈指纹收集并发分析行对应的全部堆栈样本。
     ///
     /// 业务意图：
     /// - 并发分析统计包含用户过滤后全部线程样本，包括频率页默认隐藏的单次线程；详情入口也必须使用同一口径。
     /// - 遍历快照和线程样本的原始顺序，保证详情窗口前进/后退顺序和选中日志解析顺序一致。
-    pub(in crate::app) fn thread_stack_cells_for_thread_name(
+    ///
+    /// 边界条件：
+    /// - 详情窗口必须保留原始线程名、行号和堆栈文本；这里只用规范化指纹做匹配，不替换用户最终看到的内容。
+    pub(in crate::app) fn thread_stack_cells_for_stack_key(
         analysis: &ThreadAnalysisData,
-        thread_name: &str,
+        stack_key: &str,
     ) -> Vec<Arc<ThreadTimelineCell>> {
         analysis
             .snapshots
@@ -1041,7 +1060,9 @@ impl ThreadAnalysisWindowView {
                 snapshot
                     .threads
                     .iter()
-                    .filter(move |sample| sample.name == thread_name)
+                    .filter(move |sample| {
+                        thread_stack_fingerprint_key(&sample.stack_lines) == stack_key
+                    })
                     .map(|sample| {
                         Arc::new(ThreadTimelineCell {
                             state: sample.state,
@@ -1459,10 +1480,10 @@ impl ThreadAnalysisWindowView {
             .child(self.render_horizontal_scrollbar(name_column_width, palette, context))
     }
 
-    /// 渲染线程并发分析内容区。
+    /// 渲染堆栈并发分析内容区。
     ///
     /// 业务意图：
-    /// - 并发页按线程名聚合展示，不受频率页状态图例影响；行数可能很大，因此正文仍使用 `uniform_list` 虚拟渲染。
+    /// - 并发页按堆栈指纹聚合展示，不受频率页状态图例影响；行数可能很大，因此正文仍使用 `uniform_list` 虚拟渲染。
     fn render_concurrency_content(
         &self,
         palette: AppThemePalette,
@@ -1479,7 +1500,7 @@ impl ThreadAnalysisWindowView {
                 .p_4()
                 .text_sm()
                 .text_color(rgb(palette.muted_text))
-                .child("没有可展示的线程并发数据");
+                .child("没有可展示的堆栈并发数据");
         }
 
         let scroll_handle = self.concurrency_scroll_handle.clone();

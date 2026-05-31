@@ -11,6 +11,7 @@
 
 use super::*;
 use crate::log_document::stream_log_source_bytes_to_writer;
+use chrono::{Datelike, Timelike};
 use gpui::Size;
 use gpui::prelude::FluentBuilder;
 use std::{
@@ -293,10 +294,25 @@ struct PluginTableCommandFilterInputState {
     layout: Option<PluginTableFilterInputLayout>,
     /// 空输入时的占位文案。
     placeholder: String,
+    /// 控件类型。
+    ///
+    /// 业务意图：
+    /// - 插件协议只声明通用输入语义，宿主按类型选择文本框或日期时间选择辅助。
+    /// - 字段的业务过滤规则仍由插件解析，本状态不根据 key 判断含义。
+    control_kind: PluginTableCommandFilterControlKind,
     /// 可选通用图标名。
     icon: Option<String>,
     /// 输入框建议宽度。
     width: Pixels,
+    /// 日期时间弹层是否打开。
+    ///
+    /// 边界条件：
+    /// - 仅 `DateTime` 控件使用；普通文本控件保持 false，避免渲染无效浮层。
+    date_time_picker_open: bool,
+    /// 日期时间弹层当前展示年份。
+    date_time_picker_view_year: i32,
+    /// 日期时间弹层当前展示月份。
+    date_time_picker_view_month: u32,
 }
 
 /// 插件表格过滤输入元素。
@@ -1163,15 +1179,22 @@ impl PluginPageWindowView {
                 filter
                     .controls
                     .iter()
-                    .map(|control| PluginTableCommandFilterInputState {
-                        key: control.key.clone(),
-                        input: SingleLineTextInputState::from_text(control.value.clone()),
-                        focus: context.focus_handle(),
-                        selection_drag: None,
-                        layout: None,
-                        placeholder: control.placeholder.clone(),
-                        icon: control.icon.clone(),
-                        width: px(control.width.unwrap_or(180).max(96) as f32),
+                    .map(|control| {
+                        let view_month = date_time_picker_month_from_text(&control.value);
+                        PluginTableCommandFilterInputState {
+                            key: control.key.clone(),
+                            input: SingleLineTextInputState::from_text(control.value.clone()),
+                            focus: context.focus_handle(),
+                            selection_drag: None,
+                            layout: None,
+                            placeholder: control.placeholder.clone(),
+                            control_kind: control.kind,
+                            icon: control.icon.clone(),
+                            width: px(control.width.unwrap_or(180).max(96) as f32),
+                            date_time_picker_open: false,
+                            date_time_picker_view_year: view_month.year,
+                            date_time_picker_view_month: view_month.month,
+                        }
                     })
                     .collect::<Vec<_>>()
             })
@@ -1555,6 +1578,17 @@ impl PluginPageWindowView {
                 context.stop_propagation();
             }
             "escape" => {
+                if let PluginTableInputKind::CommandFilter(index) = input_kind
+                    && self
+                        .command_filter_inputs
+                        .get(index)
+                        .is_some_and(|state| state.date_time_picker_open)
+                {
+                    self.close_command_filter_date_time_picker(index);
+                    context.notify();
+                    context.stop_propagation();
+                    return;
+                }
                 let had_text = self
                     .table_input_state(input_kind)
                     .is_some_and(|input| !input.text.is_empty());
@@ -1619,6 +1653,7 @@ impl PluginPageWindowView {
         window: &mut Window,
         context: &mut Context<Self>,
     ) {
+        self.close_command_filter_date_time_pickers_for_input_focus(input_kind);
         let index = self.table_input_index_at_position(input_kind, event.position);
         let Some(text) = self
             .table_input_state(input_kind)
@@ -2698,6 +2733,7 @@ impl PluginPageWindowView {
                         SharedString::from("plugin-table-filter-input"),
                         PluginTableInputKind::QuickFilter,
                         "过滤当前表格任意关键字".to_string(),
+                        PluginTableCommandFilterControlKind::Text,
                         Some(Icon::Search),
                         true,
                         px(0.0),
@@ -2747,6 +2783,7 @@ impl PluginPageWindowView {
                             SharedString::from(format!("plugin-command-filter-input-{index}")),
                             PluginTableInputKind::CommandFilter(index),
                             input_state.placeholder.clone(),
+                            input_state.control_kind,
                             Self::plugin_command_filter_icon(input_state.icon.as_deref()),
                             false,
                             input_state.width,
@@ -2845,6 +2882,7 @@ impl PluginPageWindowView {
         element_id: SharedString,
         input_kind: PluginTableInputKind,
         placeholder: String,
+        control_kind: PluginTableCommandFilterControlKind,
         icon: Option<Icon>,
         fill_available_width: bool,
         fixed_width: Pixels,
@@ -2858,8 +2896,26 @@ impl PluginPageWindowView {
             .table_input_focus(input_kind)
             .cloned()
             .unwrap_or_else(|| context.focus_handle());
+        let date_time_control_index = match (control_kind, input_kind) {
+            (
+                PluginTableCommandFilterControlKind::DateTime,
+                PluginTableInputKind::CommandFilter(index),
+            ) => Some(index),
+            _ => None,
+        };
+        let date_time_picker_open = date_time_control_index.is_some_and(|index| {
+            self.command_filter_inputs
+                .get(index)
+                .is_some_and(|state| state.date_time_picker_open)
+        });
+        let (render_input_icon, date_time_toggle_icon) = match (date_time_control_index, icon) {
+            (Some(_), Some(icon)) => (None, icon),
+            (Some(_), None) => (None, Icon::Calendar),
+            (None, icon) => (icon, Icon::Calendar),
+        };
         div()
             .id(element_id.clone())
+            .relative()
             .flex()
             .items_center()
             .gap_2()
@@ -2905,13 +2961,46 @@ impl PluginPageWindowView {
                     context.stop_propagation();
                 }),
             )
-            .when_some(icon, |input, icon| {
+            .when_some(render_input_icon, |input, icon| {
                 input.child(MainView::render_lucide_icon(
                     Some(icon),
                     15.0,
                     15.0,
                     palette.muted_text,
                 ))
+            })
+            .when_some(date_time_control_index, |input, index| {
+                input.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(22.0))
+                        .h(px(22.0))
+                        .rounded(px(5.0))
+                        .text_color(rgb(palette.muted_text))
+                        .cursor_pointer()
+                        .hover(move |button| button.bg(rgb(palette.hover)))
+                        .child(MainView::render_lucide_icon(
+                            Some(date_time_toggle_icon),
+                            14.0,
+                            14.0,
+                            if date_time_picker_open {
+                                palette.accent
+                            } else {
+                                palette.muted_text
+                            },
+                        ))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            context.listener(
+                                move |view, _event: &MouseDownEvent, _window, context| {
+                                    view.toggle_command_filter_date_time_picker(index, context);
+                                    context.stop_propagation();
+                                },
+                            ),
+                        ),
+                )
             })
             .child(
                 div()
@@ -2954,6 +3043,9 @@ impl PluginPageWindowView {
                                     if let Some(input) = view.table_input_state_mut(input_kind) {
                                         input.set_text(String::new());
                                     }
+                                    if let PluginTableInputKind::CommandFilter(index) = input_kind {
+                                        view.close_command_filter_date_time_picker(index);
+                                    }
                                     view.after_table_input_text_changed(input_kind, context);
                                     context.stop_propagation();
                                 },
@@ -2961,6 +3053,553 @@ impl PluginPageWindowView {
                         ),
                 )
             })
+            .when(date_time_picker_open, |input| {
+                let Some(index) = date_time_control_index else {
+                    return input;
+                };
+                input.child({
+                    gpui::deferred(
+                        self.render_command_filter_date_time_picker(index, palette, context),
+                    )
+                    .with_priority(48)
+                })
+            })
+    }
+
+    /// 切换插件命令过滤器中的日期时间弹层。
+    ///
+    /// 业务意图：
+    /// - 日期时间控件由插件声明，宿主只维护弹层打开状态和当前可见月份。
+    /// - 打开新弹层时关闭其它命令过滤控件的弹层，避免多个浮层互相遮挡和鼠标命中不确定。
+    fn toggle_command_filter_date_time_picker(
+        &mut self,
+        index: usize,
+        context: &mut Context<Self>,
+    ) {
+        let Some(current) = self.command_filter_inputs.get(index) else {
+            return;
+        };
+        if current.control_kind != PluginTableCommandFilterControlKind::DateTime {
+            return;
+        }
+
+        let will_open = !current.date_time_picker_open;
+        for input_state in &mut self.command_filter_inputs {
+            input_state.date_time_picker_open = false;
+        }
+        if let Some(input_state) = self.command_filter_inputs.get_mut(index) {
+            input_state.date_time_picker_open = will_open;
+            if will_open {
+                let view_month = date_time_picker_month_from_text(&input_state.input.text);
+                input_state.date_time_picker_view_year = view_month.year;
+                input_state.date_time_picker_view_month = view_month.month;
+            }
+        }
+        context.notify();
+    }
+
+    /// 关闭指定日期时间弹层。
+    fn close_command_filter_date_time_picker(&mut self, index: usize) {
+        if let Some(input_state) = self.command_filter_inputs.get_mut(index) {
+            input_state.date_time_picker_open = false;
+        }
+    }
+
+    /// 关闭全部日期时间弹层。
+    fn close_all_command_filter_date_time_pickers(&mut self) {
+        for input_state in &mut self.command_filter_inputs {
+            input_state.date_time_picker_open = false;
+        }
+    }
+
+    /// 输入焦点切换时收起不相关的日期时间弹层。
+    ///
+    /// 业务意图：
+    /// - 日期时间弹层覆盖在表格上方，用户点击其它输入框时应自然离开当前选择器，避免旧弹层继续遮挡后续操作。
+    /// - 点击当前已打开的日期时间输入文本时保留弹层，方便用户边手动编辑边参考日历。
+    fn close_command_filter_date_time_pickers_for_input_focus(
+        &mut self,
+        input_kind: PluginTableInputKind,
+    ) {
+        let keep_open_index = match input_kind {
+            PluginTableInputKind::QuickFilter => None,
+            PluginTableInputKind::CommandFilter(index)
+                if self.command_filter_inputs.get(index).is_some_and(|state| {
+                    state.control_kind == PluginTableCommandFilterControlKind::DateTime
+                }) =>
+            {
+                Some(index)
+            }
+            PluginTableInputKind::CommandFilter(_) => None,
+        };
+        for (index, input_state) in self.command_filter_inputs.iter_mut().enumerate() {
+            if Some(index) != keep_open_index {
+                input_state.date_time_picker_open = false;
+            }
+        }
+    }
+
+    /// 移动日期时间弹层当前月份。
+    fn move_command_filter_date_time_picker_month(
+        &mut self,
+        index: usize,
+        delta: i32,
+        context: &mut Context<Self>,
+    ) {
+        if let Some(input_state) = self.command_filter_inputs.get_mut(index) {
+            let next = date_time_picker_move_month(
+                DateTimePickerViewMonth {
+                    year: input_state.date_time_picker_view_year,
+                    month: input_state.date_time_picker_view_month,
+                },
+                delta,
+            );
+            input_state.date_time_picker_view_year = next.year;
+            input_state.date_time_picker_view_month = next.month;
+            context.notify();
+        }
+    }
+
+    /// 选中日期并把标准日期时间文本写回输入框。
+    fn select_command_filter_date_time_picker_date(
+        &mut self,
+        index: usize,
+        date: chrono::NaiveDate,
+        context: &mut Context<Self>,
+    ) {
+        let current_text = self
+            .command_filter_inputs
+            .get(index)
+            .map(|state| state.input.text.clone())
+            .unwrap_or_default();
+        let value = date_time_picker_value_for_selected_date(&current_text, date);
+        self.set_command_filter_date_time_value(index, value, context);
+    }
+
+    /// 调整日期时间输入框中的时间部分。
+    fn adjust_command_filter_date_time_picker_time(
+        &mut self,
+        index: usize,
+        part: DateTimePart,
+        delta: i32,
+        context: &mut Context<Self>,
+    ) {
+        let current_text = self
+            .command_filter_inputs
+            .get(index)
+            .map(|state| state.input.text.clone())
+            .unwrap_or_default();
+        let value = date_time_picker_adjust_time(&current_text, part, delta);
+        self.set_command_filter_date_time_value(index, value, context);
+    }
+
+    /// 使用当前本地时间填充日期时间输入框。
+    fn set_command_filter_date_time_now(&mut self, index: usize, context: &mut Context<Self>) {
+        self.set_command_filter_date_time_value(index, app_date_time_now(), context);
+    }
+
+    /// 设置日期时间输入框文本。
+    ///
+    /// 边界条件：
+    /// - 写回只更新当前窗口的输入状态，不自动执行插件命令；用户仍通过“应用”或 Enter 触发重算。
+    fn set_command_filter_date_time_value(
+        &mut self,
+        index: usize,
+        value: chrono::NaiveDateTime,
+        context: &mut Context<Self>,
+    ) {
+        if let Some(input_state) = self.command_filter_inputs.get_mut(index) {
+            input_state.input.set_text(format_app_date_time(value));
+            input_state.layout = None;
+            input_state.date_time_picker_view_year = value.date().year();
+            input_state.date_time_picker_view_month = value.date().month();
+            context.notify();
+        }
+    }
+
+    /// 渲染插件命令过滤器的日期时间弹层。
+    ///
+    /// 业务意图：
+    /// - 弹层复制 xgpui DateTimePicker 的核心交互：月历选择日期、时间部分可步进调整、写回秒级标准格式。
+    /// - 该弹层是覆盖在表格上的浮层，必须消费鼠标事件，避免点击日期时同时触发表格行或按钮。
+    fn render_command_filter_date_time_picker(
+        &self,
+        index: usize,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let Some(input_state) = self.command_filter_inputs.get(index) else {
+            return div().id("plugin-command-date-time-picker-missing").hidden();
+        };
+        let view_month = DateTimePickerViewMonth {
+            year: input_state.date_time_picker_view_year,
+            month: input_state.date_time_picker_view_month,
+        };
+        let input_text = input_state.input.text.clone();
+        let selected_date = parse_app_date_time(&input_text).map(|value| value.date());
+        let display_value = parse_app_date_time(&input_text)
+            .unwrap_or_else(|| date_time_picker_adjust_time("", DateTimePart::Second, 0));
+        let today_date = app_date_time_now().date();
+        let weekday_labels = ["一", "二", "三", "四", "五", "六", "日"];
+
+        div()
+            .id(SharedString::from(format!(
+                "plugin-command-date-time-picker-{index}"
+            )))
+            .absolute()
+            .left(px(0.0))
+            .top(px(PLUGIN_TABLE_FILTER_HEIGHT + 6.0))
+            .w(px(320.0))
+            .p_3()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.menu))
+            .shadow_md()
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                |_event: &MouseDownEvent, _window: &mut Window, context: &mut App| {
+                    context.stop_propagation();
+                },
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                |_event: &MouseDownEvent, _window: &mut Window, context: &mut App| {
+                    context.stop_propagation();
+                },
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .mb_2()
+                    .child(self.render_date_time_picker_icon_button(
+                        index,
+                        "prev-month",
+                        Icon::ChevronLeft,
+                        palette,
+                        context.listener(move |view, _event: &MouseDownEvent, _window, context| {
+                            view.move_command_filter_date_time_picker_month(index, -1, context);
+                            context.stop_propagation();
+                        }),
+                    ))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(palette.text))
+                            .child(format!("{}年{:02}月", view_month.year, view_month.month)),
+                    )
+                    .child(self.render_date_time_picker_icon_button(
+                        index,
+                        "next-month",
+                        Icon::ChevronRight,
+                        palette,
+                        context.listener(move |view, _event: &MouseDownEvent, _window, context| {
+                            view.move_command_filter_date_time_picker_month(index, 1, context);
+                            context.stop_propagation();
+                        }),
+                    )),
+            )
+            .child(div().flex().items_center().gap_1().mb_1().children(
+                weekday_labels.into_iter().map(|label| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(38.0))
+                        .h(px(24.0))
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(palette.muted_text))
+                        .child(label)
+                }),
+            ))
+            .child(
+                div().flex().flex_wrap().gap_1().children(
+                    date_time_picker_calendar_days(view_month.year, view_month.month)
+                        .into_iter()
+                        .map(|day| {
+                            let in_month = day.month() == view_month.month;
+                            let selected = selected_date == Some(day);
+                            let today = today_date == day;
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .w(px(38.0))
+                                .h(px(30.0))
+                                .rounded(px(6.0))
+                                .text_sm()
+                                .cursor_pointer()
+                                .text_color(rgb(if selected {
+                                    palette.on_accent
+                                } else if in_month {
+                                    palette.text
+                                } else {
+                                    palette.muted_text
+                                }))
+                                .when(selected, |cell| cell.bg(rgb(palette.accent)))
+                                .when(!selected && today, |cell| cell.bg(rgb(palette.selected)))
+                                .hover(move |cell| {
+                                    if selected {
+                                        cell.bg(rgb(palette.accent_hover))
+                                    } else {
+                                        cell.bg(rgb(palette.hover))
+                                    }
+                                })
+                                .child(day.day().to_string())
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    context.listener(
+                                        move |view, _event: &MouseDownEvent, _window, context| {
+                                            view.select_command_filter_date_time_picker_date(
+                                                index, day, context,
+                                            );
+                                            context.stop_propagation();
+                                        },
+                                    ),
+                                )
+                        }),
+                ),
+            )
+            .child(
+                div()
+                    .mt_3()
+                    .pt_2()
+                    .border_t_1()
+                    .border_color(rgb(palette.border))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(self.render_date_time_picker_time_stepper(
+                        index,
+                        "时",
+                        display_value.time().hour(),
+                        DateTimePart::Hour,
+                        palette,
+                        context,
+                    ))
+                    .child(self.render_date_time_picker_time_stepper(
+                        index,
+                        "分",
+                        display_value.time().minute(),
+                        DateTimePart::Minute,
+                        palette,
+                        context,
+                    ))
+                    .child(self.render_date_time_picker_time_stepper(
+                        index,
+                        "秒",
+                        display_value.time().second(),
+                        DateTimePart::Second,
+                        palette,
+                        context,
+                    )),
+            )
+            .child(
+                div()
+                    .mt_3()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(self.render_date_time_picker_text_button(
+                        "清空",
+                        false,
+                        palette,
+                        context.listener(move |view, _event: &MouseDownEvent, _window, context| {
+                            if let Some(input_state) = view.command_filter_inputs.get_mut(index) {
+                                input_state.input.set_text(String::new());
+                                input_state.layout = None;
+                            }
+                            view.close_command_filter_date_time_picker(index);
+                            context.notify();
+                            context.stop_propagation();
+                        }),
+                    ))
+                    .child(self.render_date_time_picker_text_button(
+                        "现在",
+                        false,
+                        palette,
+                        context.listener(move |view, _event: &MouseDownEvent, _window, context| {
+                            view.set_command_filter_date_time_now(index, context);
+                            context.stop_propagation();
+                        }),
+                    ))
+                    .child(self.render_date_time_picker_text_button(
+                        "确定",
+                        true,
+                        palette,
+                        context.listener(move |view, _event: &MouseDownEvent, _window, context| {
+                            view.close_command_filter_date_time_picker(index);
+                            context.notify();
+                            context.stop_propagation();
+                        }),
+                    )),
+            )
+    }
+
+    /// 渲染日期时间弹层的图标按钮。
+    fn render_date_time_picker_icon_button(
+        &self,
+        index: usize,
+        id_suffix: &'static str,
+        icon: Icon,
+        palette: AppThemePalette,
+        on_mouse_down: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(SharedString::from(format!(
+                "plugin-date-time-picker-{index}-icon-{id_suffix}"
+            )))
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(28.0))
+            .h(px(28.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .hover(move |button| button.bg(rgb(palette.hover)))
+            .child(MainView::render_lucide_icon(
+                Some(icon),
+                15.0,
+                15.0,
+                palette.muted_text,
+            ))
+            .on_mouse_down(MouseButton::Left, on_mouse_down)
+    }
+
+    /// 渲染日期时间弹层的时间步进控件。
+    fn render_date_time_picker_time_stepper(
+        &self,
+        index: usize,
+        label: &'static str,
+        value: u32,
+        part: DateTimePart,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(SharedString::from(format!(
+                "plugin-date-time-picker-{index}-{label}"
+            )))
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(self.render_date_time_picker_small_button(
+                index,
+                format!("{label}-decrease"),
+                Icon::Minus,
+                palette,
+                context.listener(move |view, _event: &MouseDownEvent, _window, context| {
+                    view.adjust_command_filter_date_time_picker_time(index, part, -1, context);
+                    context.stop_propagation();
+                }),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .min_w(px(46.0))
+                    .h(px(28.0))
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.surface))
+                    .text_sm()
+                    .text_color(rgb(palette.text))
+                    .child(format!("{value:02} {label}")),
+            )
+            .child(self.render_date_time_picker_small_button(
+                index,
+                format!("{label}-increase"),
+                Icon::Plus,
+                palette,
+                context.listener(move |view, _event: &MouseDownEvent, _window, context| {
+                    view.adjust_command_filter_date_time_picker_time(index, part, 1, context);
+                    context.stop_propagation();
+                }),
+            ))
+    }
+
+    /// 渲染时间步进的小图标按钮。
+    fn render_date_time_picker_small_button(
+        &self,
+        index: usize,
+        id_suffix: String,
+        icon: Icon,
+        palette: AppThemePalette,
+        on_mouse_down: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(SharedString::from(format!(
+                "plugin-date-time-picker-{index}-{id_suffix}"
+            )))
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(24.0))
+            .h(px(24.0))
+            .rounded(px(5.0))
+            .cursor_pointer()
+            .hover(move |button| button.bg(rgb(palette.hover)))
+            .child(MainView::render_lucide_icon(
+                Some(icon),
+                13.0,
+                13.0,
+                palette.muted_text,
+            ))
+            .on_mouse_down(MouseButton::Left, on_mouse_down)
+    }
+
+    /// 渲染日期时间弹层底部文本按钮。
+    fn render_date_time_picker_text_button(
+        &self,
+        label: &'static str,
+        primary: bool,
+        palette: AppThemePalette,
+        on_mouse_down: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(SharedString::from(format!(
+                "plugin-date-time-picker-button-{label}"
+            )))
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(28.0))
+            .px_3()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(if primary {
+                palette.accent
+            } else {
+                palette.border
+            }))
+            .bg(rgb(if primary {
+                palette.accent
+            } else {
+                palette.surface
+            }))
+            .text_sm()
+            .text_color(rgb(if primary {
+                palette.on_accent
+            } else {
+                palette.text
+            }))
+            .cursor_pointer()
+            .hover(move |button| {
+                button.bg(rgb(if primary {
+                    palette.accent_hover
+                } else {
+                    palette.hover
+                }))
+            })
+            .child(label)
+            .on_mouse_down(MouseButton::Left, on_mouse_down)
     }
 
     /// 渲染插件表格纵向滚动条。
@@ -3945,6 +4584,10 @@ impl PluginPageWindowView {
     fn clear_command_filter_inputs(&mut self) {
         for input_state in &mut self.command_filter_inputs {
             input_state.input.set_text(String::new());
+            input_state.date_time_picker_open = false;
+            let view_month = date_time_picker_month_from_text("");
+            input_state.date_time_picker_view_year = view_month.year;
+            input_state.date_time_picker_view_month = view_month.month;
         }
     }
 
@@ -3992,6 +4635,7 @@ impl PluginPageWindowView {
         command: PluginTableRowCommand,
         context: &mut Context<Self>,
     ) {
+        self.close_all_command_filter_date_time_pickers();
         let Some(plugin) = self.origin_plugin.clone() else {
             self.page = MainView::plugin_error_page("无法确定过滤命令所属插件".to_string());
             context.notify();

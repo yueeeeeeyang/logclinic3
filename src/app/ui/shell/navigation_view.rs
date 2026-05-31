@@ -1126,7 +1126,8 @@ impl MainView {
     /// 清理重新加载日志前依赖旧来源树的工作区状态。
     ///
     /// 业务意图：
-    /// - 用户重新加载日志后，右侧 tab 和搜索结果都不应继续展示旧目录树中的文件，否则会误以为这些结果来自新加载内容。
+    /// - 用户重新加载日志后，右侧 tab、搜索关键字历史和搜索结果历史都不应继续展示旧目录树中的内容，
+    ///   否则会误以为这些关键字、目录目标或结果来自新加载日志。
     /// - 清理集中在一个函数里，避免后续新增右侧工作区状态时只清 tab、漏掉搜索结果或弹层。
     ///
     /// 边界条件：
@@ -1157,10 +1158,14 @@ impl MainView {
         self.log.log_tree_scrollbar_drag = None;
         self.log.tab_bar_scroll_handle = ScrollHandle::new();
 
-        self.search.search_results_panel = None;
         self.search.search_results_resize_drag = None;
         self.search.search_results_scrollbar_drag = None;
-        self.search.search_results_context_menu = None;
+        Self::clear_search_histories_for_log_reload(
+            &mut self.search.search_query_history,
+            &mut self.search.search_results_panel,
+            &mut self.search.search_results_context_menu,
+            &mut self.search.search_dialog_open_preset,
+        );
         self.search.next_search_job_id += 1;
         if let Some(dialog) = self.search.search_dialog.as_mut() {
             Self::reset_search_dialog_for_log_reload(dialog);

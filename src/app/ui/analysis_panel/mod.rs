@@ -26,6 +26,8 @@ pub(in crate::app) use thread_stack_window_view::{
     THREAD_STACK_WINDOW_HEIGHT, THREAD_STACK_WINDOW_MIN_HEIGHT, THREAD_STACK_WINDOW_MIN_WIDTH,
     THREAD_STACK_WINDOW_WIDTH, ThreadStackWindowView,
 };
+#[cfg(test)]
+pub(in crate::app) use thread_window_view::ThreadAnalysisResultTab;
 pub(in crate::app) use thread_window_view::{
-    SearchResultsResizeDrag, SearchTarget, ThreadAnalysisResultTab, ThreadAnalysisWindowView,
+    SearchResultsResizeDrag, SearchTarget, ThreadAnalysisWindowView,
 };

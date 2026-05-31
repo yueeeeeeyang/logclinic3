@@ -36,13 +36,12 @@ mod terminal_panel;
 /// 本地和远程终端共用的键盘与鼠标协议映射。
 mod terminal_protocol;
 
-#[cfg(test)]
-pub(in crate::app) use analysis_panel::ThreadStackWindowView;
 pub(in crate::app) use analysis_panel::{
     HprofAnalysisView, LOG_AI_ANALYSIS_WINDOW_HEIGHT, LOG_AI_ANALYSIS_WINDOW_WIDTH,
-    LogAiAnalysisWindowView, SearchResultsResizeDrag, SearchTarget, ThreadAnalysisResultTab,
-    ThreadAnalysisWindowView,
+    LogAiAnalysisWindowView, SearchResultsResizeDrag, SearchTarget, ThreadAnalysisWindowView,
 };
+#[cfg(test)]
+pub(in crate::app) use analysis_panel::{ThreadAnalysisResultTab, ThreadStackWindowView};
 pub(in crate::app) use chat_panel::*;
 pub(in crate::app) use components::*;
 pub(in crate::app) use connections_panel::*;
