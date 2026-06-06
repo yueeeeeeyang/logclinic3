@@ -1679,6 +1679,9 @@ impl PluginPageWindowView {
         if let Some(focus) = self.table_input_focus(input_kind) {
             window.focus(focus);
         }
+        if let PluginTableInputKind::CommandFilter(command_filter_index) = input_kind {
+            self.open_command_filter_date_time_picker(command_filter_index, context);
+        }
         context.notify();
     }
 
@@ -3094,6 +3097,31 @@ impl PluginPageWindowView {
                 input_state.date_time_picker_view_year = view_month.year;
                 input_state.date_time_picker_view_month = view_month.month;
             }
+        }
+        context.notify();
+    }
+
+    /// 打开指定命令过滤输入框的日期时间弹层。
+    ///
+    /// 业务意图：
+    /// - 性能列表时间区间输入是日期时间控件，用户点击输入框本体时也应直接看到选择器，而不必精确点击日历图标。
+    /// - 打开时关闭其它日期时间弹层，保证同一过滤行中最多只有一个浮层参与命中测试。
+    fn open_command_filter_date_time_picker(&mut self, index: usize, context: &mut Context<Self>) {
+        let Some(current) = self.command_filter_inputs.get(index) else {
+            return;
+        };
+        if current.control_kind != PluginTableCommandFilterControlKind::DateTime {
+            return;
+        }
+
+        for input_state in &mut self.command_filter_inputs {
+            input_state.date_time_picker_open = false;
+        }
+        if let Some(input_state) = self.command_filter_inputs.get_mut(index) {
+            input_state.date_time_picker_open = true;
+            let view_month = date_time_picker_month_from_text(&input_state.input.text);
+            input_state.date_time_picker_view_year = view_month.year;
+            input_state.date_time_picker_view_month = view_month.month;
         }
         context.notify();
     }

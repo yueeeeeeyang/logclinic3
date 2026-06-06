@@ -28,6 +28,17 @@ use crate::{
 /// - 多个文件的 Java thread dump 会合并成同一条时间轴，便于比较线程在不同快照中的状态变化。
 #[derive(Clone)]
 pub(crate) struct ThreadAnalysisData {
+    /// 本次分析输入的日志来源数量。
+    ///
+    /// 业务意图：
+    /// - 线程分析窗口允许临时启停过滤规则，重算结果摘要时必须保留原始文件数量，不能从过滤后的快照反推。
+    /// - 该字段只描述本次分析任务，不参与文件系统重新读取，避免窗口内交互触发 IO。
+    pub(crate) source_count: usize,
+    /// 本次分析中因读取或解码失败而跳过的文件数。
+    ///
+    /// 边界条件：
+    /// - 临时取消过滤规则只重新计算内存中的线程样本，跳过文件数量必须保持后台解析阶段的结果。
+    pub(crate) skipped_files: usize,
     /// 分析标题。
     pub(crate) title: String,
     /// 面向用户的摘要。
@@ -38,6 +49,26 @@ pub(crate) struct ThreadAnalysisData {
     /// - 线程日志分析会读取和解码多个来源，耗时期间独立窗口需要展示确定进度，避免用户误以为界面卡住。
     /// - `None` 表示已经完成或失败到最终摘要态，窗口只展示结果矩阵。
     pub(crate) progress: Option<ThreadAnalysisProgress>,
+    /// 未应用用户过滤规则的原始线程快照。
+    ///
+    /// 业务意图：
+    /// - 过滤规则弹层中的复选框只对当前窗口临时生效；用户取消某条规则后，被该规则隐藏的线程样本需要能立即恢复。
+    /// - 因此分析完成后保留解析得到的原始快照，窗口重算时不重新读取本地文件或压缩包成员。
+    ///
+    /// 边界条件：
+    /// - 进度态和未识别到快照时该集合为空；UI 不应把空集合视为错误。
+    pub(crate) raw_snapshots: Vec<ThreadSnapshot>,
+    /// 当前窗口中可临时启停的线程分析过滤规则。
+    ///
+    /// 业务意图：
+    /// - 规则来源仍是设置页持久化配置，窗口只保存本次分析的启用状态；切换复选框不回写配置文件。
+    pub(crate) filter_rule_states: Vec<ThreadAnalysisFilterRuleState>,
+    /// 是否在频率分析中隐藏只出现一次的线程。
+    ///
+    /// 业务意图：
+    /// - 这是线程分析内置的降噪规则，也属于当前结果的有效过滤条件；窗口过滤弹层允许用户临时关闭它来排查短生命周期线程。
+    /// - 堆栈并发分析的统计口径仍基于用户规则后的全部样本，不受该频率页降噪规则影响。
+    pub(crate) hide_single_occurrence_threads: bool,
     /// 横轴快照标签。
     pub(crate) snapshots: Vec<ThreadSnapshot>,
     /// 纵轴线程名，按命中次数从高到低排序，次数相同再按首次出现顺序排序。
@@ -369,6 +400,55 @@ pub(crate) struct ThreadAnalysisFilterRule {
     /// 边界条件：
     /// - 线程名规则只使用第一行作为模式；堆栈规则保留多行连续片段。
     pub(crate) lines: Vec<String>,
+}
+
+/// 线程分析窗口中的单条过滤规则启用状态。
+///
+/// 业务意图：
+/// - 设置页维护长期规则文本，分析窗口只需要在当前结果里临时启停某些规则，用于核对过滤是否过宽。
+/// - 将规则内容和启用状态放在一起，可以在 UI 中直接展示“当前生效/已暂停”并在切换时重算结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ThreadAnalysisFilterRuleState {
+    /// 解析后的过滤规则。
+    pub(crate) rule: ThreadAnalysisFilterRule,
+    /// 当前窗口内是否启用该规则。
+    pub(crate) enabled: bool,
+}
+
+impl ThreadAnalysisFilterRuleState {
+    /// 基于解析规则创建默认启用的窗口状态。
+    pub(crate) fn enabled(rule: ThreadAnalysisFilterRule) -> Self {
+        Self {
+            rule,
+            enabled: true,
+        }
+    }
+
+    /// 返回适合过滤弹层展示的规则摘要。
+    ///
+    /// 边界条件：
+    /// - 用户可能粘贴很长的完整堆栈，弹层中只展示首行和额外行数，避免宽窗口也被超长规则撑开。
+    /// - 空规则理论上不会由解析器产生；这里仍提供兜底文案，防止未来协议扩展造成空白行。
+    pub(crate) fn display_label(&self) -> String {
+        let kind_label = match self.rule.kind {
+            ThreadAnalysisFilterRuleKind::ThreadNamePattern => "线程名",
+            ThreadAnalysisFilterRuleKind::StackLines => "堆栈",
+        };
+        let first_line = self
+            .rule
+            .lines
+            .first()
+            .map(|line| line.as_str())
+            .unwrap_or("空规则");
+        if self.rule.lines.len() <= 1 {
+            format!("{kind_label}：{first_line}")
+        } else {
+            format!(
+                "{kind_label}：{first_line}（另 {} 行）",
+                self.rule.lines.len().saturating_sub(1)
+            )
+        }
+    }
 }
 
 /// 当前日志正文按线程分析规则过滤后的结果。
@@ -1221,31 +1301,101 @@ fn build_thread_concurrency_rows(snapshots: &[ThreadSnapshot]) -> Vec<ThreadConc
 pub(crate) fn build_thread_analysis_data(
     source_count: usize,
     skipped_files: usize,
-    mut snapshots: Vec<ThreadSnapshot>,
+    snapshots: Vec<ThreadSnapshot>,
     filter_rules: &[ThreadAnalysisFilterRule],
 ) -> ThreadAnalysisData {
+    let filter_rule_states = filter_rules
+        .iter()
+        .cloned()
+        .map(ThreadAnalysisFilterRuleState::enabled)
+        .collect::<Vec<_>>();
+    build_thread_analysis_data_with_filter_states(
+        source_count,
+        skipped_files,
+        snapshots,
+        filter_rule_states,
+        true,
+    )
+}
+
+/// 使用当前过滤规则启用状态重建线程分析窗口数据。
+///
+/// 业务意图：
+/// - 线程分析窗口的“过滤”弹层允许临时停用部分规则；重建时必须保留原始解析快照和文件统计，只改变过滤后的矩阵与摘要。
+/// - 该函数是纯内存计算，不读取日志来源，也不保存设置，确保窗口内试错操作足够轻量且不会改变长期配置。
+pub(crate) fn rebuild_thread_analysis_data_with_filter_states(
+    analysis: &ThreadAnalysisData,
+    filter_rule_states: Vec<ThreadAnalysisFilterRuleState>,
+) -> ThreadAnalysisData {
+    rebuild_thread_analysis_data_with_filter_options(
+        analysis,
+        filter_rule_states,
+        analysis.hide_single_occurrence_threads,
+    )
+}
+
+/// 使用当前过滤规则和内置降噪选项重建线程分析窗口数据。
+///
+/// 业务意图：
+/// - 过滤弹层既可以临时启停用户规则，也可以取消“隐藏只出现一次线程”的内置规则；两类开关统一走同一条重算路径。
+pub(crate) fn rebuild_thread_analysis_data_with_filter_options(
+    analysis: &ThreadAnalysisData,
+    filter_rule_states: Vec<ThreadAnalysisFilterRuleState>,
+    hide_single_occurrence_threads: bool,
+) -> ThreadAnalysisData {
+    build_thread_analysis_data_with_filter_states(
+        analysis.source_count,
+        analysis.skipped_files,
+        analysis.raw_snapshots.clone(),
+        filter_rule_states,
+        hide_single_occurrence_threads,
+    )
+}
+
+/// 按指定过滤规则状态构建线程分析窗口可直接渲染的数据矩阵。
+///
+/// 边界条件：
+/// - `raw_snapshots` 必须始终是不带用户过滤的解析结果；函数内部会复制出当前过滤快照，避免启停规则时丢失可恢复样本。
+/// - 进度态不会调用该函数；进度数据由 UI 构造空快照占位。
+pub(crate) fn build_thread_analysis_data_with_filter_states(
+    source_count: usize,
+    skipped_files: usize,
+    raw_snapshots: Vec<ThreadSnapshot>,
+    filter_rule_states: Vec<ThreadAnalysisFilterRuleState>,
+    hide_single_occurrence_threads: bool,
+) -> ThreadAnalysisData {
+    let mut snapshots = raw_snapshots.clone();
+    let active_filter_rules = filter_rule_states
+        .iter()
+        .filter(|state| state.enabled)
+        .map(|state| state.rule.clone())
+        .collect::<Vec<_>>();
     // `source_index` 仍是快照来源定位元数据；虽然当前“只出现一次”过滤不再按文件数判断，
     // 构建阶段仍读取一次以保持字段参与主流程，避免后续恢复跨文件统计时误删该边界信息。
     let _has_snapshot_source_index = snapshots
         .iter()
         .any(|snapshot| snapshot.source_index < source_count);
     let mut filtered_threads = 0usize;
-    if !filter_rules.is_empty() {
+    if !active_filter_rules.is_empty() {
         for snapshot in &mut snapshots {
             let before = snapshot.threads.len();
             snapshot
                 .threads
-                .retain(|sample| !thread_sample_matches_filter_rules(sample, filter_rules));
+                .retain(|sample| !thread_sample_matches_filter_rules(sample, &active_filter_rules));
             filtered_threads += before.saturating_sub(snapshot.threads.len());
         }
     }
     let _has_snapshot_labels = snapshots.iter().any(|snapshot| !snapshot.label.is_empty());
     let concurrency_rows = build_thread_concurrency_rows(&snapshots);
-    let visible_thread_name_set = default_visible_thread_names(&snapshots, source_count);
     let all_thread_name_set = snapshots
         .iter()
         .flat_map(|snapshot| snapshot.threads.iter().map(|sample| sample.name.clone()))
         .collect::<BTreeSet<_>>();
+    let visible_thread_name_set = if hide_single_occurrence_threads {
+        default_visible_thread_names(&snapshots, source_count)
+    } else {
+        all_thread_name_set.iter().cloned().collect::<HashSet<_>>()
+    };
     let auto_filtered_threads = all_thread_name_set
         .iter()
         .filter(|thread_name| !visible_thread_name_set.contains(*thread_name))
@@ -1319,9 +1469,14 @@ pub(crate) fn build_thread_analysis_data(
         )
     };
     ThreadAnalysisData {
+        source_count,
+        skipped_files,
         title: "线程日志分析".to_string(),
         summary,
         progress: None,
+        raw_snapshots,
+        filter_rule_states,
+        hide_single_occurrence_threads,
         snapshots,
         thread_names,
         matrix,

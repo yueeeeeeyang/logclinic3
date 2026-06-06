@@ -3177,6 +3177,71 @@ mod state_tests {
         assert!(analysis.summary.contains("过滤 1 个线程"));
     }
 
+    /// 验证线程分析窗口可基于原始快照临时取消某条过滤规则。
+    ///
+    /// 业务意图：
+    /// - 结果窗口的“过滤”弹层只改变当前窗口内规则启用状态，不能重新读取文件，也不能永久修改设置页规则。
+    /// - 关闭规则后，之前由该规则隐藏的线程需要回到频率矩阵和堆栈并发统计中。
+    #[test]
+    fn 线程分析临时取消过滤规则后恢复被隐藏线程() {
+        let lines = vec![
+            "Full thread dump Java HotSpot(TM) 64-Bit Server VM:".to_string(),
+            "\"noise-thread\" #1 prio=5".to_string(),
+            "   java.lang.Thread.State: RUNNABLE".to_string(),
+            "        at demo.Noise.loop(Noise.java:10)".to_string(),
+            "\"business-thread\" #2 prio=5".to_string(),
+            "   java.lang.Thread.State: RUNNABLE".to_string(),
+            "        at demo.Business.run(Business.java:20)".to_string(),
+            "Full thread dump Java HotSpot(TM) 64-Bit Server VM:".to_string(),
+            "\"noise-thread\" #1 prio=5".to_string(),
+            "   java.lang.Thread.State: RUNNABLE".to_string(),
+            "        at demo.Noise.loop(Noise.java:10)".to_string(),
+            "\"business-thread\" #2 prio=5".to_string(),
+            "   java.lang.Thread.State: RUNNABLE".to_string(),
+            "        at demo.Business.run(Business.java:20)".to_string(),
+        ];
+        let source = LogFileSource::LocalFile {
+            path: PathBuf::from("thread.log"),
+        };
+        let snapshots = parse_thread_dump_snapshots(&lines, "thread.log", 0, &source);
+        let rules = MainView::parse_thread_analysis_name_filter_rules("noise-*");
+
+        let analysis = build_thread_analysis_data(1, 0, snapshots, &rules);
+
+        assert_eq!(analysis.raw_snapshots.len(), 2);
+        assert_eq!(analysis.filter_rule_states.len(), 1);
+        assert!(analysis.filter_rule_states[0].enabled);
+        assert_eq!(analysis.thread_names, vec!["business-thread"]);
+
+        let mut rule_states = analysis.filter_rule_states.clone();
+        rule_states[0].enabled = false;
+        let restored = rebuild_thread_analysis_data_with_filter_states(&analysis, rule_states);
+
+        assert_eq!(
+            restored.thread_names,
+            vec!["noise-thread", "business-thread"]
+        );
+        assert!(
+            restored
+                .concurrency_rows
+                .iter()
+                .any(|row| row.stack_title.contains("demo.Noise.loop"))
+        );
+        assert!(
+            restored
+                .filter_rule_states
+                .first()
+                .is_some_and(|state| !state.enabled)
+        );
+        assert!(
+            analysis
+                .filter_rule_states
+                .first()
+                .is_some_and(|state| state.enabled),
+            "临时取消只应影响重算后的窗口数据，不应反向修改旧分析快照"
+        );
+    }
+
     /// 验证线程分析全部线程被过滤时仍保留快照统计。
     ///
     /// 业务意图：
@@ -3334,9 +3399,21 @@ mod state_tests {
 
         let analysis = build_thread_analysis_data(1, 0, snapshots, &[]);
 
+        assert!(analysis.hide_single_occurrence_threads);
         assert_eq!(analysis.thread_names, vec!["repeat-thread"]);
         assert_eq!(analysis.matrix.len(), 1);
         assert!(analysis.summary.contains("过滤 1 个线程"));
+
+        let restored = rebuild_thread_analysis_data_with_filter_options(
+            &analysis,
+            analysis.filter_rule_states.clone(),
+            false,
+        );
+
+        assert!(!restored.hide_single_occurrence_threads);
+        assert_eq!(restored.thread_names, vec!["repeat-thread", "once-thread"]);
+        assert_eq!(restored.matrix.len(), 2);
+        assert!(restored.summary.contains("过滤 0 个线程"));
     }
 
     /// 验证线程分析结果按线程命中次数从高到低排序。

@@ -162,9 +162,14 @@ impl MainView {
         let progress_snapshot = Arc::new(std::sync::Mutex::new(initial_progress.clone()));
         let task_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let loading_analysis = ThreadAnalysisData {
+            source_count,
+            skipped_files: 0,
             title: "线程日志分析".to_string(),
             summary: format!("正在分析 {} 个文件...", source_count),
             progress: Some(initial_progress),
+            raw_snapshots: Vec::new(),
+            filter_rule_states: Vec::new(),
+            hide_single_occurrence_threads: true,
             snapshots: Vec::new(),
             thread_names: Vec::new(),
             matrix: Vec::new(),
@@ -199,9 +204,14 @@ impl MainView {
                         continue;
                     };
                     let progress_analysis = ThreadAnalysisData {
+                        source_count,
+                        skipped_files: progress.skipped_files,
                         title: "线程日志分析".to_string(),
                         summary: progress.message(),
                         progress: Some(progress),
+                        raw_snapshots: Vec::new(),
+                        filter_rule_states: Vec::new(),
+                        hide_single_occurrence_threads: true,
                         snapshots: Vec::new(),
                         thread_names: Vec::new(),
                         matrix: Vec::new(),

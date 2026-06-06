@@ -49,6 +49,18 @@ const THREAD_ANALYSIS_CONCURRENCY_STATE_COLUMN_WIDTH: f32 = 104.0;
 /// - 业务栈帧通常很长，最小宽度需要保留包名和方法名前缀；窗口变窄时仍允许表格整体横向溢出，由 GPUI 裁剪处理。
 const THREAD_ANALYSIS_CONCURRENCY_NAME_MIN_WIDTH: f32 = 320.0;
 
+/// 线程过滤规则弹层宽度。
+///
+/// 业务意图：
+/// - 规则内容可能来自完整堆栈，弹层需要足够宽展示首行特征，同时不能占满分析窗口影响用户对照时间线。
+const THREAD_ANALYSIS_FILTER_POPOVER_WIDTH: f32 = 420.0;
+
+/// 线程过滤规则弹层最大高度。
+///
+/// 边界条件：
+/// - 用户可能配置很多过滤规则；限制高度并启用内部滚动，避免弹层越过窗口底部导致按钮不可点击。
+const THREAD_ANALYSIS_FILTER_POPOVER_MAX_HEIGHT: f32 = 320.0;
+
 /// 搜索结果面板高度拖动状态。
 ///
 /// 业务意图：
@@ -157,6 +169,11 @@ pub(in crate::app) struct ThreadAnalysisWindowView {
     /// - 右上角图例同时作为状态过滤器；用户可以按状态隐藏无关线程和色块，默认只关注 RUNNABLE 线程。
     /// - 集合为空时表示用户主动隐藏全部状态，时间线列表应展示为空，而不是自动回退为全部显示。
     pub(in crate::app) visible_state_kinds: HashSet<ThreadStateKind>,
+    /// 过滤规则弹层是否打开。
+    ///
+    /// 业务意图：
+    /// - 弹层展示本次分析实际携带的规则，并允许用户临时启停；该状态只属于当前窗口，不回写设置页。
+    pub(in crate::app) filter_popover_open: bool,
     /// 主窗口状态变更订阅。
     pub(in crate::app) _main_view_subscription: gpui::Subscription,
 }
@@ -232,6 +249,7 @@ impl ThreadAnalysisWindowView {
             jumped_cell: None,
             stack_window: None,
             visible_state_kinds: Self::default_visible_state_kinds(),
+            filter_popover_open: false,
             _main_view_subscription: main_view_subscription,
         }
     }
@@ -269,6 +287,7 @@ impl ThreadAnalysisWindowView {
                 }
             }
             self.visible_state_kinds = Self::default_visible_state_kinds();
+            self.filter_popover_open = false;
         }
         context.notify();
     }
@@ -292,6 +311,81 @@ impl ThreadAnalysisWindowView {
         self.active_tab = active_tab;
         self.scrollbar_drag = None;
         self.cell_popup = None;
+        self.filter_popover_open = false;
+        context.notify();
+    }
+
+    /// 切换过滤规则弹层打开状态。
+    ///
+    /// 业务意图：
+    /// - “过滤”按钮用于核对当前分析生效的规则；再次点击关闭，和常见下拉弹层行为一致。
+    fn toggle_filter_popover(&mut self, context: &mut Context<Self>) {
+        self.filter_popover_open = !self.filter_popover_open;
+        self.cell_popup = None;
+        context.notify();
+    }
+
+    /// 切换单条线程分析过滤规则的临时启用状态。
+    ///
+    /// 业务意图：
+    /// - 用户在结果窗口里取消勾选某条规则时，需要基于同一批原始快照立即重算频率页和堆栈并发页。
+    /// - 该操作只更新当前 `ThreadAnalysisData`，不保存设置页配置，避免一次排查影响后续默认规则。
+    fn toggle_filter_rule_enabled(&mut self, index: usize, context: &mut Context<Self>) {
+        let Some(current_state) = self.analysis.filter_rule_states.get(index) else {
+            return;
+        };
+        let mut filter_rule_states = self.analysis.filter_rule_states.clone();
+        filter_rule_states[index].enabled = !current_state.enabled;
+        self.analysis =
+            rebuild_thread_analysis_data_with_filter_states(&self.analysis, filter_rule_states);
+        self.scroll_handle = UniformListScrollHandle::new();
+        self.concurrency_scroll_handle = UniformListScrollHandle::new();
+        self.name_column_width = THREAD_ANALYSIS_NAME_COLUMN_WIDTH;
+        self.scrollbar_drag = None;
+        self.cell_popup = None;
+        self.jumped_cell = None;
+        if let Some(stack_window) = self.stack_window {
+            if stack_window
+                .update(context, |stack_view, window, context| {
+                    stack_view.update_stacks(Vec::new(), 0, context);
+                    window.set_window_title(&ThreadStackWindowView::window_title_for_cell(None));
+                })
+                .is_err()
+            {
+                self.stack_window = None;
+            }
+        }
+        context.notify();
+    }
+
+    /// 切换频率页内置的单次线程隐藏规则。
+    ///
+    /// 业务意图：
+    /// - 只出现一次的线程默认被隐藏以降低噪声，但排查短生命周期线程时需要临时查看它们。
+    /// - 该开关只影响频率页纵轴和摘要中的自动过滤数量，不改变堆栈并发分析的统计口径。
+    fn toggle_single_occurrence_filter_enabled(&mut self, context: &mut Context<Self>) {
+        let filter_rule_states = self.analysis.filter_rule_states.clone();
+        self.analysis = rebuild_thread_analysis_data_with_filter_options(
+            &self.analysis,
+            filter_rule_states,
+            !self.analysis.hide_single_occurrence_threads,
+        );
+        self.scroll_handle = UniformListScrollHandle::new();
+        self.name_column_width = THREAD_ANALYSIS_NAME_COLUMN_WIDTH;
+        self.scrollbar_drag = None;
+        self.cell_popup = None;
+        self.jumped_cell = None;
+        if let Some(stack_window) = self.stack_window {
+            if stack_window
+                .update(context, |stack_view, window, context| {
+                    stack_view.update_stacks(Vec::new(), 0, context);
+                    window.set_window_title(&ThreadStackWindowView::window_title_for_cell(None));
+                })
+                .is_err()
+            {
+                self.stack_window = None;
+            }
+        }
         context.notify();
     }
 
@@ -472,6 +566,242 @@ impl ThreadAnalysisWindowView {
                     )
             }),
         )
+    }
+
+    /// 渲染线程分析过滤按钮和规则弹层。
+    ///
+    /// 业务意图：
+    /// - 按钮显示当前启用规则数，弹层里用复选框临时开启或取消规则，帮助用户排查某条规则是否隐藏了有价值线程。
+    /// - 弹层挂在按钮所在的相对容器内，按钮和弹层都消费点击，避免操作穿透到下层时间线或堆栈并发行。
+    fn render_filter_rules_control(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let total_count = self.analysis.filter_rule_states.len().saturating_add(1);
+        let enabled_count = self
+            .analysis
+            .filter_rule_states
+            .iter()
+            .filter(|state| state.enabled)
+            .count()
+            .saturating_add(self.analysis.hide_single_occurrence_threads as usize);
+        let label = if total_count == 0 {
+            "过滤".to_string()
+        } else {
+            format!("过滤 {enabled_count}/{total_count}")
+        };
+
+        div()
+            .id("thread-analysis-filter-control")
+            .relative()
+            .flex_none()
+            .child(
+                div()
+                    .id("thread-analysis-filter-button")
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .h(px(28.0))
+                    .px_3()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(rgb(if self.filter_popover_open {
+                        palette.accent
+                    } else {
+                        palette.border
+                    }))
+                    .bg(rgb(if self.filter_popover_open {
+                        palette.selected
+                    } else {
+                        palette.panel
+                    }))
+                    .text_xs()
+                    .text_color(rgb(palette.text))
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(rgb(palette.hover)))
+                    .child(MainView::render_lucide_icon(
+                        Some(Icon::ListFilter),
+                        13.0,
+                        13.0,
+                        palette.text,
+                    ))
+                    .child(label)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        context.listener(|view, _event: &MouseDownEvent, _window, context| {
+                            view.toggle_filter_popover(context);
+                            context.stop_propagation();
+                        }),
+                    ),
+            )
+            .when(self.filter_popover_open, |control| {
+                control.child(gpui::deferred(
+                    self.render_filter_rules_popover(palette, context),
+                ))
+            })
+    }
+
+    /// 渲染线程分析过滤规则弹层。
+    ///
+    /// 边界条件：
+    /// - 没有配置规则时展示明确空态；有规则时每行固定高度、首行截断，避免超长堆栈规则破坏窗口布局。
+    fn render_filter_rules_popover(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let has_user_rules = !self.analysis.filter_rule_states.is_empty();
+        div()
+            .id("thread-analysis-filter-popover")
+            .absolute()
+            .right(px(0.0))
+            .top(px(34.0))
+            .w(px(THREAD_ANALYSIS_FILTER_POPOVER_WIDTH))
+            .max_h(px(THREAD_ANALYSIS_FILTER_POPOVER_MAX_HEIGHT))
+            .p_2()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.menu))
+            .shadow_md()
+            .overflow_y_scroll()
+            .scrollbar_width(px(6.0))
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                |_event: &MouseDownEvent, _window: &mut Window, context: &mut App| {
+                    context.stop_propagation();
+                },
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                |_event: &MouseDownEvent, _window: &mut Window, context: &mut App| {
+                    context.stop_propagation();
+                },
+            )
+            .on_scroll_wheel(context.listener(
+                |_view, _event: &ScrollWheelEvent, _window, context| {
+                    context.stop_propagation();
+                },
+            ))
+            .child(
+                div()
+                    .px_1()
+                    .pb_2()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(palette.muted_text))
+                    .child("当前线程分析过滤规则"),
+            )
+            .child(self.render_single_occurrence_filter_row(palette, context))
+            .when(!has_user_rules, |popover| {
+                popover.child(
+                    div()
+                        .px_1()
+                        .pt_2()
+                        .pb_1()
+                        .text_xs()
+                        .text_color(rgb(palette.muted_text))
+                        .child("当前没有配置用户过滤规则"),
+                )
+            })
+            .children(
+                self.analysis
+                    .filter_rule_states
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(index, state)| {
+                        self.render_filter_rule_row(index, state, palette, context)
+                    }),
+            )
+    }
+
+    /// 渲染内置单次线程隐藏规则。
+    ///
+    /// 业务意图：
+    /// - 该规则不是设置页中的文本规则，但它会影响频率页结果，因此需要在“过滤”弹层中和其它规则一起展示。
+    fn render_single_occurrence_filter_row(
+        &self,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let enabled = self.analysis.hide_single_occurrence_threads;
+        div()
+            .id("thread-analysis-filter-rule-single-occurrence")
+            .flex()
+            .items_center()
+            .gap_2()
+            .min_w_0()
+            .h(px(30.0))
+            .px_1()
+            .rounded(px(5.0))
+            .cursor_pointer()
+            .opacity(if enabled { 1.0 } else { 0.58 })
+            .hover(move |row| row.bg(rgb(palette.hover)))
+            .child(MainView::render_checkbox(enabled, palette))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(rgb(palette.text))
+                    .child("内置：隐藏只出现一次的线程"),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(|view, _event: &MouseDownEvent, _window, context| {
+                    view.toggle_single_occurrence_filter_enabled(context);
+                    context.stop_propagation();
+                }),
+            )
+    }
+
+    /// 渲染过滤弹层中的单条规则。
+    ///
+    /// 业务意图：
+    /// - 整行可点击，复选框只表达启用状态；禁用规则降低透明度但保留文本，方便用户确认当前临时取消的是哪一条。
+    fn render_filter_rule_row(
+        &self,
+        index: usize,
+        state: ThreadAnalysisFilterRuleState,
+        palette: AppThemePalette,
+        context: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let enabled = state.enabled;
+        div()
+            .id(SharedString::from(format!(
+                "thread-analysis-filter-rule-{index}"
+            )))
+            .flex()
+            .items_center()
+            .gap_2()
+            .min_w_0()
+            .h(px(30.0))
+            .px_1()
+            .rounded(px(5.0))
+            .cursor_pointer()
+            .opacity(if enabled { 1.0 } else { 0.58 })
+            .hover(move |row| row.bg(rgb(palette.hover)))
+            .child(MainView::render_checkbox(enabled, palette))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(rgb(palette.text))
+                    .child(state.display_label()),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                context.listener(move |view, _event: &MouseDownEvent, _window, context| {
+                    view.toggle_filter_rule_enabled(index, context);
+                    context.stop_propagation();
+                }),
+            )
     }
 
     /// 返回线程分析图例中展示的状态顺序。
@@ -1131,13 +1461,16 @@ impl ThreadAnalysisWindowView {
         (px(x), px(y))
     }
 
-    /// 关闭当前线程分析悬浮气泡。
+    /// 关闭当前线程分析窗口中的临时浮层。
     ///
     /// 业务意图：
-    /// - 用户查看完某个色块后，点击分析窗口的其它位置应恢复干净时间线视图。
-    /// - 正常离开色块时由悬浮事件关闭气泡；这里保留兜底，处理点击空白区域和滚动条拖动等场景。
-    fn dismiss_cell_popup(&mut self, context: &mut Context<Self>) {
-        if self.cell_popup.take().is_some() {
+    /// - 用户点击分析窗口空白区域时，应同时关闭色块悬浮气泡和过滤规则弹层，恢复干净的分析视图。
+    /// - 正常离开色块时由悬浮事件关闭气泡；这里保留兜底，处理点击空白区域、切换页签和滚动条拖动等场景。
+    fn dismiss_transient_overlays(&mut self, context: &mut Context<Self>) {
+        let had_cell_popup = self.cell_popup.take().is_some();
+        let had_filter_popover = self.filter_popover_open;
+        self.filter_popover_open = false;
+        if had_cell_popup || had_filter_popover {
             context.notify();
         }
     }
@@ -1624,7 +1957,7 @@ impl Render for ThreadAnalysisWindowView {
             .on_mouse_down(
                 MouseButton::Left,
                 context.listener(|view, _event: &MouseDownEvent, _window, context| {
-                    view.dismiss_cell_popup(context);
+                    view.dismiss_transient_overlays(context);
                 }),
             )
             .on_mouse_move(
@@ -1688,9 +2021,18 @@ impl Render for ThreadAnalysisWindowView {
                                             .child(self.analysis.summary.clone()),
                                     ),
                             )
-                            .when(
-                                self.active_tab == ThreadAnalysisResultTab::Frequency,
-                                |row| row.child(self.render_legend(palette, theme, context)),
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .when(
+                                        self.active_tab == ThreadAnalysisResultTab::Frequency,
+                                        |row| {
+                                            row.child(self.render_legend(palette, theme, context))
+                                        },
+                                    )
+                                    .child(self.render_filter_rules_control(palette, context)),
                             ),
                     )
                     .child(self.render_result_tabs(palette, context)),

@@ -58,11 +58,13 @@ use crate::shell_integration::{
 };
 use crate::theme::{AppThemePalette, EffectiveTheme, ThemePreference};
 use crate::thread_analysis::{
-    ThreadAnalysisData, ThreadAnalysisFilterRule, ThreadAnalysisProgress, ThreadConcurrencyRow,
-    ThreadDumpLineFilterSummary, ThreadStateKind, ThreadTimelineCell,
-    analyze_thread_dump_sources_with_progress, filter_thread_dump_lines_with_analysis_rules,
-    has_java_thread_dump_snapshots, parse_thread_analysis_filter_rules,
-    parse_thread_analysis_name_filter_rules, thread_stack_fingerprint_key,
+    ThreadAnalysisData, ThreadAnalysisFilterRule, ThreadAnalysisFilterRuleState,
+    ThreadAnalysisProgress, ThreadConcurrencyRow, ThreadDumpLineFilterSummary, ThreadStateKind,
+    ThreadTimelineCell, analyze_thread_dump_sources_with_progress,
+    filter_thread_dump_lines_with_analysis_rules, has_java_thread_dump_snapshots,
+    parse_thread_analysis_filter_rules, parse_thread_analysis_name_filter_rules,
+    rebuild_thread_analysis_data_with_filter_options,
+    rebuild_thread_analysis_data_with_filter_states, thread_stack_fingerprint_key,
     visible_thread_indexes_for_state_kinds,
 };
 #[cfg(test)]
